@@ -144,9 +144,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
-## Credits
+## Credits..
 
-Developed by **Fiverecords** — [fiverecords.com](https://fiverecords.com)
+Developed by **Fiverecords** — [fiverecords.com](https://github.com/fiverecords]((https://github.com/fiverecords/SuperTimecodeConverter)
 
 Built with [JUCE](https://juce.com/) — the cross-platform C++ framework for audio applications.
 
