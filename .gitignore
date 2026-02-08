@@ -1,0 +1,64 @@
+# ====================
+# Build outputs
+# ====================
+Builds/
+build/
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# ====================
+# Visual Studio
+# ====================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+x64/
+x86/
+Debug/
+Release/
+ipch/
+*.aps
+
+# ====================
+# JUCE / Projucer
+# ====================
+JuceLibraryCode/
+*.filterguid
+
+# ====================
+# OS files
+# ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# ====================
+# IDE
+# ====================
+.idea/
+.vscode/
+*.code-workspace
+
+# ====================
+# Dependencies
+# ====================
+libs/
+SDKs/
