@@ -11,6 +11,7 @@
 #include "AudioThru.h"
 #include "AppSettings.h"
 #include "CustomLookAndFeel.h"
+#include "LevelMeter.h"
 
 //==============================================================================
 class GainSlider : public juce::Slider
@@ -105,6 +106,10 @@ private:
     bool outputLtcEnabled    = false;
     bool outputThruEnabled   = false;
 
+    int mtcOutputOffset      = 0;
+    int artnetOutputOffset   = 0;
+    int ltcOutputOffset      = 0;
+
     // --- Collapse state ---
     bool inputConfigExpanded  = true;
     bool mtcOutExpanded       = true;
@@ -155,8 +160,10 @@ private:
     juce::ComboBox cmbAudioInputDevice;      juce::Label lblAudioInputDevice;
     juce::ComboBox cmbAudioInputChannel;     juce::Label lblAudioInputChannel;
     GainSlider sldLtcInputGain;              juce::Label lblLtcInputGain;
+    LevelMeter mtrLtcInput;
     juce::ComboBox cmbThruInputChannel;      juce::Label lblThruInputChannel;
     GainSlider sldThruInputGain;             juce::Label lblThruInputGain;
+    LevelMeter mtrThruInput;
     juce::Label lblInputStatus;
 
     // Right panel - scrollable
@@ -170,12 +177,17 @@ private:
     juce::ComboBox cmbAudioOutputDevice;     juce::Label lblAudioOutputDevice;
     juce::ComboBox cmbAudioOutputChannel;    juce::Label lblAudioOutputChannel;
     GainSlider sldLtcOutputGain;             juce::Label lblLtcOutputGain;
+    LevelMeter mtrLtcOutput;
     juce::ComboBox cmbThruOutputDevice;      juce::Label lblThruOutputDevice;
     juce::ComboBox cmbThruOutputChannel;     juce::Label lblThruOutputChannel;
     GainSlider sldThruOutputGain;            juce::Label lblThruOutputGain;
+    LevelMeter mtrThruOutput;
     juce::Label lblOutputMtcStatus;
+    GainSlider sldMtcOffset;                 juce::Label lblMtcOffset;
     juce::Label lblOutputArtnetStatus;
+    GainSlider sldArtnetOffset;              juce::Label lblArtnetOffset;
     juce::Label lblOutputLtcStatus;
+    GainSlider sldLtcOffset;                 juce::Label lblLtcOffset;
     juce::Label lblOutputThruStatus;
 
     juce::TextButton btnRefreshDevices { "Refresh Devices" };
@@ -257,6 +269,7 @@ private:
     void styleComboBox(juce::ComboBox& cmb);
     void styleLabel(juce::Label& lbl, float fontSize = 10.0f);
     void styleGainSlider(GainSlider& sld);
+    void styleOffsetSlider(GainSlider& sld);
     void styleCollapseButton(juce::TextButton& btn);
     void updateCollapseButtonText(juce::TextButton& btn, bool expanded);
 
