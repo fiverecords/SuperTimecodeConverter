@@ -42,7 +42,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device – single open call
+        // Open the specific device â€“ single open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.inputDeviceName   = devName;
         setup.outputDeviceName  = "";
@@ -124,6 +124,13 @@ public:
     float getPassthruGain() const    { return passthruGain.load(std::memory_order_relaxed); }
 
     //==============================================================================
+    // Peak levels for metering (0.0 - 1.0+)
+    //==============================================================================
+    float getLtcPeakLevel() const    { return ltcPeakLevel.load(std::memory_order_relaxed); }
+    float getThruPeakLevel() const   { return thruPeakLevel.load(std::memory_order_relaxed); }
+    void resetPeakLevels()           { ltcPeakLevel.store(0.0f, std::memory_order_relaxed); thruPeakLevel.store(0.0f, std::memory_order_relaxed); }
+
+    //==============================================================================
     // Passthrough ring buffer
     //==============================================================================
     int readPassthruSamples(float* dest, int numSamples)
@@ -155,6 +162,8 @@ private:
 
     std::atomic<float> inputGain    { 1.0f };
     std::atomic<float> passthruGain { 1.0f };
+    std::atomic<float> ltcPeakLevel  { 0.0f };
+    std::atomic<float> thruPeakLevel { 0.0f };
 
     static constexpr int RING_SIZE = 32768;
     static constexpr int RING_MASK = RING_SIZE - 1;
@@ -319,10 +328,17 @@ private:
             const float pGain = passthruGain.load(std::memory_order_relaxed);
             int wp = passthruWritePos.load(std::memory_order_relaxed);
 
+            float thruPeak = 0.0f;
             for (int i = 0; i < numSamples; i++)
-                passthruBuffer[(wp + i) & RING_MASK] = thruData[i] * pGain;
+            {
+                float s = thruData[i] * pGain;
+                passthruBuffer[(wp + i) & RING_MASK] = s;
+                float a = std::abs(s);
+                if (a > thruPeak) thruPeak = a;
+            }
 
             passthruWritePos.store(wp + numSamples, std::memory_order_release);
+            thruPeakLevel.store(thruPeak, std::memory_order_relaxed);
         }
 
         // --- LTC decode on the selected channel ---
@@ -335,9 +351,12 @@ private:
 
         const float gain = inputGain.load(std::memory_order_relaxed);
 
+        float ltcPeak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
         {
             float sample = data[i] * gain;
+            float a = std::abs(sample);
+            if (a > ltcPeak) ltcPeak = a;
             samplesSinceEdge++;
             samplesSinceLastSync += 1.0;
 
@@ -366,6 +385,7 @@ private:
                 samplesSinceEdge = 0;
             }
         }
+        ltcPeakLevel.store(ltcPeak, std::memory_order_relaxed);
     }
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override
