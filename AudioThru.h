@@ -38,7 +38,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device – single open call
+        // Open the specific device â€“ single open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.outputDeviceName  = devName;
         setup.inputDeviceName   = "";
@@ -88,6 +88,8 @@ public:
     void setOutputGain(float gain) { outputGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
     float getOutputGain() const { return outputGain.load(std::memory_order_relaxed); }
 
+    float getPeakLevel() const { return peakLevel.load(std::memory_order_relaxed); }
+
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
@@ -98,6 +100,7 @@ private:
     int currentBufferSize = 512;
     LtcInput* sourceInput = nullptr;
     std::atomic<float> outputGain { 1.0f };
+    std::atomic<float> peakLevel { 0.0f };
 
     void audioDeviceIOCallbackWithContext(const float* const*, int,
                                           float* const* outputChannelData,
@@ -119,9 +122,14 @@ private:
         sourceInput->readPassthruSamples(output, numSamples);
 
         const float gain = outputGain.load(std::memory_order_relaxed);
-        if (gain != 1.0f)
-            for (int i = 0; i < numSamples; i++)
-                output[i] *= gain;
+        float peak = 0.0f;
+        for (int i = 0; i < numSamples; i++)
+        {
+            if (gain != 1.0f) output[i] *= gain;
+            float a = std::abs(output[i]);
+            if (a > peak) peak = a;
+        }
+        peakLevel.store(peak, std::memory_order_relaxed);
 
         if (stereoMode && numOutputCh >= 2 && outputChannelData[1])
             std::memcpy(outputChannelData[1], output, sizeof(float) * (size_t)numSamples);
