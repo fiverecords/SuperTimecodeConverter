@@ -35,7 +35,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device – this is the ONLY open call
+        // Open the specific device â€“ this is the ONLY open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.outputDeviceName  = devName;
         setup.inputDeviceName   = "";
@@ -99,6 +99,8 @@ public:
     void setOutputGain(float gain)    { outputGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
     float getOutputGain() const       { return outputGain.load(std::memory_order_relaxed); }
 
+    float getPeakLevel() const        { return peakLevel.load(std::memory_order_relaxed); }
+
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
@@ -115,6 +117,7 @@ private:
     std::atomic<FrameRate> pendingFps { FrameRate::FPS_25 };
     std::atomic<bool> paused { false };
     std::atomic<float> outputGain { 1.0f };
+    std::atomic<float> peakLevel { 0.0f };
 
     static constexpr int LTC_FRAME_BITS = 80;
     uint8_t frameBits[LTC_FRAME_BITS] = {};
@@ -228,6 +231,7 @@ private:
                             ? outputChannelData[1] : nullptr;
         const float amplitude = baseAmplitude * outputGain.load(std::memory_order_relaxed);
 
+        float peak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
         {
             if (needNewFrame)
@@ -244,6 +248,8 @@ private:
             float sample = currentLevel * amplitude;
             output[i] = sample;
             if (output2) output2[i] = sample;
+            float a = std::abs(sample);
+            if (a > peak) peak = a;
             samplePositionInHalfBit += 1.0;
 
             if (samplePositionInHalfBit >= samplesPerHalfBit)
@@ -268,6 +274,7 @@ private:
                 }
             }
         }
+        peakLevel.store(peak, std::memory_order_relaxed);
     }
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override
