@@ -45,6 +45,11 @@ struct AppSettings
     // FPS
     int fpsSelection = 3;
 
+    // Output offsets (frames, -30 to +30)
+    int mtcOutputOffset = 0;
+    int artnetOutputOffset = 0;
+    int ltcOutputOffset = 0;
+
     //==============================================================================
     static juce::File getSettingsFile()
     {
@@ -94,6 +99,10 @@ struct AppSettings
 
         obj->setProperty("fpsSelection", fpsSelection);
 
+        obj->setProperty("mtcOutputOffset", mtcOutputOffset);
+        obj->setProperty("artnetOutputOffset", artnetOutputOffset);
+        obj->setProperty("ltcOutputOffset", ltcOutputOffset);
+
         juce::var jsonVar(obj.release());
         getSettingsFile().replaceWithText(juce::JSON::toString(jsonVar));
     }
@@ -142,6 +151,12 @@ struct AppSettings
             preferredBufferSize = (int)obj->getProperty("preferredBufferSize");
 
             fpsSelection   = (int)obj->getProperty("fpsSelection");
+
+            auto clampOffset = [](int v) { return juce::jlimit(-30, 30, v); };
+            mtcOutputOffset    = clampOffset((int)obj->getProperty("mtcOutputOffset"));
+            artnetOutputOffset = clampOffset((int)obj->getProperty("artnetOutputOffset"));
+            ltcOutputOffset    = clampOffset((int)obj->getProperty("ltcOutputOffset"));
+
             return true;
         }
         return false;
