@@ -59,6 +59,32 @@ inline juce::String frameRateToString(FrameRate fps)
 }
 
 //==============================================================================
+// Apply a frame offset (+/-) to a Timecode, wrapping at 24h
+//==============================================================================
+inline Timecode offsetTimecode(const Timecode& tc, int offsetFrames, FrameRate fps)
+{
+    if (offsetFrames == 0) return tc;
+
+    int maxFrames = frameRateToInt(fps);
+    int64_t total = (int64_t)tc.hours * 3600 * maxFrames
+                  + (int64_t)tc.minutes * 60 * maxFrames
+                  + (int64_t)tc.seconds * maxFrames
+                  + (int64_t)tc.frames
+                  + offsetFrames;
+
+    // Wrap around 24h
+    int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
+    total = ((total % dayFrames) + dayFrames) % dayFrames;
+
+    Timecode result;
+    result.frames  = (int)(total % maxFrames);
+    result.seconds = (int)((total / maxFrames) % 60);
+    result.minutes = (int)((total / (maxFrames * 60)) % 60);
+    result.hours   = (int)((total / (maxFrames * 3600)) % 24);
+    return result;
+}
+
+//==============================================================================
 // Audio device entry with device type information
 //==============================================================================
 struct AudioDeviceEntry
@@ -76,7 +102,7 @@ struct AudioDeviceEntry
         if (name == "DirectSound")      return "DirectSound";
         if (name == "CoreAudio")        return "";
 
-        // WASAPI variants â€” JUCE may use different parenthetical suffixes
+        // WASAPI variants Ã¢â‚¬â€ JUCE may use different parenthetical suffixes
         // e.g. "Windows Audio (Exclusive Mode)", "Windows Audio (Exclusive)",
         //      "Windows Audio (Low Latency)"
         if (name.startsWith("Windows Audio"))
@@ -92,7 +118,7 @@ struct AudioDeviceEntry
             return "WASAPI";
         }
 
-        // Unknown type â€” use full name
+        // Unknown type Ã¢â‚¬â€ use full name
         return name;
     }
 
