@@ -119,7 +119,7 @@ MainComponent::MainComponent()
     addAndMakeVisible(timecodeDisplay);
 
     // =====================================================================
-    // LEFT PANEL â€“ INPUT SELECTORS
+    // LEFT PANEL Ã¢â‚¬â€œ INPUT SELECTORS
     // =====================================================================
     auto addLabelAndCombo = [this](juce::Label& lbl, juce::ComboBox& cmb, const juce::String& text)
     {
@@ -173,6 +173,7 @@ MainComponent::MainComponent()
 
     addAndMakeVisible(sldLtcInputGain); styleGainSlider(sldLtcInputGain);
     addAndMakeVisible(lblLtcInputGain); lblLtcInputGain.setText("LTC INPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcInputGain);
+    addAndMakeVisible(mtrLtcInput); mtrLtcInput.setColour(accentPurple);
     sldLtcInputGain.onValueChange = [this] { ltcInput.setInputGain((float)sldLtcInputGain.getValue() / 100.0f); saveSettings(); };
 
     addLabelAndCombo(lblThruInputChannel, cmbThruInputChannel, "AUDIO THRU CHANNEL:");
@@ -180,12 +181,13 @@ MainComponent::MainComponent()
 
     addAndMakeVisible(sldThruInputGain); styleGainSlider(sldThruInputGain);
     addAndMakeVisible(lblThruInputGain); lblThruInputGain.setText("AUDIO THRU INPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruInputGain);
+    addAndMakeVisible(mtrThruInput); mtrThruInput.setColour(accentCyan);
     sldThruInputGain.onValueChange = [this] { ltcInput.setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); };
 
     addAndMakeVisible(lblInputStatus); styleLabel(lblInputStatus); lblInputStatus.setColour(juce::Label::textColourId, accentGreen);
 
     // =====================================================================
-    // RIGHT PANEL â€“ OUTPUT SELECTORS
+    // RIGHT PANEL Ã¢â‚¬â€œ OUTPUT SELECTORS
     // =====================================================================
     addLabelAndCombo(lblMidiOutputDevice, cmbMidiOutputDevice, "MIDI OUTPUT DEVICE:");
     cmbMidiOutputDevice.onChange = [this]
@@ -195,6 +197,9 @@ MainComponent::MainComponent()
         { stopMtcOutput(); mtcOutput.refreshDeviceList(); if (mtcOutput.start(sel)) { mtcOutput.setFrameRate(currentFps); mtcOutStatusText = "TX: " + mtcOutput.getCurrentDeviceName(); } else mtcOutStatusText = "FAILED TO OPEN"; saveSettings(); }
     };
     addAndMakeVisible(lblOutputMtcStatus); styleLabel(lblOutputMtcStatus); lblOutputMtcStatus.setColour(juce::Label::textColourId, accentRed);
+    addAndMakeVisible(sldMtcOffset); styleOffsetSlider(sldMtcOffset);
+    addAndMakeVisible(lblMtcOffset); lblMtcOffset.setText("MTC OFFSET:", juce::dontSendNotification); styleLabel(lblMtcOffset);
+    sldMtcOffset.onValueChange = [this] { mtcOutputOffset = (int)sldMtcOffset.getValue(); saveSettings(); };
 
     addLabelAndCombo(lblArtnetOutputInterface, cmbArtnetOutputInterface, "ART-NET OUTPUT DEVICE:");
     cmbArtnetOutputInterface.onChange = [this]
@@ -203,6 +208,9 @@ MainComponent::MainComponent()
         { int sel = cmbArtnetOutputInterface.getSelectedId() - 1; stopArtnetOutput(); artnetOutput.refreshNetworkInterfaces(); if (artnetOutput.start(sel, 6454)) { artnetOutput.setFrameRate(currentFps); artnetOutStatusText = "TX: " + artnetOutput.getBroadcastIp() + ":6454"; } else artnetOutStatusText = "FAILED TO BIND"; saveSettings(); }
     };
     addAndMakeVisible(lblOutputArtnetStatus); styleLabel(lblOutputArtnetStatus); lblOutputArtnetStatus.setColour(juce::Label::textColourId, accentOrange);
+    addAndMakeVisible(sldArtnetOffset); styleOffsetSlider(sldArtnetOffset);
+    addAndMakeVisible(lblArtnetOffset); lblArtnetOffset.setText("ART-NET OFFSET:", juce::dontSendNotification); styleLabel(lblArtnetOffset);
+    sldArtnetOffset.onValueChange = [this] { artnetOutputOffset = (int)sldArtnetOffset.getValue(); saveSettings(); };
 
     addLabelAndCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, "AUDIO DRIVER:");
     cmbAudioOutputTypeFilter.onChange = [this]
@@ -231,9 +239,13 @@ MainComponent::MainComponent()
 
     addAndMakeVisible(sldLtcOutputGain); styleGainSlider(sldLtcOutputGain);
     addAndMakeVisible(lblLtcOutputGain); lblLtcOutputGain.setText("LTC OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcOutputGain);
+    addAndMakeVisible(mtrLtcOutput); mtrLtcOutput.setColour(accentPurple);
     sldLtcOutputGain.onValueChange = [this] { ltcOutput.setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); };
 
     addAndMakeVisible(lblOutputLtcStatus); styleLabel(lblOutputLtcStatus); lblOutputLtcStatus.setColour(juce::Label::textColourId, accentPurple);
+    addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
+    addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
+    sldLtcOffset.onValueChange = [this] { ltcOutputOffset = (int)sldLtcOffset.getValue(); saveSettings(); };
 
     addLabelAndCombo(lblThruOutputDevice, cmbThruOutputDevice, "AUDIO THRU OUTPUT DEVICE:");
     cmbThruOutputDevice.onChange = [this]
@@ -251,6 +263,7 @@ MainComponent::MainComponent()
 
     addAndMakeVisible(sldThruOutputGain); styleGainSlider(sldThruOutputGain);
     addAndMakeVisible(lblThruOutputGain); lblThruOutputGain.setText("AUDIO THRU OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruOutputGain);
+    addAndMakeVisible(mtrThruOutput); mtrThruOutput.setColour(accentCyan);
     sldThruOutputGain.onValueChange = [this] { audioThru.setOutputGain((float)sldThruOutputGain.getValue() / 100.0f); saveSettings(); };
 
     addAndMakeVisible(lblOutputThruStatus); styleLabel(lblOutputThruStatus); lblOutputThruStatus.setColour(juce::Label::textColourId, accentCyan);
@@ -701,7 +714,7 @@ int MainComponent::getChannelFromCombo(const juce::ComboBox& cmb) const
 }
 
 //==============================================================================
-// SETTINGS â€“ Phase 1
+// SETTINGS Ã¢â‚¬â€œ Phase 1
 //==============================================================================
 void MainComponent::loadAndApplyNonAudioSettings()
 {
@@ -753,6 +766,14 @@ void MainComponent::loadAndApplyNonAudioSettings()
     outputArtnetEnabled = settings.artnetOutEnabled;
     outputLtcEnabled = settings.ltcOutEnabled;
     outputThruEnabled = settings.thruOutEnabled;
+
+    mtcOutputOffset = settings.mtcOutputOffset;
+    artnetOutputOffset = settings.artnetOutputOffset;
+    ltcOutputOffset = settings.ltcOutputOffset;
+    sldMtcOffset.setValue(mtcOutputOffset, juce::dontSendNotification);
+    sldArtnetOffset.setValue(artnetOutputOffset, juce::dontSendNotification);
+    sldLtcOffset.setValue(ltcOutputOffset, juce::dontSendNotification);
+
     btnMtcOut.setToggleState(outputMtcEnabled, juce::dontSendNotification);
     btnArtnetOut.setToggleState(outputArtnetEnabled, juce::dontSendNotification);
     btnLtcOut.setToggleState(outputLtcEnabled, juce::dontSendNotification);
@@ -780,7 +801,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
 }
 
 //==============================================================================
-// SETTINGS â€“ Phase 2
+// SETTINGS Ã¢â‚¬â€œ Phase 2
 //==============================================================================
 void MainComponent::applyAudioSettings()
 {
@@ -852,6 +873,10 @@ void MainComponent::saveSettings()
     settings.artnetOutEnabled = outputArtnetEnabled;
     settings.ltcOutEnabled = outputLtcEnabled;
     settings.thruOutEnabled = outputThruEnabled;
+
+    settings.mtcOutputOffset = mtcOutputOffset;
+    settings.artnetOutputOffset = artnetOutputOffset;
+    settings.ltcOutputOffset = ltcOutputOffset;
 
     settings.ltcInputGain   = (int)sldLtcInputGain.getValue();
     settings.thruInputGain  = (int)sldThruInputGain.getValue();
@@ -1084,9 +1109,21 @@ void MainComponent::routeTimecodeToOutputs()
 {
     if (sourceActive)
     {
-        if (outputMtcEnabled && mtcOutput.getIsRunning()) { mtcOutput.setTimecode(currentTimecode); mtcOutput.setPaused(false); }
-        if (outputArtnetEnabled && artnetOutput.getIsRunning()) { artnetOutput.setTimecode(currentTimecode); artnetOutput.setPaused(false); }
-        if (outputLtcEnabled && ltcOutput.getIsRunning()) { ltcOutput.setTimecode(currentTimecode); ltcOutput.setPaused(false); }
+        if (outputMtcEnabled && mtcOutput.getIsRunning())
+        {
+            mtcOutput.setTimecode(offsetTimecode(currentTimecode, mtcOutputOffset, currentFps));
+            mtcOutput.setPaused(false);
+        }
+        if (outputArtnetEnabled && artnetOutput.getIsRunning())
+        {
+            artnetOutput.setTimecode(offsetTimecode(currentTimecode, artnetOutputOffset, currentFps));
+            artnetOutput.setPaused(false);
+        }
+        if (outputLtcEnabled && ltcOutput.getIsRunning())
+        {
+            ltcOutput.setTimecode(offsetTimecode(currentTimecode, ltcOutputOffset, currentFps));
+            ltcOutput.setPaused(false);
+        }
     }
     else
     {
@@ -1122,8 +1159,10 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbAudioInputDevice.setVisible(showLtcIn);        lblAudioInputDevice.setVisible(showLtcIn);
     cmbAudioInputChannel.setVisible(showLtcIn);       lblAudioInputChannel.setVisible(showLtcIn);
     sldLtcInputGain.setVisible(showLtcIn);            lblLtcInputGain.setVisible(showLtcIn);
+    mtrLtcInput.setVisible(showLtcIn);
     cmbThruInputChannel.setVisible(showLtcIn && outputThruEnabled);  lblThruInputChannel.setVisible(showLtcIn && outputThruEnabled);
     sldThruInputGain.setVisible(showLtcIn && outputThruEnabled);     lblThruInputGain.setVisible(showLtcIn && outputThruEnabled);
+    mtrThruInput.setVisible(showLtcIn && outputThruEnabled);
     lblInputStatus.setVisible(true);
 
     // Output sections: visible = enabled, config visible = enabled && expanded
@@ -1143,9 +1182,11 @@ void MainComponent::updateDeviceSelectorVisibility()
     updateCollapseButtonText(btnCollapseThruOut, thruOutExpanded);
 
     cmbMidiOutputDevice.setVisible(showMtcConfig);       lblMidiOutputDevice.setVisible(showMtcConfig);
+    sldMtcOffset.setVisible(showMtcConfig);              lblMtcOffset.setVisible(showMtcConfig);
     lblOutputMtcStatus.setVisible(outputMtcEnabled);
 
     cmbArtnetOutputInterface.setVisible(showArtnetConfig); lblArtnetOutputInterface.setVisible(showArtnetConfig);
+    sldArtnetOffset.setVisible(showArtnetConfig);          lblArtnetOffset.setVisible(showArtnetConfig);
     lblOutputArtnetStatus.setVisible(outputArtnetEnabled);
 
     cmbAudioOutputTypeFilter.setVisible(showAudioOut && (showLtcConfig || showThruConfig));
@@ -1154,11 +1195,14 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbAudioOutputDevice.setVisible(showLtcConfig);  lblAudioOutputDevice.setVisible(showLtcConfig);
     cmbAudioOutputChannel.setVisible(showLtcConfig); lblAudioOutputChannel.setVisible(showLtcConfig);
     sldLtcOutputGain.setVisible(showLtcConfig);      lblLtcOutputGain.setVisible(showLtcConfig);
+    mtrLtcOutput.setVisible(showLtcConfig);
+    sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
     lblOutputLtcStatus.setVisible(outputLtcEnabled);
 
     cmbThruOutputDevice.setVisible(showThruConfig);  lblThruOutputDevice.setVisible(showThruConfig);
     cmbThruOutputChannel.setVisible(showThruConfig); lblThruOutputChannel.setVisible(showThruConfig);
     sldThruOutputGain.setVisible(showThruConfig);    lblThruOutputGain.setVisible(showThruConfig);
+    mtrThruOutput.setVisible(showThruConfig);
     lblOutputThruStatus.setVisible(outputThruEnabled);
 
     bool anyDevice = (activeInput != InputSource::SystemTime) || outputMtcEnabled || outputArtnetEnabled || outputLtcEnabled || outputThruEnabled;
@@ -1217,7 +1261,7 @@ void MainComponent::paint(juce::Graphics& g)
     g.setColour(bgDarker); g.fillRect(0, getHeight() - bbH, getWidth(), bbH);
     g.setColour(borderCol); g.drawLine(0.0f, (float)(getHeight() - bbH), (float)getWidth(), (float)(getHeight() - bbH), 1.0f);
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions("Consolas", 9.0f, juce::Font::plain)));
-    g.drawText("STC v1.0  |  Fiverecords " + juce::String(juce::CharPointer_UTF8("\xc2\xa9")) + " 2026", juce::Rectangle<int>(10, getHeight() - bbH, 280, bbH), juce::Justification::centredLeft);
+    g.drawText("STC v1.1  |  Fiverecords " + juce::String(juce::CharPointer_UTF8("\xc2\xa9")) + " 2026", juce::Rectangle<int>(10, getHeight() - bbH, 280, bbH), juce::Justification::centredLeft);
 
     juce::String statusText; juce::Colour statusColour;
     if (sourceActive) { statusText = getInputName(activeInput) + " ACTIVE"; statusColour = getInputColour(activeInput); }
@@ -1232,7 +1276,7 @@ void MainComponent::paint(juce::Graphics& g)
 }
 
 //==============================================================================
-// RESIZED â€” Interleaved layout
+// RESIZED Ã¢â‚¬â€ Interleaved layout
 //==============================================================================
 void MainComponent::resized()
 {
@@ -1254,6 +1298,9 @@ void MainComponent::resized()
     auto laySlider = [](juce::Label& l, GainSlider& s, juce::Rectangle<int>& panel) {
         l.setBounds(panel.removeFromTop(14)); panel.removeFromTop(2);
         s.setBounds(panel.removeFromTop(20)); panel.removeFromTop(3);
+    };
+    auto layMeter = [](LevelMeter& m, juce::Rectangle<int>& panel) {
+        m.setBounds(panel.removeFromTop(6)); panel.removeFromTop(3);
     };
     auto layStatus = [](juce::Label& l, juce::Rectangle<int>& panel) {
         l.setBounds(panel.removeFromTop(13)); panel.removeFromTop(4);
@@ -1292,16 +1339,18 @@ void MainComponent::resized()
         layCombo(lblAudioInputDevice, cmbAudioInputDevice, leftPanel);
         layCombo(lblAudioInputChannel, cmbAudioInputChannel, leftPanel);
         laySlider(lblLtcInputGain, sldLtcInputGain, leftPanel);
+        if (mtrLtcInput.isVisible()) layMeter(mtrLtcInput, leftPanel);
         if (cmbThruInputChannel.isVisible())
         {
             layCombo(lblThruInputChannel, cmbThruInputChannel, leftPanel);
             laySlider(lblThruInputGain, sldThruInputGain, leftPanel);
+            if (mtrThruInput.isVisible()) layMeter(mtrThruInput, leftPanel);
         }
     }
 
     lblInputStatus.setBounds(leftPanel.removeFromTop(14));
 
-    // ===== RIGHT PANEL â€” Interleaved: toggle â†’ config â†’ toggle â†’ config =====
+    // ===== RIGHT PANEL Ã¢â‚¬â€ Interleaved: toggle Ã¢â€ â€™ config Ã¢â€ â€™ toggle Ã¢â€ â€™ config =====
     auto rightPanel = bounds.removeFromRight(panelWidth);
     rightPanel.removeFromTop(topBar + 40);
     rightPanel.removeFromBottom(bottomBar);
@@ -1318,6 +1367,7 @@ void MainComponent::resized()
         rightPanel.removeFromTop(2);
 
         if (cmbMidiOutputDevice.isVisible()) layCombo(lblMidiOutputDevice, cmbMidiOutputDevice, rightPanel);
+        if (sldMtcOffset.isVisible()) laySlider(lblMtcOffset, sldMtcOffset, rightPanel);
         if (lblOutputMtcStatus.isVisible()) layStatus(lblOutputMtcStatus, rightPanel);
         rightPanel.removeFromTop(2);
     }
@@ -1331,6 +1381,7 @@ void MainComponent::resized()
         rightPanel.removeFromTop(2);
 
         if (cmbArtnetOutputInterface.isVisible()) layCombo(lblArtnetOutputInterface, cmbArtnetOutputInterface, rightPanel);
+        if (sldArtnetOffset.isVisible()) laySlider(lblArtnetOffset, sldArtnetOffset, rightPanel);
         if (lblOutputArtnetStatus.isVisible()) layStatus(lblOutputArtnetStatus, rightPanel);
         rightPanel.removeFromTop(2);
     }
@@ -1343,7 +1394,7 @@ void MainComponent::resized()
         btnLtcOut.setBounds(row);
         rightPanel.removeFromTop(2);
 
-        // Shared audio driver filter â€” shown inside LTC/Thru config area
+        // Shared audio driver filter Ã¢â‚¬â€ shown inside LTC/Thru config area
         if (cmbAudioOutputTypeFilter.isVisible())
             layCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, rightPanel);
 
@@ -1352,6 +1403,8 @@ void MainComponent::resized()
             layCombo(lblAudioOutputDevice, cmbAudioOutputDevice, rightPanel);
             layCombo(lblAudioOutputChannel, cmbAudioOutputChannel, rightPanel);
             laySlider(lblLtcOutputGain, sldLtcOutputGain, rightPanel);
+            if (mtrLtcOutput.isVisible()) layMeter(mtrLtcOutput, rightPanel);
+            if (sldLtcOffset.isVisible()) laySlider(lblLtcOffset, sldLtcOffset, rightPanel);
         }
         if (lblOutputLtcStatus.isVisible()) layStatus(lblOutputLtcStatus, rightPanel);
         rightPanel.removeFromTop(2);
@@ -1370,6 +1423,7 @@ void MainComponent::resized()
             layCombo(lblThruOutputDevice, cmbThruOutputDevice, rightPanel);
             layCombo(lblThruOutputChannel, cmbThruOutputChannel, rightPanel);
             laySlider(lblThruOutputGain, sldThruOutputGain, rightPanel);
+            if (mtrThruOutput.isVisible()) layMeter(mtrThruOutput, rightPanel);
         }
         if (lblOutputThruStatus.isVisible()) layStatus(lblOutputThruStatus, rightPanel);
         rightPanel.removeFromTop(2);
@@ -1379,7 +1433,7 @@ void MainComponent::resized()
     if (btnRefreshDevices.isVisible())
         btnRefreshDevices.setBounds(rightPanel.removeFromBottom(26));
 
-    // ===== CENTER â€” Timecode + FPS =====
+    // ===== CENTER Ã¢â‚¬â€ Timecode + FPS =====
     auto centerArea = bounds;
     centerArea.removeFromTop(topBar);
     centerArea.removeFromBottom(bottomBar);
@@ -1437,6 +1491,27 @@ void MainComponent::timerCallback()
     routeTimecodeToOutputs(); updateStatusLabels();
     timecodeDisplay.setTimecode(currentTimecode); timecodeDisplay.setFrameRate(currentFps);
     timecodeDisplay.setRunning(sourceActive); timecodeDisplay.setSourceName(getInputName(activeInput));
+
+    // Update level meters (with decay for smooth visual)
+    auto decayLevel = [](float current, float target, float decay = 0.85f) {
+        return target > current ? target : current * decay;
+    };
+    float ltcInLvl  = ltcInput.getIsRunning()  ? ltcInput.getLtcPeakLevel()  : 0.0f;
+    float thruInLvl = ltcInput.getIsRunning()  ? ltcInput.getThruPeakLevel() : 0.0f;
+    float ltcOutLvl = ltcOutput.getIsRunning() ? ltcOutput.getPeakLevel()    : 0.0f;
+    float thruOutLvl = audioThru.getIsRunning() ? audioThru.getPeakLevel()   : 0.0f;
+
+    static float sLtcIn = 0, sThruIn = 0, sLtcOut = 0, sThruOut = 0;
+    sLtcIn  = decayLevel(sLtcIn,  ltcInLvl);
+    sThruIn = decayLevel(sThruIn, thruInLvl);
+    sLtcOut = decayLevel(sLtcOut, ltcOutLvl);
+    sThruOut = decayLevel(sThruOut, thruOutLvl);
+
+    mtrLtcInput.setLevel(sLtcIn);
+    mtrThruInput.setLevel(sThruIn);
+    mtrLtcOutput.setLevel(sLtcOut);
+    mtrThruOutput.setLevel(sThruOut);
+
     repaint();
 }
 
@@ -1537,6 +1612,20 @@ void MainComponent::styleGainSlider(GainSlider& sld)
     sld.setColour(juce::Slider::textBoxOutlineColourId, borderCol);
 }
 
+void MainComponent::styleOffsetSlider(GainSlider& sld)
+{
+    sld.setSliderStyle(juce::Slider::LinearHorizontal);
+    sld.setTextBoxStyle(juce::Slider::TextBoxRight, false, 44, 20);
+    sld.setRange(-30.0, 30.0, 1.0); sld.setValue(0.0, juce::dontSendNotification);
+    sld.setTextValueSuffix(" f"); sld.setDoubleClickReturnValue(true, 0.0);
+    sld.setColour(juce::Slider::backgroundColourId, juce::Colour(0xFF1A1D23));
+    sld.setColour(juce::Slider::trackColourId, juce::Colour(0xFF37474F));
+    sld.setColour(juce::Slider::thumbColourId, juce::Colour(0xFF78909C));
+    sld.setColour(juce::Slider::textBoxTextColourId, textBright);
+    sld.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xFF1A1D23));
+    sld.setColour(juce::Slider::textBoxOutlineColourId, borderCol);
+}
+
 void MainComponent::styleCollapseButton(juce::TextButton& btn)
 {
     btn.setColour(juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
@@ -1547,6 +1636,6 @@ void MainComponent::styleCollapseButton(juce::TextButton& btn)
 
 void MainComponent::updateCollapseButtonText(juce::TextButton& btn, bool expanded)
 {
-    btn.setButtonText(expanded ? juce::String::charToString(0x25BE)   // â–¾
-                               : juce::String::charToString(0x25B8)); // â–¸
+    btn.setButtonText(expanded ? juce::String::charToString(0x25BE)   // Ã¢â€“Â¾
+                               : juce::String::charToString(0x25B8)); // Ã¢â€“Â¸
 }
