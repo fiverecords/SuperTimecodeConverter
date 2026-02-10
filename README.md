@@ -3,6 +3,7 @@
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Receives timecode from multiple sources and routes it to multiple outputs simultaneously — ideal for live events, broadcast, post-production, and AV installations.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![C++](https://img.shields.io/badge/language-C%2B%2B-orange)
 ![JUCE](https://img.shields.io/badge/framework-JUCE-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
@@ -23,14 +24,20 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 - **LTC Out** — generate LTC audio signal on any audio output device and channel
 - **Audio Thru** — passthrough audio from the LTC input device to a separate output device (independent routing)
 
-### Additional Capabilities
+### Audio Monitoring
+- **VU Meters** — real-time level metering for all audio paths (LTC input, LTC output, Audio Thru input, Audio Thru output) with color-coded feedback (green → yellow → red)
+- **Per-channel gain control** — independent input/output gain for LTC and Audio Thru paths
+
+### Synchronization
 - **Frame rate support:** 24, 25, 29.97 (drop-frame), 30 fps
 - **Auto-detection:** frame rate is automatically detected from incoming MTC, Art-Net, or LTC signals
-- **Per-channel gain control:** independent input/output gain for LTC and Audio Thru paths
+- **Output frame offsets** — independent offset per output (MTC, Art-Net, LTC) from -30 to +30 frames, to compensate for device latency or synchronization differences
+
+### Additional Capabilities
 - **Stereo or mono output:** configurable per output (LTC Out and Audio Thru)
-- **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound, etc.)
+- **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS)
 - **Configurable sample rate and buffer size**
-- **ASIO support** for low-latency professional audio interfaces
+- **ASIO support** for low-latency professional audio interfaces (Windows)
 - **Device conflict detection** to prevent multiple outputs from opening the same device
 - **Persistent settings** — all configuration is saved automatically and restored on launch
 - **Dark theme UI** with a clean, professional look
@@ -48,11 +55,18 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ### Prerequisites
 
-- **Windows 10/11** (primary platform)
+#### Windows
+- **Windows 10/11**
 - **Visual Studio 2022** (Community, Professional, or Enterprise)
 - **JUCE Framework** — download from [juce.com](https://juce.com/get-juce/)
-- **Projucer** (included with JUCE) — used to generate the Visual Studio project
+- **Projucer** (included with JUCE) — used to generate the IDE project
 - **ASIO SDK** (optional, for ASIO device support) — download from [Steinberg](https://www.steinberg.net/developers/)
+
+#### macOS
+- **macOS 12 Monterey or later**
+- **Xcode 14+**
+- **JUCE Framework** — download from [juce.com](https://juce.com/get-juce/)
+- **Projucer** (included with JUCE)
 
 ### Build Instructions
 
@@ -64,16 +78,18 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 2. **Open the `.jucer` file in Projucer:**
    - Set the JUCE modules path to your local JUCE installation
-   - If using ASIO: set the ASIO SDK path in the exporter settings
+   - Windows: if using ASIO, set the ASIO SDK path in the exporter settings
 
 3. **Export and build:**
    - Click "Save and Open in IDE" in Projucer
-   - Build the solution in Visual Studio (Release or Debug)
+   - **Windows:** Build the solution in Visual Studio (Release or Debug)
+   - **macOS:** Build the project in Xcode (Release or Debug)
 
 4. **Run:**
-   - The built executable will be in `Builds/VisualStudio2022/x64/Release/` (or Debug)
+   - **Windows:** `Builds/VisualStudio2022/x64/Release/`
+   - **macOS:** `Builds/MacOSX/build/Release/`
 
-### ASIO Setup (Optional)
+### ASIO Setup (Windows, Optional)
 
 To enable ASIO support:
 1. Download the ASIO SDK from Steinberg
@@ -92,6 +108,10 @@ To enable ASIO support:
 3. **Select the frame rate** or let it auto-detect from the input signal
 4. The timecode display in the center shows the current time in real-time
 
+### Output Frame Offsets
+
+Each timecode output (MTC, Art-Net, LTC) has an independent frame offset control (-30 to +30 frames). Use this to compensate for device latency or to intentionally advance/delay timecode to specific destinations. Double-click the offset slider to reset to zero.
+
 ### Audio Thru
 
 The Audio Thru feature lets you route audio (e.g., music or program audio) from a channel on the LTC input device to a separate output device. This is useful when your LTC signal arrives on one channel while program audio arrives on another — you can decode LTC and pass through the audio independently.
@@ -99,9 +119,8 @@ The Audio Thru feature lets you route audio (e.g., music or program audio) from 
 ### Settings
 
 All settings are automatically saved to:
-```
-%APPDATA%/SuperTimecodeConverter/settings.json
-```
+- **Windows:** `%APPDATA%/SuperTimecodeConverter/settings.json`
+- **macOS:** `~/Library/Application Support/SuperTimecodeConverter/settings.json`
 
 ---
 
@@ -113,6 +132,7 @@ The application is built around a modular architecture:
 |---|---|
 | `TimecodeCore.h` | Core timecode and frame rate types |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
+| `LevelMeter.h` | Real-time VU meter component |
 | `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) |
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) |
@@ -129,6 +149,7 @@ The application is built around a modular architecture:
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** settings are loaded in two phases — non-audio settings are applied immediately, while audio device settings are applied after the background scan completes
+- **Cross-platform:** built with JUCE for native performance on both Windows and macOS
 
 ---
 
@@ -144,9 +165,9 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
-## Credits..
+## Credits
 
-Developed by **Joaquin Villodre** - [github.com/fiverecords](https://github.com/fiverecords)
+Developed by **Joaquin Villodre** — [github.com/fiverecords](https://github.com/fiverecords)
 
 Built with [JUCE](https://juce.com/) — the cross-platform C++ framework for audio applications.
 
