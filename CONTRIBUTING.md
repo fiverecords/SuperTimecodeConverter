@@ -5,9 +5,9 @@ Thanks for your interest in contributing! Here's how you can help.
 ## Reporting Bugs
 
 - Open an [issue](https://github.com/fiverecords/SuperTimecodeConverter/issues) with a clear title
-- Include your OS version, audio driver type (WASAPI/ASIO), and device details
+- Include your OS version, audio driver type (WASAPI/ASIO/CoreAudio/ALSA), and device details
 - Describe the steps to reproduce the problem
-- Include the contents of `%APPDATA%/SuperTimecodeConverter/settings.json` if relevant
+- Include the contents of your `settings.json` if relevant (see README for location per platform)
 
 ## Suggesting Features
 

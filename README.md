@@ -4,8 +4,9 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
-![C++](https://img.shields.io/badge/language-C%2B%2B-orange)
-![JUCE](https://img.shields.io/badge/framework-JUCE-green)
+![Linux](https://img.shields.io/badge/platform-Linux-yellow)
+![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)
+![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
 ---
@@ -35,10 +36,11 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ### Additional Capabilities
 - **Stereo or mono output:** configurable per output (LTC Out and Audio Thru)
-- **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS)
+- **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS; ALSA on Linux)
 - **Configurable sample rate and buffer size**
 - **ASIO support** for low-latency professional audio interfaces (Windows)
 - **Device conflict detection** to prevent multiple outputs from opening the same device
+- **Collapsible UI panels** to reduce clutter and focus on active sections
 - **Persistent settings** — all configuration is saved automatically and restored on launch
 - **Dark theme UI** with a clean, professional look
 
@@ -46,7 +48,6 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ## Screenshot
 
-<!-- Replace with an actual screenshot of the application -->
 ![Super Timecode Converter](docs/screenshot.png)
 
 ---
@@ -55,20 +56,25 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ### Prerequisites
 
+- **JUCE Framework 7.x or 8.x** — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
+
 #### Windows
-- **Windows 10/11**
-- **Visual Studio 2022** (Community, Professional, or Enterprise)
-- **JUCE Framework** — download from [juce.com](https://juce.com/get-juce/)
-- **Projucer** (included with JUCE) — used to generate the IDE project
-- **ASIO SDK** (optional, for ASIO device support) — download from [Steinberg](https://www.steinberg.net/developers/)
+- Windows 10/11
+- Visual Studio 2022 (Community, Professional, or Enterprise)
+- ASIO SDK (optional, for ASIO device support) — download from [Steinberg](https://www.steinberg.net/developers/)
 
 #### macOS
-- **macOS 12 Monterey or later**
-- **Xcode 14+**
-- **JUCE Framework** — download from [juce.com](https://juce.com/get-juce/)
-- **Projucer** (included with JUCE)
+- macOS 12 Monterey or later
+- Xcode 14+
+
+#### Linux
+- Ubuntu 22.04+ / Debian 12+ (or equivalent)
+- GCC 11+ or Clang 14+
+- Development packages: `libfreetype-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libfontconfig1-dev libasound2-dev`
 
 ### Build Instructions
+
+#### Option A: CMake (all platforms)
 
 1. **Clone the repository:**
    ```bash
@@ -76,25 +82,87 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
    cd SuperTimecodeConverter
    ```
 
-2. **Open the `.jucer` file in Projucer:**
-   - Set the JUCE modules path to your local JUCE installation
-   - Windows: if using ASIO, set the ASIO SDK path in the exporter settings
+2. **Clone JUCE** (if you don't have it already):
+   ```bash
+   git clone --depth 1 --branch 8.0.6 https://github.com/juce-framework/JUCE.git ../JUCE
+   ```
 
-3. **Export and build:**
+3. **Create a `CMakeLists.txt`** in the project root:
+   ```cmake
+   cmake_minimum_required(VERSION 3.22)
+   project(SuperTimecodeConverter VERSION 1.2)
+
+   set(CMAKE_CXX_STANDARD 17)
+   set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+   # Adjust this path to where your JUCE installation is located
+   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../JUCE ${CMAKE_BINARY_DIR}/JUCE)
+
+   juce_add_gui_app(SuperTimecodeConverter
+       PRODUCT_NAME "Super Timecode Converter"
+       COMPANY_NAME "Fiverecords"
+       VERSION "1.2"
+   )
+
+   juce_generate_juce_header(SuperTimecodeConverter)
+
+   target_sources(SuperTimecodeConverter PRIVATE
+       Main.cpp
+       MainComponent.cpp
+   )
+
+   target_compile_definitions(SuperTimecodeConverter PRIVATE
+       JUCE_WEB_BROWSER=0
+       JUCE_USE_CURL=0
+       JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_PRODUCT_NAME>"
+       JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
+   )
+
+   target_link_libraries(SuperTimecodeConverter PRIVATE
+       juce::juce_audio_basics
+       juce::juce_audio_devices
+       juce::juce_audio_formats
+       juce::juce_audio_utils
+       juce::juce_core
+       juce::juce_events
+       juce::juce_graphics
+       juce::juce_gui_basics
+       juce::juce_gui_extra
+       juce::juce_recommended_config_flags
+   )
+   ```
+
+4. **Build:**
+   ```bash
+   cmake -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build -j$(nproc)
+   ```
+
+5. **Run:**
+   - The binary will be in `build/SuperTimecodeConverter_artefacts/Release/`
+
+#### Option B: Projucer (Windows / macOS)
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/fiverecords/SuperTimecodeConverter.git
+   ```
+
+2. **Open Projucer** (included with JUCE) and create a new GUI Application project pointing to the source files in this repository.
+
+3. **Configure modules:** Set the JUCE modules path to your local JUCE installation. If using ASIO on Windows, set the ASIO SDK path in the exporter settings.
+
+4. **Export and build:**
    - Click "Save and Open in IDE" in Projucer
    - **Windows:** Build the solution in Visual Studio (Release or Debug)
    - **macOS:** Build the project in Xcode (Release or Debug)
-
-4. **Run:**
-   - **Windows:** `Builds/VisualStudio2022/x64/Release/`
-   - **macOS:** `Builds/MacOSX/build/Release/`
 
 ### ASIO Setup (Windows, Optional)
 
 To enable ASIO support:
 1. Download the ASIO SDK from Steinberg
 2. Extract it to a known path (e.g., `C:\SDKs\asiosdk_2.3.3_2019-06-14`)
-3. In Projucer, go to the Visual Studio exporter settings and add the ASIO SDK path to the header search paths
+3. Add the ASIO SDK path to your project's header search paths
 4. Enable `JUCE_ASIO=1` in the project preprocessor definitions
 
 ---
@@ -121,6 +189,7 @@ The Audio Thru feature lets you route audio (e.g., music or program audio) from 
 All settings are automatically saved to:
 - **Windows:** `%APPDATA%/SuperTimecodeConverter/settings.json`
 - **macOS:** `~/Library/Application Support/SuperTimecodeConverter/settings.json`
+- **Linux:** `~/.config/SuperTimecodeConverter/settings.json`
 
 ---
 
@@ -130,26 +199,29 @@ The application is built around a modular architecture:
 
 | Component | Description |
 |---|---|
-| `TimecodeCore.h` | Core timecode and frame rate types |
+| `TimecodeCore.h` | Core timecode types, frame rate utilities, SMPTE drop-frame logic, atomic pack/unpack helpers |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
-| `LevelMeter.h` | Real-time VU meter component |
-| `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) |
-| `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer) |
-| `ArtnetInput.h` | Art-Net timecode receiver (UDP) |
-| `ArtnetOutput.h` | Art-Net timecode broadcaster (UDP) |
-| `LtcInput.h` | LTC audio decoder with passthrough ring buffer |
-| `LtcOutput.h` | LTC audio encoder/generator |
+| `LevelMeter.h` | Real-time VU meter component with clipping indicator |
+| `NetworkUtils.h` | Cross-platform network interface enumeration (Windows/macOS/Linux) |
+| `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) with interpolation |
+| `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
+| `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
+| `ArtnetOutput.h` | Art-Net timecode broadcaster (UDP) with drift-free timing |
+| `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC) |
+| `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
 | `AudioThru.h` | Audio passthrough with independent device routing |
-| `AppSettings.h` | JSON-based persistent settings |
-| `MainComponent.*` | Main UI and routing logic |
+| `CustomLookAndFeel.h` | Dark theme UI styling and cross-platform font selection |
+| `AppSettings.h` | JSON-based persistent settings with backward-compatible loading |
+| `MainComponent.*` | Main UI, routing logic, and device management |
 
 ### Key Design Decisions
 
 - **Lock-free audio:** LTC decode and audio passthrough use lock-free ring buffers (SPSC) for real-time safety
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
+- **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** settings are loaded in two phases — non-audio settings are applied immediately, while audio device settings are applied after the background scan completes
-- **Cross-platform:** built with JUCE for native performance on both Windows and macOS
+- **Cross-platform:** built with JUCE for native performance on Windows, macOS, and Linux
 
 ---
 
