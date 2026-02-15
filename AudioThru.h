@@ -1,7 +1,12 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "LtcInput.h"
 #include <atomic>
+#include <cstring>
 
 class AudioThru : private juce::AudioIODeviceCallback
 {
@@ -23,7 +28,8 @@ public:
 
         selectedChannel = channel;
         currentDeviceName = devName;
-        sourceInput = source;
+        currentTypeName = typeName;
+        sourceInput.store(source, std::memory_order_relaxed);
 
         deviceManager.closeAudioDevice();
 
@@ -38,7 +44,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device â€“ single open call
+        // Open the specific device -- single open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.outputDeviceName  = devName;
         setup.inputDeviceName   = "";
@@ -61,31 +67,33 @@ public:
         currentSampleRate = device->getCurrentSampleRate();
         currentBufferSize = device->getCurrentBufferSizeSamples();
 
+        peakLevel.store(0.0f, std::memory_order_relaxed);
         deviceManager.addAudioCallback(this);
-        isRunningFlag = true;
+        isRunningFlag.store(true, std::memory_order_relaxed);
         return true;
     }
 
     void stop()
     {
-        if (isRunningFlag)
+        if (isRunningFlag.load(std::memory_order_relaxed))
         {
             deviceManager.removeAudioCallback(this);
+            sourceInput.store(nullptr, std::memory_order_relaxed);
             deviceManager.closeAudioDevice();
-            isRunningFlag = false;
-            sourceInput = nullptr;
+            isRunningFlag.store(false, std::memory_order_relaxed);
         }
     }
 
-    bool getIsRunning() const { return isRunningFlag; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
+    juce::String getCurrentTypeName() const { return currentTypeName; }
     int getSelectedChannel() const { return selectedChannel; }
     int getChannelCount() const { return numChannelsAvailable; }
     bool isStereoMode() const { return selectedChannel == -1; }
     double getActualSampleRate() const { return currentSampleRate; }
     int getActualBufferSize() const { return currentBufferSize; }
 
-    void setOutputGain(float gain) { outputGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
+    void setOutputGain(float gain) { outputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
     float getOutputGain() const { return outputGain.load(std::memory_order_relaxed); }
 
     float getPeakLevel() const { return peakLevel.load(std::memory_order_relaxed); }
@@ -93,12 +101,16 @@ public:
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
-    bool isRunningFlag = false;
+    juce::String currentTypeName;
+    std::atomic<bool> isRunningFlag { false };
     int selectedChannel = 0;
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
-    LtcInput* sourceInput = nullptr;
+    // sourceInput points to a LtcInput owned by MainComponent.  Lifetime is
+    // guaranteed because ~MainComponent() calls stopThruOutput() (which nulls
+    // this pointer via stop()) BEFORE destroying LtcInput.
+    std::atomic<LtcInput*> sourceInput { nullptr };
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };
 
@@ -111,7 +123,8 @@ private:
             if (outputChannelData[ch])
                 std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
 
-        if (!sourceInput) return;
+        auto* src = sourceInput.load(std::memory_order_acquire);
+        if (!src) return;
 
         bool stereoMode = (selectedChannel == -1);
         int primaryCh = stereoMode ? 0 : selectedChannel;
@@ -119,7 +132,7 @@ private:
             return;
 
         float* output = outputChannelData[primaryCh];
-        sourceInput->readPassthruSamples(output, numSamples);
+        src->readPassthruSamples(output, numSamples);
 
         const float gain = outputGain.load(std::memory_order_relaxed);
         float peak = 0.0f;
@@ -145,6 +158,9 @@ private:
         }
     }
 
-    void audioDeviceStopped() override {}
+    void audioDeviceStopped() override
+    {
+        peakLevel.store(0.0f, std::memory_order_relaxed);
+    }
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioThru)
 };

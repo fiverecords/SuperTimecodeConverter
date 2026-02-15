@@ -1,5 +1,31 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
+#include <atomic>
+
+// Several protocol handlers use std::atomic<double> for cross-thread timing.
+// Verify the platform provides lock-free atomics for double so we don't
+// inadvertently introduce mutex contention on the audio or timer threads.
+// This requires a 64-bit platform (x86_64, ARM64, etc.).
+static_assert(std::atomic<double>::is_always_lock_free,
+              "This project requires a 64-bit platform for lock-free atomic<double>");
+
+enum class FrameRate
+{
+    FPS_24    = 0,
+    FPS_25    = 1,
+    FPS_2997  = 2,
+    FPS_30    = 3
+};
+
+// std::atomic<FrameRate> is used in several protocol handlers for cross-thread
+// frame rate updates.  Verify it is lock-free (guaranteed on 64-bit platforms
+// for any enum backed by a 4-byte int, but worth asserting explicitly).
+static_assert(std::atomic<FrameRate>::is_always_lock_free,
+              "This project requires lock-free atomic<FrameRate>");
 
 struct Timecode
 {
@@ -12,14 +38,21 @@ struct Timecode
     {
         return juce::String::formatted("%02d:%02d:%02d.%02d", hours, minutes, seconds, frames);
     }
-};
 
-enum class FrameRate
-{
-    FPS_24    = 0,
-    FPS_25    = 1,
-    FPS_2997  = 2,
-    FPS_30    = 3
+    // SMPTE-standard display: uses ';' as frame separator for drop-frame,
+    // ':' for non-drop-frame (broadcast convention per SMPTE ST 12-1)
+    // Clamps values to valid SMPTE ranges to prevent garbled display from
+    // corrupt or uninitialised data.
+    juce::String toDisplayString(FrameRate fps) const
+    {
+        int h = juce::jlimit(0, 23, hours);
+        int m = juce::jlimit(0, 59, minutes);
+        int s = juce::jlimit(0, 59, seconds);
+        int f = juce::jlimit(0, 29, frames);
+        const char* frameSep = (fps == FrameRate::FPS_2997) ? ";" : ":";
+        return juce::String::formatted("%02d:%02d:%02d", h, m, s)
+             + frameSep + juce::String::formatted("%02d", f);
+    }
 };
 
 inline double frameRateToDouble(FrameRate fps)
@@ -59,7 +92,69 @@ inline juce::String frameRateToString(FrameRate fps)
 }
 
 //==============================================================================
-// Apply a frame offset (+/-) to a Timecode, wrapping at 24h
+// Increment a timecode by one frame, wrapping at 24h.
+// For 29.97 drop-frame: skips frames 0 and 1 at the start of each
+// minute that is NOT a multiple of 10 (SMPTE 12M standard).
+//==============================================================================
+inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
+{
+    int maxFrames = frameRateToInt(fps);
+    Timecode r = tc;
+    r.frames++;
+    if (r.frames >= maxFrames) { r.frames = 0; r.seconds++; }
+    if (r.seconds >= 60)       { r.seconds = 0; r.minutes++; }
+    if (r.minutes >= 60)       { r.minutes = 0; r.hours++; }
+    if (r.hours >= 24)         { r.hours = 0; }
+
+    // Drop-frame: skip frames 0 and 1 at the start of each minute
+    // except every 10th minute (00, 10, 20, 30, 40, 50)
+    if (fps == FrameRate::FPS_2997
+        && r.frames == 0
+        && r.seconds == 0
+        && (r.minutes % 10) != 0)
+    {
+        r.frames = 2;
+    }
+
+    return r;
+}
+
+//==============================================================================
+// Source activity timeout: if no data arrives within this window,
+// the source is considered paused.  MTC at 24fps sends QF every ~10ms,
+// Art-Net at 30fps sends a packet every ~33ms, LTC frames arrive every
+// ~33-42ms.  150ms covers several missed frames with margin.
+//==============================================================================
+static constexpr double kSourceTimeoutMs = 150.0;
+
+//==============================================================================
+// Atomic-safe pack/unpack -- fits H:M:S:F into a single uint64_t
+//==============================================================================
+inline uint64_t packTimecode(int h, int m, int s, int f)
+{
+    return ((uint64_t)(h & 0xFF) << 24)
+         | ((uint64_t)(m & 0xFF) << 16)
+         | ((uint64_t)(s & 0xFF) << 8)
+         |  (uint64_t)(f & 0xFF);
+}
+
+inline Timecode unpackTimecode(uint64_t packed)
+{
+    Timecode tc;
+    tc.hours   = (int)((packed >> 24) & 0xFF);
+    tc.minutes = (int)((packed >> 16) & 0xFF);
+    tc.seconds = (int)((packed >> 8)  & 0xFF);
+    tc.frames  = (int)( packed        & 0xFF);
+    return tc;
+}
+
+//==============================================================================
+// Apply a frame offset (+/-) to a Timecode, wrapping at 24h.
+// Note: this uses a linear frame-count model (maxFrames per second) rather
+// than true SMPTE DF counting.  The DF correction at the end patches any
+// landing on skipped frame numbers 0-1.  This is exact for small offsets
+// (the ±30 frame range used by output offsets) because DF skips only occur
+// at minute boundaries, which are always >30 frames apart.
 //==============================================================================
 inline Timecode offsetTimecode(const Timecode& tc, int offsetFrames, FrameRate fps)
 {
@@ -81,7 +176,95 @@ inline Timecode offsetTimecode(const Timecode& tc, int offsetFrames, FrameRate f
     result.seconds = (int)((total / maxFrames) % 60);
     result.minutes = (int)((total / (maxFrames * 60)) % 60);
     result.hours   = (int)((total / (maxFrames * 3600)) % 24);
+
+    // Drop-frame: skip frames 0 and 1 at the start of each minute
+    // except every 10th minute (00, 10, 20, 30, 40, 50)
+    if (fps == FrameRate::FPS_2997
+        && result.frames < 2
+        && result.seconds == 0
+        && (result.minutes % 10) != 0)
+    {
+        result.frames = 2;
+    }
+
     return result;
+}
+
+//==============================================================================
+// Convert wall-clock time (ms since midnight) to timecode.
+// For 29.97fps, uses SMPTE drop-frame counting so that timecode stays
+// synchronised with real time (drops frames 0 and 1 at the start of each
+// minute, except every 10th minute).
+//==============================================================================
+inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
+{
+    if (fps == FrameRate::FPS_2997)
+    {
+        // Drop-frame: 29.97fps = 30000/1001 frames per second
+        // Total frames elapsed = ms * 29.97 / 1000
+        double exactFps = 30000.0 / 1001.0;
+        int64_t totalFrames = (int64_t)(msSinceMidnight / 1000.0 * exactFps);
+
+        // SMPTE drop-frame algorithm:
+        // In DF counting, every minute (except every 10th) drops 2 frame numbers.
+        // D = frames per 10-minute block = 17982 (10*60*30 - 9*2)
+        // d = frames per 1-minute block  = 1798  (60*30 - 2)
+        const int64_t framesPerTenMin = 17982;
+        const int64_t framesPerMin    = 1798;
+
+        int64_t tenMinBlocks = totalFrames / framesPerTenMin;
+        int64_t remainder    = totalFrames % framesPerTenMin;
+
+        // First minute of each 10-min block is NOT dropped (has 1800 frames)
+        int64_t minutesSinceBlock;
+        if (remainder < 1800)
+            minutesSinceBlock = 0;
+        else
+            minutesSinceBlock = 1 + (remainder - 1800) / framesPerMin;
+
+        // Convert back to a frame number in 30fps space
+        int64_t frameNumber = totalFrames + 18 * tenMinBlocks + 2 * minutesSinceBlock;
+
+        Timecode tc;
+        tc.frames  = (int)(frameNumber % 30);
+        tc.seconds = (int)((frameNumber / 30) % 60);
+        tc.minutes = (int)((frameNumber / 1800) % 60);
+        tc.hours   = (int)((frameNumber / 108000) % 24);
+        return tc;
+    }
+    else
+    {
+        // Non-drop-frame: straightforward conversion
+        double fpsVal = frameRateToDouble(fps);
+        int maxFrames = frameRateToInt(fps);
+        double secondsTotal = msSinceMidnight / 1000.0;
+
+        Timecode tc;
+        int64_t totalSeconds = (int64_t)secondsTotal;
+        double fractional = secondsTotal - (double)totalSeconds;
+
+        tc.hours   = (int)((totalSeconds / 3600) % 24);
+        tc.minutes = (int)((totalSeconds / 60) % 60);
+        tc.seconds = (int)(totalSeconds % 60);
+        tc.frames  = (int)(fractional * fpsVal) % maxFrames;
+        return tc;
+    }
+}
+
+//==============================================================================
+// SMPTE rate code (shared by MTC and Art-Net)
+//   0 = 24fps, 1 = 25fps, 2 = 29.97df, 3 = 30fps
+//==============================================================================
+inline int fpsToRateCode(FrameRate fps)
+{
+    switch (fps)
+    {
+        case FrameRate::FPS_24:   return 0;
+        case FrameRate::FPS_25:   return 1;
+        case FrameRate::FPS_2997: return 2;
+        case FrameRate::FPS_30:   return 3;
+        default:                  return 1;
+    }
 }
 
 //==============================================================================
@@ -102,7 +285,7 @@ struct AudioDeviceEntry
         if (name == "DirectSound")      return "DirectSound";
         if (name == "CoreAudio")        return "";
 
-        // WASAPI variants Ã¢â‚¬â€ JUCE may use different parenthetical suffixes
+        // WASAPI variants -- JUCE may use different parenthetical suffixes
         // e.g. "Windows Audio (Exclusive Mode)", "Windows Audio (Exclusive)",
         //      "Windows Audio (Low Latency)"
         if (name.startsWith("Windows Audio"))
@@ -118,7 +301,7 @@ struct AudioDeviceEntry
             return "WASAPI";
         }
 
-        // Unknown type Ã¢â‚¬â€ use full name
+        // Unknown type -- use full name
         return name;
     }
 

@@ -1,3 +1,7 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 
@@ -8,7 +12,8 @@ public:
 
     void setLevel(float newLevel)
     {
-        newLevel = juce::jlimit(0.0f, 1.0f, newLevel);
+        // Allow levels above 1.0 so we can indicate clipping/hot signal
+        newLevel = juce::jlimit(0.0f, 2.0f, newLevel);
         if (std::abs(currentLevel - newLevel) > 0.001f)
         {
             currentLevel = newLevel;
@@ -16,7 +21,7 @@ public:
         }
     }
 
-    void setColour(juce::Colour c) { meterColour = c; }
+    void setMeterColour(juce::Colour c) { meterColour = c; }
 
     void paint(juce::Graphics& g) override
     {
@@ -30,10 +35,12 @@ public:
         // Filled level bar
         if (currentLevel > 0.001f)
         {
-            float fillW = bounds.getWidth() * currentLevel;
+            // Clamp display width to bar bounds, but use real level for colour
+            float displayLevel = juce::jmin(1.0f, currentLevel);
+            float fillW = bounds.getWidth() * displayLevel;
             auto fillBounds = bounds.withWidth(fillW);
 
-            // Green -> Yellow -> Red gradient based on level
+            // Green -> Yellow -> Red gradient based on actual level (not clamped)
             juce::Colour barColour;
             if (currentLevel < 0.6f)
                 barColour = meterColour.withAlpha(0.7f);
@@ -48,6 +55,13 @@ public:
             // Subtle glow on top
             g.setColour(juce::Colours::white.withAlpha(0.08f));
             g.fillRoundedRectangle(fillBounds.withHeight(fillBounds.getHeight() * 0.4f), cornerSize);
+
+            // Clipping indicator: flash full bar red when level > 1.0
+            if (currentLevel > 1.0f)
+            {
+                g.setColour(juce::Colour(0xFFC62828).withAlpha(0.3f));
+                g.fillRoundedRectangle(bounds, cornerSize);
+            }
         }
 
         // Border

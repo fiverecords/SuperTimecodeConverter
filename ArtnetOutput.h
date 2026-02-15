@@ -1,28 +1,14 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
+#include "NetworkUtils.h"
+#include <atomic>
 
-#ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <iphlpapi.h>
-    #pragma comment(lib, "iphlpapi.lib")
-    #pragma comment(lib, "ws2_32.lib")
-#else
-    #include <ifaddrs.h>
-    #include <net/if.h>
-    #include <arpa/inet.h>
-#endif
-
-struct NetworkInterface
-{
-    juce::String name;
-    juce::String ip;
-    juce::String broadcast;
-    juce::String subnet;
-};
-
-class ArtnetOutput : public juce::Timer
+class ArtnetOutput : public juce::HighResolutionTimer
 {
 public:
     ArtnetOutput()
@@ -38,113 +24,7 @@ public:
     //==============================================================================
     static juce::Array<NetworkInterface> getNetworkInterfaces()
     {
-        juce::Array<NetworkInterface> interfaces;
-
-#ifdef _WIN32
-        ULONG bufSize = 15000;
-        PIP_ADAPTER_ADDRESSES addresses = nullptr;
-        ULONG result = 0;
-
-        for (int attempts = 0; attempts < 3; attempts++)
-        {
-            addresses = (PIP_ADAPTER_ADDRESSES)malloc(bufSize);
-            if (addresses == nullptr) return interfaces;
-
-            result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, addresses, &bufSize);
-            if (result == ERROR_BUFFER_OVERFLOW)
-            {
-                free(addresses);
-                addresses = nullptr;
-                continue;
-            }
-            break;
-        }
-
-        if (result != NO_ERROR || addresses == nullptr)
-        {
-            if (addresses) free(addresses);
-            return interfaces;
-        }
-
-        for (auto* adapter = addresses; adapter != nullptr; adapter = adapter->Next)
-        {
-            if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-                continue;
-            if (adapter->OperStatus != IfOperStatusUp)
-                continue;
-
-            for (auto* unicast = adapter->FirstUnicastAddress; unicast != nullptr; unicast = unicast->Next)
-            {
-                if (unicast->Address.lpSockaddr->sa_family == AF_INET)
-                {
-                    auto* addr = (sockaddr_in*)unicast->Address.lpSockaddr;
-                    char ipStr[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
-
-                    ULONG prefixLength = unicast->OnLinkPrefixLength;
-                    uint32_t ip = ntohl(addr->sin_addr.s_addr);
-                    uint32_t mask = (prefixLength > 0) ? (~0u << (32 - prefixLength)) : 0;
-                    uint32_t broadcast = ip | ~mask;
-
-                    char broadcastStr[INET_ADDRSTRLEN];
-                    struct in_addr broadcastAddr;
-                    broadcastAddr.s_addr = htonl(broadcast);
-                    inet_ntop(AF_INET, &broadcastAddr, broadcastStr, sizeof(broadcastStr));
-
-                    char maskStr[INET_ADDRSTRLEN];
-                    struct in_addr maskAddr;
-                    maskAddr.s_addr = htonl(mask);
-                    inet_ntop(AF_INET, &maskAddr, maskStr, sizeof(maskStr));
-
-                    NetworkInterface ni;
-                    ni.name = juce::String(adapter->FriendlyName);
-                    ni.ip = juce::String(ipStr);
-                    ni.broadcast = juce::String(broadcastStr);
-                    ni.subnet = juce::String(maskStr);
-
-                    interfaces.add(ni);
-                }
-            }
-        }
-
-        free(addresses);
-#else
-        struct ifaddrs* ifaddr;
-        if (getifaddrs(&ifaddr) == -1)
-            return interfaces;
-
-        for (auto* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
-        {
-            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET)
-                continue;
-            if (ifa->ifa_flags & IFF_LOOPBACK)
-                continue;
-            if (!(ifa->ifa_flags & IFF_UP))
-                continue;
-
-            auto* addr = (sockaddr_in*)ifa->ifa_addr;
-            char ipStr[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
-
-            char broadcastStr[INET_ADDRSTRLEN] = "255.255.255.255";
-            if (ifa->ifa_broadaddr)
-            {
-                auto* baddr = (sockaddr_in*)ifa->ifa_broadaddr;
-                inet_ntop(AF_INET, &baddr->sin_addr, broadcastStr, sizeof(broadcastStr));
-            }
-
-            NetworkInterface ni;
-            ni.name = juce::String(ifa->ifa_name);
-            ni.ip = juce::String(ipStr);
-            ni.broadcast = juce::String(broadcastStr);
-
-            interfaces.add(ni);
-        }
-
-        freeifaddrs(ifaddr);
-#endif
-
-        return interfaces;
+        return ::getNetworkInterfaces();
     }
 
     void refreshNetworkInterfaces()
@@ -200,8 +80,9 @@ public:
             }
         }
 
-        isRunning = true;
-        paused = false;
+        isRunningFlag.store(true, std::memory_order_relaxed);
+        paused.store(false, std::memory_order_relaxed);
+        sendErrors.store(0, std::memory_order_relaxed);
         updateTimerRate();
         return true;
     }
@@ -209,8 +90,8 @@ public:
     void stop()
     {
         stopTimer();
-        isRunning = false;
-        paused = false;
+        isRunningFlag.store(false, std::memory_order_relaxed);
+        paused.store(false, std::memory_order_relaxed);
 
         if (socket != nullptr)
         {
@@ -219,61 +100,93 @@ public:
         }
     }
 
-    bool getIsRunning() const { return isRunning; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getBroadcastIp() const { return broadcastIp; }
+    uint32_t getSendErrors() const { return sendErrors.load(std::memory_order_relaxed); }
 
     //==============================================================================
     void setTimecode(const Timecode& tc)
     {
+        const juce::SpinLock::ScopedLockType lock(tcLock);
         timecodeToSend = tc;
     }
 
+    // Called from UI thread.  startTimer() is internally serialised in JUCE's
+    // HighResolutionTimer, so calling it from the message thread is safe.
     void setFrameRate(FrameRate fps)
     {
-        if (currentFps != fps)
+        auto prev = currentFps.load(std::memory_order_relaxed);
+        if (prev != fps)
         {
-            currentFps = fps;
-            if (isRunning && !paused)
+            currentFps.store(fps, std::memory_order_relaxed);
+            if (isRunningFlag.load(std::memory_order_relaxed) && !paused.load(std::memory_order_relaxed))
                 updateTimerRate();
         }
-    }
-
-    void setEnabled(bool enabled)
-    {
-        outputEnabled = enabled;
     }
 
     // Pause/resume transmission
     void setPaused(bool shouldPause)
     {
-        if (paused == shouldPause)
+        if (paused.load(std::memory_order_relaxed) == shouldPause)
             return;
 
-        paused = shouldPause;
+        paused.store(shouldPause, std::memory_order_relaxed);
 
-        if (paused)
+        if (shouldPause)
         {
             stopTimer();
         }
-        else if (isRunning)
+        else if (isRunningFlag.load(std::memory_order_relaxed))
         {
+            lastFrameSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
             updateTimerRate();
         }
     }
 
-    bool isPaused() const { return paused; }
+    bool isPaused() const { return paused.load(std::memory_order_relaxed); }
 
 private:
-    void timerCallback() override
+    void hiResTimerCallback() override
     {
-        if (!isRunning || !outputEnabled || paused || socket == nullptr)
+        if (!isRunningFlag.load(std::memory_order_relaxed)
+            || paused.load(std::memory_order_relaxed)
+            || socket == nullptr)
             return;
 
-        sendArtTimeCode();
+        // Fractional accumulator: compare real elapsed time against ideal frame interval
+        // to eliminate drift caused by integer-ms timer resolution
+        double now = juce::Time::getMillisecondCounterHiRes();
+        double frameInterval = 1000.0 / frameRateToDouble(currentFps.load(std::memory_order_relaxed));
+
+        // Allow up to 2 catch-up sends per callback to handle jitter
+        int sent = 0;
+        double lastSend = lastFrameSendTime.load(std::memory_order_relaxed);
+        while ((now - lastSend) >= frameInterval && sent < 2)
+        {
+            sendArtTimeCode();
+            // Advance by ideal interval (not by 'now') to prevent cumulative drift
+            lastSend += frameInterval;
+            sent++;
+        }
+        lastFrameSendTime.store(lastSend, std::memory_order_relaxed);
+
+        // If we fell too far behind (>100ms), reset to avoid a burst
+        if ((now - lastSend) > 100.0)
+            lastFrameSendTime.store(now, std::memory_order_relaxed);
     }
 
     void sendArtTimeCode()
     {
+        Timecode tc;
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
+            tc = timecodeToSend;
+        }
+
+        // Validate ranges -- don't send corrupt data to the network
+        if (tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames > 29)
+            return;
+
         uint8_t packet[19] = {};
 
         packet[0] = 'A';
@@ -288,34 +201,30 @@ private:
         packet[8] = 0x00;
         packet[9] = 0x97;
 
-        packet[10] = 0;
-        packet[11] = 0;
+        packet[10] = 0x00;  // ProtVer Hi (big-endian)
+        packet[11] = 0x0E;  // ProtVer Lo = 14 (Art-Net 4 standard)
         packet[12] = 0;
         packet[13] = 0;
 
-        packet[14] = (uint8_t)timecodeToSend.frames;
-        packet[15] = (uint8_t)timecodeToSend.seconds;
-        packet[16] = (uint8_t)timecodeToSend.minutes;
-        packet[17] = (uint8_t)timecodeToSend.hours;
+        packet[14] = (uint8_t)tc.frames;
+        packet[15] = (uint8_t)tc.seconds;
+        packet[16] = (uint8_t)tc.minutes;
+        packet[17] = (uint8_t)tc.hours;
 
-        int rateCode = 0;
-        switch (currentFps)
-        {
-            case FrameRate::FPS_24:   rateCode = 0; break;
-            case FrameRate::FPS_25:   rateCode = 1; break;
-            case FrameRate::FPS_2997: rateCode = 2; break;
-            case FrameRate::FPS_30:   rateCode = 3; break;
-        }
-        packet[18] = (uint8_t)rateCode;
+        FrameRate fps = currentFps.load(std::memory_order_relaxed);
+        packet[18] = (uint8_t)fpsToRateCode(fps);
 
-        socket->write(broadcastIp, destPort, packet, sizeof(packet));
+        int written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
+        if (written < 0)
+            sendErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
     void updateTimerRate()
     {
-        double fps = frameRateToDouble(currentFps);
-        int intervalMs = juce::jmax(1, (int)(1000.0 / fps));
-        startTimer(intervalMs);
+        // Run timer at 1ms fixed rate -- the fractional accumulator in
+        // hiResTimerCallback handles exact frame timing to avoid drift
+        lastFrameSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+        startTimer(1);
     }
 
     std::unique_ptr<juce::DatagramSocket> socket;
@@ -323,14 +232,16 @@ private:
     juce::String bindIp = "0.0.0.0";
     int destPort = 6454;
     int selectedInterface = -1;
-    bool isRunning = false;
-    bool outputEnabled = true;
-    bool paused = false;
+    std::atomic<bool> isRunningFlag { false };
+    std::atomic<bool> paused { false };
 
     juce::Array<NetworkInterface> availableInterfaces;
 
-    Timecode timecodeToSend;
-    FrameRate currentFps = FrameRate::FPS_30;
+    juce::SpinLock tcLock;
+    Timecode timecodeToSend;        // Written by UI thread under tcLock, read by timer thread under tcLock
+    std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
+    std::atomic<double> lastFrameSendTime { 0.0 };
+    std::atomic<uint32_t> sendErrors { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetOutput)
 };

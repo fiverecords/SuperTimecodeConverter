@@ -1,7 +1,12 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
-#include "ArtnetOutput.h"
+#include "NetworkUtils.h"
+#include <atomic>
 
 class ArtnetInput : public juce::Thread
 {
@@ -19,7 +24,7 @@ public:
     //==============================================================================
     void refreshNetworkInterfaces()
     {
-        availableInterfaces = ArtnetOutput::getNetworkInterfaces();
+        availableInterfaces = ::getNetworkInterfaces();
     }
 
     juce::StringArray getInterfaceNames() const
@@ -34,6 +39,7 @@ public:
     int getInterfaceCount() const { return availableInterfaces.size() + 1; }
 
     juce::String getBindInfo() const { return bindIp + ":" + juce::String(listenPort); }
+    bool didFallBackToAllInterfaces() const { return bindFellBack.load(std::memory_order_relaxed); }
 
     //==============================================================================
     bool start(int interfaceIndex = 0, int port = 6454)
@@ -56,14 +62,23 @@ public:
         socket = std::make_unique<juce::DatagramSocket>(false);
 
         bool bound = false;
+        bool fellBack = false;
         if (bindIp != "0.0.0.0")
             bound = socket->bindToPort(listenPort, bindIp);
         if (!bound)
+        {
             bound = socket->bindToPort(listenPort);
+            if (bound)
+            {
+                fellBack = (bindIp != "0.0.0.0");  // only a fallback if we tried a specific IP
+                bindIp = "0.0.0.0";   // reflect actual bind address
+            }
+        }
+        bindFellBack.store(fellBack, std::memory_order_relaxed);
 
         if (bound)
         {
-            isRunning = true;
+            isRunningFlag.store(true, std::memory_order_relaxed);
             startThread();
             return true;
         }
@@ -74,7 +89,8 @@ public:
 
     void stop()
     {
-        isRunning = false;
+        isRunningFlag.store(false, std::memory_order_relaxed);
+        bindFellBack.store(false, std::memory_order_relaxed);
 
         if (socket != nullptr)
             socket->shutdown();
@@ -85,34 +101,42 @@ public:
         socket = nullptr;
     }
 
-    bool getIsRunning() const { return isRunning; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     int getListenPort() const { return listenPort; }
 
     //==============================================================================
     // True if Art-Net TC packets are actively arriving
     bool isReceiving() const
     {
-        if (lastPacketTime == 0.0)
+        double lpt = lastPacketTime.load(std::memory_order_relaxed);
+        if (lpt == 0.0)
             return false;
 
         double now = juce::Time::getMillisecondCounterHiRes();
-        double elapsed = now - lastPacketTime;
+        double elapsed = now - lpt;
 
         // At 24fps a packet arrives every ~41ms, at 30fps ~33ms
-        // 150ms silence = source paused
-        return elapsed < 150.0;
+        return elapsed < kSourceTimeoutMs;
     }
 
-    Timecode getCurrentTimecode() const { return currentTimecode; }
-    FrameRate getDetectedFrameRate() const { return detectedFps; }
+    Timecode getCurrentTimecode() const
+    {
+        return unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
+    }
+    FrameRate getDetectedFrameRate() const { return detectedFps.load(std::memory_order_relaxed); }
 
 private:
     void run() override
     {
         uint8_t buffer[1024];
 
-        while (!threadShouldExit() && isRunning && socket != nullptr)
+        while (!threadShouldExit() && isRunningFlag.load(std::memory_order_relaxed) && socket != nullptr)
         {
+            // Wait up to 100ms for data -- allows periodic threadShouldExit() checks
+            // so the thread can shut down cleanly even if no packets are arriving
+            if (!socket->waitUntilReady(true, 100))
+                continue;
+
             int bytesRead = socket->read(buffer, sizeof(buffer), false);
 
             if (bytesRead >= 19)
@@ -134,39 +158,44 @@ private:
         if (opcode != 0x9700)
             return;
 
-        lastPacketTime = juce::Time::getMillisecondCounterHiRes();
-
         int frames  = data[14];
         int seconds = data[15];
         int minutes = data[16];
         int hours   = data[17];
         int rateCode = data[18] & 0x03;
 
+        // Validate ranges -- discard malformed packets
+        // (lastPacketTime is updated AFTER validation so isReceiving()
+        //  only returns true when we actually accepted valid data)
+        if (hours > 23 || minutes > 59 || seconds > 59 || frames > 29)
+            return;
+
+        lastPacketTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+
         switch (rateCode)
         {
-            case 0: detectedFps = FrameRate::FPS_24;   break;
-            case 1: detectedFps = FrameRate::FPS_25;   break;
-            case 2: detectedFps = FrameRate::FPS_2997; break;
-            case 3: detectedFps = FrameRate::FPS_30;   break;
+            case 0: detectedFps.store(FrameRate::FPS_24, std::memory_order_relaxed);   break;
+            case 1: detectedFps.store(FrameRate::FPS_25, std::memory_order_relaxed);   break;
+            case 2: detectedFps.store(FrameRate::FPS_2997, std::memory_order_relaxed); break;
+            case 3: detectedFps.store(FrameRate::FPS_30, std::memory_order_relaxed);   break;
         }
 
-        currentTimecode.hours   = hours;
-        currentTimecode.minutes = minutes;
-        currentTimecode.seconds = seconds;
-        currentTimecode.frames  = frames;
+        packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
+                             std::memory_order_relaxed);
     }
 
     std::unique_ptr<juce::DatagramSocket> socket;
     juce::String bindIp = "0.0.0.0";
     int listenPort = 6454;
     int selectedInterface = 0;
-    bool isRunning = false;
+    std::atomic<bool> isRunningFlag { false };
+    std::atomic<bool> bindFellBack { false };
 
     juce::Array<NetworkInterface> availableInterfaces;
-    double lastPacketTime = 0.0;
+    std::atomic<double> lastPacketTime { 0.0 };
 
-    Timecode currentTimecode;
-    FrameRate detectedFps = FrameRate::FPS_25;
+    std::atomic<uint64_t> packedTimecode { 0 };
+    std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetInput)
 };

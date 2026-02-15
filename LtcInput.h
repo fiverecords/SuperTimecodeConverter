@@ -1,8 +1,13 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 class LtcInput : private juce::AudioIODeviceCallback
 {
@@ -25,8 +30,8 @@ public:
     {
         stop();
 
-        selectedChannel = ltcChannel;
-        passthruChannel = thruChannel;
+        selectedChannel.store(ltcChannel, std::memory_order_relaxed);
+        passthruChannel.store(thruChannel, std::memory_order_relaxed);
         currentDeviceName = devName;
 
         deviceManager.closeAudioDevice();
@@ -42,7 +47,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device â€“ single open call
+        // Open the specific device -- single open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.inputDeviceName   = devName;
         setup.outputDeviceName  = "";
@@ -59,48 +64,54 @@ public:
             return false;
 
         numChannelsAvailable = device->getActiveInputChannels().countNumberOfSetBits();
-        if (selectedChannel >= numChannelsAvailable)
-            selectedChannel = 0;
-        if (passthruChannel >= numChannelsAvailable)
-            passthruChannel = -1;
+        int selCh = selectedChannel.load(std::memory_order_relaxed);
+        int thruCh = passthruChannel.load(std::memory_order_relaxed);
+        if (selCh >= numChannelsAvailable)
+            selCh = 0;
+        if (thruCh >= numChannelsAvailable)
+            thruCh = -1;
+        // Prevent passthrough from using the same channel as LTC decode
+        if (thruCh >= 0 && thruCh == selCh)
+            thruCh = -1;
+        selectedChannel.store(selCh, std::memory_order_relaxed);
+        passthruChannel.store(thruCh, std::memory_order_relaxed);
 
         currentSampleRate = device->getCurrentSampleRate();
         currentBufferSize = device->getCurrentBufferSizeSamples();
 
-        resetDecoder();
-        resetPassthruBuffer();
+        // resetDecoder() and resetPassthruBuffer() are called by
+        // audioDeviceAboutToStart() when addAudioCallback triggers the device;
+        // only peak levels need explicit reset here since they're not part of
+        // the device-start callback.
+        ltcPeakLevel.store(0.0f, std::memory_order_relaxed);
+        thruPeakLevel.store(0.0f, std::memory_order_relaxed);
         deviceManager.addAudioCallback(this);
-        isRunningFlag = true;
+        isRunningFlag.store(true, std::memory_order_relaxed);
         return true;
     }
 
     void stop()
     {
-        if (isRunningFlag)
+        if (isRunningFlag.load(std::memory_order_relaxed))
         {
             deviceManager.removeAudioCallback(this);
             deviceManager.closeAudioDevice();
-            isRunningFlag = false;
+            isRunningFlag.store(false, std::memory_order_relaxed);
         }
     }
 
     //==============================================================================
-    bool getIsRunning() const { return isRunningFlag; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
-    int getSelectedChannel() const { return selectedChannel; }
-    int getPassthruChannel() const { return passthruChannel; }
+    int getSelectedChannel() const { return selectedChannel.load(std::memory_order_relaxed); }
+    int getPassthruChannel() const { return passthruChannel.load(std::memory_order_relaxed); }
     int getChannelCount() const { return numChannelsAvailable; }
     double getActualSampleRate() const { return currentSampleRate; }
     int getActualBufferSize() const { return currentBufferSize; }
 
     Timecode getCurrentTimecode() const
     {
-        Timecode tc;
-        tc.hours   = decodedHours.load(std::memory_order_relaxed);
-        tc.minutes = decodedMinutes.load(std::memory_order_relaxed);
-        tc.seconds = decodedSeconds.load(std::memory_order_relaxed);
-        tc.frames  = decodedFrames.load(std::memory_order_relaxed);
-        return tc;
+        return unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
     }
 
     FrameRate getDetectedFrameRate() const
@@ -111,16 +122,16 @@ public:
     bool isReceiving() const
     {
         auto now = juce::Time::getMillisecondCounterHiRes();
-        return (now - lastFrameTime.load(std::memory_order_relaxed)) < 200.0;
+        return (now - lastFrameTime.load(std::memory_order_relaxed)) < kSourceTimeoutMs;
     }
 
     //==============================================================================
     // Independent gain controls
     //==============================================================================
-    void setInputGain(float gain)    { inputGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
+    void setInputGain(float gain)    { inputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
     float getInputGain() const       { return inputGain.load(std::memory_order_relaxed); }
 
-    void setPassthruGain(float gain) { passthruGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
+    void setPassthruGain(float gain) { passthruGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
     float getPassthruGain() const    { return passthruGain.load(std::memory_order_relaxed); }
 
     //==============================================================================
@@ -135,27 +146,53 @@ public:
     //==============================================================================
     int readPassthruSamples(float* dest, int numSamples)
     {
-        int wp = passthruWritePos.load(std::memory_order_acquire);
-        int rp = passthruReadPos.load(std::memory_order_relaxed);
-        int available = wp - rp;
-        if (available < 0) available = 0;
+        if (!passthruBuffer)
+        {
+            std::memset(dest, 0, sizeof(float) * (size_t)numSamples);
+            return 0;
+        }
 
-        int toRead = juce::jmin(numSamples, available);
+        uint32_t wp = passthruWritePos.load(std::memory_order_acquire);
+        uint32_t rp = passthruReadPos.load(std::memory_order_relaxed);
+        uint32_t available = wp - rp;  // works correctly with unsigned wrap-around
+
+        int toRead = (int)juce::jmin((uint32_t)numSamples, available);
+
+        // Track underruns: if we can't supply all requested samples, it's an underrun
+        if (toRead < numSamples)
+            passthruUnderruns.fetch_add(1, std::memory_order_relaxed);
+
         for (int i = 0; i < toRead; i++)
-            dest[i] = passthruBuffer[(rp + i) & RING_MASK];
+            dest[i] = passthruBuffer[(rp + (uint32_t)i) & RING_MASK];
 
-        passthruReadPos.store(rp + toRead, std::memory_order_release);
+        // Zero-fill any samples we couldn't supply (silence instead of old data)
+        for (int i = toRead; i < numSamples; i++)
+            dest[i] = 0.0f;
+
+        passthruReadPos.store(rp + (uint32_t)toRead, std::memory_order_release);
         return toRead;
     }
 
-    bool hasPassthruChannel() const { return passthruChannel >= 0; }
+    bool hasPassthruChannel() const { return passthruChannel.load(std::memory_order_relaxed) >= 0; }
+    uint32_t getPassthruUnderruns() const { return passthruUnderruns.load(std::memory_order_relaxed); }
+    uint32_t getPassthruOverruns() const  { return passthruOverruns.load(std::memory_order_relaxed); }
+    void resetPassthruCounters() { passthruUnderruns.store(0, std::memory_order_relaxed); passthruOverruns.store(0, std::memory_order_relaxed); }
+
+    // Snap the read position to the current write position so the next reader
+    // starts from fresh data instead of consuming stale buffered samples.
+    // Call this just before starting AudioThru while LtcInput is already running.
+    void syncPassthruReadPosition()
+    {
+        passthruReadPos.store(passthruWritePos.load(std::memory_order_acquire),
+                              std::memory_order_release);
+    }
 
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
-    bool isRunningFlag = false;
-    int selectedChannel = 0;
-    int passthruChannel = -1;
+    std::atomic<bool> isRunningFlag { false };
+    std::atomic<int> selectedChannel { 0 };
+    std::atomic<int> passthruChannel { -1 };
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
@@ -165,29 +202,39 @@ private:
     std::atomic<float> ltcPeakLevel  { 0.0f };
     std::atomic<float> thruPeakLevel { 0.0f };
 
+    //==============================================================================
+    // Passthrough ring buffer (SPSC: single producer = audio callback,
+    // single consumer = AudioThru callback).  Uses unsigned wrap-around
+    // arithmetic so writePos/readPos never need resetting during operation.
+    // Heap-allocated to keep class size reasonable (~128KB buffer).
+    //==============================================================================
     static constexpr int RING_SIZE = 32768;
-    static constexpr int RING_MASK = RING_SIZE - 1;
-    float passthruBuffer[RING_SIZE] = {};
-    std::atomic<int> passthruWritePos { 0 };
-    std::atomic<int> passthruReadPos  { 0 };
+    static constexpr uint32_t RING_MASK = RING_SIZE - 1;
+    std::unique_ptr<float[]> passthruBuffer;
+    std::atomic<uint32_t> passthruWritePos { 0 };
+    std::atomic<uint32_t> passthruReadPos  { 0 };
+    std::atomic<uint32_t> passthruUnderruns { 0 };
+    std::atomic<uint32_t> passthruOverruns  { 0 };
 
+    // Safe to call from audioDeviceAboutToStart(): JUCE guarantees no audio
+    // callbacks are active during device start, so no concurrent reader/writer.
     void resetPassthruBuffer()
     {
         passthruWritePos.store(0, std::memory_order_relaxed);
         passthruReadPos.store(0, std::memory_order_relaxed);
-        std::memset(passthruBuffer, 0, sizeof(passthruBuffer));
+        if (!passthruBuffer)
+            passthruBuffer = std::make_unique<float[]>(RING_SIZE);
+        std::memset(passthruBuffer.get(), 0, sizeof(float) * RING_SIZE);
     }
 
-    std::atomic<int> decodedHours   { 0 };
-    std::atomic<int> decodedMinutes { 0 };
-    std::atomic<int> decodedSeconds { 0 };
-    std::atomic<int> decodedFrames  { 0 };
+    std::atomic<uint64_t> packedTimecode { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameTime  { 0.0 };
 
+    // LTC decoder state -- audio-callback-thread-only (no synchronisation needed)
     bool signalHigh = false;
     static constexpr float kHysteresisThreshold = 0.05f;
-    int samplesSinceEdge = 0;
+    int64_t samplesSinceEdge = 0;  // int64_t: prevents overflow at 192kHz without signal (~3h with int)
     double bitPeriodEstimate = 0.0;
     bool halfBitPending = false;
     bool firstEdgeAfterReset = true;
@@ -207,7 +254,9 @@ private:
         shiftRegHigh = 0;
         samplesSinceLastSync = 0.0;
         consecutiveGoodFrames = 0;
-        bitPeriodEstimate = currentSampleRate / 2000.0;
+        // Initial bit period estimate: use ~27fps midpoint (2160 transitions/sec)
+        // to minimize convergence time across all frame rates (24-30fps)
+        bitPeriodEstimate = currentSampleRate / 2160.0;
     }
 
     void pushBit(int bit)
@@ -237,7 +286,7 @@ private:
         int minutes = minTens   * 10 + minUnits;
         int hours   = hourTens  * 10 + hourUnits;
 
-        if (hours > 23 || minutes > 59 || seconds > 59 || frames > 30)
+        if (hours > 23 || minutes > 59 || seconds > 59 || frames > 29)
         {
             consecutiveGoodFrames = 0;
             samplesSinceLastSync = 0.0;
@@ -266,14 +315,12 @@ private:
 
         samplesSinceLastSync = 0.0;
 
-        decodedFrames.store(frames,   std::memory_order_relaxed);
-        decodedSeconds.store(seconds, std::memory_order_relaxed);
-        decodedMinutes.store(minutes, std::memory_order_relaxed);
-        decodedHours.store(hours,     std::memory_order_relaxed);
+        packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
+                             std::memory_order_relaxed);
         lastFrameTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
     }
 
-    void onEdgeDetected(int intervalSamples)
+    void onEdgeDetected(int64_t intervalSamples)
     {
         if (firstEdgeAfterReset)
         {
@@ -321,35 +368,60 @@ private:
                                           const juce::AudioIODeviceCallbackContext&) override
     {
         // --- Passthrough: capture channel into ring buffer ---
-        if (passthruChannel >= 0 && passthruChannel < numInputCh
-            && inputChannelData[passthruChannel])
+        int pCh = passthruChannel.load(std::memory_order_relaxed);
+        if (pCh >= 0 && pCh < numInputCh
+            && inputChannelData[pCh] && passthruBuffer)
         {
-            const float* thruData = inputChannelData[passthruChannel];
+            const float* thruData = inputChannelData[pCh];
             const float pGain = passthruGain.load(std::memory_order_relaxed);
-            int wp = passthruWritePos.load(std::memory_order_relaxed);
+            uint32_t wp = passthruWritePos.load(std::memory_order_relaxed);
+            uint32_t rp = passthruReadPos.load(std::memory_order_acquire);
+            uint32_t used = wp - rp;                    // unsigned wrap-around gives correct count
+            uint32_t freeSlots = RING_SIZE - used;      // includes the 1 reserved sentinel slot
 
             float thruPeak = 0.0f;
+
+            // Reserve 1 slot to distinguish full from empty; require >= 2 free slots to write
+            int toWrite = (freeSlots >= 2)
+                        ? (int)juce::jmin((uint32_t)numSamples, freeSlots - 1)
+                        : 0;
+
+            // Track overruns: if we can't write all samples, input is outpacing output
+            if (toWrite < numSamples)
+                passthruOverruns.fetch_add(1, std::memory_order_relaxed);
+
+            // Measure peak over ALL incoming samples (including those that won't
+            // fit in the ring buffer) so the meter reflects the true input level
+            // even during overruns.  Write only the samples that fit.
             for (int i = 0; i < numSamples; i++)
             {
                 float s = thruData[i] * pGain;
-                passthruBuffer[(wp + i) & RING_MASK] = s;
                 float a = std::abs(s);
                 if (a > thruPeak) thruPeak = a;
+                if (i < toWrite)
+                    passthruBuffer[(wp + (uint32_t)i) & RING_MASK] = s;
             }
 
-            passthruWritePos.store(wp + numSamples, std::memory_order_release);
+            passthruWritePos.store(wp + (uint32_t)toWrite, std::memory_order_release);
             thruPeakLevel.store(thruPeak, std::memory_order_relaxed);
         }
 
         // --- LTC decode on the selected channel ---
-        if (numInputCh <= 0 || selectedChannel >= numInputCh)
+        int sCh = selectedChannel.load(std::memory_order_relaxed);
+        if (numInputCh <= 0 || sCh >= numInputCh)
             return;
 
-        const float* data = inputChannelData[selectedChannel];
+        const float* data = inputChannelData[sCh];
         if (!data)
             return;
 
         const float gain = inputGain.load(std::memory_order_relaxed);
+
+        // Fixed threshold: the gain slider amplifies the signal before edge
+        // detection, so raising gain genuinely helps decode weak LTC signals.
+        // A fixed threshold keeps the hysteresis behaviour predictable while
+        // letting the user compensate for low-level inputs.
+        const float effectiveThreshold = kHysteresisThreshold;
 
         float ltcPeak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
@@ -364,7 +436,7 @@ private:
 
             if (signalHigh)
             {
-                if (sample < -kHysteresisThreshold)
+                if (sample < -effectiveThreshold)
                 {
                     signalHigh = false;
                     edgeDetected = true;
@@ -372,7 +444,7 @@ private:
             }
             else
             {
-                if (sample > kHysteresisThreshold)
+                if (sample > effectiveThreshold)
                 {
                     signalHigh = true;
                     edgeDetected = true;
@@ -400,7 +472,11 @@ private:
         resetPassthruBuffer();
     }
 
-    void audioDeviceStopped() override {}
+    void audioDeviceStopped() override
+    {
+        ltcPeakLevel.store(0.0f, std::memory_order_relaxed);
+        thruPeakLevel.store(0.0f, std::memory_order_relaxed);
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LtcInput)
 };

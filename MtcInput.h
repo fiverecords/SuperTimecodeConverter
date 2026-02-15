@@ -1,6 +1,11 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
+#include <atomic>
 
 class MtcInput : public juce::MidiInputCallback
 {
@@ -53,7 +58,7 @@ public:
             midiInput = std::move(device);
             midiInput->start();
             currentDeviceIndex = deviceIndex;
-            isRunning = true;
+            isRunningFlag.store(true, std::memory_order_relaxed);
             resetState();
             return true;
         }
@@ -68,53 +73,69 @@ public:
             midiInput->stop();
             midiInput = nullptr;
         }
-        isRunning = false;
+        isRunningFlag.store(false, std::memory_order_relaxed);
         currentDeviceIndex = -1;
     }
 
-    bool getIsRunning() const { return isRunning; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
 
     //==============================================================================
     // True if QF messages are actively arriving
     bool isReceiving() const
     {
-        if (!synced)
+        if (!synced.load(std::memory_order_acquire))
             return false;
 
         double now = juce::Time::getMillisecondCounterHiRes();
-        double elapsed = now - lastQfReceiveTime;
+        double elapsed = now - lastQfReceiveTime.load(std::memory_order_relaxed);
 
         // MTC at 24fps sends QF every ~10.4ms, at 30fps ~8.3ms
-        // 150ms silence = source paused
-        return elapsed < 150.0;
+        return elapsed < kSourceTimeoutMs;
     }
 
     Timecode getCurrentTimecode() const
     {
-        if (!synced)
+        if (!synced.load(std::memory_order_acquire))
             return Timecode();
 
         if (!isReceiving())
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
             return lastSyncTimecode; // Frozen
+        }
+
+        Timecode syncTc;
+        double syncMs;
+        FrameRate fps;
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
+            syncTc = lastSyncTimecode;
+            syncMs = syncTimeMs;
+            fps = detectedFps;
+        }
 
         double now = juce::Time::getMillisecondCounterHiRes();
-        double elapsed = now - syncTimeMs;
+        double elapsed = now - syncMs;
 
         if (elapsed < 0.0)
-            return lastSyncTimecode;
+            return syncTc;
 
-        double fps = frameRateToDouble(detectedFps);
-        int maxFrames = frameRateToInt(detectedFps);
-        double msPerFrame = 1000.0 / fps;
+        double fpsDouble = frameRateToDouble(fps);
+        int maxFrames = frameRateToInt(fps);
+        double msPerFrame = 1000.0 / fpsDouble;
 
         int extraFrames = (int)(elapsed / msPerFrame);
 
-        int64_t syncTotal = (int64_t)lastSyncTimecode.hours * 3600 * maxFrames
-                          + (int64_t)lastSyncTimecode.minutes * 60 * maxFrames
-                          + (int64_t)lastSyncTimecode.seconds * maxFrames
-                          + (int64_t)lastSyncTimecode.frames;
+        int64_t syncTotal = (int64_t)syncTc.hours * 3600 * maxFrames
+                          + (int64_t)syncTc.minutes * 60 * maxFrames
+                          + (int64_t)syncTc.seconds * maxFrames
+                          + (int64_t)syncTc.frames;
 
         int64_t currentTotal = syncTotal + extraFrames;
+
+        // Wrap at 24h so interpolation across midnight stays valid
+        int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
+        currentTotal = ((currentTotal % dayFrames) + dayFrames) % dayFrames;
 
         Timecode result;
         result.frames  = (int)(currentTotal % maxFrames);
@@ -122,10 +143,24 @@ public:
         result.minutes = (int)((currentTotal / (maxFrames * 60)) % 60);
         result.hours   = (int)((currentTotal / (maxFrames * 3600)) % 24);
 
+        // Drop-frame correction: interpolation may land on frames 0/1 at the
+        // start of a non-10th minute -- these frame numbers don't exist in DF
+        if (fps == FrameRate::FPS_2997
+            && result.frames < 2
+            && result.seconds == 0
+            && (result.minutes % 10) != 0)
+        {
+            result.frames = 2;
+        }
+
         return result;
     }
 
-    FrameRate getDetectedFrameRate() const { return detectedFps; }
+    FrameRate getDetectedFrameRate() const
+    {
+        const juce::SpinLock::ScopedLockType lock(tcLock);
+        return detectedFps;
+    }
 
     //==============================================================================
     void handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMessage& message) override
@@ -135,7 +170,7 @@ public:
 
         if (rawSize >= 2 && rawData[0] == 0xF1)
         {
-            lastQfReceiveTime = juce::Time::getMillisecondCounterHiRes();
+            lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
 
             int dataByte = rawData[1];
             int index = (dataByte >> 4) & 0x07;
@@ -158,7 +193,7 @@ public:
                 sysex[0] == 0x7F && sysex[1] == 0x7F &&
                 sysex[2] == 0x01 && sysex[3] == 0x01)
             {
-                lastQfReceiveTime = juce::Time::getMillisecondCounterHiRes();
+                lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
 
                 int hr = sysex[4];
                 int mn = sysex[5];
@@ -168,14 +203,17 @@ public:
                 int rateCode = (hr >> 5) & 0x03;
                 hr &= 0x1F;
 
-                updateDetectedFps(rateCode);
+                {
+                    const juce::SpinLock::ScopedLockType lock(tcLock);
+                    updateDetectedFps(rateCode);
 
-                lastSyncTimecode.hours   = hr;
-                lastSyncTimecode.minutes = mn;
-                lastSyncTimecode.seconds = sc;
-                lastSyncTimecode.frames  = fr;
-                syncTimeMs = juce::Time::getMillisecondCounterHiRes();
-                synced = true;
+                    lastSyncTimecode.hours   = hr;
+                    lastSyncTimecode.minutes = mn;
+                    lastSyncTimecode.seconds = sc;
+                    lastSyncTimecode.frames  = fr;
+                    syncTimeMs = juce::Time::getMillisecondCounterHiRes();
+                }
+                synced.store(true, std::memory_order_release);
             }
         }
     }
@@ -189,23 +227,33 @@ private:
         int hours   = mtcData[6] | ((mtcData[7] & 0x01) << 4);
 
         int rateCode = (mtcData[7] >> 1) & 0x03;
-        updateDetectedFps(rateCode);
 
-        int maxFrames = frameRateToInt(detectedFps);
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
+            updateDetectedFps(rateCode);
 
-        int64_t totalFrames = (int64_t)hours * 3600 * maxFrames
-                            + (int64_t)minutes * 60 * maxFrames
-                            + (int64_t)seconds * maxFrames
-                            + (int64_t)frames
-                            + 2;
+            int maxFrames = frameRateToInt(detectedFps);
 
-        lastSyncTimecode.frames  = (int)(totalFrames % maxFrames);
-        lastSyncTimecode.seconds = (int)((totalFrames / maxFrames) % 60);
-        lastSyncTimecode.minutes = (int)((totalFrames / (maxFrames * 60)) % 60);
-        lastSyncTimecode.hours   = (int)((totalFrames / (maxFrames * 3600)) % 24);
+            // MTC quarter-frame messages describe the timecode from 2 frames
+            // prior (8 QFs × ¼ frame = 2 frames of latency).  Adding 2 compensates
+            // so the displayed timecode matches the current position.
+            // NOTE: this compensation assumes forward playback.  Reverse or locate
+            // operations may briefly show a ±4 frame discrepancy until the next
+            // full 8-QF cycle completes.
+            int64_t totalFrames = (int64_t)hours * 3600 * maxFrames
+                                + (int64_t)minutes * 60 * maxFrames
+                                + (int64_t)seconds * maxFrames
+                                + (int64_t)frames
+                                + 2;
 
-        syncTimeMs = juce::Time::getMillisecondCounterHiRes();
-        synced = true;
+            lastSyncTimecode.frames  = (int)(totalFrames % maxFrames);
+            lastSyncTimecode.seconds = (int)((totalFrames / maxFrames) % 60);
+            lastSyncTimecode.minutes = (int)((totalFrames / (maxFrames * 60)) % 60);
+            lastSyncTimecode.hours   = (int)((totalFrames / (maxFrames * 3600)) % 24);
+
+            syncTimeMs = juce::Time::getMillisecondCounterHiRes();
+        }
+        synced.store(true, std::memory_order_release);
     }
 
     void updateDetectedFps(int rateCode)
@@ -216,6 +264,7 @@ private:
             case 1: detectedFps = FrameRate::FPS_25;   break;
             case 2: detectedFps = FrameRate::FPS_2997; break;
             case 3: detectedFps = FrameRate::FPS_30;   break;
+            default: break;  // Unknown rate code: keep previous value
         }
     }
 
@@ -223,23 +272,32 @@ private:
     {
         for (int i = 0; i < 8; i++)
             mtcData[i] = 0;
-        synced = false;
-        syncTimeMs = 0.0;
-        lastQfReceiveTime = 0.0;
-        lastSyncTimecode = Timecode();
+        synced.store(false, std::memory_order_relaxed);
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
+            syncTimeMs = 0.0;
+            lastSyncTimecode = Timecode();
+        }
+        lastQfReceiveTime.store(0.0, std::memory_order_relaxed);
     }
 
     std::unique_ptr<juce::MidiInput> midiInput;
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
-    bool isRunning = false;
+    std::atomic<bool> isRunningFlag { false };
 
+    // Quarter-frame accumulator -- MIDI-callback-thread-only
     int mtcData[8] = {};
+
+    // Protected by tcLock (written from MIDI thread, read from UI thread)
+    mutable juce::SpinLock tcLock;
     Timecode lastSyncTimecode;
     double syncTimeMs = 0.0;
-    double lastQfReceiveTime = 0.0;
-    bool synced = false;
     FrameRate detectedFps = FrameRate::FPS_25;
+
+    // Atomic cross-thread fields
+    std::atomic<double> lastQfReceiveTime { 0.0 };
+    std::atomic<bool> synced { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MtcInput)
 };

@@ -1,6 +1,11 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
+#include "CustomLookAndFeel.h"  // getMonoFontName()
 
 class TimecodeDisplay : public juce::Component
 {
@@ -57,7 +62,7 @@ public:
         auto statusColour = running ? juce::Colour(0xFF2E7D32) : juce::Colour(0xFF37474F);
 
         // --- Main timecode display ---
-        juce::String tcText = currentTimecode.toString();
+        juce::String tcText = currentTimecode.toDisplayString(currentFps);
 
         // Scale font to fit available width (11 chars at ~0.6 em width in Consolas)
         float maxFontSize = 72.0f;
@@ -88,7 +93,7 @@ public:
         g.fillEllipse(bounds.getCentreX() - 40.0f, statusY, 6.0f, 6.0f);
 
         g.setColour(juce::Colour(0xFF546E7A));
-        g.setFont(juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::plain)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
         g.drawText(running ? "RUNNING" : "STOPPED",
                    juce::Rectangle<float>(bounds.getCentreX() - 30.0f, statusY - 2.0f, 80.0f, 14.0f),
                    juce::Justification::centredLeft);
@@ -96,7 +101,7 @@ public:
         // --- Timecode text ---
         float tcY = statusY + statusH + gap1;
 
-        g.setFont(juce::Font(juce::FontOptions("Consolas", fontSize, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), fontSize, juce::Font::bold)));
         g.setColour(juce::Colour(0xFFE0F7FA));
         g.drawText(tcText,
                    juce::Rectangle<float>(bounds.getX(), tcY, bounds.getWidth(), tcHeight),
@@ -104,7 +109,7 @@ public:
 
         // --- Labels under each pair ---
         float labelY = tcY + tcHeight + gap2;
-        g.setFont(juce::Font(juce::FontOptions("Consolas", juce::jmax(7.0f, labelSize), juce::Font::plain)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), juce::jmax(7.0f, labelSize), juce::Font::plain)));
         g.setColour(juce::Colour(0xFF546E7A));
 
         float centerX = bounds.getCentreX();
@@ -125,7 +130,7 @@ public:
 
         // --- Source + FPS info ---
         float infoY = bounds.getBottom() - 40.0f;
-        g.setFont(juce::Font(juce::FontOptions("Consolas", 10.0f, juce::Font::plain)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::plain)));
         g.setColour(juce::Colour(0xFF37474F));
 
         juce::String infoText = "SOURCE: " + sourceName + "  |  " + frameRateToString(currentFps) + " FPS";

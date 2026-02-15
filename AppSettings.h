@@ -1,3 +1,7 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 
@@ -115,47 +119,65 @@ struct AppSettings
         auto parsed = juce::JSON::parse(file.loadFileAsString());
         if (auto* obj = parsed.getDynamicObject())
         {
-            inputSource          = obj->getProperty("inputSource").toString();
-            midiInputDevice      = obj->getProperty("midiInputDevice").toString();
-            artnetInputInterface = (int)obj->getProperty("artnetInputInterface");
-            audioInputDevice     = obj->getProperty("audioInputDevice").toString();
-            audioInputType       = obj->getProperty("audioInputType").toString();
-            audioInputChannel    = (int)obj->getProperty("audioInputChannel");
+            // Helpers for safe loading with defaults (handles missing keys from older versions)
+            auto getBool = [&](const char* key, bool def) {
+                auto v = obj->getProperty(key);
+                return v.isVoid() ? def : (bool)v;
+            };
+            auto getInt = [&](const char* key, int def) {
+                auto v = obj->getProperty(key);
+                return v.isVoid() ? def : (int)v;
+            };
+            auto getDouble = [&](const char* key, double def) {
+                auto v = obj->getProperty(key);
+                return v.isVoid() ? def : (double)v;
+            };
+            auto getString = [&](const char* key, const juce::String& def = {}) {
+                auto v = obj->getProperty(key);
+                return v.isVoid() ? def : v.toString();
+            };
 
-            mtcOutEnabled        = (bool)obj->getProperty("mtcOutEnabled");
-            artnetOutEnabled     = (bool)obj->getProperty("artnetOutEnabled");
-            ltcOutEnabled        = (bool)obj->getProperty("ltcOutEnabled");
-            thruOutEnabled       = (bool)obj->getProperty("thruOutEnabled");
-            midiOutputDevice     = obj->getProperty("midiOutputDevice").toString();
-            artnetOutputInterface = (int)obj->getProperty("artnetOutputInterface");
-            audioOutputDevice    = obj->getProperty("audioOutputDevice").toString();
-            audioOutputType      = obj->getProperty("audioOutputType").toString();
-            audioOutputChannel   = (int)obj->getProperty("audioOutputChannel");
-            audioOutputStereo    = (bool)obj->getProperty("audioOutputStereo");
-            thruOutputDevice     = obj->getProperty("thruOutputDevice").toString();
-            thruOutputType       = obj->getProperty("thruOutputType").toString();
-            thruOutputChannel    = (int)obj->getProperty("thruOutputChannel");
-            thruOutputStereo     = (bool)obj->getProperty("thruOutputStereo");
-            thruInputChannel     = (int)obj->getProperty("thruInputChannel");
+            inputSource          = getString("inputSource", "SystemTime");
+            midiInputDevice      = getString("midiInputDevice");
+            artnetInputInterface = getInt("artnetInputInterface", 0);
+            audioInputDevice     = getString("audioInputDevice");
+            audioInputType       = getString("audioInputType");
+            audioInputChannel    = getInt("audioInputChannel", 0);
 
-            auto clampGain = [](int v) { return (v <= 0 || v > 400) ? 100 : v; };
-            ltcInputGain   = clampGain((int)obj->getProperty("ltcInputGain"));
-            thruInputGain  = clampGain((int)obj->getProperty("thruInputGain"));
-            ltcOutputGain  = clampGain((int)obj->getProperty("ltcOutputGain"));
-            thruOutputGain = clampGain((int)obj->getProperty("thruOutputGain"));
+            mtcOutEnabled        = getBool("mtcOutEnabled", false);
+            artnetOutEnabled     = getBool("artnetOutEnabled", false);
+            ltcOutEnabled        = getBool("ltcOutEnabled", false);
+            thruOutEnabled       = getBool("thruOutEnabled", false);
+            midiOutputDevice     = getString("midiOutputDevice");
+            artnetOutputInterface = getInt("artnetOutputInterface", -1);
+            audioOutputDevice    = getString("audioOutputDevice");
+            audioOutputType      = getString("audioOutputType");
+            audioOutputChannel   = getInt("audioOutputChannel", 0);
+            audioOutputStereo    = getBool("audioOutputStereo", true);
+            thruOutputDevice     = getString("thruOutputDevice");
+            thruOutputType       = getString("thruOutputType");
+            thruOutputChannel    = getInt("thruOutputChannel", 1);
+            thruOutputStereo     = getBool("thruOutputStereo", true);
+            thruInputChannel     = getInt("thruInputChannel", 1);
 
-            audioInputTypeFilter  = obj->getProperty("audioInputTypeFilter").toString();
-            audioOutputTypeFilter = obj->getProperty("audioOutputTypeFilter").toString();
+            auto clampGain = [](int v) { return (v < 0 || v > 200) ? 100 : v; };
+            ltcInputGain   = clampGain(getInt("ltcInputGain", 100));
+            thruInputGain  = clampGain(getInt("thruInputGain", 100));
+            ltcOutputGain  = clampGain(getInt("ltcOutputGain", 100));
+            thruOutputGain = clampGain(getInt("thruOutputGain", 100));
 
-            preferredSampleRate = (double)obj->getProperty("preferredSampleRate");
-            preferredBufferSize = (int)obj->getProperty("preferredBufferSize");
+            audioInputTypeFilter  = getString("audioInputTypeFilter");
+            audioOutputTypeFilter = getString("audioOutputTypeFilter");
 
-            fpsSelection   = (int)obj->getProperty("fpsSelection");
+            preferredSampleRate = getDouble("preferredSampleRate", 0.0);
+            preferredBufferSize = getInt("preferredBufferSize", 0);
+
+            fpsSelection   = juce::jlimit(0, 3, getInt("fpsSelection", 3));
 
             auto clampOffset = [](int v) { return juce::jlimit(-30, 30, v); };
-            mtcOutputOffset    = clampOffset((int)obj->getProperty("mtcOutputOffset"));
-            artnetOutputOffset = clampOffset((int)obj->getProperty("artnetOutputOffset"));
-            ltcOutputOffset    = clampOffset((int)obj->getProperty("ltcOutputOffset"));
+            mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
+            artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
+            ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
 
             return true;
         }

@@ -1,3 +1,7 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
@@ -21,19 +25,23 @@ public:
     void mouseDown(const juce::MouseEvent& e) override
     {
         if (e.mods.isRightButtonDown() || e.mods.isPopupMenu())
-        { setValue(100.0, juce::sendNotificationAsync); return; }
+        { setValue(getDoubleClickReturnValue(), juce::sendNotificationAsync); return; }
         juce::Slider::mouseDown(e);
     }
 };
 
 //==============================================================================
-// Scrollable panel content component
+// Content component for scrollable right panel
 //==============================================================================
 class PanelContent : public juce::Component
 {
 public:
-    PanelContent() = default;
-    void setContentHeight(int h) { if (getHeight() != h) setSize(getWidth(), h); }
+    PanelContent() { setOpaque(false); }
+    void setContentHeight(int h)
+    {
+        if (getHeight() != h)
+            setSize(getWidth(), h);
+    }
 };
 
 //==============================================================================
@@ -109,6 +117,9 @@ private:
     int mtcOutputOffset      = 0;
     int artnetOutputOffset   = 0;
     int ltcOutputOffset      = 0;
+
+    // VU meter decay state
+    float sLtcIn = 0.0f, sThruIn = 0.0f, sLtcOut = 0.0f, sThruOut = 0.0f;
 
     // --- Collapse state ---
     bool inputConfigExpanded  = true;
@@ -198,7 +209,13 @@ private:
     juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText;
 
     AppSettings settings;
-    static constexpr int kStereoItemId = 900;
+    static constexpr int kStereoItemId = 10000;
+    static constexpr int kPlaceholderItemId = 10001;  // "Scanning..." / "No devices" placeholder
+
+    // --- Save debounce ---
+    bool settingsDirty = false;
+    int settingsSaveCountdown = 0;
+    static constexpr int kSaveDelayTicks = 30;  // ~500ms at 60fps
 
     // --- Methods ---
     void startAudioDeviceScan();
@@ -220,8 +237,6 @@ private:
     int getPreferredBufferSize() const;
     void restartAllAudioDevices();
 
-    int findAudioDevice(const juce::Array<AudioDeviceEntry>& entries,
-                        const juce::String& typeName, const juce::String& deviceName);
     int findFilteredIndex(const juce::Array<int>& filteredIndices,
                           const juce::Array<AudioDeviceEntry>& entries,
                           const juce::String& typeName, const juce::String& deviceName);
@@ -255,6 +270,7 @@ private:
     void layoutLeftPanel();
     void layoutRightPanel();
     void saveSettings();
+    void flushSettings();
     int findDeviceByName(const juce::ComboBox& cmb, const juce::String& name);
 
     juce::Colour getInputColour(InputSource source) const;

@@ -1,8 +1,14 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 class LtcOutput : private juce::AudioIODeviceCallback
 {
@@ -21,6 +27,7 @@ public:
         stop();
         selectedChannel = channel;
         currentDeviceName = devName;
+        currentTypeName = typeName;
 
         deviceManager.closeAudioDevice();
 
@@ -35,7 +42,7 @@ public:
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
             type->scanForDevices();
 
-        // Open the specific device â€“ this is the ONLY open call
+        // Open the specific device -- this is the ONLY open call
         auto setup = deviceManager.getAudioDeviceSetup();
         setup.outputDeviceName  = devName;
         setup.inputDeviceName   = "";
@@ -61,23 +68,25 @@ public:
         currentBufferSize = device->getCurrentBufferSizeSamples();
 
         resetEncoder();
+        peakLevel.store(0.0f, std::memory_order_relaxed);
         deviceManager.addAudioCallback(this);
-        isRunningFlag = true;
+        isRunningFlag.store(true, std::memory_order_relaxed);
         return true;
     }
 
     void stop()
     {
-        if (isRunningFlag)
+        if (isRunningFlag.load(std::memory_order_relaxed))
         {
             deviceManager.removeAudioCallback(this);
             deviceManager.closeAudioDevice();
-            isRunningFlag = false;
+            isRunningFlag.store(false, std::memory_order_relaxed);
         }
     }
 
-    bool getIsRunning() const { return isRunningFlag; }
+    bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
+    juce::String getCurrentTypeName() const { return currentTypeName; }
     int getSelectedChannel() const { return selectedChannel; }
     int getChannelCount() const { return numChannelsAvailable; }
     bool isStereoMode() const { return selectedChannel == -1; }
@@ -86,17 +95,15 @@ public:
 
     void setTimecode(const Timecode& tc)
     {
-        pendingHours.store(tc.hours, std::memory_order_relaxed);
-        pendingMinutes.store(tc.minutes, std::memory_order_relaxed);
-        pendingSeconds.store(tc.seconds, std::memory_order_relaxed);
-        pendingFrames.store(tc.frames, std::memory_order_relaxed);
+        packedPendingTc.store(packTimecode(tc.hours, tc.minutes, tc.seconds, tc.frames),
+                              std::memory_order_relaxed);
     }
 
     void setFrameRate(FrameRate fps)  { pendingFps.store(fps, std::memory_order_relaxed); }
     void setPaused(bool p)            { paused.store(p, std::memory_order_relaxed); }
     bool isPaused() const             { return paused.load(std::memory_order_relaxed); }
 
-    void setOutputGain(float gain)    { outputGain.store(juce::jlimit(0.0f, 4.0f, gain), std::memory_order_relaxed); }
+    void setOutputGain(float gain)    { outputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
     float getOutputGain() const       { return outputGain.load(std::memory_order_relaxed); }
 
     float getPeakLevel() const        { return peakLevel.load(std::memory_order_relaxed); }
@@ -104,21 +111,20 @@ public:
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
-    bool isRunningFlag = false;
+    juce::String currentTypeName;
+    std::atomic<bool> isRunningFlag { false };
     int selectedChannel = 0;
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
 
-    std::atomic<int> pendingHours   { 0 };
-    std::atomic<int> pendingMinutes { 0 };
-    std::atomic<int> pendingSeconds { 0 };
-    std::atomic<int> pendingFrames  { 0 };
+    std::atomic<uint64_t> packedPendingTc { 0 };
     std::atomic<FrameRate> pendingFps { FrameRate::FPS_25 };
     std::atomic<bool> paused { false };
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };
 
+    // LTC encoder state -- audio-callback-thread-only (no synchronisation needed)
     static constexpr int LTC_FRAME_BITS = 80;
     uint8_t frameBits[LTC_FRAME_BITS] = {};
     int currentBitIndex = 0;
@@ -129,6 +135,11 @@ private:
     bool needNewFrame = true;
     static constexpr float baseAmplitude = 0.8f;
 
+    // Auto-increment state: the encoder maintains its own running timecode
+    // to avoid repeating frames when the UI thread lags behind the audio clock
+    Timecode encoderTc;
+    bool encoderSeeded = false;
+
     void resetEncoder()
     {
         currentBitIndex = 0;
@@ -136,6 +147,8 @@ private:
         samplePositionInHalfBit = 0.0;
         currentLevel = 1.0f;
         needNewFrame = true;
+        encoderSeeded = false;
+        encoderTc = Timecode();
         updateSamplesPerBit();
     }
 
@@ -147,11 +160,42 @@ private:
 
     void packFrame()
     {
-        int frames  = pendingFrames.load(std::memory_order_relaxed);
-        int seconds = pendingSeconds.load(std::memory_order_relaxed);
-        int minutes = pendingMinutes.load(std::memory_order_relaxed);
-        int hours   = pendingHours.load(std::memory_order_relaxed);
         FrameRate fps = pendingFps.load(std::memory_order_relaxed);
+        Timecode pendingTc = unpackTimecode(packedPendingTc.load(std::memory_order_relaxed));
+
+        if (!encoderSeeded)
+        {
+            // First frame: seed from UI
+            encoderTc = pendingTc;
+            encoderSeeded = true;
+        }
+        else
+        {
+            // Auto-increment from the last encoded frame
+            encoderTc = incrementFrame(encoderTc, fps);
+
+            // If the UI-provided timecode differs significantly (>1 frame),
+            // re-sync to the UI value (handles seeks, source switches, jumps)
+            int maxFrames = frameRateToInt(fps);
+            auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
+                return (int64_t)t.hours * 3600 * maxFrames
+                     + (int64_t)t.minutes * 60 * maxFrames
+                     + (int64_t)t.seconds * maxFrames
+                     + (int64_t)t.frames;
+            };
+            int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
+            int64_t rawDiff = toTotal(pendingTc) - toTotal(encoderTc);
+            // Modular distance: shortest path around the 24h wheel
+            int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
+            if (diff > dayFrames / 2) diff = dayFrames - diff;
+            if (diff > 1)
+                encoderTc = pendingTc;
+        }
+
+        int frames  = encoderTc.frames;
+        int seconds = encoderTc.seconds;
+        int minutes = encoderTc.minutes;
+        int hours   = encoderTc.hours;
 
         int frameUnits = frames % 10,  frameTens = frames / 10;
         int secUnits   = seconds % 10, secTens   = seconds / 10;
@@ -180,6 +224,16 @@ private:
         frameBits[25] = (secTens >> 1) & 1;
         frameBits[26] = (secTens >> 2) & 1;
 
+        // Biphase polarity correction bit 27 (BGF0):
+        // even parity over bits 0-26 so total 1s in bits 0-27 is even
+        // NOTE: This parity calculation is correct only while user bits (4-7, 12-15,
+        // 20-23, 28-31) are zero.  If user bits are ever populated, the parity
+        // must still include them (they are already in the 0-26 range for this half).
+        int parityLow = 0;
+        for (int i = 0; i < 27; i++)
+            parityLow += frameBits[i];
+        frameBits[27] = (parityLow & 1) ? 1 : 0;
+
         frameBits[32] = (minUnits >> 0) & 1;
         frameBits[33] = (minUnits >> 1) & 1;
         frameBits[34] = (minUnits >> 2) & 1;
@@ -202,10 +256,15 @@ private:
         frameBits[72] = 1; frameBits[73] = 1; frameBits[74] = 1; frameBits[75] = 1;
         frameBits[76] = 1; frameBits[77] = 1; frameBits[78] = 0; frameBits[79] = 1;
 
-        int onesCount = 0;
-        for (int i = 0; i < 59; i++)
-            onesCount += frameBits[i];
-        frameBits[59] = (onesCount & 1) ? 1 : 0;
+        // Biphase polarity correction bit 59 (BGF2):
+        // even parity over bits 32-58 so total 1s in bits 32-59 is even
+        // NOTE: Same caveat as BGF0 — user bits (36-39, 44-47, 52-55) are
+        // within this range and are currently zero.  Keep parity updated if
+        // user bits are populated in the future.
+        int parityHigh = 0;
+        for (int i = 32; i < 59; i++)
+            parityHigh += frameBits[i];
+        frameBits[59] = (parityHigh & 1) ? 1 : 0;
     }
 
     //==============================================================================
@@ -288,6 +347,9 @@ private:
         resetEncoder();
     }
 
-    void audioDeviceStopped() override {}
+    void audioDeviceStopped() override
+    {
+        peakLevel.store(0.0f, std::memory_order_relaxed);
+    }
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LtcOutput)
 };

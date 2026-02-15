@@ -1,5 +1,24 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #pragma once
 #include <JuceHeader.h>
+
+//==============================================================================
+// Cross-platform monospace font name
+// Consolas is Windows-only; macOS uses Menlo, Linux uses monospace fallback
+//==============================================================================
+inline juce::String getMonoFontName()
+{
+#if JUCE_MAC
+    return "Menlo";
+#elif JUCE_WINDOWS
+    return "Consolas";
+#else
+    return juce::Font::getDefaultMonospacedFontName();
+#endif
+}
 
 class CustomLookAndFeel : public juce::LookAndFeel_V4
 {
@@ -48,7 +67,7 @@ public:
     void drawButtonText(juce::Graphics& g, juce::TextButton& button,
                         bool isHighlighted, bool /*isDown*/) override
     {
-        auto font = juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::bold));
+        auto font = juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold));
         g.setFont(font);
         g.setColour(button.findColour(isHighlighted ? juce::TextButton::textColourOnId
                                                     : juce::TextButton::textColourOffId));
@@ -59,7 +78,7 @@ public:
 
     juce::Font getTextButtonFont(juce::TextButton&, int) override
     {
-        return juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::bold));
+        return juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold));
     }
 
     //==============================================================================
@@ -74,13 +93,13 @@ public:
 
         auto tickColour = button.findColour(juce::ToggleButton::tickColourId);
 
-        // Background â€” strong accent tint when ON
+        // Background -- strong accent tint when ON
         auto bgCol = isOn ? tickColour.withAlpha(0.18f) : bg;
         if (isHighlighted) bgCol = bgCol.brighter(0.04f);
         g.setColour(bgCol);
         g.fillRoundedRectangle(bounds.reduced(0.5f), cornerSize);
 
-        // Border â€” accent colour when ON
+        // Border -- accent colour when ON
         g.setColour(isOn ? tickColour.withAlpha(0.5f) : border);
         g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, isOn ? 1.5f : 1.0f);
 
@@ -111,14 +130,14 @@ public:
             g.fillEllipse(indicatorBounds.reduced(3.5f));
         }
 
-        // Text â€” brighter when ON, with accent tint
+        // Text -- brighter when ON, with accent tint
         auto textBounds = bounds.withTrimmedLeft(indicatorX + indicatorSize + 8.0f);
-        g.setFont(juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::bold)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
         g.setColour(isOn ? textBright : textMid);
         g.drawText(button.getButtonText(), textBounds.toNearestInt(),
                    juce::Justification::centredLeft, false);
 
-        // Status dot â€” pulsing accent
+        // Status dot -- pulsing accent
         if (isOn)
         {
             float dotSize = 6.0f;
@@ -164,7 +183,7 @@ public:
 
     juce::Font getComboBoxFont(juce::ComboBox&) override
     {
-        return juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::plain));
+        return juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain));
     }
 
     void positionComboBoxText(juce::ComboBox& box, juce::Label& label) override
@@ -205,7 +224,7 @@ public:
             g.fillRoundedRectangle(area.toFloat().reduced(2, 1), 3.0f);
         }
 
-        g.setFont(juce::Font(juce::FontOptions("Consolas", 11.0f, juce::Font::plain)));
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
         g.setColour(isActive ? textBright : textDim);
         g.drawText(text, area.reduced(12, 0), juce::Justification::centredLeft);
 
@@ -252,16 +271,10 @@ public:
                                 .withX(thumbBounds.getCentreX() - 1.0f), 1.0f);
     }
 
-    juce::Slider::SliderLayout getSliderLayout(juce::Slider& slider) override
-    {
-        auto layout = LookAndFeel_V4::getSliderLayout(slider);
-        return layout;
-    }
-
     juce::Label* createSliderTextBox(juce::Slider& slider) override
     {
         auto* label = LookAndFeel_V4::createSliderTextBox(slider);
-        label->setFont(juce::Font(juce::FontOptions("Consolas", 10.0f, juce::Font::plain)));
+        label->setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::plain)));
         return label;
     }
 

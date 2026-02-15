@@ -1,3 +1,7 @@
+// Super Timecode Converter
+// Copyright (c) 2026 Fiverecords — MIT License
+// https://github.com/fiverecords/SuperTimecodeConverter
+
 #include <JuceHeader.h>
 #include "MainComponent.h"
 
@@ -7,7 +11,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.1"; }
+    const juce::String getApplicationVersion() override { return "1.2"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
