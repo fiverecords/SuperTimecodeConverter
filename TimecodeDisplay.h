@@ -7,6 +7,15 @@
 #include "TimecodeCore.h"
 #include "CustomLookAndFeel.h"  // getMonoFontName()
 
+// Replacement for the deprecated juce::Font::getStringWidthFloat().
+// JUCE now recommends using GlyphArrangement to measure text layouts.
+static inline float measureStringWidth(const juce::Font& font, const juce::String& text)
+{
+    juce::GlyphArrangement ga;
+    ga.addLineOfText(font, text, 0.0f, 0.0f);
+    return ga.getBoundingBox(0, -1, true).getWidth();
+}
+
 class TimecodeDisplay : public juce::Component
 {
 public:
@@ -54,6 +63,37 @@ public:
         }
     }
 
+    // FPS conversion display state
+    void setFpsConvertEnabled(bool enabled)
+    {
+        if (fpsConvertActive != enabled)
+        {
+            fpsConvertActive = enabled;
+            repaint();
+        }
+    }
+
+    void setOutputTimecode(const Timecode& tc)
+    {
+        if (outTimecode.hours   != tc.hours   ||
+            outTimecode.minutes != tc.minutes  ||
+            outTimecode.seconds != tc.seconds  ||
+            outTimecode.frames  != tc.frames)
+        {
+            outTimecode = tc;
+            if (fpsConvertActive) repaint();
+        }
+    }
+
+    void setOutputFrameRate(FrameRate fps)
+    {
+        if (outFps != fps)
+        {
+            outFps = fps;
+            if (fpsConvertActive) repaint();
+        }
+    }
+
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat();
@@ -64,11 +104,19 @@ public:
         // --- Main timecode display ---
         juce::String tcText = currentTimecode.toDisplayString(currentFps);
 
-        // Scale font to fit available width (11 chars at ~0.6 em width in Consolas)
+        // Scale font to fit available width
+        // When FPS convert is active, we need room for "/FF" suffix (~14 chars total)
         float maxFontSize = 72.0f;
         float availW = bounds.getWidth() - 20.0f;
-        float charWidthRatio = 0.62f;  // Consolas character width / font size
-        float fittedSize = availW / (11.0f * charWidthRatio);
+        float totalChars = fpsConvertActive ? 14.0f : 11.0f;
+
+        // Compute character width ratio dynamically from the actual font metrics
+        // (avoids hardcoded values that only match a single platform's monospace font)
+        auto measureFont = juce::Font(juce::FontOptions(getMonoFontName(), maxFontSize, juce::Font::bold));
+        float charWidthRatio = measureStringWidth(measureFont, "0") / maxFontSize;
+        if (charWidthRatio <= 0.0f) charWidthRatio = 0.6f;  // safe fallback
+
+        float fittedSize = availW / (totalChars * charWidthRatio);
         float fontSize = juce::jmin(maxFontSize, juce::jmax(24.0f, fittedSize));
 
         float tcHeight = fontSize * 1.25f;
@@ -100,43 +148,138 @@ public:
 
         // --- Timecode text ---
         float tcY = statusY + statusH + gap1;
+        juce::Font tcFont(juce::FontOptions(getMonoFontName(), fontSize, juce::Font::bold));
+        g.setFont(tcFont);
 
-        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), fontSize, juce::Font::bold)));
-        g.setColour(juce::Colour(0xFFE0F7FA));
-        g.drawText(tcText,
-                   juce::Rectangle<float>(bounds.getX(), tcY, bounds.getWidth(), tcHeight),
-                   juce::Justification::centred);
+        if (fpsConvertActive)
+        {
+            // Split rendering: main TC in white, "/FF" suffix in cyan
+            juce::String outFrameStr = juce::String::formatted("%02d",
+                juce::jlimit(0, 29, outTimecode.frames));
+            juce::String fullText = tcText + "/" + outFrameStr;
+
+            // Measure widths to position both parts
+            float fullW = measureStringWidth(tcFont, fullText);
+            float mainW = measureStringWidth(tcFont, tcText);
+            float suffixW = fullW - mainW;
+            float textStartX = bounds.getCentreX() - fullW / 2.0f;
+
+            // Draw main TC (input) — standard bright colour
+            g.setColour(juce::Colour(0xFFE0F7FA));
+            g.drawText(tcText,
+                       juce::Rectangle<float>(textStartX, tcY, mainW, tcHeight),
+                       juce::Justification::centredLeft);
+
+            // Draw "/FF" suffix — cyan accent
+            g.setColour(juce::Colour(0xFF00ACC1));
+            g.drawText("/" + outFrameStr,
+                       juce::Rectangle<float>(textStartX + mainW, tcY, suffixW, tcHeight),
+                       juce::Justification::centredLeft);
+        }
+        else
+        {
+            // Standard display — single colour
+            g.setColour(juce::Colour(0xFFE0F7FA));
+            g.drawText(tcText,
+                       juce::Rectangle<float>(bounds.getX(), tcY, bounds.getWidth(), tcHeight),
+                       juce::Justification::centred);
+        }
 
         // --- Labels under each pair ---
         float labelY = tcY + tcHeight + gap2;
         g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), juce::jmax(7.0f, labelSize), juce::Font::plain)));
-        g.setColour(juce::Colour(0xFF546E7A));
 
+        // Compute label positions based on the full displayed text width
         float centerX = bounds.getCentreX();
-        float tcWidth = fontSize * 11.0f * charWidthRatio;
+        float displayChars = fpsConvertActive ? 14.0f : 11.0f;
+        float tcWidth = fontSize * displayChars * charWidthRatio;
         float startX = centerX - tcWidth / 2.0f;
-        float segW = tcWidth / 4.0f;
 
-        float positions[] = { startX + segW * 0.5f, startX + segW * 1.5f,
-                              startX + segW * 2.5f, startX + segW * 3.5f };
-        const char* labels[] = { "HRS", "MIN", "SEC", "FRM" };
-
-        for (int i = 0; i < 4; i++)
+        if (fpsConvertActive)
         {
-            g.drawText(labels[i],
-                       juce::Rectangle<float>(positions[i] - 15.0f, labelY, 60.0f, 14.0f),
-                       juce::Justification::centred);
+            // Character layout: HH:MM:SS.FF/FF = 14 chars
+            // Positions:         01 2 34 5 67 8 9A B CD
+            // Centre of each group:
+            //   HRS = chars 0-1  → centre at char 1.0
+            //   MIN = chars 3-4  → centre at char 3.5
+            //   SEC = chars 6-7  → centre at char 6.5
+            //   FRM = chars 9-10 → centre at char 9.5
+            //   OUT = chars 12-13→ centre at char 12.5
+            float charW = tcWidth / displayChars;
+            float posHrs = startX + 1.0f  * charW;
+            float posMn  = startX + 3.5f  * charW;
+            float posSec = startX + 6.5f  * charW;
+            float posFrm = startX + 9.5f  * charW;
+            float posOut = startX + 12.5f * charW;
+
+            g.setColour(juce::Colour(0xFF546E7A));
+            g.drawText("HRS", juce::Rectangle<float>(posHrs - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
+            g.drawText("MIN", juce::Rectangle<float>(posMn  - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
+            g.drawText("SEC", juce::Rectangle<float>(posSec - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
+            g.drawText("FRM", juce::Rectangle<float>(posFrm - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
+
+            // "OUT" label in cyan under the converted frame digits
+            g.setColour(juce::Colour(0xFF00838F));
+            g.drawText("OUT", juce::Rectangle<float>(posOut - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
+        }
+        else
+        {
+            float segW = tcWidth / 4.0f;
+            float positions[] = { startX + segW * 0.5f, startX + segW * 1.5f,
+                                  startX + segW * 2.5f, startX + segW * 3.5f };
+            const char* labels[] = { "HRS", "MIN", "SEC", "FRM" };
+
+            g.setColour(juce::Colour(0xFF546E7A));
+            for (int i = 0; i < 4; i++)
+            {
+                g.drawText(labels[i],
+                           juce::Rectangle<float>(positions[i] - 15.0f, labelY, 60.0f, 14.0f),
+                           juce::Justification::centred);
+            }
         }
 
         // --- Source + FPS info ---
         float infoY = bounds.getBottom() - 40.0f;
         g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::plain)));
-        g.setColour(juce::Colour(0xFF37474F));
 
-        juce::String infoText = "SOURCE: " + sourceName + "  |  " + frameRateToString(currentFps) + " FPS";
-        g.drawText(infoText,
-                   juce::Rectangle<float>(0.0f, infoY, bounds.getWidth(), 14.0f),
-                   juce::Justification::centred);
+        if (fpsConvertActive)
+        {
+            // Show both input and output rates with arrow
+            juce::String inLabel  = "SOURCE: " + sourceName + "  |  "
+                                  + frameRateToString(currentFps);
+            juce::String arrow    = juce::String::fromUTF8(" \xe2\x86\x92 ");  // " → "
+            juce::String outLabel = frameRateToString(outFps) + " FPS";
+
+            // Measure to centre the full composite string
+            juce::Font infoFont(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::plain));
+            g.setFont(infoFont);
+            float inW  = measureStringWidth(infoFont, inLabel);
+            float arW  = measureStringWidth(infoFont, arrow);
+            float outW = measureStringWidth(infoFont, outLabel);
+            float totW = inW + arW + outW;
+            float sx   = bounds.getCentreX() - totW / 2.0f;
+
+            g.setColour(juce::Colour(0xFF37474F));
+            g.drawText(inLabel, juce::Rectangle<float>(sx, infoY, inW, 14.0f),
+                       juce::Justification::centredLeft);
+
+            g.setColour(juce::Colour(0xFF546E7A));
+            g.drawText(arrow, juce::Rectangle<float>(sx + inW, infoY, arW, 14.0f),
+                       juce::Justification::centredLeft);
+
+            g.setColour(juce::Colour(0xFF00ACC1));
+            g.drawText(outLabel, juce::Rectangle<float>(sx + inW + arW, infoY, outW, 14.0f),
+                       juce::Justification::centredLeft);
+        }
+        else
+        {
+            g.setColour(juce::Colour(0xFF37474F));
+            juce::String infoText = "SOURCE: " + sourceName + "  |  "
+                                  + frameRateToString(currentFps) + " FPS";
+            g.drawText(infoText,
+                       juce::Rectangle<float>(0.0f, infoY, bounds.getWidth(), 14.0f),
+                       juce::Justification::centred);
+        }
     }
 
 private:
@@ -144,6 +287,11 @@ private:
     FrameRate currentFps = FrameRate::FPS_30;
     juce::String sourceName = "SYSTEM";
     bool running = false;
+
+    // FPS conversion state
+    bool fpsConvertActive = false;
+    Timecode outTimecode;
+    FrameRate outFps = FrameRate::FPS_30;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TimecodeDisplay)
 };
