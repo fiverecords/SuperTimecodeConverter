@@ -293,12 +293,19 @@ private:
             return;
         }
 
-        if (samplesSinceLastSync > 0.0)
+        // Only compute fps from inter-frame period if the gap is reasonable
+        // (< 2 seconds).  Longer gaps mean signal was lost/corrupt and the
+        // measured period would be meaningless for rate detection.
+        if (samplesSinceLastSync > 0.0 && samplesSinceLastSync < currentSampleRate * 2.0)
         {
             double framePeriodSec = samplesSinceLastSync / currentSampleRate;
             double measuredFps = 1.0 / framePeriodSec;
 
             FrameRate detected = FrameRate::FPS_25;
+            // NOTE: LTC cannot distinguish 23.976fps from 24fps — both use 80 bits
+            // per frame with no drop-frame flag.  The ~0.1% rate difference is too
+            // small to measure reliably from frame-to-frame period.  If 23.976 support
+            // is needed, the user must manually select the frame rate.
             if (measuredFps < 24.5)       detected = FrameRate::FPS_24;
             else if (measuredFps < 27.0)  detected = FrameRate::FPS_25;
             else if (dropFrame)           detected = FrameRate::FPS_2997;
