@@ -124,6 +124,12 @@ public:
         int maxFrames = frameRateToInt(fps);
         double msPerFrame = 1000.0 / fpsDouble;
 
+        // Linear interpolation from last sync point.
+        // NOTE: for 29.97 DF, this uses simple frame counting (maxFrames per second)
+        // rather than true DF-aware counting.  The DF correction at the end patches
+        // any landing on skipped frame numbers 0-1.  This is exact for the typical
+        // interpolation range (a few dozen frames between QF syncs), because DF skips
+        // only occur at minute boundaries which are always >1798 frames apart.
         int extraFrames = (int)(elapsed / msPerFrame);
 
         int64_t syncTotal = (int64_t)syncTc.hours * 3600 * maxFrames
@@ -173,16 +179,13 @@ public:
             lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
 
             int dataByte = rawData[1];
-            int index = (dataByte >> 4) & 0x07;
+            int index = (dataByte >> 4) & 0x07;  // 0-7 guaranteed by mask
             int value = dataByte & 0x0F;
 
-            if (index >= 0 && index <= 7)
-            {
-                mtcData[index] = value;
+            mtcData[index] = value;
 
-                if (index == 7)
-                    reconstructAndSync();
-            }
+            if (index == 7)
+                reconstructAndSync();
         }
         else if (message.isSysEx())
         {
@@ -190,8 +193,9 @@ public:
             int sysexSize = message.getSysExDataSize();
 
             if (sysexSize >= 8 &&
-                sysex[0] == 0x7F && sysex[1] == 0x7F &&
-                sysex[2] == 0x01 && sysex[3] == 0x01)
+                sysex[0] == 0x7F &&                     // Universal Real Time
+                                                         // sysex[1] = device ID (0x00-0x7F, accept any)
+                sysex[2] == 0x01 && sysex[3] == 0x01)   // MTC Full Frame
             {
                 lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
 
@@ -260,7 +264,13 @@ private:
     {
         switch (rateCode)
         {
-            case 0: detectedFps = FrameRate::FPS_24;   break;
+            case 0:
+                // MTC rate code 0 means "24fps". SMPTE MTC has no code for
+                // 23.976, so if the user has selected FPS_2398 we preserve
+                // it rather than silently overwriting with FPS_24.
+                if (detectedFps != FrameRate::FPS_2398)
+                    detectedFps = FrameRate::FPS_24;
+                break;
             case 1: detectedFps = FrameRate::FPS_25;   break;
             case 2: detectedFps = FrameRate::FPS_2997; break;
             case 3: detectedFps = FrameRate::FPS_30;   break;
