@@ -15,10 +15,11 @@ static_assert(std::atomic<double>::is_always_lock_free,
 
 enum class FrameRate
 {
-    FPS_24    = 0,
-    FPS_25    = 1,
-    FPS_2997  = 2,
-    FPS_30    = 3
+    FPS_2398  = 0,  // 23.976 (24000/1001) — cinema/digital workflows
+    FPS_24    = 1,
+    FPS_25    = 2,
+    FPS_2997  = 3,
+    FPS_30    = 4
 };
 
 // std::atomic<FrameRate> is used in several protocol handlers for cross-thread
@@ -43,15 +44,18 @@ struct Timecode
     // ':' for non-drop-frame (broadcast convention per SMPTE ST 12-1)
     // Clamps values to valid SMPTE ranges to prevent garbled display from
     // corrupt or uninitialised data.
-    juce::String toDisplayString(FrameRate fps) const
+    juce::String toDisplayString(FrameRate /*fps*/) const
     {
         int h = juce::jlimit(0, 23, hours);
         int m = juce::jlimit(0, 59, minutes);
         int s = juce::jlimit(0, 59, seconds);
         int f = juce::jlimit(0, 29, frames);
-        const char* frameSep = (fps == FrameRate::FPS_2997) ? ";" : ":";
-        return juce::String::formatted("%02d:%02d:%02d", h, m, s)
-             + frameSep + juce::String::formatted("%02d", f);
+        // Use '.' as the frame separator for all frame rates.
+        // This visually distinguishes the frame count from the HH:MM:SS time
+        // fields (which always use ':').
+        // Note: SMPTE ST 12-1 recommends ';' for drop-frame, but this app
+        // intentionally uses '.' for visual clarity in all modes.
+        return juce::String::formatted("%02d:%02d:%02d.%02d", h, m, s, f);
     }
 };
 
@@ -59,9 +63,10 @@ inline double frameRateToDouble(FrameRate fps)
 {
     switch (fps)
     {
+        case FrameRate::FPS_2398: return 24000.0 / 1001.0;   // exact 23.976023976... (not truncated 23.976)
         case FrameRate::FPS_24:   return 24.0;
         case FrameRate::FPS_25:   return 25.0;
-        case FrameRate::FPS_2997: return 29.97;
+        case FrameRate::FPS_2997: return 30000.0 / 1001.0;   // exact 29.970029970... (consistent with DF math)
         case FrameRate::FPS_30:   return 30.0;
         default:                  return 30.0;
     }
@@ -71,6 +76,7 @@ inline int frameRateToInt(FrameRate fps)
 {
     switch (fps)
     {
+        case FrameRate::FPS_2398: return 24;
         case FrameRate::FPS_24:   return 24;
         case FrameRate::FPS_25:   return 25;
         case FrameRate::FPS_2997: return 30;
@@ -83,6 +89,7 @@ inline juce::String frameRateToString(FrameRate fps)
 {
     switch (fps)
     {
+        case FrameRate::FPS_2398: return "23.976";
         case FrameRate::FPS_24:   return "24";
         case FrameRate::FPS_25:   return "25";
         case FrameRate::FPS_2997: return "29.97";
@@ -125,7 +132,7 @@ inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
 // Art-Net at 30fps sends a packet every ~33ms, LTC frames arrive every
 // ~33-42ms.  150ms covers several missed frames with margin.
 //==============================================================================
-static constexpr double kSourceTimeoutMs = 150.0;
+inline constexpr double kSourceTimeoutMs = 150.0;
 
 //==============================================================================
 // Atomic-safe pack/unpack -- fits H:M:S:F into a single uint64_t
@@ -159,6 +166,12 @@ inline Timecode unpackTimecode(uint64_t packed)
 inline Timecode offsetTimecode(const Timecode& tc, int offsetFrames, FrameRate fps)
 {
     if (offsetFrames == 0) return tc;
+
+    // The linear-frame arithmetic below is exact only for small offsets.
+    // Drop-frame timecode has non-uniform frame distribution, so converting
+    // linear→DF→linear for large offsets accumulates error. The UI sliders
+    // are constrained to ±30 frames; assert here to catch any future misuse.
+    jassert(std::abs(offsetFrames) <= 30);
 
     int maxFrames = frameRateToInt(fps);
     int64_t total = (int64_t)tc.hours * 3600 * maxFrames
@@ -252,6 +265,57 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
 }
 
 //==============================================================================
+// Convert a Timecode back to milliseconds since midnight.
+// Inverse of wallClockToTimecode().  For 29.97 drop-frame, converts
+// the DF frame numbering back to a linear frame count before computing
+// real elapsed time using the exact 30000/1001 rate.
+//==============================================================================
+inline double timecodeToMs(const Timecode& tc, FrameRate fps)
+{
+    if (fps == FrameRate::FPS_2997)
+    {
+        // Drop-frame: frame numbers 0 and 1 are skipped at the start
+        // of each minute except every 10th minute.  To recover the true
+        // linear frame count, subtract the total dropped frame numbers.
+        int totalMinutes = tc.hours * 60 + tc.minutes;
+        int tenMinBlocks = totalMinutes / 10;
+
+        // Frame number in 30fps space (as written in the TC display)
+        int64_t frameNumber = (int64_t)tc.hours   * 108000   // 30 * 3600
+                            + (int64_t)tc.minutes  * 1800     // 30 * 60
+                            + (int64_t)tc.seconds  * 30
+                            + (int64_t)tc.frames;
+
+        // Total dropped frame numbers up to this point:
+        // 2 per minute, except every 10th minute (which has no drops)
+        int64_t droppedFrames = 2 * (totalMinutes - tenMinBlocks);
+        int64_t actualFrames  = frameNumber - droppedFrames;
+
+        double exactFps = 30000.0 / 1001.0;
+        return (double)actualFrames / exactFps * 1000.0;
+    }
+    else
+    {
+        double fpsVal = frameRateToDouble(fps);
+        return (tc.hours * 3600.0 + tc.minutes * 60.0 + tc.seconds) * 1000.0
+             + ((double)tc.frames / fpsVal) * 1000.0;
+    }
+}
+
+//==============================================================================
+// Convert a Timecode from one frame rate to another.
+// Uses milliseconds as the intermediate representation so the same
+// point in real time maps correctly between any pair of rates,
+// including drop-frame ↔ non-drop-frame conversions.
+//==============================================================================
+inline Timecode convertTimecodeRate(const Timecode& tc, FrameRate fromFps, FrameRate toFps)
+{
+    if (fromFps == toFps) return tc;
+    double ms = timecodeToMs(tc, fromFps);
+    return wallClockToTimecode(ms, toFps);
+}
+
+//==============================================================================
 // SMPTE rate code (shared by MTC and Art-Net)
 //   0 = 24fps, 1 = 25fps, 2 = 29.97df, 3 = 30fps
 //==============================================================================
@@ -259,6 +323,7 @@ inline int fpsToRateCode(FrameRate fps)
 {
     switch (fps)
     {
+        case FrameRate::FPS_2398: return 0;  // Transmitted as 24fps rate code (no dedicated SMPTE code)
         case FrameRate::FPS_24:   return 0;
         case FrameRate::FPS_25:   return 1;
         case FrameRate::FPS_2997: return 2;
