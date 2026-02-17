@@ -8,7 +8,7 @@
 class LevelMeter : public juce::Component
 {
 public:
-    LevelMeter() { setOpaque(false); }
+    LevelMeter() { setOpaque(false); }  // false: parent repaints the 1px margin cleanly
 
     void setLevel(float newLevel)
     {
@@ -25,12 +25,18 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        auto bounds = getLocalBounds().toFloat().reduced(0.5f);
+        // Use full integer bounds for the background fill so there are no
+        // uncleared pixels at the component edge (previously reduced(0.5f)
+        // left a fractional-pixel strip that caused a flickering halo).
+        auto intBounds = getLocalBounds();
         float cornerSize = 2.0f;
 
-        // Background
+        // Background — fill the full component area first
         g.setColour(juce::Colour(0xFF0D0E12));
-        g.fillRoundedRectangle(bounds, cornerSize);
+        g.fillRoundedRectangle(intBounds.toFloat(), cornerSize);
+
+        // Inner drawing area inset by 1px so the border sits cleanly on top
+        auto bounds = intBounds.toFloat().reduced(1.0f);
 
         // Filled level bar
         if (currentLevel > 0.001f)
