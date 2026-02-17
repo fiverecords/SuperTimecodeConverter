@@ -154,8 +154,14 @@ private:
             data[6] != 't' || data[7] != 0)
             return;
 
-        uint16_t opcode = (uint16_t)(data[8] | (data[9] << 8));
+        uint16_t opcode = (uint16_t)((uint16_t)data[8] | ((uint16_t)data[9] << 8));
         if (opcode != 0x9700)
+            return;
+
+        // ProtVer is big-endian (Hi byte at offset 10, Lo at 11)
+        // Art-Net 4 requires ProtVer >= 14; accept anything >= 14 for compatibility
+        uint16_t protVer = (uint16_t)(((uint16_t)data[10] << 8) | (uint16_t)data[11]);
+        if (protVer < 14)
             return;
 
         int frames  = data[14];
@@ -163,6 +169,15 @@ private:
         int minutes = data[16];
         int hours   = data[17];
         int rateCode = data[18] & 0x03;
+
+        // Art-Net 4 spec: bits 2-7 of the Type field are reserved and must be 0.
+        // Log a warning if they are non-zero (malformed sender), but still
+        // process the packet — the frame-rate bits 0-1 remain valid.
+        if ((data[18] & 0xFC) != 0)
+        {
+            DBG("ArtTimeCode: reserved bits in Type field are non-zero (0x"
+                + juce::String::toHexString(data[18]) + "). Packet may be malformed.");
+        }
 
         // Validate ranges -- discard malformed packets
         // (lastPacketTime is updated AFTER validation so isReceiving()
@@ -178,6 +193,7 @@ private:
             case 1: detectedFps.store(FrameRate::FPS_25, std::memory_order_relaxed);   break;
             case 2: detectedFps.store(FrameRate::FPS_2997, std::memory_order_relaxed); break;
             case 3: detectedFps.store(FrameRate::FPS_30, std::memory_order_relaxed);   break;
+            default: break;  // mask guarantees 0-3, but be explicit
         }
 
         packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
