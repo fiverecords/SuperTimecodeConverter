@@ -25,7 +25,7 @@ public:
                int channel = 0, double sampleRate = 0, int bufferSize = 0)
     {
         stop();
-        selectedChannel = channel;
+        selectedChannel.store(channel, std::memory_order_relaxed);
         currentDeviceName = devName;
         currentTypeName = typeName;
 
@@ -59,10 +59,14 @@ public:
             return false;
 
         numChannelsAvailable = device->getActiveOutputChannels().countNumberOfSetBits();
-        if (selectedChannel >= 0 && selectedChannel >= numChannelsAvailable)
-            selectedChannel = 0;
-        if (selectedChannel == -1 && numChannelsAvailable < 2)
-            selectedChannel = 0;
+        {
+            int ch = selectedChannel.load(std::memory_order_relaxed);
+            if (ch >= 0 && ch >= numChannelsAvailable)
+                ch = 0;
+            if (ch == -1 && numChannelsAvailable < 2)
+                ch = 0;
+            selectedChannel.store(ch, std::memory_order_relaxed);
+        }
 
         currentSampleRate = device->getCurrentSampleRate();
         currentBufferSize = device->getCurrentBufferSizeSamples();
@@ -87,9 +91,9 @@ public:
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
     juce::String getCurrentTypeName() const { return currentTypeName; }
-    int getSelectedChannel() const { return selectedChannel; }
+    int getSelectedChannel() const { return selectedChannel.load(std::memory_order_relaxed); }
     int getChannelCount() const { return numChannelsAvailable; }
-    bool isStereoMode() const { return selectedChannel == -1; }
+    bool isStereoMode() const { return selectedChannel.load(std::memory_order_relaxed) == -1; }
     double getActualSampleRate() const { return currentSampleRate; }
     int getActualBufferSize() const { return currentBufferSize; }
 
@@ -100,7 +104,12 @@ public:
     }
 
     void setFrameRate(FrameRate fps)  { pendingFps.store(fps, std::memory_order_relaxed); }
-    void setPaused(bool p)            { paused.store(p, std::memory_order_relaxed); }
+    void setPaused(bool p)
+    {
+        paused.store(p, std::memory_order_relaxed);
+        if (p)
+            peakLevel.store(0.0f, std::memory_order_relaxed);  // meter drops immediately
+    }
     bool isPaused() const             { return paused.load(std::memory_order_relaxed); }
 
     void setOutputGain(float gain)    { outputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
@@ -113,7 +122,11 @@ private:
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
-    int selectedChannel = 0;
+    // selectedChannel is written in start() (UI thread) and read in
+    // audioDeviceIOCallbackWithContext() (audio thread).  JUCE's
+    // addAudioCallback provides a happens-before, but atomic makes
+    // the cross-thread contract explicit.
+    std::atomic<int> selectedChannel { 0 };
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
@@ -225,10 +238,10 @@ private:
         frameBits[26] = (secTens >> 2) & 1;
 
         // Biphase polarity correction bit 27 (BGF0):
-        // even parity over bits 0-26 so total 1s in bits 0-27 is even
-        // NOTE: This parity calculation is correct only while user bits (4-7, 12-15,
-        // 20-23, 28-31) are zero.  If user bits are ever populated, the parity
-        // must still include them (they are already in the 0-26 range for this half).
+        // even parity over bits 0-26 so total 1s in bits 0-27 is even.
+        // User bits at positions 4-7, 12-15, 20-23 are within this range
+        // and ARE correctly included in the sum.  User bits group 4 (bits
+        // 28-31) are outside this parity region and do not participate.
         int parityLow = 0;
         for (int i = 0; i < 27; i++)
             parityLow += frameBits[i];
@@ -257,10 +270,10 @@ private:
         frameBits[76] = 1; frameBits[77] = 1; frameBits[78] = 0; frameBits[79] = 1;
 
         // Biphase polarity correction bit 59 (BGF2):
-        // even parity over bits 32-58 so total 1s in bits 32-59 is even
-        // NOTE: Same caveat as BGF0 — user bits (36-39, 44-47, 52-55) are
-        // within this range and are currently zero.  Keep parity updated if
-        // user bits are populated in the future.
+        // even parity over bits 32-58 so total 1s in bits 32-59 is even.
+        // User bits at positions 36-39, 44-47, 52-55 are within this range
+        // and ARE correctly included in the sum.  User bits group 8 (bits
+        // 60-63) are outside this parity region and do not participate.
         int parityHigh = 0;
         for (int i = 32; i < 59; i++)
             parityHigh += frameBits[i];
@@ -280,8 +293,9 @@ private:
         if (paused.load(std::memory_order_relaxed))
             return;
 
-        bool stereoMode = (selectedChannel == -1);
-        int primaryCh = stereoMode ? 0 : selectedChannel;
+        int selCh = selectedChannel.load(std::memory_order_relaxed);
+        bool stereoMode = (selCh == -1);
+        int primaryCh = stereoMode ? 0 : selCh;
         if (primaryCh >= numOutputChannels || !outputChannelData[primaryCh])
             return;
 
@@ -301,7 +315,12 @@ private:
                 halfCellIndex = 0;
                 samplePositionInHalfBit = 0.0;
                 needNewFrame = false;
-                currentLevel = -currentLevel;
+                // Do NOT invert currentLevel here. In biphase-mark encoding
+                // the mandatory transition at the start of each bit cell is
+                // already handled by the halfCellIndex == 0 branch below.
+                // An extra inversion here would create a double-transition
+                // (no-transition) at the frame boundary, causing biphase
+                // parity errors on strict LTC decoders.
             }
 
             float sample = currentLevel * amplitude;
