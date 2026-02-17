@@ -11,7 +11,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.2"; }
+    const juce::String getApplicationVersion() override { return "1.3"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
@@ -41,7 +41,7 @@ public:
             setContentOwned(new MainComponent(), true);
 
             setResizable(true, true);
-            setResizeLimits(800, 450, 1920, 1080);
+            setResizeLimits(800, 550, 1920, 1080);
             centreWithSize(getWidth(), getHeight());
 
             setVisible(true);
