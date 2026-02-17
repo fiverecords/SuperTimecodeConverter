@@ -16,7 +16,27 @@ inline juce::String getMonoFontName()
 #elif JUCE_WINDOWS
     return "Consolas";
 #else
-    return juce::Font::getDefaultMonospacedFontName();
+    // On Linux, JUCE's getDefaultMonospacedFontName() can return a generic
+    // name not present on all distros. Try common monospace fonts first.
+    // Result is cached after the first call — findAllTypefaceNames() scans
+    // the system font database and is too expensive to call from paint().
+    static juce::String cached;
+    if (cached.isNotEmpty())
+        return cached;
+
+    const juce::StringArray candidates { "DejaVu Sans Mono", "Liberation Mono",
+                                         "Noto Mono", "Courier New" };
+    const auto sysFonts = juce::Font::findAllTypefaceNames();
+    for (const auto& candidate : candidates)
+    {
+        if (sysFonts.contains(candidate))
+        {
+            cached = candidate;
+            return cached;
+        }
+    }
+    cached = juce::Font::getDefaultMonospacedFontName();
+    return cached;
 #endif
 }
 
