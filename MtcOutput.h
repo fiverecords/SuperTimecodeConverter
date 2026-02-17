@@ -58,7 +58,7 @@ public:
             currentDeviceIndex = deviceIndex;
             isRunningFlag.store(true, std::memory_order_relaxed);
             paused.store(false, std::memory_order_relaxed);
-            currentQFIndex = 0;
+            currentQFIndex.store(0, std::memory_order_relaxed);
 
             // Full Frame is sent after the first setTimecode() call populates
             // pendingTimecode -- avoids transmitting a misleading 00:00:00.00
@@ -76,9 +76,7 @@ public:
     void stop()
     {
         stopTimer();
-
-        if (midiOutput != nullptr)
-            midiOutput = nullptr;
+        midiOutput = nullptr;
 
         isRunningFlag.store(false, std::memory_order_relaxed);
         paused.store(false, std::memory_order_relaxed);
@@ -121,7 +119,7 @@ public:
         else if (isRunningFlag.load(std::memory_order_relaxed))
         {
             stopTimer();
-            currentQFIndex = 0;
+            currentQFIndex.store(0, std::memory_order_relaxed);
             paused.store(false, std::memory_order_relaxed);
 
             // Re-sync receivers after pause with a Full Frame message
@@ -150,11 +148,15 @@ public:
             tc = pendingTimecode;
         }
 
+        // Single atomic read — guarantees maxFrames and rateCode are consistent
+        FrameRate fps = currentFps.load(std::memory_order_relaxed);
+
         // Validate ranges -- don't send corrupt data to MIDI devices
-        if (tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames > 29)
+        int maxFrames = frameRateToInt(fps);
+        if (tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames >= maxFrames)
             return;
 
-        int rateCode = fpsToRateCode(currentFps.load(std::memory_order_relaxed));
+        int rateCode = fpsToRateCode(fps);
         uint8_t hr = (uint8_t)((tc.hours & 0x1F) | (rateCode << 5));
 
         uint8_t sysex[] = {
@@ -178,10 +180,13 @@ private:
             || paused.load(std::memory_order_relaxed))
             return;
 
+        // Single atomic read — guarantees QF interval and rate code are consistent
+        FrameRate fps = currentFps.load(std::memory_order_relaxed);
+
         // Fractional accumulator: compare real elapsed time against ideal QF interval
         // to eliminate drift caused by integer-ms timer resolution
         double now = juce::Time::getMillisecondCounterHiRes();
-        double qfInterval = 1000.0 / (frameRateToDouble(currentFps.load(std::memory_order_relaxed)) * 4.0);
+        double qfInterval = 1000.0 / (frameRateToDouble(fps) * 4.0);
 
         // Guard against sending too many QFs if the timer fires in a burst
         // (allow up to 2 catch-up QFs per callback to handle jitter)
@@ -191,17 +196,19 @@ private:
         {
             // At QF index 0, snapshot the timecode for this entire 8-QF cycle
             // This guarantees all 8 QFs describe the SAME timecode - no jumps
-            if (currentQFIndex == 0)
+            int qfIdx = currentQFIndex.load(std::memory_order_relaxed);
+            if (qfIdx == 0)
             {
                 const juce::SpinLock::ScopedLockType lock(tcLock);
                 cycleTimecode = pendingTimecode;
             }
 
-            sendQuarterFrame(currentQFIndex);
+            sendQuarterFrame(qfIdx, fps);
 
-            currentQFIndex++;
-            if (currentQFIndex >= 8)
-                currentQFIndex = 0;
+            qfIdx++;
+            if (qfIdx >= 8)
+                qfIdx = 0;
+            currentQFIndex.store(qfIdx, std::memory_order_relaxed);
 
             // Advance by ideal interval (not by 'now') to prevent cumulative drift
             lastSend += qfInterval;
@@ -214,7 +221,7 @@ private:
             lastQfSendTime.store(now, std::memory_order_relaxed);
     }
 
-    void sendQuarterFrame(int index)
+    void sendQuarterFrame(int index, FrameRate fps)
     {
         // MTC spec: QF messages encode the timecode that was current
         // at the START of the 8-QF sequence (2 frames ago from receiver's perspective)
@@ -232,7 +239,7 @@ private:
             case 6: value = cycleTimecode.hours & 0x0F;           break;
             case 7:
             {
-                int rateCode = fpsToRateCode(currentFps.load(std::memory_order_relaxed));
+                int rateCode = fpsToRateCode(fps);
                 value = ((cycleTimecode.hours >> 4) & 0x01) | (rateCode << 1);
                 break;
             }
@@ -261,7 +268,11 @@ private:
     Timecode pendingTimecode;   // Written by UI thread, read under tcLock
     Timecode cycleTimecode;     // Timer-thread-only: snapshot taken at QF index 0, read through QF 1-7
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
-    int currentQFIndex = 0;              // Timer-thread-only (start/setPaused stop timer before writing)
+    // currentQFIndex is primarily accessed from the timer thread, but reset from
+    // the UI thread in start()/setPaused() after stopTimer().  JUCE guarantees
+    // stopTimer() blocks until the current callback completes, but we use atomic
+    // as belt-and-suspenders safety against platform-specific timing.
+    std::atomic<int> currentQFIndex { 0 };
     std::atomic<double> lastQfSendTime { 0.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MtcOutput)
