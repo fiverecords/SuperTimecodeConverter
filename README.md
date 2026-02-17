@@ -64,7 +64,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ## Screenshot
 
-![Super Timecode Converter](docs/screenshot.png)
+![Super Timecode Converter](docs/screenshotV1.3.png)
 
 ---
 
