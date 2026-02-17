@@ -8,6 +8,12 @@
 #include "NetworkUtils.h"
 #include <atomic>
 
+#ifdef _WIN32
+    #include <winsock2.h>
+#else
+    #include <sys/socket.h>
+#endif
+
 class ArtnetOutput : public juce::HighResolutionTimer
 {
 public:
@@ -22,14 +28,9 @@ public:
     }
 
     //==============================================================================
-    static juce::Array<NetworkInterface> getNetworkInterfaces()
-    {
-        return ::getNetworkInterfaces();
-    }
-
     void refreshNetworkInterfaces()
     {
-        availableInterfaces = getNetworkInterfaces();
+        availableInterfaces = ::getNetworkInterfaces();
     }
 
     juce::StringArray getInterfaceNames() const
@@ -78,6 +79,21 @@ public:
                 socket = nullptr;
                 return false;
             }
+        }
+
+        // Enable SO_BROADCAST so the OS allows sending to broadcast addresses.
+        // Some systems (especially Linux) reject broadcast sends without this.
+        auto rawSock = socket->getRawSocketHandle();
+        if (rawSock >= 0)
+        {
+            int broadcastFlag = 1;
+#ifdef _WIN32
+            setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
+                       (const char*)&broadcastFlag, sizeof(broadcastFlag));
+#else
+            setsockopt(rawSock, SOL_SOCKET, SO_BROADCAST,
+                       &broadcastFlag, sizeof(broadcastFlag));
+#endif
         }
 
         isRunningFlag.store(true, std::memory_order_relaxed);
@@ -153,17 +169,20 @@ private:
             || socket == nullptr)
             return;
 
+        // Single atomic read — guarantees frame interval and packet rate code are consistent
+        FrameRate fps = currentFps.load(std::memory_order_relaxed);
+
         // Fractional accumulator: compare real elapsed time against ideal frame interval
         // to eliminate drift caused by integer-ms timer resolution
         double now = juce::Time::getMillisecondCounterHiRes();
-        double frameInterval = 1000.0 / frameRateToDouble(currentFps.load(std::memory_order_relaxed));
+        double frameInterval = 1000.0 / frameRateToDouble(fps);
 
         // Allow up to 2 catch-up sends per callback to handle jitter
         int sent = 0;
         double lastSend = lastFrameSendTime.load(std::memory_order_relaxed);
         while ((now - lastSend) >= frameInterval && sent < 2)
         {
-            sendArtTimeCode();
+            sendArtTimeCode(fps);
             // Advance by ideal interval (not by 'now') to prevent cumulative drift
             lastSend += frameInterval;
             sent++;
@@ -175,7 +194,7 @@ private:
             lastFrameSendTime.store(now, std::memory_order_relaxed);
     }
 
-    void sendArtTimeCode()
+    void sendArtTimeCode(FrameRate fps)
     {
         Timecode tc;
         {
@@ -184,7 +203,8 @@ private:
         }
 
         // Validate ranges -- don't send corrupt data to the network
-        if (tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames > 29)
+        int maxFrames = frameRateToInt(fps);
+        if (tc.hours > 23 || tc.minutes > 59 || tc.seconds > 59 || tc.frames >= maxFrames)
             return;
 
         uint8_t packet[19] = {};
@@ -211,7 +231,6 @@ private:
         packet[16] = (uint8_t)tc.minutes;
         packet[17] = (uint8_t)tc.hours;
 
-        FrameRate fps = currentFps.load(std::memory_order_relaxed);
         packet[18] = (uint8_t)fpsToRateCode(fps);
 
         int written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
