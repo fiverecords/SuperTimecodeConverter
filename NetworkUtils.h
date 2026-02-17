@@ -73,7 +73,7 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces()
 
                 ULONG prefixLength = unicast->OnLinkPrefixLength;
                 uint32_t ip = ntohl(addr->sin_addr.s_addr);
-                uint32_t mask = (prefixLength > 0) ? (~0u << (32 - prefixLength)) : 0;
+                uint32_t mask = (prefixLength == 0) ? 0u : (prefixLength >= 32) ? ~0u : (~0u << (32 - prefixLength));
                 uint32_t broadcast = ip | ~mask;
 
                 char broadcastStr[INET_ADDRSTRLEN];
