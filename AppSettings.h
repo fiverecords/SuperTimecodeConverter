@@ -46,8 +46,16 @@ struct AppSettings
     double preferredSampleRate = 0;
     int preferredBufferSize = 0;
 
-    // FPS
-    int fpsSelection = 3;
+    // FPS  (0=23.976, 1=24, 2=25, 3=29.97, 4=30)
+    int fpsSelection = 4;
+
+    // FPS conversion
+    bool fpsConvertEnabled = false;
+    int outputFpsSelection = 4;  // 0=23.976, 1=24, 2=25, 3=29.97, 4=30
+
+    // LTC input: user may force 23.976 or 29.97 DF since LTC cannot carry
+    // that distinction automatically. Persisted so the choice survives restarts.
+    bool ltcFpsUserOverride = false;
 
     // Output offsets (frames, -30 to +30)
     int mtcOutputOffset = 0;
@@ -102,6 +110,9 @@ struct AppSettings
         obj->setProperty("preferredBufferSize", preferredBufferSize);
 
         obj->setProperty("fpsSelection", fpsSelection);
+        obj->setProperty("fpsConvertEnabled", fpsConvertEnabled);
+        obj->setProperty("outputFpsSelection", outputFpsSelection);
+        obj->setProperty("ltcFpsUserOverride", ltcFpsUserOverride);
 
         obj->setProperty("mtcOutputOffset", mtcOutputOffset);
         obj->setProperty("artnetOutputOffset", artnetOutputOffset);
@@ -172,7 +183,10 @@ struct AppSettings
             preferredSampleRate = getDouble("preferredSampleRate", 0.0);
             preferredBufferSize = getInt("preferredBufferSize", 0);
 
-            fpsSelection   = juce::jlimit(0, 3, getInt("fpsSelection", 3));
+            fpsSelection   = juce::jlimit(0, 4, getInt("fpsSelection", 4));
+            fpsConvertEnabled  = getBool("fpsConvertEnabled", false);
+            outputFpsSelection = juce::jlimit(0, 4, getInt("outputFpsSelection", 4));
+            ltcFpsUserOverride = getBool("ltcFpsUserOverride", false);
 
             auto clampOffset = [](int v) { return juce::jlimit(-30, 30, v); };
             mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
