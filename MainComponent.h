@@ -109,6 +109,16 @@ private:
     Timecode currentTimecode;
     bool sourceActive = true;
 
+    // When the user manually selects a frame rate while LTC is the active input,
+    // we suppress auto-detection for ambiguous pairs (24↔23.976, 30↔29.97)
+    // because LTC cannot carry that distinction in its bitstream.
+    bool userOverrodeLtcFps = false;
+
+    // FPS conversion
+    bool fpsConvertEnabled = false;
+    FrameRate outputFps = FrameRate::FPS_30;
+    Timecode outputTimecode;
+
     bool outputMtcEnabled    = false;
     bool outputArtnetEnabled = false;
     bool outputLtcEnabled    = false;
@@ -120,6 +130,10 @@ private:
 
     // VU meter decay state
     float sLtcIn = 0.0f, sThruIn = 0.0f, sLtcOut = 0.0f, sThruOut = 0.0f;
+
+    // Bottom bar repaint tracking
+    juce::String lastBottomBarStatus;
+    bool lastBottomBarActive = false;
 
     // --- Collapse state ---
     bool inputConfigExpanded  = true;
@@ -150,10 +164,19 @@ private:
     juce::ToggleButton btnLtcOut    { "LTC OUT" };
     juce::ToggleButton btnThruOut   { "AUDIO THRU" };
 
+    juce::TextButton btnFps2398 { "23.976" };
     juce::TextButton btnFps24   { "24" };
     juce::TextButton btnFps25   { "25" };
     juce::TextButton btnFps2997 { "29.97" };
     juce::TextButton btnFps30   { "30" };
+
+    // FPS conversion controls
+    juce::ToggleButton btnFpsConvert { "FPS CONVERT" };
+    juce::TextButton btnOutFps2398 { "23.976" };
+    juce::TextButton btnOutFps24   { "24" };
+    juce::TextButton btnOutFps25   { "25" };
+    juce::TextButton btnOutFps2997 { "29.97" };
+    juce::TextButton btnOutFps30   { "30" };
 
     // --- Collapse toggle buttons ---
     juce::TextButton btnCollapseInput     { "SETTINGS" };
@@ -249,6 +272,9 @@ private:
     void updateSystemTime();
     void setInputSource(InputSource source);
     void setFrameRate(FrameRate fps);
+    void setOutputFrameRate(FrameRate fps);
+    void updateOutputFpsButtonStates();
+    FrameRate getEffectiveOutputFps() const;
     void routeTimecodeToOutputs();
 
     void startMtcInput();    void stopMtcInput();
