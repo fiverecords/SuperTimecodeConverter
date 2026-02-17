@@ -26,7 +26,7 @@ public:
         stop();
         if (!source) return false;
 
-        selectedChannel = channel;
+        selectedChannel.store(channel, std::memory_order_relaxed);
         currentDeviceName = devName;
         currentTypeName = typeName;
         sourceInput.store(source, std::memory_order_relaxed);
@@ -59,10 +59,14 @@ public:
         if (!device) return false;
 
         numChannelsAvailable = device->getActiveOutputChannels().countNumberOfSetBits();
-        if (selectedChannel >= 0 && selectedChannel >= numChannelsAvailable)
-            selectedChannel = 0;
-        if (selectedChannel == -1 && numChannelsAvailable < 2)
-            selectedChannel = 0;
+        {
+            int ch = selectedChannel.load(std::memory_order_relaxed);
+            if (ch >= 0 && ch >= numChannelsAvailable)
+                ch = 0;
+            if (ch == -1 && numChannelsAvailable < 2)
+                ch = 0;
+            selectedChannel.store(ch, std::memory_order_relaxed);
+        }
 
         currentSampleRate = device->getCurrentSampleRate();
         currentBufferSize = device->getCurrentBufferSizeSamples();
@@ -87,9 +91,9 @@ public:
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
     juce::String getCurrentTypeName() const { return currentTypeName; }
-    int getSelectedChannel() const { return selectedChannel; }
+    int getSelectedChannel() const { return selectedChannel.load(std::memory_order_relaxed); }
     int getChannelCount() const { return numChannelsAvailable; }
-    bool isStereoMode() const { return selectedChannel == -1; }
+    bool isStereoMode() const { return selectedChannel.load(std::memory_order_relaxed) == -1; }
     double getActualSampleRate() const { return currentSampleRate; }
     int getActualBufferSize() const { return currentBufferSize; }
 
@@ -103,7 +107,10 @@ private:
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
-    int selectedChannel = 0;
+    // selectedChannel is written in start() (UI thread) and read in
+    // audioDeviceIOCallbackWithContext() (audio thread).  Atomic makes
+    // the cross-thread contract explicit.
+    std::atomic<int> selectedChannel { 0 };
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
@@ -126,8 +133,9 @@ private:
         auto* src = sourceInput.load(std::memory_order_acquire);
         if (!src) return;
 
-        bool stereoMode = (selectedChannel == -1);
-        int primaryCh = stereoMode ? 0 : selectedChannel;
+        int selCh = selectedChannel.load(std::memory_order_relaxed);
+        bool stereoMode = (selCh == -1);
+        int primaryCh = stereoMode ? 0 : selCh;
         if (primaryCh >= numOutputCh || !outputChannelData[primaryCh])
             return;
 
