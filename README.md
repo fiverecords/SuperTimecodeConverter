@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Receives timecode from multiple sources and routes it to multiple outputs simultaneously — ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![Windows](https://img.shields.io/badge/platform-Windows-blue)](https://img.shields.io/badge/platform-Windows-blue)
 [![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](https://img.shields.io/badge/platform-macOS-lightgrey)
@@ -13,14 +13,26 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ## Features
 
-### Inputs (select one)
+### Multi-Engine Routing
+
+Run **up to 8 independent timecode engines** simultaneously. Each engine has its own input source, frame rate, output destinations, and offset settings — all running in parallel.
+
+- Route system clock to MTC on one engine while converting LTC input to Art-Net on another
+- Feed the same source to multiple outputs with different frame offsets
+- Run independent MTC, Art-Net, and LTC pipelines side by side — each with its own device assignments
+
+Engines are managed through the tab bar at the top of the window. Click **+** to add a new engine, right-click a tab to rename or remove it. The dashboard in the centre shows all engines at a glance with their current timecodes and status.
+
+Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1), since it shares the audio device with LTC input.
+
+### Inputs (select one per engine)
 
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
 - **System Time** — use the system clock as a timecode source
 
-### Outputs (enable any combination)
+### Outputs (enable any combination per engine)
 
 - **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
@@ -54,7 +66,8 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 - **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS; ALSA on Linux)
 - **Configurable sample rate and buffer size**
 - **ASIO support** for low-latency professional audio interfaces (Windows)
-- **Device conflict detection** to prevent multiple outputs from opening the same device
+- **Cross-engine device conflict detection** — device selectors show which devices are in use by other engines with colour-coded indicators (cyan for current engine, amber for other engines)
+- **Check for updates** — manually check for new versions from the title bar, with automatic check on startup
 - **Refresh Devices** — scan for newly connected interfaces without losing existing configuration
 - **Collapsible UI panels** to reduce clutter and focus on active sections
 - **Persistent settings** — all configuration saved automatically and restored on launch
@@ -64,7 +77,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ## Screenshot
 
-![Super Timecode Converter](docs/screenshotV1.3.png)
+![Super Timecode Converter](docs/screenshotV1.4.png)
 
 ---
 
@@ -109,7 +122,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.3)
+   project(SuperTimecodeConverter VERSION 1.4)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -119,7 +132,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.3"
+       VERSION "1.4"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -178,10 +191,12 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 ### Basic Workflow
 
-1. **Select an input source** from the left panel (MTC, Art-Net, System, or LTC).
-2. **Enable one or more outputs** from the right panel.
-3. **Select the frame rate** or let it auto-detect from the input signal.
-4. The timecode display in the centre shows the current time in real-time.
+1. **Engine 1** is ready by default. Click **+** in the tab bar to add more engines (up to 8).
+2. **Select an input source** from the left panel (MTC, Art-Net, System, or LTC).
+3. **Enable one or more outputs** from the right panel.
+4. **Select the frame rate** or let it auto-detect from the input signal.
+5. The timecode display in the centre shows the current time in real-time.
+6. Switch between engines via the tab bar. The dashboard shows all engines at a glance.
 
 ### Output Frame Rate Conversion
 
@@ -201,7 +216,7 @@ The **Refresh Devices** button scans for newly connected MIDI devices, audio int
 
 ### Settings
 
-All settings are automatically saved to:
+All settings are automatically saved per engine to:
 
 - **Windows:** `%APPDATA%\SuperTimecodeConverter\settings.json`
 - **macOS:** `~/Library/Application Support/SuperTimecodeConverter/settings.json`
@@ -227,11 +242,14 @@ The application is built around a modular, header-only architecture:
 | `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
 | `AudioThru.h` | Audio passthrough with independent device routing |
 | `CustomLookAndFeel.h` | Dark theme UI styling and cross-platform font selection |
-| `AppSettings.h` | JSON-based persistent settings with backward-compatible loading |
+| `TimecodeEngine.h` | Per-engine state container: input/output routing, device assignments, offsets, and frame rate |
+| `UpdateChecker.h` | GitHub release version checker (automatic on startup + manual) |
+| `AppSettings.h` | JSON-based persistent settings with backward-compatible loading and per-engine storage |
 | `MainComponent.*` | Main UI, routing logic, and device management |
 
 ### Key Design Decisions
 
+- **Multi-engine architecture:** each engine encapsulates its own input/output state, enabling up to 8 independent timecode pipelines
 - **Lock-free audio:** LTC decode and audio passthrough use lock-free ring buffers (SPSC) for real-time safety
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
