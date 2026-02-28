@@ -4,39 +4,62 @@
 
 #include "MainComponent.h"
 
+using InputSource = TimecodeEngine::InputSource;
+
 //==============================================================================
-// AudioScanThread
+// BACKGROUND AUDIO DEVICE SCANNER
 //==============================================================================
 MainComponent::AudioScanThread::AudioScanThread(MainComponent* owner)
-    : Thread("AudioDeviceScan"), safeOwner(owner) {}
+    : juce::Thread("AudioScanThread"), safeOwner(owner) {}
 
 void MainComponent::AudioScanThread::run()
 {
     juce::Array<AudioDeviceEntry> inputs, outputs;
 
-    juce::AudioDeviceManager tempMgr;
-    tempMgr.initialise(128, 128, nullptr, false);
+    if (!tempManager)
+        return;
 
-    for (auto* type : tempMgr.getAvailableDeviceTypes())
+    for (auto* type : tempManager->getAvailableDeviceTypes())
     {
         if (threadShouldExit()) return;
-        type->scanForDevices();
         auto typeName = type->getTypeName();
+        type->scanForDevices();
         for (auto& name : type->getDeviceNames(true))
             inputs.add({ typeName, name, AudioDeviceEntry::makeDisplayName(typeName, name) });
         for (auto& name : type->getDeviceNames(false))
             outputs.add({ typeName, name, AudioDeviceEntry::makeDisplayName(typeName, name) });
     }
 
-    if (!threadShouldExit())
+    juce::MessageManager::callAsync([safeOwner = this->safeOwner, inputs, outputs]()
     {
-        auto safe = safeOwner;
-        juce::MessageManager::callAsync([safe, inputs, outputs]()
-        {
-            if (auto* mc = safe.getComponent())
-                mc->onAudioScanComplete(inputs, outputs);
-        });
-    }
+        if (auto* comp = safeOwner.getComponent())
+            comp->onAudioScanComplete(inputs, outputs);
+    });
+}
+
+//==============================================================================
+// SAMPLE RATE / BUFFER SIZE helpers (same as v1.3)
+//==============================================================================
+static int sampleRateToComboId(double sr)
+{
+    if (sr <= 0) return 1;
+    if (std::abs(sr - 44100) < 1) return 2;
+    if (std::abs(sr - 48000) < 1) return 3;
+    if (std::abs(sr - 88200) < 1) return 4;
+    if (std::abs(sr - 96000) < 1) return 5;
+    return 1;
+}
+
+static int bufferSizeToComboId(int bs)
+{
+    if (bs <= 0)    return 1;
+    if (bs <= 32)   return 2;
+    if (bs <= 64)   return 3;
+    if (bs <= 128)  return 4;
+    if (bs <= 256)  return 5;
+    if (bs <= 512)  return 6;
+    if (bs <= 1024) return 7;
+    return 8;
 }
 
 //==============================================================================
@@ -44,8 +67,20 @@ void MainComponent::AudioScanThread::run()
 //==============================================================================
 MainComponent::MainComponent()
 {
-    setSize(900, 700);
     setLookAndFeel(&customLookAndFeel);
+
+    // --- Create initial engine BEFORE setSize, because setSize triggers
+    //     resized() which calls currentEngine() ---
+    engines.push_back(std::make_unique<TimecodeEngine>(0));
+
+    setSize(900, 700);
+
+    // --- Tab bar ---
+    addAndMakeVisible(btnAddEngine);
+    btnAddEngine.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
+    btnAddEngine.setColour(juce::TextButton::textColourOffId, accentBlue);
+    btnAddEngine.onClick = [this] { addEngine(); };
+    rebuildTabButtons();
 
     // --- Right panel scrollable viewport ---
     addAndMakeVisible(rightViewport);
@@ -56,22 +91,29 @@ MainComponent::MainComponent()
     for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnSysTime, &btnLtcIn })
     { addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
 
-    // Input buttons: switch source OR toggle collapse if already active
     btnMtcIn.onClick = [this] {
-        if (activeInput == InputSource::MTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; setInputSource(InputSource::MTC); saveSettings(); }
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::MTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(InputSource::MTC); startCurrentMtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnArtnetIn.onClick = [this] {
-        if (activeInput == InputSource::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; setInputSource(InputSource::ArtNet); saveSettings(); }
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(InputSource::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnSysTime.onClick = [this] {
-        if (activeInput == InputSource::SystemTime) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; setInputSource(InputSource::SystemTime); saveSettings(); }
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::SystemTime) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(InputSource::SystemTime); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnLtcIn.onClick = [this] {
-        if (activeInput == InputSource::LTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; setInputSource(InputSource::LTC); saveSettings(); }
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::LTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(InputSource::LTC); if (!scannedAudioInputs.isEmpty()) startCurrentLtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
 
     // --- Output toggles ---
@@ -85,11 +127,13 @@ MainComponent::MainComponent()
 
     auto outputToggleHandler = [this]
     {
-        outputMtcEnabled    = btnMtcOut.getToggleState();
-        outputArtnetEnabled = btnArtnetOut.getToggleState();
-        outputLtcEnabled    = btnLtcOut.getToggleState();
-        outputThruEnabled   = btnThruOut.getToggleState();
-        updateOutputStates();
+        if (syncing) return;
+        auto& eng = currentEngine();
+        eng.setOutputMtcEnabled(btnMtcOut.getToggleState());
+        eng.setOutputArtnetEnabled(btnArtnetOut.getToggleState());
+        eng.setOutputLtcEnabled(btnLtcOut.getToggleState());
+        eng.setOutputThruEnabled(btnThruOut.getToggleState());
+        updateCurrentOutputStates();
         updateDeviceSelectorVisibility();
         saveSettings();
     };
@@ -132,21 +176,31 @@ MainComponent::MainComponent()
     { addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
 
     btnFps2398.onClick = [this] {
-        if (activeInput == InputSource::LTC) userOverrodeLtcFps = true;
-        setFrameRate(FrameRate::FPS_2398); saveSettings();
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::LTC) eng.setUserOverrodeLtcFps(true);
+        eng.setFrameRate(FrameRate::FPS_2398); updateFpsButtonStates(); saveSettings();
     };
     btnFps24.onClick = [this] {
-        userOverrodeLtcFps = false;  // 24 is unambiguous — re-enable auto-detect
-        setFrameRate(FrameRate::FPS_24); saveSettings();
+        if (syncing) return;
+        currentEngine().setUserOverrodeLtcFps(false);
+        currentEngine().setFrameRate(FrameRate::FPS_24); updateFpsButtonStates(); saveSettings();
     };
-    btnFps25.onClick   = [this] { userOverrodeLtcFps = false; setFrameRate(FrameRate::FPS_25);   saveSettings(); };
+    btnFps25.onClick = [this] {
+        if (syncing) return;
+        currentEngine().setUserOverrodeLtcFps(false);
+        currentEngine().setFrameRate(FrameRate::FPS_25); updateFpsButtonStates(); saveSettings();
+    };
     btnFps2997.onClick = [this] {
-        if (activeInput == InputSource::LTC) userOverrodeLtcFps = true;
-        setFrameRate(FrameRate::FPS_2997); saveSettings();
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == InputSource::LTC) eng.setUserOverrodeLtcFps(true);
+        eng.setFrameRate(FrameRate::FPS_2997); updateFpsButtonStates(); saveSettings();
     };
     btnFps30.onClick = [this] {
-        userOverrodeLtcFps = false;  // 30 is unambiguous — re-enable auto-detect
-        setFrameRate(FrameRate::FPS_30); saveSettings();
+        if (syncing) return;
+        currentEngine().setUserOverrodeLtcFps(false);
+        currentEngine().setFrameRate(FrameRate::FPS_30); updateFpsButtonStates(); saveSettings();
     };
 
     // --- FPS Conversion ---
@@ -154,27 +208,22 @@ MainComponent::MainComponent()
     styleOutputToggle(btnFpsConvert, accentGreen);
     btnFpsConvert.onClick = [this]
     {
-        fpsConvertEnabled = btnFpsConvert.getToggleState();
-        if (!fpsConvertEnabled)
-        {
-            // Disable: outputs revert to input FPS
-            outputFps = currentFps;
-            setOutputFrameRate(currentFps);
-        }
+        if (syncing) return;
+        auto& eng = currentEngine();
+        eng.setFpsConvertEnabled(btnFpsConvert.getToggleState());
         updateOutputFpsButtonStates();
-        resized();
-        repaint();
+        resized(); repaint();
         saveSettings();
     };
 
     for (auto* btn : { &btnOutFps2398, &btnOutFps24, &btnOutFps25, &btnOutFps2997, &btnOutFps30 })
     { addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
 
-    btnOutFps2398.onClick = [this] { setOutputFrameRate(FrameRate::FPS_2398); saveSettings(); };
-    btnOutFps24.onClick   = [this] { setOutputFrameRate(FrameRate::FPS_24); saveSettings(); };
-    btnOutFps25.onClick   = [this] { setOutputFrameRate(FrameRate::FPS_25); saveSettings(); };
-    btnOutFps2997.onClick = [this] { setOutputFrameRate(FrameRate::FPS_2997); saveSettings(); };
-    btnOutFps30.onClick   = [this] { setOutputFrameRate(FrameRate::FPS_30); saveSettings(); };
+    btnOutFps2398.onClick = [this] { if (!syncing) { currentEngine().setOutputFrameRate(FrameRate::FPS_2398); updateOutputFpsButtonStates(); saveSettings(); } };
+    btnOutFps24.onClick   = [this] { if (!syncing) { currentEngine().setOutputFrameRate(FrameRate::FPS_24);   updateOutputFpsButtonStates(); saveSettings(); } };
+    btnOutFps25.onClick   = [this] { if (!syncing) { currentEngine().setOutputFrameRate(FrameRate::FPS_25);   updateOutputFpsButtonStates(); saveSettings(); } };
+    btnOutFps2997.onClick = [this] { if (!syncing) { currentEngine().setOutputFrameRate(FrameRate::FPS_2997); updateOutputFpsButtonStates(); saveSettings(); } };
+    btnOutFps30.onClick   = [this] { if (!syncing) { currentEngine().setOutputFrameRate(FrameRate::FPS_30);   updateOutputFpsButtonStates(); saveSettings(); } };
 
     addAndMakeVisible(timecodeDisplay);
 
@@ -198,32 +247,31 @@ MainComponent::MainComponent()
     addLabelAndCombo(lblAudioInputTypeFilter, cmbAudioInputTypeFilter, "AUDIO DRIVER:");
     cmbAudioInputTypeFilter.onChange = [this]
     {
+        if (syncing) return;
         populateFilteredInputDeviceCombo();
-        if (activeInput == InputSource::LTC)
-            restartLtcWithCurrentSettings();
+        if (currentEngine().getActiveInput() == InputSource::LTC)
+            startCurrentLtcInput();
         saveSettings();
     };
 
     addLabelAndCombo(lblSampleRate, cmbSampleRate, "SAMPLE RATE / BUFFER:");
     populateSampleRateCombo();
-    cmbSampleRate.onChange = [this] { restartAllAudioDevices(); saveSettings(); };
+    cmbSampleRate.onChange = [this] { if (!syncing) { restartAllAudioDevices(); saveSettings(); } };
 
     addLabelAndCombo(lblBufferSize, cmbBufferSize, "BUFFER SIZE:");
     populateBufferSizeCombo();
-    cmbBufferSize.onChange = [this] { restartAllAudioDevices(); saveSettings(); };
+    cmbBufferSize.onChange = [this] { if (!syncing) { restartAllAudioDevices(); saveSettings(); } };
 
     addLabelAndCombo(lblMidiInputDevice, cmbMidiInputDevice, "MIDI INPUT DEVICE:");
     cmbMidiInputDevice.onChange = [this]
     {
+        if (syncing) return;
         int sel = cmbMidiInputDevice.getSelectedId() - 1;
-        if (sel >= 0 && activeInput == InputSource::MTC)
+        if (sel >= 0 && currentEngine().getActiveInput() == InputSource::MTC)
         {
-            stopMtcInput();
-            mtcInput.refreshDeviceList();
-            if (mtcInput.start(sel))
-                inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
-            else
-                inputStatusText = "FAILED TO OPEN";
+            currentEngine().stopMtcInput();
+            currentEngine().getMtcInput().refreshDeviceList();
+            currentEngine().startMtcInput(sel);
             saveSettings();
         }
     };
@@ -231,19 +279,12 @@ MainComponent::MainComponent()
     addLabelAndCombo(lblArtnetInputInterface, cmbArtnetInputInterface, "ART-NET INPUT DEVICE:");
     cmbArtnetInputInterface.onChange = [this]
     {
-        if (activeInput == InputSource::ArtNet)
+        if (syncing) return;
+        if (currentEngine().getActiveInput() == InputSource::ArtNet)
         {
             int sel = cmbArtnetInputInterface.getSelectedId() - 1;
-            stopArtnetInput();
-            artnetInput.refreshNetworkInterfaces();
-            if (artnetInput.start(sel, 6454))
-            {
-                inputStatusText = "RX ON " + artnetInput.getBindInfo();
-                if (artnetInput.didFallBackToAllInterfaces())
-                    inputStatusText += " [FALLBACK]";
-            }
-            else
-                inputStatusText = "FAILED TO BIND";
+            currentEngine().stopArtnetInput();
+            currentEngine().startArtnetInput(sel);
             saveSettings();
         }
     };
@@ -251,26 +292,28 @@ MainComponent::MainComponent()
     addLabelAndCombo(lblAudioInputDevice, cmbAudioInputDevice, "AUDIO INPUT DEVICE:");
     cmbAudioInputDevice.onChange = [this]
     {
-        if (activeInput == InputSource::LTC && cmbAudioInputDevice.getSelectedId() > 0
+        if (syncing) return;
+        if (currentEngine().getActiveInput() == InputSource::LTC
+            && cmbAudioInputDevice.getSelectedId() > 0
             && cmbAudioInputDevice.getSelectedId() != kPlaceholderItemId)
-        { restartLtcWithCurrentSettings(); populateAudioInputChannels(); }
+        { startCurrentLtcInput(); populateAudioInputChannels(); }
     };
 
     addLabelAndCombo(lblAudioInputChannel, cmbAudioInputChannel, "LTC CHANNEL:");
-    cmbAudioInputChannel.onChange = [this] { if (activeInput == InputSource::LTC) restartLtcWithCurrentSettings(); };
+    cmbAudioInputChannel.onChange = [this] { if (!syncing && currentEngine().getActiveInput() == InputSource::LTC) { startCurrentLtcInput(); saveSettings(); } };
 
     addAndMakeVisible(sldLtcInputGain); styleGainSlider(sldLtcInputGain);
     addAndMakeVisible(lblLtcInputGain); lblLtcInputGain.setText("LTC INPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcInputGain);
     addAndMakeVisible(mtrLtcInput); mtrLtcInput.setMeterColour(accentPurple);
-    sldLtcInputGain.onValueChange = [this] { ltcInput.setInputGain((float)sldLtcInputGain.getValue() / 100.0f); saveSettings(); };
+    sldLtcInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setInputGain((float)sldLtcInputGain.getValue() / 100.0f); saveSettings(); } };
 
     addLabelAndCombo(lblThruInputChannel, cmbThruInputChannel, "AUDIO THRU CHANNEL:");
-    cmbThruInputChannel.onChange = [this] { if (activeInput == InputSource::LTC) restartLtcWithCurrentSettings(); };
+    cmbThruInputChannel.onChange = [this] { if (!syncing && currentEngine().getActiveInput() == InputSource::LTC) { startCurrentLtcInput(); saveSettings(); } };
 
     addAndMakeVisible(sldThruInputGain); styleGainSlider(sldThruInputGain);
     addAndMakeVisible(lblThruInputGain); lblThruInputGain.setText("AUDIO THRU INPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruInputGain);
     addAndMakeVisible(mtrThruInput); mtrThruInput.setMeterColour(accentCyan);
-    sldThruInputGain.onValueChange = [this] { ltcInput.setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); };
+    sldThruInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); } };
 
     addAndMakeVisible(lblInputStatus); styleLabel(lblInputStatus); lblInputStatus.setColour(juce::Label::textColourId, accentGreen);
 
@@ -280,102 +323,103 @@ MainComponent::MainComponent()
     addRightLabelAndCombo(lblMidiOutputDevice, cmbMidiOutputDevice, "MIDI OUTPUT DEVICE:");
     cmbMidiOutputDevice.onChange = [this]
     {
+        if (syncing) return;
         int sel = cmbMidiOutputDevice.getSelectedId() - 1;
-        if (sel >= 0 && outputMtcEnabled)
+        auto& eng = currentEngine();
+        if (sel >= 0 && eng.isOutputMtcEnabled())
         {
-            stopMtcOutput();
-            mtcOutput.refreshDeviceList();
-            if (mtcOutput.start(sel))
-            {
-                mtcOutput.setFrameRate(getEffectiveOutputFps());
-                mtcOutStatusText = "TX: " + mtcOutput.getCurrentDeviceName();
-            }
-            else
-                mtcOutStatusText = "FAILED TO OPEN";
+            eng.stopMtcOutput();
+            eng.getMtcOutput().refreshDeviceList();
+            eng.startMtcOutput(sel);
             saveSettings();
         }
     };
     rightContent.addAndMakeVisible(lblOutputMtcStatus); styleLabel(lblOutputMtcStatus); lblOutputMtcStatus.setColour(juce::Label::textColourId, accentRed);
     rightContent.addAndMakeVisible(sldMtcOffset); styleOffsetSlider(sldMtcOffset);
     rightContent.addAndMakeVisible(lblMtcOffset); lblMtcOffset.setText("MTC OFFSET:", juce::dontSendNotification); styleLabel(lblMtcOffset);
-    sldMtcOffset.onValueChange = [this] { mtcOutputOffset = (int)sldMtcOffset.getValue(); saveSettings(); };
+    sldMtcOffset.onValueChange = [this] { if (!syncing) { currentEngine().setMtcOutputOffset((int)sldMtcOffset.getValue()); saveSettings(); } };
 
     addRightLabelAndCombo(lblArtnetOutputInterface, cmbArtnetOutputInterface, "ART-NET OUTPUT DEVICE:");
     cmbArtnetOutputInterface.onChange = [this]
     {
-        if (outputArtnetEnabled)
+        if (syncing) return;
+        auto& eng = currentEngine();
+        if (eng.isOutputArtnetEnabled())
         {
             int sel = cmbArtnetOutputInterface.getSelectedId() - 1;
-            stopArtnetOutput();
-            artnetOutput.refreshNetworkInterfaces();
-            if (artnetOutput.start(sel, 6454))
-            {
-                artnetOutput.setFrameRate(getEffectiveOutputFps());
-                artnetOutStatusText = "TX: " + artnetOutput.getBroadcastIp() + ":6454";
-            }
-            else
-                artnetOutStatusText = "FAILED TO BIND";
+            eng.stopArtnetOutput();
+            eng.startArtnetOutput(sel);
             saveSettings();
         }
     };
     rightContent.addAndMakeVisible(lblOutputArtnetStatus); styleLabel(lblOutputArtnetStatus); lblOutputArtnetStatus.setColour(juce::Label::textColourId, accentOrange);
     rightContent.addAndMakeVisible(sldArtnetOffset); styleOffsetSlider(sldArtnetOffset);
     rightContent.addAndMakeVisible(lblArtnetOffset); lblArtnetOffset.setText("ART-NET OFFSET:", juce::dontSendNotification); styleLabel(lblArtnetOffset);
-    sldArtnetOffset.onValueChange = [this] { artnetOutputOffset = (int)sldArtnetOffset.getValue(); saveSettings(); };
+    sldArtnetOffset.onValueChange = [this] { if (!syncing) { currentEngine().setArtnetOutputOffset((int)sldArtnetOffset.getValue()); saveSettings(); } };
 
     addRightLabelAndCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, "AUDIO DRIVER:");
     cmbAudioOutputTypeFilter.onChange = [this]
     {
+        if (syncing) return;
         populateFilteredOutputDeviceCombos();
-        if (outputLtcEnabled) { stopLtcOutput(); startLtcOutput(); }
-        if (outputThruEnabled) startThruOutput();
+        auto& eng = currentEngine();
+        if (eng.isOutputLtcEnabled()) startCurrentLtcOutput();
+        if (eng.isOutputThruEnabled()) startCurrentThruOutput();
         saveSettings();
     };
 
     addRightLabelAndCombo(lblAudioOutputDevice, cmbAudioOutputDevice, "LTC OUTPUT DEVICE:");
     cmbAudioOutputDevice.onChange = [this]
     {
+        if (syncing) return;
         if (cmbAudioOutputDevice.getSelectedId() > 0
-            && cmbAudioOutputDevice.getSelectedId() != kPlaceholderItemId && outputLtcEnabled)
-        { stopLtcOutput(); startLtcOutput(); saveSettings(); }
+            && cmbAudioOutputDevice.getSelectedId() != kPlaceholderItemId && currentEngine().isOutputLtcEnabled())
+        { startCurrentLtcOutput(); saveSettings(); }
     };
 
     addRightLabelAndCombo(lblAudioOutputChannel, cmbAudioOutputChannel, "LTC CHANNEL:");
     cmbAudioOutputChannel.onChange = [this]
     {
-        if (outputLtcEnabled && cmbAudioOutputDevice.getSelectedId() > 0
+        if (syncing) return;
+        if (currentEngine().isOutputLtcEnabled() && cmbAudioOutputDevice.getSelectedId() > 0
             && cmbAudioOutputDevice.getSelectedId() != kPlaceholderItemId)
-        { stopLtcOutput(); startLtcOutput(); saveSettings(); }
+        { startCurrentLtcOutput(); saveSettings(); }
     };
 
     rightContent.addAndMakeVisible(sldLtcOutputGain); styleGainSlider(sldLtcOutputGain);
     rightContent.addAndMakeVisible(lblLtcOutputGain); lblLtcOutputGain.setText("LTC OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcOutputGain);
     rightContent.addAndMakeVisible(mtrLtcOutput); mtrLtcOutput.setMeterColour(accentPurple);
-    sldLtcOutputGain.onValueChange = [this] { ltcOutput.setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); };
+    sldLtcOutputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); } };
 
     rightContent.addAndMakeVisible(lblOutputLtcStatus); styleLabel(lblOutputLtcStatus); lblOutputLtcStatus.setColour(juce::Label::textColourId, accentPurple);
     rightContent.addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
-    sldLtcOffset.onValueChange = [this] { ltcOutputOffset = (int)sldLtcOffset.getValue(); saveSettings(); };
+    sldLtcOffset.onValueChange = [this] { if (!syncing) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
 
+    // AudioThru controls visible for all engines in the panel but only functional for engine 0
     addRightLabelAndCombo(lblThruOutputDevice, cmbThruOutputDevice, "AUDIO THRU OUTPUT DEVICE:");
     cmbThruOutputDevice.onChange = [this]
     {
-        if (outputThruEnabled && cmbThruOutputDevice.getSelectedId() != kPlaceholderItemId)
-        { startThruOutput(); saveSettings(); }
+        if (syncing) return;
+        if (currentEngine().isOutputThruEnabled() && cmbThruOutputDevice.getSelectedId() != kPlaceholderItemId)
+        { startCurrentThruOutput(); saveSettings(); }
     };
 
     addRightLabelAndCombo(lblThruOutputChannel, cmbThruOutputChannel, "AUDIO THRU OUTPUT CHANNEL:");
     cmbThruOutputChannel.onChange = [this]
     {
-        if (outputThruEnabled && cmbThruOutputDevice.getSelectedId() != kPlaceholderItemId)
-        { startThruOutput(); saveSettings(); }
+        if (syncing) return;
+        if (currentEngine().isOutputThruEnabled() && cmbThruOutputDevice.getSelectedId() != kPlaceholderItemId)
+        { startCurrentThruOutput(); saveSettings(); }
     };
 
     rightContent.addAndMakeVisible(sldThruOutputGain); styleGainSlider(sldThruOutputGain);
     rightContent.addAndMakeVisible(lblThruOutputGain); lblThruOutputGain.setText("AUDIO THRU OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruOutputGain);
     rightContent.addAndMakeVisible(mtrThruOutput); mtrThruOutput.setMeterColour(accentCyan);
-    sldThruOutputGain.onValueChange = [this] { audioThru.setOutputGain((float)sldThruOutputGain.getValue() / 100.0f); saveSettings(); };
+    sldThruOutputGain.onValueChange = [this] {
+        if (!syncing && currentEngine().getAudioThru())
+        { currentEngine().getAudioThru()->setOutputGain((float)sldThruOutputGain.getValue() / 100.0f); saveSettings(); }
+    };
 
     rightContent.addAndMakeVisible(lblOutputThruStatus); styleLabel(lblOutputThruStatus); lblOutputThruStatus.setColour(juce::Label::textColourId, accentCyan);
 
@@ -387,6 +431,26 @@ MainComponent::MainComponent()
     addAndMakeVisible(btnGitHub);
     btnGitHub.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)), false);
     btnGitHub.setColour(juce::HyperlinkButton::textColourId, juce::Colour(0xFF546E7A));
+
+    // --- Update checker button (hidden until update found) ---
+    addChildComponent(btnUpdateAvailable);   // hidden by default
+    btnUpdateAvailable.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::bold)), false);
+    btnUpdateAvailable.setColour(juce::HyperlinkButton::textColourId, juce::Colour(0xFF4FC3F7));  // cyan
+
+    addAndMakeVisible(btnCheckUpdates);
+    btnCheckUpdates.setColour(juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
+    btnCheckUpdates.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF546E7A));
+    btnCheckUpdates.onClick = [this]
+    {
+        auto appVer = juce::JUCEApplication::getInstance()->getApplicationVersion();
+        updateNotificationShown = false;
+        updateCheckDelay = 0;
+        btnUpdateAvailable.setVisible(false);
+        btnCheckUpdates.setButtonText("Checking...");
+        btnCheckUpdates.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF78909C));
+        updateChecker.checkAsync(appVer);
+    };
+    updateCheckDelay = 180;  // ~3 seconds at 60Hz before first check
 
     // =====================================================================
     // STARTUP
@@ -404,27 +468,513 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     setLookAndFeel(nullptr);
-    flushSettings();   // immediate save on exit
+    flushSettings();
     stopTimer();
 
     if (scanThread && scanThread->isThreadRunning())
     {
         if (!scanThread->stopThread(2000))
+        { DBG("WARNING: AudioScanThread did not stop within 2s timeout (destructor)"); }
+    }
+
+    // NOTE: Any pending callAsync from AudioScanThread::run() is safe here because
+    // callAsync dispatches on the message thread, and the destructor also runs on the
+    // message thread, so there is no interleaving between engines.clear() and the
+    // async callback.  The SafePointer guard would also catch a fully-deleted component.
+    engines.clear();
+}
+
+//==============================================================================
+// ENGINE MANAGEMENT
+//==============================================================================
+void MainComponent::addEngine()
+{
+    if ((int)engines.size() >= kMaxEngines)
+        return;
+
+    // Generate a unique name
+    int nameNum = (int)engines.size() + 1;
+    auto nameExists = [this](const juce::String& name) {
+        for (auto& e : engines)
+            if (e->getName() == name) return true;
+        return false;
+    };
+    juce::String newName;
+    do { newName = "ENGINE " + juce::String(nameNum++); } while (nameExists(newName));
+
+    int newIndex = (int)engines.size();
+    engines.push_back(std::make_unique<TimecodeEngine>(newIndex, newName));
+    rebuildTabButtons();
+    selectEngine(newIndex);
+    saveSettings();
+}
+
+void MainComponent::removeEngine(int index)
+{
+    if (engines.size() <= 1 || index < 0 || index >= (int)engines.size())
+        return;
+
+    // Flush pending settings before modifying arrays
+    if (settingsDirty)
+        flushSettings();
+
+    // Remember if the deleted engine was the primary and had thru enabled,
+    // so we can restart AudioThru on the new primary after reindexing.
+    bool deletedWasPrimary = engines[(size_t)index]->isPrimary();
+    bool deletedHadThru    = deletedWasPrimary
+                           && engines[(size_t)index]->isOutputThruEnabled();
+
+    // Explicitly stop all protocols on the engine being deleted BEFORE
+    // erasing it, so destructors don't race with any pending callbacks.
+    engines[(size_t)index]->stopMtcOutput();
+    engines[(size_t)index]->stopArtnetOutput();
+    engines[(size_t)index]->stopLtcOutput();
+    engines[(size_t)index]->stopThruOutput();
+    engines[(size_t)index]->stopMtcInput();
+    engines[(size_t)index]->stopArtnetInput();
+    engines[(size_t)index]->stopLtcInput();
+
+    engines.erase(engines.begin() + index);
+
+    // Re-index remaining engines so isPrimary() and getIndex() stay correct.
+    // This also creates AudioThru on the new primary engine if engine 0 was deleted.
+    for (int i = 0; i < (int)engines.size(); i++)
+        engines[(size_t)i]->reindex(i);
+
+    // Keep settings.engines in sync with engines vector
+    if (index < (int)settings.engines.size())
+        settings.engines.erase(settings.engines.begin() + index);
+
+    // Fix selectedEngine to track the same engine after shift
+    if (index < selectedEngine)
+        selectedEngine--;               // engine we were on shifted left
+    else if (selectedEngine >= (int)engines.size())
+        selectedEngine = (int)engines.size() - 1;  // we deleted the one we were on (or last)
+
+    rebuildTabButtons();
+    syncUIFromEngine();
+
+    // If the deleted engine was the primary with AudioThru active,
+    // the new primary engine (index 0) got a fresh AudioThru instance
+    // from reindex() but it's not started.  Attempt to restart it if
+    // the new primary's LTC input is running and thru settings exist.
+    if (deletedHadThru && !engines.empty())
+    {
+        auto& newPrimary = *engines[0];
+        if (newPrimary.getActiveInput() == InputSource::LTC
+            && newPrimary.getLtcInput().getIsRunning()
+            && !settings.engines.empty()
+            && settings.engines[0].thruOutEnabled)
         {
-            DBG("WARNING: AudioScanThread did not stop within 2s timeout (destructor)");
+            newPrimary.setOutputThruEnabled(true);
+            // If engine 0 is currently selected, use UI combos; otherwise use saved settings
+            if (selectedEngine == 0)
+            {
+                startCurrentThruOutput();
+            }
+            else if (!settings.engines[0].thruOutputDevice.isEmpty())
+            {
+                int ch = settings.engines[0].thruOutputStereo ? -1 : settings.engines[0].thruOutputChannel;
+                newPrimary.startThruOutput(settings.engines[0].thruOutputType,
+                                           settings.engines[0].thruOutputDevice, ch,
+                                           getPreferredSampleRate(), getPreferredBufferSize());
+            }
         }
     }
 
-    // Shutdown order: outputs first (they reference input data via timers/threads),
-    // then inputs, to prevent stale reads during teardown
-    stopMtcOutput();
-    stopArtnetOutput();
-    stopLtcOutput();
-    stopThruOutput();
+    saveSettings();
+}
 
-    stopMtcInput();
-    stopArtnetInput();
-    stopLtcInput();
+void MainComponent::selectEngine(int index)
+{
+    if (index < 0 || index >= (int)engines.size() || index == selectedEngine)
+        return;
+
+    // Flush any pending settings from the current engine before switching
+    if (settingsDirty)
+        flushSettings();
+
+    selectedEngine = index;
+    inputConfigExpanded = true;
+    mtcOutExpanded = artnetOutExpanded = ltcOutExpanded = thruOutExpanded = true;
+
+    // Reset FPS tracking so buttons update immediately for new engine
+    lastDisplayedFps    = engines[(size_t)index]->getCurrentFps();
+    lastDisplayedOutFps = engines[(size_t)index]->getEffectiveOutputFps();
+
+    syncUIFromEngine();
+    updateTabAppearance();
+    repaint();
+}
+
+void MainComponent::renameEngine(int index)
+{
+    if (index < 0 || index >= (int)engines.size()) return;
+
+    auto alertWindow = std::make_shared<juce::AlertWindow>("Rename Engine",
+                                                "Enter a name for this engine:",
+                                                juce::MessageBoxIconType::NoIcon, this);
+    alertWindow->addTextEditor("name", engines[(size_t)index]->getName());
+    alertWindow->addButton("OK", 1);
+    alertWindow->addButton("Cancel", 0);
+
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+    alertWindow->enterModalState(true, juce::ModalCallbackFunction::create(
+        [safeThis, index, alertWindow](int result)
+        {
+            if (result == 1 && safeThis != nullptr)
+            {
+                auto newName = alertWindow->getTextEditorContents("name").trim();
+                if (newName.isNotEmpty() && index < (int)safeThis->engines.size())
+                {
+                    safeThis->engines[(size_t)index]->setName(newName);
+                    // Only update text — don't rebuild buttons (avoids heap
+                    // corruption from destroying components during modal callback)
+                    safeThis->updateTabAppearance();
+                    safeThis->resized();  // reposition in case text width changed
+                    safeThis->saveSettings();
+                }
+            }
+            // alertWindow is destroyed automatically when shared_ptr goes out of scope
+        }), true);
+}
+
+//==============================================================================
+// TAB BAR
+//==============================================================================
+void MainComponent::rebuildTabButtons()
+{
+    for (auto& tb : tabButtons)
+        removeChildComponent(tb.get());
+    tabButtons.clear();
+
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        auto btn = std::make_unique<TabButton>(engines[(size_t)i]->getName());
+        btn->setClickingTogglesState(false);
+        int idx = i;
+        btn->onClick = [this, idx] { selectEngine(idx); };
+        btn->onRightClick = [this, idx] { showTabContextMenu(idx); };
+        addAndMakeVisible(btn.get());
+        tabButtons.push_back(std::move(btn));
+    }
+
+    updateTabAppearance();
+    resized();
+
+    // Disable "+" button when at max engines
+    btnAddEngine.setEnabled((int)engines.size() < kMaxEngines);
+    btnAddEngine.setAlpha((int)engines.size() < kMaxEngines ? 1.0f : 0.3f);
+}
+
+void MainComponent::updateTabAppearance()
+{
+    for (int i = 0; i < (int)tabButtons.size(); i++)
+    {
+        bool active = (i == selectedEngine);
+        auto& btn = *tabButtons[(size_t)i];
+        btn.setButtonText(engines[(size_t)i]->getName());
+        btn.setColour(juce::TextButton::buttonColourId, active ? accentBlue.withAlpha(0.2f) : juce::Colour(0xFF1A1D23));
+        btn.setColour(juce::TextButton::textColourOffId, active ? textBright : textMid);
+    }
+}
+
+void MainComponent::showTabContextMenu(int index)
+{
+    juce::PopupMenu menu;
+    menu.addItem(1, "Rename");
+    if (engines.size() > 1)
+        menu.addItem(2, "Delete");
+
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+    menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, index](int result) {
+        if (safeThis == nullptr) return;
+        if (result == 1) safeThis->renameEngine(index);
+        else if (result == 2) safeThis->removeEngine(index);
+    });
+}
+
+//==============================================================================
+// SYNC UI <-> ENGINE
+//==============================================================================
+void MainComponent::syncUIFromEngine()
+{
+    syncing = true;
+
+    auto& eng = currentEngine();
+
+    // Input buttons
+    updateInputButtonStates();
+
+    // FPS
+    updateFpsButtonStates();
+    btnFpsConvert.setToggleState(eng.isFpsConvertEnabled(), juce::dontSendNotification);
+    updateOutputFpsButtonStates();
+
+    // Output toggles
+    btnMtcOut.setToggleState(eng.isOutputMtcEnabled(), juce::dontSendNotification);
+    btnArtnetOut.setToggleState(eng.isOutputArtnetEnabled(), juce::dontSendNotification);
+    btnLtcOut.setToggleState(eng.isOutputLtcEnabled(), juce::dontSendNotification);
+
+    // AudioThru toggle: only show for primary engine
+    btnThruOut.setToggleState(eng.isOutputThruEnabled(), juce::dontSendNotification);
+    btnThruOut.setVisible(eng.isPrimary());
+
+    // Offsets
+    sldMtcOffset.setValue(eng.getMtcOutputOffset(), juce::dontSendNotification);
+    sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
+    sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
+
+    // Gains
+    sldLtcInputGain.setValue(eng.getLtcInput().getInputGain() * 100.0f, juce::dontSendNotification);
+    sldThruInputGain.setValue(eng.getLtcInput().getPassthruGain() * 100.0f, juce::dontSendNotification);
+    sldLtcOutputGain.setValue(eng.getLtcOutput().getOutputGain() * 100.0f, juce::dontSendNotification);
+    if (eng.getAudioThru())
+        sldThruOutputGain.setValue(eng.getAudioThru()->getOutputGain() * 100.0f, juce::dontSendNotification);
+
+    // Repopulate device combos so in-use markers reflect the new engine context
+    populateMidiAndNetworkCombos();
+    populateFilteredInputDeviceCombo();
+    populateFilteredOutputDeviceCombos();
+
+    // MIDI device selections — find matching device in combo
+    {
+        int idx = findDeviceByName(cmbMidiInputDevice, eng.getMtcInput().getCurrentDeviceName());
+        if (idx >= 0) cmbMidiInputDevice.setSelectedId(idx + 1, juce::dontSendNotification);
+    }
+    {
+        int idx = findDeviceByName(cmbMidiOutputDevice, eng.getMtcOutput().getCurrentDeviceName());
+        if (idx >= 0) cmbMidiOutputDevice.setSelectedId(idx + 1, juce::dontSendNotification);
+    }
+
+    // ArtNet interface selections — restore from saved settings
+    if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+        int artInId = es.artnetInputInterface + 1;   // combo id is 1-based (1 = All Interfaces)
+        if (artInId < 1) artInId = 1;                // handle legacy -1 default
+        if (artInId <= cmbArtnetInputInterface.getNumItems())
+            cmbArtnetInputInterface.setSelectedId(artInId, juce::dontSendNotification);
+        int artOutId = es.artnetOutputInterface + 1;
+        if (artOutId < 1) artOutId = 1;              // handle legacy -1 default
+        if (artOutId <= cmbArtnetOutputInterface.getNumItems())
+            cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
+    }
+
+    // Audio device selections — find matching device in filtered list
+    if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+
+        int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs,
+                                            es.audioInputType, es.audioInputDevice);
+        if (audioInIdx >= 0)
+            cmbAudioInputDevice.setSelectedId(audioInIdx + 1, juce::dontSendNotification);
+
+        int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                             es.audioOutputType, es.audioOutputDevice);
+        if (audioOutIdx >= 0)
+            cmbAudioOutputDevice.setSelectedId(audioOutIdx + 1, juce::dontSendNotification);
+
+        int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                            es.thruOutputType, es.thruOutputDevice);
+        if (thruOutIdx >= 0)
+            cmbThruOutputDevice.setSelectedId(thruOutIdx + 1, juce::dontSendNotification);
+    }
+
+    // Audio channel selections based on running engines
+    if (eng.getLtcInput().getIsRunning())
+    {
+        int ch = eng.getLtcInput().getSelectedChannel();
+        if (ch >= 0) cmbAudioInputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
+
+        if (eng.getLtcInput().hasPassthruChannel())
+        {
+            int thruCh = eng.getLtcInput().getPassthruChannel();
+            if (thruCh >= 0) cmbThruInputChannel.setSelectedId(thruCh + 1, juce::dontSendNotification);
+        }
+    }
+    else if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+        cmbAudioInputChannel.setSelectedId(es.audioInputChannel + 1, juce::dontSendNotification);
+        cmbThruInputChannel.setSelectedId(es.thruInputChannel + 1, juce::dontSendNotification);
+    }
+
+    if (eng.getLtcOutput().getIsRunning())
+    {
+        int ch = eng.getLtcOutput().getSelectedChannel();
+        if (ch == -1)
+            cmbAudioOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else if (ch >= 0)
+            cmbAudioOutputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
+    }
+    else if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+        if (es.audioOutputStereo)
+            cmbAudioOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else
+            cmbAudioOutputChannel.setSelectedId(es.audioOutputChannel + 1, juce::dontSendNotification);
+    }
+
+    if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
+    {
+        int ch = eng.getAudioThru()->getSelectedChannel();
+        if (ch == -1)
+            cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else if (ch >= 0)
+            cmbThruOutputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
+    }
+    else if (selectedEngine < (int)settings.engines.size())
+    {
+        auto& es = settings.engines[(size_t)selectedEngine];
+        if (es.thruOutputStereo)
+            cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
+        else
+            cmbThruOutputChannel.setSelectedId(es.thruOutputChannel + 1, juce::dontSendNotification);
+    }
+
+    updateDeviceSelectorVisibility();
+    resized();
+    repaint();
+
+    syncing = false;
+}
+
+//==============================================================================
+// ENGINE-LEVEL START/STOP (gathers params from UI)
+//==============================================================================
+void MainComponent::startCurrentMtcInput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbMidiInputDevice.getSelectedId() - 1;
+    eng.startMtcInput(sel);
+}
+
+void MainComponent::startCurrentArtnetInput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbArtnetInputInterface.getSelectedId() - 1;
+    eng.startArtnetInput(sel);
+}
+
+void MainComponent::startCurrentLtcInput()
+{
+    auto& eng = currentEngine();
+    auto entry = getSelectedAudioInput();
+    if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
+    { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
+
+    int ltcCh = cmbAudioInputChannel.getSelectedId() - 1;
+    if (ltcCh < 0) ltcCh = 0;
+
+    int thruCh = -1;
+    if (eng.isPrimary() && eng.isOutputThruEnabled())
+    { thruCh = cmbThruInputChannel.getSelectedId() - 1; if (thruCh < 0) thruCh = 1; }
+
+    if (eng.startLtcInput(entry.typeName, entry.deviceName, ltcCh, thruCh,
+                           getPreferredSampleRate(), getPreferredBufferSize()))
+    {
+        eng.getLtcInput().setInputGain((float)sldLtcInputGain.getValue() / 100.0f);
+        eng.getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f);
+        populateAudioInputChannels();
+        if (eng.isPrimary() && eng.isOutputThruEnabled())
+            startCurrentThruOutput();
+    }
+    saveSettings();
+}
+
+void MainComponent::startCurrentThruOutput()
+{
+    auto& eng = currentEngine();
+    if (!eng.isPrimary()) return;
+
+    auto entry = getSelectedThruOutput();
+    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
+    { cmbThruOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedThruOutput(); }
+
+    int outCh = getChannelFromCombo(cmbThruOutputChannel);
+    eng.startThruOutput(entry.typeName, entry.deviceName, outCh,
+                         getPreferredSampleRate(), getPreferredBufferSize());
+
+    if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
+    {
+        eng.getAudioThru()->setOutputGain((float)sldThruOutputGain.getValue() / 100.0f);
+        populateThruOutputChannels();
+    }
+}
+
+void MainComponent::startCurrentMtcOutput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbMidiOutputDevice.getSelectedId() - 1;
+    eng.startMtcOutput(sel);
+}
+
+void MainComponent::startCurrentArtnetOutput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbArtnetOutputInterface.getSelectedId() - 1;
+    eng.startArtnetOutput(sel);
+}
+
+void MainComponent::startCurrentLtcOutput()
+{
+    auto& eng = currentEngine();
+    eng.stopLtcOutput();
+
+    auto entry = getSelectedAudioOutput();
+    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
+    { cmbAudioOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioOutput(); }
+
+    int channel = getChannelFromCombo(cmbAudioOutputChannel);
+
+    if (eng.startLtcOutput(entry.typeName, entry.deviceName, channel,
+                            getPreferredSampleRate(), getPreferredBufferSize()))
+    {
+        eng.getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f);
+        populateAudioOutputChannels();
+
+        // Restart thru if it was stopped due to a previous device conflict
+        if (eng.isPrimary() && eng.isOutputThruEnabled()
+            && eng.getAudioThru() && !eng.getAudioThru()->getIsRunning())
+        {
+            auto thruEntry = getSelectedThruOutput();
+            if (thruEntry.deviceName.isNotEmpty()
+                && !(thruEntry.deviceName == entry.deviceName && thruEntry.typeName == entry.typeName))
+                startCurrentThruOutput();
+        }
+    }
+}
+
+void MainComponent::updateCurrentOutputStates()
+{
+    auto& eng = currentEngine();
+
+    if (eng.isOutputMtcEnabled() && !eng.getMtcOutput().getIsRunning()) startCurrentMtcOutput();
+    else if (!eng.isOutputMtcEnabled() && eng.getMtcOutput().getIsRunning()) eng.stopMtcOutput();
+
+    if (eng.isOutputArtnetEnabled() && !eng.getArtnetOutput().getIsRunning()) startCurrentArtnetOutput();
+    else if (!eng.isOutputArtnetEnabled() && eng.getArtnetOutput().getIsRunning()) eng.stopArtnetOutput();
+
+    if (eng.isOutputLtcEnabled() && !eng.getLtcOutput().getIsRunning() && !scannedAudioOutputs.isEmpty()) startCurrentLtcOutput();
+    else if (!eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning()) eng.stopLtcOutput();
+
+    if (eng.isPrimary())
+    {
+        if (eng.isOutputThruEnabled() && eng.getAudioThru() && !eng.getAudioThru()->getIsRunning())
+        {
+            if (eng.getActiveInput() == InputSource::LTC)
+                startCurrentLtcInput();
+            else
+                startCurrentThruOutput();
+        }
+        else if (!eng.isOutputThruEnabled() && eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
+        {
+            eng.stopThruOutput();
+        }
+    }
 }
 
 //==============================================================================
@@ -435,12 +985,13 @@ void MainComponent::startAudioDeviceScan()
     if (scanThread && scanThread->isThreadRunning())
     {
         if (!scanThread->stopThread(2000))
-        {
-            DBG("WARNING: AudioScanThread did not stop within 2s timeout (rescan) — skipping new scan");
-            return;  // Don't start a new scan if the old one is still alive
-        }
+        { DBG("WARNING: AudioScanThread did not stop within 2s timeout — skipping new scan"); return; }
     }
     scanThread = std::make_unique<AudioScanThread>(this);
+    // Create AudioDeviceManager on the message thread — JUCE 8.x internally
+    // registers a MIDI device-change listener that requires JUCE_ASSERT_MESSAGE_THREAD.
+    scanThread->tempManager = std::make_unique<juce::AudioDeviceManager>();
+    scanThread->tempManager->initialise(128, 128, nullptr, false);
     scanThread->startThread();
 }
 
@@ -454,7 +1005,7 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
 }
 
 //==============================================================================
-// DRIVER TYPE FILTER HELPERS
+// DRIVER TYPE FILTER HELPERS (same as v1.3)
 //==============================================================================
 juce::StringArray MainComponent::getUniqueTypeNames(const juce::Array<AudioDeviceEntry>& entries) const
 {
@@ -468,192 +1019,190 @@ juce::StringArray MainComponent::getUniqueTypeNames(const juce::Array<AudioDevic
 juce::String MainComponent::getInputTypeFilter() const
 {
     int sel = cmbAudioInputTypeFilter.getSelectedId();
-    if (sel <= 1) return {};
-    return cmbAudioInputTypeFilter.getText();
+    return (sel <= 1) ? juce::String() : cmbAudioInputTypeFilter.getText();
 }
 
 juce::String MainComponent::getOutputTypeFilter() const
 {
     int sel = cmbAudioOutputTypeFilter.getSelectedId();
-    if (sel <= 1) return {};
-    return cmbAudioOutputTypeFilter.getText();
+    return (sel <= 1) ? juce::String() : cmbAudioOutputTypeFilter.getText();
 }
 
 void MainComponent::populateTypeFilterCombos()
 {
     auto inputTypes = getUniqueTypeNames(scannedAudioInputs);
-    juce::String prevInputFilter = getInputTypeFilter();
+    auto outputTypes = getUniqueTypeNames(scannedAudioOutputs);
 
     cmbAudioInputTypeFilter.clear(juce::dontSendNotification);
-    cmbAudioInputTypeFilter.addItem("ALL", 1);
+    cmbAudioInputTypeFilter.addItem("All Drivers", 1);
     for (int i = 0; i < inputTypes.size(); i++)
     {
         auto shortName = AudioDeviceEntry::shortenTypeName(inputTypes[i]);
         cmbAudioInputTypeFilter.addItem(shortName.isEmpty() ? inputTypes[i] : shortName, i + 2);
     }
 
-    juce::String filterToApply = prevInputFilter.isNotEmpty() ? prevInputFilter : settings.audioInputTypeFilter;
-    bool found = false;
-    if (filterToApply.isNotEmpty())
+    // Restore saved filter
+    if (settings.audioInputTypeFilter.isNotEmpty())
     {
         for (int i = 0; i < inputTypes.size(); i++)
         {
             auto shortName = AudioDeviceEntry::shortenTypeName(inputTypes[i]);
-            auto displayName = shortName.isEmpty() ? inputTypes[i] : shortName;
-            if (displayName == filterToApply || inputTypes[i] == filterToApply)
-            { cmbAudioInputTypeFilter.setSelectedId(i + 2, juce::dontSendNotification); found = true; break; }
+            if (shortName == settings.audioInputTypeFilter || inputTypes[i] == settings.audioInputTypeFilter)
+            { cmbAudioInputTypeFilter.setSelectedId(i + 2, juce::dontSendNotification); break; }
         }
     }
-    if (!found) cmbAudioInputTypeFilter.setSelectedId(1, juce::dontSendNotification);
-
-    auto outputTypes = getUniqueTypeNames(scannedAudioOutputs);
-    juce::String prevOutputFilter = getOutputTypeFilter();
+    if (cmbAudioInputTypeFilter.getSelectedId() == 0)
+        cmbAudioInputTypeFilter.setSelectedId(1, juce::dontSendNotification);
 
     cmbAudioOutputTypeFilter.clear(juce::dontSendNotification);
-    cmbAudioOutputTypeFilter.addItem("ALL", 1);
+    cmbAudioOutputTypeFilter.addItem("All Drivers", 1);
     for (int i = 0; i < outputTypes.size(); i++)
     {
         auto shortName = AudioDeviceEntry::shortenTypeName(outputTypes[i]);
         cmbAudioOutputTypeFilter.addItem(shortName.isEmpty() ? outputTypes[i] : shortName, i + 2);
     }
 
-    filterToApply = prevOutputFilter.isNotEmpty() ? prevOutputFilter : settings.audioOutputTypeFilter;
-    found = false;
-    if (filterToApply.isNotEmpty())
+    if (settings.audioOutputTypeFilter.isNotEmpty())
     {
         for (int i = 0; i < outputTypes.size(); i++)
         {
             auto shortName = AudioDeviceEntry::shortenTypeName(outputTypes[i]);
-            auto displayName = shortName.isEmpty() ? outputTypes[i] : shortName;
-            if (displayName == filterToApply || outputTypes[i] == filterToApply)
-            { cmbAudioOutputTypeFilter.setSelectedId(i + 2, juce::dontSendNotification); found = true; break; }
+            if (shortName == settings.audioOutputTypeFilter || outputTypes[i] == settings.audioOutputTypeFilter)
+            { cmbAudioOutputTypeFilter.setSelectedId(i + 2, juce::dontSendNotification); break; }
         }
     }
-    if (!found) cmbAudioOutputTypeFilter.setSelectedId(1, juce::dontSendNotification);
+    if (cmbAudioOutputTypeFilter.getSelectedId() == 0)
+        cmbAudioOutputTypeFilter.setSelectedId(1, juce::dontSendNotification);
 }
 
 void MainComponent::populateFilteredInputDeviceCombo()
 {
-    auto prevEntry = getSelectedAudioInput();
-
-    juce::String filter;
-    int filterId = cmbAudioInputTypeFilter.getSelectedId();
-    if (filterId >= 2)
-    {
-        auto inputTypes = getUniqueTypeNames(scannedAudioInputs);
-        int typeIdx = filterId - 2;
-        if (typeIdx >= 0 && typeIdx < inputTypes.size()) filter = inputTypes[typeIdx];
-    }
-
+    auto filter = getInputTypeFilter();
     filteredInputIndices.clear();
     cmbAudioInputDevice.clear(juce::dontSendNotification);
 
     for (int i = 0; i < scannedAudioInputs.size(); i++)
     {
-        if (filter.isEmpty() || scannedAudioInputs[i].typeName == filter)
+        if (filter.isEmpty() || AudioDeviceEntry::shortenTypeName(scannedAudioInputs[i].typeName) == filter
+            || scannedAudioInputs[i].typeName == filter)
         {
             filteredInputIndices.add(i);
-            juce::String displayName = filter.isNotEmpty()
-                ? scannedAudioInputs[i].deviceName : scannedAudioInputs[i].displayName;
-            cmbAudioInputDevice.addItem(displayName, filteredInputIndices.size());
+            auto marker = getDeviceInUseMarker(scannedAudioInputs[i].deviceName,
+                                                scannedAudioInputs[i].typeName, true);
+            cmbAudioInputDevice.addItem(scannedAudioInputs[i].displayName + marker,
+                                         filteredInputIndices.size());
         }
-    }
-
-    if (filteredInputIndices.isEmpty())
-        cmbAudioInputDevice.addItem("(No audio devices)", kPlaceholderItemId);
-
-    if (prevEntry.deviceName.isNotEmpty())
-    {
-        int idx = findFilteredIndex(filteredInputIndices, scannedAudioInputs, prevEntry.typeName, prevEntry.deviceName);
-        if (idx >= 0) cmbAudioInputDevice.setSelectedId(idx + 1, juce::dontSendNotification);
     }
 }
 
 void MainComponent::populateFilteredOutputDeviceCombos()
 {
-    auto prevLtcEntry = getSelectedAudioOutput();
-    auto prevThruEntry = getSelectedThruOutput();
-
-    juce::String filter;
-    int filterId = cmbAudioOutputTypeFilter.getSelectedId();
-    if (filterId >= 2)
-    {
-        auto outputTypes = getUniqueTypeNames(scannedAudioOutputs);
-        int typeIdx = filterId - 2;
-        if (typeIdx >= 0 && typeIdx < outputTypes.size()) filter = outputTypes[typeIdx];
-    }
-
+    auto filter = getOutputTypeFilter();
     filteredOutputIndices.clear();
     cmbAudioOutputDevice.clear(juce::dontSendNotification);
     cmbThruOutputDevice.clear(juce::dontSendNotification);
 
     for (int i = 0; i < scannedAudioOutputs.size(); i++)
     {
-        if (filter.isEmpty() || scannedAudioOutputs[i].typeName == filter)
+        if (filter.isEmpty() || AudioDeviceEntry::shortenTypeName(scannedAudioOutputs[i].typeName) == filter
+            || scannedAudioOutputs[i].typeName == filter)
         {
             filteredOutputIndices.add(i);
-            juce::String displayName = filter.isNotEmpty()
-                ? scannedAudioOutputs[i].deviceName : scannedAudioOutputs[i].displayName;
             int id = filteredOutputIndices.size();
-            cmbAudioOutputDevice.addItem(displayName, id);
-            cmbThruOutputDevice.addItem(displayName, id);
+            auto marker = getDeviceInUseMarker(scannedAudioOutputs[i].deviceName,
+                                                scannedAudioOutputs[i].typeName, false);
+            cmbAudioOutputDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
+            cmbThruOutputDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
         }
-    }
-
-    if (filteredOutputIndices.isEmpty())
-    {
-        cmbAudioOutputDevice.addItem("(No audio devices)", kPlaceholderItemId);
-        cmbThruOutputDevice.addItem("(No audio devices)", kPlaceholderItemId);
-    }
-
-    if (prevLtcEntry.deviceName.isNotEmpty())
-    {
-        int idx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs, prevLtcEntry.typeName, prevLtcEntry.deviceName);
-        if (idx >= 0) cmbAudioOutputDevice.setSelectedId(idx + 1, juce::dontSendNotification);
-    }
-
-    if (prevThruEntry.deviceName.isNotEmpty())
-    {
-        int idx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs, prevThruEntry.typeName, prevThruEntry.deviceName);
-        if (idx >= 0) cmbThruOutputDevice.setSelectedId(idx + 1, juce::dontSendNotification);
     }
 }
 
-int MainComponent::findFilteredIndex(const juce::Array<int>& filteredIndices,
-                                      const juce::Array<AudioDeviceEntry>& entries,
-                                      const juce::String& typeName, const juce::String& deviceName)
+//==============================================================================
+// Returns " [ENGINE N]" if the device is in use by another engine, "" otherwise.
+// typeName is checked for audio devices; for MIDI pass "".
+//==============================================================================
+juce::String MainComponent::getDeviceInUseMarker(const juce::String& devName,
+                                                  const juce::String& typeName,
+                                                  bool isInput)
 {
-    if (deviceName.isEmpty()) return -1;
-    if (typeName.isNotEmpty())
-        for (int i = 0; i < filteredIndices.size(); i++)
-        {
-            int realIdx = filteredIndices[i];
-            if (realIdx >= 0 && realIdx < entries.size()
-                && entries[realIdx].typeName == typeName && entries[realIdx].deviceName == deviceName)
-                return i;
-        }
-    for (int i = 0; i < filteredIndices.size(); i++)
+    if (devName.isEmpty()) return {};
+
+    juce::String result;
+
+    for (int i = 0; i < (int)engines.size(); i++)
     {
-        int realIdx = filteredIndices[i];
-        if (realIdx >= 0 && realIdx < entries.size() && entries[realIdx].deviceName == deviceName)
-            return i;
+        auto& eng = *engines[(size_t)i];
+        bool isCurrent = (i == selectedEngine);
+
+        if (isInput)
+        {
+            // MIDI input (typeName empty → MIDI check)
+            if (typeName.isEmpty()
+                && eng.getMtcInput().getIsRunning()
+                && eng.getMtcInput().getCurrentDeviceName() == devName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }   // "●"
+                else           { return " [" + eng.getName() + "]"; }
+            }
+
+            // Audio input (LTC)
+            if (typeName.isNotEmpty()
+                && eng.getLtcInput().getIsRunning()
+                && eng.getLtcInput().getCurrentDeviceName() == devName
+                && eng.getLtcInput().getCurrentTypeName() == typeName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + "]"; }
+            }
+        }
+        else
+        {
+            // MIDI output
+            if (typeName.isEmpty()
+                && eng.getMtcOutput().getIsRunning()
+                && eng.getMtcOutput().getCurrentDeviceName() == devName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + "]"; }
+            }
+
+            // Audio output (LTC)
+            if (typeName.isNotEmpty()
+                && eng.getLtcOutput().getIsRunning()
+                && eng.getLtcOutput().getCurrentDeviceName() == devName
+                && eng.getLtcOutput().getCurrentTypeName() == typeName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + "]"; }
+            }
+
+            // Audio output (Thru)
+            if (typeName.isNotEmpty()
+                && eng.getAudioThru() && eng.getAudioThru()->getIsRunning()
+                && eng.getAudioThru()->getCurrentDeviceName() == devName
+                && eng.getAudioThru()->getCurrentTypeName() == typeName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + " THRU]"; }
+            }
+        }
     }
-    return -1;
+
+    // "●" prefix for current engine's active device
+    if (result.isNotEmpty())
+        return " " + result;
+
+    return {};
 }
 
-//==============================================================================
-// SAMPLE RATE / BUFFER SIZE
-//==============================================================================
 void MainComponent::populateSampleRateCombo()
 {
     cmbSampleRate.clear(juce::dontSendNotification);
     cmbSampleRate.addItem("Default", 1);
-    cmbSampleRate.addItem("44100 Hz", 2);
-    cmbSampleRate.addItem("48000 Hz", 3);
-    cmbSampleRate.addItem("88200 Hz", 4);
-    cmbSampleRate.addItem("96000 Hz", 5);
-    cmbSampleRate.addItem("176400 Hz", 6);
-    cmbSampleRate.addItem("192000 Hz", 7);
+    cmbSampleRate.addItem("44100", 2);
+    cmbSampleRate.addItem("48000", 3);
+    cmbSampleRate.addItem("88200", 4);
+    cmbSampleRate.addItem("96000", 5);
     cmbSampleRate.setSelectedId(1, juce::dontSendNotification);
 }
 
@@ -661,14 +1210,13 @@ void MainComponent::populateBufferSizeCombo()
 {
     cmbBufferSize.clear(juce::dontSendNotification);
     cmbBufferSize.addItem("Default", 1);
-    cmbBufferSize.addItem("32 smp", 2);
-    cmbBufferSize.addItem("64 smp", 3);
-    cmbBufferSize.addItem("128 smp", 4);
-    cmbBufferSize.addItem("256 smp", 5);
-    cmbBufferSize.addItem("512 smp", 6);
-    cmbBufferSize.addItem("1024 smp", 7);
-    cmbBufferSize.addItem("2048 smp", 8);
-    cmbBufferSize.addItem("4096 smp", 9);
+    cmbBufferSize.addItem("32", 2);
+    cmbBufferSize.addItem("64", 3);
+    cmbBufferSize.addItem("128", 4);
+    cmbBufferSize.addItem("256", 5);
+    cmbBufferSize.addItem("512", 6);
+    cmbBufferSize.addItem("1024", 7);
+    cmbBufferSize.addItem("2048", 8);
     cmbBufferSize.setSelectedId(1, juce::dontSendNotification);
 }
 
@@ -676,10 +1224,9 @@ double MainComponent::getPreferredSampleRate() const
 {
     switch (cmbSampleRate.getSelectedId())
     {
-        case 2: return 44100.0;  case 3: return 48000.0;
-        case 4: return 88200.0;  case 5: return 96000.0;
-        case 6: return 176400.0; case 7: return 192000.0;
-        default: return 0.0;
+        case 2: return 44100; case 3: return 48000;
+        case 4: return 88200; case 5: return 96000;
+        default: return 0;
     }
 }
 
@@ -687,115 +1234,125 @@ int MainComponent::getPreferredBufferSize() const
 {
     switch (cmbBufferSize.getSelectedId())
     {
-        case 2: return 32;   case 3: return 64;   case 4: return 128;
-        case 5: return 256;  case 6: return 512;  case 7: return 1024;
-        case 8: return 2048; case 9: return 4096;
+        case 2: return 32; case 3: return 64; case 4: return 128;
+        case 5: return 256; case 6: return 512; case 7: return 1024; case 8: return 2048;
         default: return 0;
-    }
-}
-
-static int sampleRateToComboId(double sr)
-{
-    if (sr <= 0) return 1;
-    if (std::abs(sr - 44100.0) < 1.0)  return 2;
-    if (std::abs(sr - 48000.0) < 1.0)  return 3;
-    if (std::abs(sr - 88200.0) < 1.0)  return 4;
-    if (std::abs(sr - 96000.0) < 1.0)  return 5;
-    if (std::abs(sr - 176400.0) < 1.0) return 6;
-    if (std::abs(sr - 192000.0) < 1.0) return 7;
-    return 1;
-}
-
-static int bufferSizeToComboId(int bs)
-{
-    switch (bs)
-    {
-        case 32: return 2; case 64: return 3; case 128: return 4;
-        case 256: return 5; case 512: return 6; case 1024: return 7;
-        case 2048: return 8; case 4096: return 9; default: return 1;
     }
 }
 
 void MainComponent::restartAllAudioDevices()
 {
-    bool ltcInWasRunning  = ltcInput.getIsRunning();
-    bool ltcOutWasRunning = ltcOutput.getIsRunning();
-    bool thruWasRunning   = audioThru.getIsRunning();
+    double sr = getPreferredSampleRate();
+    int bs = getPreferredBufferSize();
 
-    // Shutdown order matters: thru (consumer) first, then ltcInput (producer),
-    // then ltcOutput, to prevent stale reads from the passthrough ring buffer.
-    if (thruWasRunning)   stopThruOutput();
-    if (ltcInWasRunning)  ltcInput.stop();
-    if (ltcOutWasRunning) stopLtcOutput();
+    // Restart LTC input/output for ALL engines
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        auto& eng = *engines[(size_t)i];
 
-    // Restart in dependency order: input -> output -> thru.
-    // startThruOutput() calls syncPassthruReadPosition() to skip stale data.
-    if (ltcInWasRunning && activeInput == InputSource::LTC) startLtcInput();
-    if (ltcOutWasRunning && outputLtcEnabled) startLtcOutput();
-    if (thruWasRunning && outputThruEnabled)  startThruOutput();
+        if (i == selectedEngine)
+        {
+            // Selected engine: restart via UI combos
+            if (eng.getActiveInput() == InputSource::LTC && eng.getLtcInput().getIsRunning())
+                startCurrentLtcInput();
+            if (eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning())
+                startCurrentLtcOutput();
+        }
+        else
+        {
+            // Non-selected engines: restart using their current device settings
+            if (eng.getActiveInput() == InputSource::LTC && eng.getLtcInput().getIsRunning())
+            {
+                auto devName = eng.getLtcInput().getCurrentDeviceName();
+                auto typeName = eng.getLtcInput().getCurrentTypeName();
+                int ltcCh = eng.getLtcInput().getSelectedChannel();
+                int thruCh = eng.getLtcInput().hasPassthruChannel() ? eng.getLtcInput().getPassthruChannel() : -1;
+                eng.startLtcInput(typeName, devName, ltcCh, thruCh, sr, bs);
+            }
+            if (eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning())
+            {
+                auto devName = eng.getLtcOutput().getCurrentDeviceName();
+                auto typeName = eng.getLtcOutput().getCurrentTypeName();
+                int ch = eng.getLtcOutput().getSelectedChannel();
+                eng.startLtcOutput(typeName, devName, ch, sr, bs);
+            }
+            if (eng.isPrimary() && eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
+            {
+                auto devName = eng.getAudioThru()->getCurrentDeviceName();
+                auto typeName = eng.getAudioThru()->getCurrentTypeName();
+                int ch = eng.getAudioThru()->getSelectedChannel();
+                eng.startThruOutput(typeName, devName, ch, sr, bs);
+            }
+        }
+    }
+    saveSettings();
 }
 
-//==============================================================================
-// DEVICE COMBO POPULATION
-//==============================================================================
 void MainComponent::populateMidiAndNetworkCombos()
 {
-    // Capture current selections before clearing so we can restore them
-    // after the device list is refreshed. This is what makes Refresh Devices
-    // add new devices without wiping the user's existing configuration.
-    juce::String prevMidiIn   = cmbMidiInputDevice.getText();
-    juce::String prevMidiOut  = cmbMidiOutputDevice.getText();
-    int prevArtIn             = cmbArtnetInputInterface.getSelectedId() - 1;
-    int prevArtOut            = cmbArtnetOutputInterface.getSelectedId() - 1;
-    juce::String prevArtInName  = cmbArtnetInputInterface.getText();
-    juce::String prevArtOutName = cmbArtnetOutputInterface.getText();
-
-    mtcInput.refreshDeviceList();
+    // MIDI Input
+    auto midiIns = juce::MidiInput::getAvailableDevices();
     cmbMidiInputDevice.clear(juce::dontSendNotification);
-    auto inNames = mtcInput.getDeviceNames();
-    for (int i = 0; i < inNames.size(); i++) cmbMidiInputDevice.addItem(inNames[i], i + 1);
-    if (inNames.isEmpty()) cmbMidiInputDevice.addItem("(No MIDI devices)", kPlaceholderItemId);
+    for (int i = 0; i < midiIns.size(); i++)
+    {
+        auto marker = getDeviceInUseMarker(midiIns[i].name, "", true);
+        cmbMidiInputDevice.addItem(midiIns[i].name + marker, i + 1);
+    }
 
-    mtcOutput.refreshDeviceList();
+    // MIDI Output
+    auto midiOuts = juce::MidiOutput::getAvailableDevices();
     cmbMidiOutputDevice.clear(juce::dontSendNotification);
-    auto outNames = mtcOutput.getDeviceNames();
-    for (int i = 0; i < outNames.size(); i++) cmbMidiOutputDevice.addItem(outNames[i], i + 1);
-    if (outNames.isEmpty()) cmbMidiOutputDevice.addItem("(No MIDI devices)", kPlaceholderItemId);
+    for (int i = 0; i < midiOuts.size(); i++)
+    {
+        auto marker = getDeviceInUseMarker(midiOuts[i].name, "", false);
+        cmbMidiOutputDevice.addItem(midiOuts[i].name + marker, i + 1);
+    }
 
-    artnetInput.refreshNetworkInterfaces();
+    // Art-Net interfaces
+    auto nets = getNetworkInterfaces();
     cmbArtnetInputInterface.clear(juce::dontSendNotification);
-    auto inIfaces = artnetInput.getInterfaceNames();
-    for (int i = 0; i < inIfaces.size(); i++) cmbArtnetInputInterface.addItem(inIfaces[i], i + 1);
-    if (inIfaces.isEmpty()) cmbArtnetInputInterface.addItem("(No interfaces)", kPlaceholderItemId);
-
-    artnetOutput.refreshNetworkInterfaces();
     cmbArtnetOutputInterface.clear(juce::dontSendNotification);
-    auto outIfaces = artnetOutput.getInterfaceNames();
-    for (int i = 0; i < outIfaces.size(); i++) cmbArtnetOutputInterface.addItem(outIfaces[i], i + 1);
-    if (outIfaces.isEmpty()) cmbArtnetOutputInterface.addItem("(No interfaces)", kPlaceholderItemId);
 
-    // Restore previous selections by name (MIDI) or by name then index (ArtNet).
-    // If the previously selected device is still present it will be found;
-    // if it has disappeared the combo will fall back to no selection, which
-    // is the correct behaviour (device is gone).
-    int midiInIdx = findDeviceByName(cmbMidiInputDevice, prevMidiIn);
-    if (midiInIdx >= 0) cmbMidiInputDevice.setSelectedId(midiInIdx + 1, juce::dontSendNotification);
+    // Helper: check if an Art-Net interface combo ID is in use by another engine
+    auto getArtnetMarker = [&](int comboId, bool isInput) -> juce::String
+    {
+        juce::String currentDot;
 
-    int midiOutIdx = findDeviceByName(cmbMidiOutputDevice, prevMidiOut);
-    if (midiOutIdx >= 0) cmbMidiOutputDevice.setSelectedId(midiOutIdx + 1, juce::dontSendNotification);
+        for (int i = 0; i < (int)engines.size(); i++)
+        {
+            auto& eng = *engines[(size_t)i];
+            bool isCurrent = (i == selectedEngine);
 
-    // ArtNet interfaces: try to match by name first, fall back to previous index
-    int artInIdx = findDeviceByName(cmbArtnetInputInterface, prevArtInName);
-    if (artInIdx >= 0)
-        cmbArtnetInputInterface.setSelectedId(artInIdx + 1, juce::dontSendNotification);
-    else if (prevArtIn >= 0 && prevArtIn < cmbArtnetInputInterface.getNumItems())
-        cmbArtnetInputInterface.setSelectedId(prevArtIn + 1, juce::dontSendNotification);
+            if (isInput && eng.getArtnetInput().getIsRunning())
+            {
+                int inUseComboId = eng.getArtnetInput().getSelectedInterface() + 1;
+                if (inUseComboId == comboId)
+                {
+                    if (isCurrent) currentDot = juce::String(" ") + juce::String::charToString(0x25CF);
+                    else           return " [" + eng.getName() + "]";
+                }
+            }
+            if (!isInput && eng.getArtnetOutput().getIsRunning())
+            {
+                int inUseComboId = eng.getArtnetOutput().getSelectedInterface() + 2;
+                if (inUseComboId == comboId)
+                {
+                    if (isCurrent) currentDot = juce::String(" ") + juce::String::charToString(0x25CF);
+                    else           return " [" + eng.getName() + "]";
+                }
+            }
+        }
+        return currentDot;
+    };
 
-    int artOutIdx = findDeviceByName(cmbArtnetOutputInterface, prevArtOutName);
-    if (artOutIdx >= 0)
-        cmbArtnetOutputInterface.setSelectedId(artOutIdx + 1, juce::dontSendNotification);
-    else if (prevArtOut >= 0 && prevArtOut < cmbArtnetOutputInterface.getNumItems())
-        cmbArtnetOutputInterface.setSelectedId(prevArtOut + 1, juce::dontSendNotification);
+    cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
+    cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
+    for (int i = 0; i < nets.size(); i++)
+    {
+        auto label = nets[i].name + " (" + nets[i].ip + ")";
+        cmbArtnetInputInterface.addItem(label + getArtnetMarker(i + 2, true), i + 2);
+        cmbArtnetOutputInterface.addItem(label + getArtnetMarker(i + 2, false), i + 2);
+    }
 }
 
 void MainComponent::populateAudioCombos()
@@ -803,280 +1360,274 @@ void MainComponent::populateAudioCombos()
     populateTypeFilterCombos();
     populateFilteredInputDeviceCombo();
     populateFilteredOutputDeviceCombos();
-
-    auto resetChannels = [](juce::ComboBox& cmb, int defId, int kStereo = -1)
-    {
-        if (cmb.getNumItems() == 0)
-        {
-            if (kStereo > 0) cmb.addItem("Ch 1 + Ch 2", kStereo);
-            cmb.addItem("Ch 1", 1);
-            cmb.addItem("Ch 2", 2);
-            cmb.setSelectedId(defId, juce::dontSendNotification);
-        }
-    };
-
-    resetChannels(cmbAudioInputChannel, 1);
-    resetChannels(cmbThruInputChannel, 2);
-    resetChannels(cmbAudioOutputChannel, kStereoItemId, kStereoItemId);
-    resetChannels(cmbThruOutputChannel, kStereoItemId, kStereoItemId);
-}
-
-AudioDeviceEntry MainComponent::getSelectedAudioInput() const
-{
-    int filtIdx = cmbAudioInputDevice.getSelectedId() - 1;
-    if (filtIdx >= 0 && filtIdx < filteredInputIndices.size())
-    {
-        int realIdx = filteredInputIndices[filtIdx];
-        if (realIdx >= 0 && realIdx < scannedAudioInputs.size())
-            return scannedAudioInputs[realIdx];
-    }
-    return {};
-}
-
-AudioDeviceEntry MainComponent::getSelectedAudioOutput() const
-{
-    int filtIdx = cmbAudioOutputDevice.getSelectedId() - 1;
-    if (filtIdx >= 0 && filtIdx < filteredOutputIndices.size())
-    {
-        int realIdx = filteredOutputIndices[filtIdx];
-        if (realIdx >= 0 && realIdx < scannedAudioOutputs.size())
-            return scannedAudioOutputs[realIdx];
-    }
-    return {};
-}
-
-AudioDeviceEntry MainComponent::getSelectedThruOutput() const
-{
-    int filtIdx = cmbThruOutputDevice.getSelectedId() - 1;
-    if (filtIdx >= 0 && filtIdx < filteredOutputIndices.size())
-    {
-        int realIdx = filteredOutputIndices[filtIdx];
-        if (realIdx >= 0 && realIdx < scannedAudioOutputs.size())
-            return scannedAudioOutputs[realIdx];
-    }
-    return {};
-}
-
-int MainComponent::getChannelFromCombo(const juce::ComboBox& cmb) const
-{
-    return (cmb.getSelectedId() == kStereoItemId) ? -1 : (cmb.getSelectedId() - 1);
 }
 
 //==============================================================================
-// SETTINGS -- Phase 1
+// SETTINGS LOAD / SAVE
 //==============================================================================
 void MainComponent::loadAndApplyNonAudioSettings()
 {
     if (!settings.load())
     {
         settingsLoaded = true;
-        updateInputButtonStates();
-        updateFpsButtonStates();
-        updateOutputFpsButtonStates();
-        updateDeviceSelectorVisibility();
+        syncUIFromEngine();
         return;
     }
 
-    FrameRate fpsValues[] = { FrameRate::FPS_2398, FrameRate::FPS_24, FrameRate::FPS_25, FrameRate::FPS_2997, FrameRate::FPS_30 };
-    currentFps = fpsValues[juce::jlimit(0, 4, settings.fpsSelection)];
+    // Ensure we have enough engines
+    while (engines.size() < settings.engines.size())
+        engines.push_back(std::make_unique<TimecodeEngine>((int)engines.size()));
 
-    // FPS conversion
-    fpsConvertEnabled = settings.fpsConvertEnabled;
-    outputFps = fpsValues[juce::jlimit(0, 4, settings.outputFpsSelection)];
-    btnFpsConvert.setToggleState(fpsConvertEnabled, juce::dontSendNotification);
-    userOverrodeLtcFps = settings.ltcFpsUserOverride;
+    // Apply per-engine settings
+    for (int i = 0; i < (int)settings.engines.size() && i < (int)engines.size(); i++)
+    {
+        auto& es = settings.engines[(size_t)i];
+        auto& eng = *engines[(size_t)i];
 
-    int midiInIdx = findDeviceByName(cmbMidiInputDevice, settings.midiInputDevice);
-    if (midiInIdx >= 0) cmbMidiInputDevice.setSelectedId(midiInIdx + 1, juce::dontSendNotification);
+        if (es.engineName.isNotEmpty())
+            eng.setName(es.engineName);
 
-    int midiOutIdx = findDeviceByName(cmbMidiOutputDevice, settings.midiOutputDevice);
-    if (midiOutIdx >= 0) cmbMidiOutputDevice.setSelectedId(midiOutIdx + 1, juce::dontSendNotification);
+        eng.setFrameRate(TimecodeEngine::indexToFps(es.fpsSelection));
+        eng.setFpsConvertEnabled(es.fpsConvertEnabled);
+        eng.setOutputFrameRate(TimecodeEngine::indexToFps(es.outputFpsSelection));
+        eng.setUserOverrodeLtcFps(es.ltcFpsUserOverride);
 
-    if (settings.artnetInputInterface >= 0 && settings.artnetInputInterface < cmbArtnetInputInterface.getNumItems())
-        cmbArtnetInputInterface.setSelectedId(settings.artnetInputInterface + 1, juce::dontSendNotification);
-    if (settings.artnetOutputInterface >= 0 && settings.artnetOutputInterface < cmbArtnetOutputInterface.getNumItems())
-        cmbArtnetOutputInterface.setSelectedId(settings.artnetOutputInterface + 1, juce::dontSendNotification);
+        eng.setOutputMtcEnabled(es.mtcOutEnabled);
+        eng.setOutputArtnetEnabled(es.artnetOutEnabled);
+        eng.setOutputLtcEnabled(es.ltcOutEnabled);
+        eng.setOutputThruEnabled(es.thruOutEnabled);
 
-    sldLtcInputGain.setValue(settings.ltcInputGain, juce::dontSendNotification);
-    sldThruInputGain.setValue(settings.thruInputGain, juce::dontSendNotification);
-    sldLtcOutputGain.setValue(settings.ltcOutputGain, juce::dontSendNotification);
-    sldThruOutputGain.setValue(settings.thruOutputGain, juce::dontSendNotification);
+        eng.setMtcOutputOffset(es.mtcOutputOffset);
+        eng.setArtnetOutputOffset(es.artnetOutputOffset);
+        eng.setLtcOutputOffset(es.ltcOutputOffset);
 
+        eng.getLtcInput().setInputGain((float)es.ltcInputGain / 100.0f);
+        eng.getLtcInput().setPassthruGain((float)es.thruInputGain / 100.0f);
+        eng.getLtcOutput().setOutputGain((float)es.ltcOutputGain / 100.0f);
+        if (eng.getAudioThru())
+            eng.getAudioThru()->setOutputGain((float)es.thruOutputGain / 100.0f);
+
+        // Set input source (defer actual device start)
+        auto src = TimecodeEngine::stringToInputSource(es.inputSource);
+        eng.setInputSource(src);
+
+        // Start non-audio protocols
+        if (src == InputSource::MTC)
+        {
+            int idx = findDeviceByName(cmbMidiInputDevice, es.midiInputDevice);
+            eng.startMtcInput(idx);
+        }
+        else if (src == InputSource::ArtNet)
+        {
+            eng.startArtnetInput(es.artnetInputInterface);
+        }
+
+        // Start non-audio outputs
+        if (es.mtcOutEnabled)
+        {
+            int idx = findDeviceByName(cmbMidiOutputDevice, es.midiOutputDevice);
+            eng.startMtcOutput(idx);
+        }
+        if (es.artnetOutEnabled)
+            eng.startArtnetOutput(es.artnetOutputInterface);
+    }
+
+    // Global settings
     cmbSampleRate.setSelectedId(sampleRateToComboId(settings.preferredSampleRate), juce::dontSendNotification);
     cmbBufferSize.setSelectedId(bufferSizeToComboId(settings.preferredBufferSize), juce::dontSendNotification);
 
-    if (settings.audioInputChannel >= 0)
-        cmbAudioInputChannel.setSelectedId(settings.audioInputChannel + 1, juce::dontSendNotification);
-    if (settings.thruInputChannel >= 0)
-        cmbThruInputChannel.setSelectedId(settings.thruInputChannel + 1, juce::dontSendNotification);
-    if (settings.audioOutputStereo)
-        cmbAudioOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
-    else if (settings.audioOutputChannel >= 0)
-        cmbAudioOutputChannel.setSelectedId(settings.audioOutputChannel + 1, juce::dontSendNotification);
-    if (settings.thruOutputStereo)
-        cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
-    else if (settings.thruOutputChannel >= 0)
-        cmbThruOutputChannel.setSelectedId(settings.thruOutputChannel + 1, juce::dontSendNotification);
-
-    outputMtcEnabled = settings.mtcOutEnabled;
-    outputArtnetEnabled = settings.artnetOutEnabled;
-    outputLtcEnabled = settings.ltcOutEnabled;
-    outputThruEnabled = settings.thruOutEnabled;
-
-    mtcOutputOffset = settings.mtcOutputOffset;
-    artnetOutputOffset = settings.artnetOutputOffset;
-    ltcOutputOffset = settings.ltcOutputOffset;
-    sldMtcOffset.setValue(mtcOutputOffset, juce::dontSendNotification);
-    sldArtnetOffset.setValue(artnetOutputOffset, juce::dontSendNotification);
-    sldLtcOffset.setValue(ltcOutputOffset, juce::dontSendNotification);
-
-    btnMtcOut.setToggleState(outputMtcEnabled, juce::dontSendNotification);
-    btnArtnetOut.setToggleState(outputArtnetEnabled, juce::dontSendNotification);
-    btnLtcOut.setToggleState(outputLtcEnabled, juce::dontSendNotification);
-    btnThruOut.setToggleState(outputThruEnabled, juce::dontSendNotification);
-
-    if (outputMtcEnabled) startMtcOutput();
-    if (outputArtnetEnabled) startArtnetOutput();
-
-    InputSource src = stringToInputSource(settings.inputSource);
-    activeInput = src;
-    sourceActive = false;
-
-    switch (src)
-    {
-        case InputSource::MTC:        startMtcInput();     break;
-        case InputSource::ArtNet:     startArtnetInput();  break;
-        case InputSource::SystemTime: sourceActive = true; break;
-        case InputSource::LTC:        break;
-    }
+    selectedEngine = juce::jlimit(0, (int)engines.size() - 1, settings.selectedEngine);
+    rebuildTabButtons();
 
     settingsLoaded = true;
-    updateInputButtonStates();
-    updateFpsButtonStates();
-    updateOutputFpsButtonStates();
-    updateDeviceSelectorVisibility();
+    syncUIFromEngine();
 }
 
-//==============================================================================
-// SETTINGS -- Phase 2
-//==============================================================================
 void MainComponent::applyAudioSettings()
 {
-    int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs,
-                                        settings.audioInputType, settings.audioInputDevice);
-    if (audioInIdx >= 0) cmbAudioInputDevice.setSelectedId(audioInIdx + 1, juce::dontSendNotification);
-
-    int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
-                                         settings.audioOutputType, settings.audioOutputDevice);
-    if (audioOutIdx >= 0) cmbAudioOutputDevice.setSelectedId(audioOutIdx + 1, juce::dontSendNotification);
-
-    int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
-                                        settings.thruOutputType, settings.thruOutputDevice);
-    if (thruOutIdx >= 0) cmbThruOutputDevice.setSelectedId(thruOutIdx + 1, juce::dontSendNotification);
-
-    ltcInput.setInputGain((float)settings.ltcInputGain / 100.0f);
-    ltcInput.setPassthruGain((float)settings.thruInputGain / 100.0f);
-    ltcOutput.setOutputGain((float)settings.ltcOutputGain / 100.0f);
-    audioThru.setOutputGain((float)settings.thruOutputGain / 100.0f);
-
-    if (outputLtcEnabled) startLtcOutput();
-
-    if (activeInput == InputSource::LTC) startLtcInput();
-
-    if (outputThruEnabled && !audioThru.getIsRunning())
+    // Apply audio device settings for all engines
+    for (int i = 0; i < (int)settings.engines.size() && i < (int)engines.size(); i++)
     {
-        if (activeInput == InputSource::LTC && ltcInput.getIsRunning())
-            startThruOutput();
+        auto& es = settings.engines[(size_t)i];
+        auto& eng = *engines[(size_t)i];
+
+        // Audio inputs (LTC)
+        if (eng.getActiveInput() == InputSource::LTC)
+        {
+            // Find the device in our scanned list
+            int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs,
+                                                es.audioInputType, es.audioInputDevice);
+
+            if (i == selectedEngine)
+            {
+                // For selected engine, use combo box path
+                if (audioInIdx >= 0) cmbAudioInputDevice.setSelectedId(audioInIdx + 1, juce::dontSendNotification);
+                startCurrentLtcInput();
+            }
+            else if (!es.audioInputDevice.isEmpty())
+            {
+                // For non-selected engines, start directly
+                int thruCh = (eng.isPrimary() && eng.isOutputThruEnabled()) ? es.thruInputChannel : -1;
+                eng.startLtcInput(es.audioInputType, es.audioInputDevice,
+                                   es.audioInputChannel, thruCh,
+                                   getPreferredSampleRate(), getPreferredBufferSize());
+            }
+        }
+
+        // Audio outputs (LTC)
+        if (eng.isOutputLtcEnabled())
+        {
+            if (i == selectedEngine)
+            {
+                int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                                     es.audioOutputType, es.audioOutputDevice);
+                if (audioOutIdx >= 0) cmbAudioOutputDevice.setSelectedId(audioOutIdx + 1, juce::dontSendNotification);
+                startCurrentLtcOutput();
+            }
+            else if (!es.audioOutputDevice.isEmpty())
+            {
+                int ch = es.audioOutputStereo ? -1 : es.audioOutputChannel;
+                eng.startLtcOutput(es.audioOutputType, es.audioOutputDevice, ch,
+                                    getPreferredSampleRate(), getPreferredBufferSize());
+            }
+        }
+
+        // AudioThru (only engine 0)
+        if (eng.isPrimary() && eng.isOutputThruEnabled() && eng.getAudioThru() && !eng.getAudioThru()->getIsRunning())
+        {
+            if (eng.getLtcInput().getIsRunning())
+            {
+                if (i == selectedEngine)
+                {
+                    int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
+                                                        es.thruOutputType, es.thruOutputDevice);
+                    if (thruOutIdx >= 0) cmbThruOutputDevice.setSelectedId(thruOutIdx + 1, juce::dontSendNotification);
+                    startCurrentThruOutput();
+                }
+                else if (!es.thruOutputDevice.isEmpty())
+                {
+                    int ch = es.thruOutputStereo ? -1 : es.thruOutputChannel;
+                    eng.startThruOutput(es.thruOutputType, es.thruOutputDevice, ch,
+                                         getPreferredSampleRate(), getPreferredBufferSize());
+                }
+            }
+        }
     }
 
     updateDeviceSelectorVisibility();
 }
 
-//==============================================================================
-// SAVE SETTINGS
-//==============================================================================
 void MainComponent::saveSettings()
 {
     if (!settingsLoaded) return;
-
-    // Mark dirty and reset countdown -- actual save happens in timerCallback
     settingsDirty = true;
     settingsSaveCountdown = kSaveDelayTicks;
 }
 
-// Flush is called from timerCallback() (message thread) and ~MainComponent()
-// (message thread).  onAudioScanComplete() also runs on the message thread
-// (via MessageManager::callAsync), so scannedAudioInputs/Outputs are never
-// accessed concurrently — JUCE serialises all message-thread work.
 void MainComponent::flushSettings()
 {
     if (!settingsLoaded) return;
     settingsDirty = false;
 
-    settings.inputSource = inputSourceToString(activeInput);
-
-    switch (currentFps)
-    {
-        case FrameRate::FPS_2398: settings.fpsSelection = 0; break;
-        case FrameRate::FPS_24:   settings.fpsSelection = 1; break;
-        case FrameRate::FPS_25:   settings.fpsSelection = 2; break;
-        case FrameRate::FPS_2997: settings.fpsSelection = 3; break;
-        case FrameRate::FPS_30:   settings.fpsSelection = 4; break;
-    }
-
-    settings.fpsConvertEnabled = fpsConvertEnabled;
-    switch (outputFps)
-    {
-        case FrameRate::FPS_2398: settings.outputFpsSelection = 0; break;
-        case FrameRate::FPS_24:   settings.outputFpsSelection = 1; break;
-        case FrameRate::FPS_25:   settings.outputFpsSelection = 2; break;
-        case FrameRate::FPS_2997: settings.outputFpsSelection = 3; break;
-        case FrameRate::FPS_30:   settings.outputFpsSelection = 4; break;
-    }
-    settings.ltcFpsUserOverride = userOverrodeLtcFps;
-
-    settings.midiInputDevice = cmbMidiInputDevice.getText();
-    settings.midiOutputDevice = cmbMidiOutputDevice.getText();
-    settings.artnetInputInterface = cmbArtnetInputInterface.getSelectedId() - 1;
-    settings.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
-
-    bool audioReady = !scannedAudioInputs.isEmpty() || !scannedAudioOutputs.isEmpty();
-    if (audioReady)
-    {
-        auto inEntry = getSelectedAudioInput();
-        if (inEntry.deviceName.isNotEmpty()) { settings.audioInputDevice = inEntry.deviceName; settings.audioInputType = inEntry.typeName; }
-        settings.audioInputChannel = cmbAudioInputChannel.getSelectedId() - 1;
-
-        auto outEntry = getSelectedAudioOutput();
-        if (outEntry.deviceName.isNotEmpty()) { settings.audioOutputDevice = outEntry.deviceName; settings.audioOutputType = outEntry.typeName; }
-        settings.audioOutputStereo = (cmbAudioOutputChannel.getSelectedId() == kStereoItemId);
-        settings.audioOutputChannel = settings.audioOutputStereo ? 0 : (cmbAudioOutputChannel.getSelectedId() - 1);
-
-        auto thruEntry = getSelectedThruOutput();
-        if (thruEntry.deviceName.isNotEmpty()) { settings.thruOutputDevice = thruEntry.deviceName; settings.thruOutputType = thruEntry.typeName; }
-        settings.thruOutputStereo = (cmbThruOutputChannel.getSelectedId() == kStereoItemId);
-        settings.thruOutputChannel = settings.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
-        settings.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
-    }
-
-    settings.mtcOutEnabled = outputMtcEnabled;
-    settings.artnetOutEnabled = outputArtnetEnabled;
-    settings.ltcOutEnabled = outputLtcEnabled;
-    settings.thruOutEnabled = outputThruEnabled;
-
-    settings.mtcOutputOffset = mtcOutputOffset;
-    settings.artnetOutputOffset = artnetOutputOffset;
-    settings.ltcOutputOffset = ltcOutputOffset;
-
-    settings.ltcInputGain   = (int)sldLtcInputGain.getValue();
-    settings.thruInputGain  = (int)sldThruInputGain.getValue();
-    settings.ltcOutputGain  = (int)sldLtcOutputGain.getValue();
-    settings.thruOutputGain = (int)sldThruOutputGain.getValue();
-
+    settings.selectedEngine = selectedEngine;
     settings.audioInputTypeFilter  = (cmbAudioInputTypeFilter.getSelectedId() <= 1) ? "" : cmbAudioInputTypeFilter.getText();
     settings.audioOutputTypeFilter = (cmbAudioOutputTypeFilter.getSelectedId() <= 1) ? "" : cmbAudioOutputTypeFilter.getText();
     settings.preferredSampleRate = getPreferredSampleRate();
     settings.preferredBufferSize = getPreferredBufferSize();
+
+    settings.engines.resize(engines.size());
+
+    bool audioReady = !scannedAudioInputs.isEmpty() || !scannedAudioOutputs.isEmpty();
+
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        auto& eng = *engines[(size_t)i];
+        auto& es = settings.engines[(size_t)i];
+
+        es.engineName = eng.getName();
+        es.inputSource = TimecodeEngine::inputSourceToString(eng.getActiveInput());
+        es.fpsSelection = TimecodeEngine::fpsToIndex(eng.getCurrentFps());
+        es.fpsConvertEnabled = eng.isFpsConvertEnabled();
+        es.outputFpsSelection = TimecodeEngine::fpsToIndex(eng.getOutputFps());
+        es.ltcFpsUserOverride = eng.getUserOverrodeLtcFps();
+
+        es.mtcOutEnabled = eng.isOutputMtcEnabled();
+        es.artnetOutEnabled = eng.isOutputArtnetEnabled();
+        es.ltcOutEnabled = eng.isOutputLtcEnabled();
+        es.thruOutEnabled = eng.isOutputThruEnabled();
+
+        es.mtcOutputOffset = eng.getMtcOutputOffset();
+        es.artnetOutputOffset = eng.getArtnetOutputOffset();
+        es.ltcOutputOffset = eng.getLtcOutputOffset();
+
+        es.ltcInputGain = (int)(eng.getLtcInput().getInputGain() * 100.0f);
+        es.thruInputGain = (int)(eng.getLtcInput().getPassthruGain() * 100.0f);
+        es.ltcOutputGain = (int)(eng.getLtcOutput().getOutputGain() * 100.0f);
+        if (eng.getAudioThru())
+            es.thruOutputGain = (int)(eng.getAudioThru()->getOutputGain() * 100.0f);
+
+        // For the selected engine, read from combos (may have been changed)
+        if (i == selectedEngine)
+        {
+            es.midiInputDevice = cmbMidiInputDevice.getText();
+            es.midiOutputDevice = cmbMidiOutputDevice.getText();
+            es.artnetInputInterface = cmbArtnetInputInterface.getSelectedId() - 1;
+            es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
+
+            if (audioReady)
+            {
+                auto inEntry = getSelectedAudioInput();
+                if (inEntry.deviceName.isNotEmpty()) { es.audioInputDevice = inEntry.deviceName; es.audioInputType = inEntry.typeName; }
+                es.audioInputChannel = cmbAudioInputChannel.getSelectedId() - 1;
+
+                auto outEntry = getSelectedAudioOutput();
+                if (outEntry.deviceName.isNotEmpty()) { es.audioOutputDevice = outEntry.deviceName; es.audioOutputType = outEntry.typeName; }
+                es.audioOutputStereo = (cmbAudioOutputChannel.getSelectedId() == kStereoItemId);
+                es.audioOutputChannel = es.audioOutputStereo ? 0 : (cmbAudioOutputChannel.getSelectedId() - 1);
+
+                auto thruEntry = getSelectedThruOutput();
+                if (thruEntry.deviceName.isNotEmpty()) { es.thruOutputDevice = thruEntry.deviceName; es.thruOutputType = thruEntry.typeName; }
+                es.thruOutputStereo = (cmbThruOutputChannel.getSelectedId() == kStereoItemId);
+                es.thruOutputChannel = es.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
+                es.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
+            }
+        }
+        else
+        {
+            // For non-selected engines, read device names from the running handler
+            // state to keep settings in sync even if devices were reconnected or
+            // changed programmatically (e.g., via restartAllAudioDevices).
+            if (eng.getMtcInput().getIsRunning())
+                es.midiInputDevice = eng.getMtcInput().getCurrentDeviceName();
+            if (eng.getMtcOutput().getIsRunning())
+                es.midiOutputDevice = eng.getMtcOutput().getCurrentDeviceName();
+            if (eng.getLtcInput().getIsRunning())
+            {
+                es.audioInputDevice  = eng.getLtcInput().getCurrentDeviceName();
+                es.audioInputType    = eng.getLtcInput().getCurrentTypeName();
+                es.audioInputChannel = eng.getLtcInput().getSelectedChannel();
+                if (eng.getLtcInput().hasPassthruChannel())
+                    es.thruInputChannel = eng.getLtcInput().getPassthruChannel();
+            }
+            if (eng.getLtcOutput().getIsRunning())
+            {
+                es.audioOutputDevice  = eng.getLtcOutput().getCurrentDeviceName();
+                es.audioOutputType    = eng.getLtcOutput().getCurrentTypeName();
+                int ch = eng.getLtcOutput().getSelectedChannel();
+                es.audioOutputStereo  = (ch == -1);
+                es.audioOutputChannel = (ch == -1) ? 0 : ch;
+            }
+            if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
+            {
+                es.thruOutputDevice = eng.getAudioThru()->getCurrentDeviceName();
+                es.thruOutputType   = eng.getAudioThru()->getCurrentTypeName();
+                int ch = eng.getAudioThru()->getSelectedChannel();
+                es.thruOutputStereo  = (ch == -1);
+                es.thruOutputChannel = (ch == -1) ? 0 : ch;
+            }
+            // ArtNet interfaces preserved from last save when engine was selected
+        }
+    }
 
     settings.save();
 }
@@ -1084,238 +1635,68 @@ void MainComponent::flushSettings()
 int MainComponent::findDeviceByName(const juce::ComboBox& cmb, const juce::String& name)
 {
     if (name.isEmpty()) return -1;
+    static const juce::String dotSuffix = juce::String(" ") + juce::String::charToString(0x25CF);
     for (int i = 0; i < cmb.getNumItems(); i++)
-        if (cmb.getItemText(i) == name) return i;
+    {
+        auto text = cmb.getItemText(i);
+        // Exact match, or match ignoring the " [ENGINE N]" or " ●" marker suffix
+        if (text == name || text.startsWith(name + " [") || text == name + dotSuffix)
+            return i;
+    }
     return -1;
 }
 
-juce::String MainComponent::inputSourceToString(InputSource src) const
+int MainComponent::findFilteredIndex(const juce::Array<int>& filteredIndices,
+                                      const juce::Array<AudioDeviceEntry>& entries,
+                                      const juce::String& typeName, const juce::String& deviceName)
 {
-    switch (src)
+    for (int f = 0; f < filteredIndices.size(); f++)
     {
-        case InputSource::MTC:        return "MTC";
-        case InputSource::ArtNet:     return "ArtNet";
-        case InputSource::SystemTime: return "SystemTime";
-        case InputSource::LTC:        return "LTC";
+        int realIdx = filteredIndices[f];
+        if (realIdx < entries.size()
+            && entries[realIdx].deviceName == deviceName
+            && (typeName.isEmpty() || entries[realIdx].typeName == typeName))
+            return f;
     }
-    return "SystemTime";
+    return -1;
 }
 
-MainComponent::InputSource MainComponent::stringToInputSource(const juce::String& s) const
+AudioDeviceEntry MainComponent::getSelectedAudioInput() const
 {
-    if (s == "MTC") return InputSource::MTC;
-    if (s == "ArtNet") return InputSource::ArtNet;
-    if (s == "LTC") return InputSource::LTC;
-    return InputSource::SystemTime;
+    int sel = cmbAudioInputDevice.getSelectedId() - 1;
+    if (sel >= 0 && sel < filteredInputIndices.size())
+    { int realIdx = filteredInputIndices[sel]; if (realIdx < scannedAudioInputs.size()) return scannedAudioInputs[realIdx]; }
+    return {};
+}
+
+AudioDeviceEntry MainComponent::getSelectedAudioOutput() const
+{
+    int sel = cmbAudioOutputDevice.getSelectedId() - 1;
+    if (sel >= 0 && sel < filteredOutputIndices.size())
+    { int realIdx = filteredOutputIndices[sel]; if (realIdx < scannedAudioOutputs.size()) return scannedAudioOutputs[realIdx]; }
+    return {};
+}
+
+AudioDeviceEntry MainComponent::getSelectedThruOutput() const
+{
+    int sel = cmbThruOutputDevice.getSelectedId() - 1;
+    if (sel >= 0 && sel < filteredOutputIndices.size())
+    { int realIdx = filteredOutputIndices[sel]; if (realIdx < scannedAudioOutputs.size()) return scannedAudioOutputs[realIdx]; }
+    return {};
 }
 
 //==============================================================================
-// INPUT/OUTPUT CONTROL (unchanged logic)
+// CHANNEL HELPERS
 //==============================================================================
-void MainComponent::startMtcInput()
-{
-    stopMtcInput();
-    int sel = cmbMidiInputDevice.getSelectedId() - 1;
-    if (sel < 0 && mtcInput.getDeviceCount() > 0) sel = 0;
-
-    if (sel >= 0 && mtcInput.start(sel))
-    {
-        inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
-        cmbMidiInputDevice.setSelectedId(sel + 1, juce::dontSendNotification);
-    }
-    else
-    {
-        inputStatusText = sel < 0 ? "NO MIDI DEVICE AVAILABLE" : "FAILED TO OPEN DEVICE";
-        DBG("MTC Input: " + inputStatusText);
-    }
-}
-
-void MainComponent::stopMtcInput() { mtcInput.stop(); }
-
-void MainComponent::startArtnetInput()
-{
-    stopArtnetInput();
-    int sel = cmbArtnetInputInterface.getSelectedId() - 1;
-    if (sel < 0) sel = 0;
-    artnetInput.refreshNetworkInterfaces();
-    if (artnetInput.start(sel, 6454))
-    {
-        inputStatusText = "RX ON " + artnetInput.getBindInfo();
-        if (artnetInput.didFallBackToAllInterfaces())
-            inputStatusText += " [FALLBACK]";
-        cmbArtnetInputInterface.setSelectedId(sel + 1, juce::dontSendNotification);
-    }
-    else { inputStatusText = "FAILED TO BIND PORT 6454"; DBG("Art-Net Input: " + inputStatusText); }
-}
-
-void MainComponent::stopArtnetInput() { artnetInput.stop(); }
-
-void MainComponent::startLtcInput()
-{
-    stopLtcInput();
-    auto entry = getSelectedAudioInput();
-    if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
-    { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
-
-    if (entry.deviceName.isEmpty()) { inputStatusText = "NO AUDIO DEVICE AVAILABLE"; DBG("LTC Input: " + inputStatusText); return; }
-
-    int ltcCh = cmbAudioInputChannel.getSelectedId() - 1;
-    if (ltcCh < 0) ltcCh = 0;
-
-    int thruCh = -1;
-    if (outputThruEnabled) { thruCh = cmbThruInputChannel.getSelectedId() - 1; if (thruCh < 0) thruCh = 1; }
-
-    if (ltcInput.start(entry.typeName, entry.deviceName, ltcCh, thruCh,
-                       getPreferredSampleRate(), getPreferredBufferSize()))
-    {
-        ltcInput.setInputGain((float)sldLtcInputGain.getValue() / 100.0f);
-        ltcInput.setPassthruGain((float)sldThruInputGain.getValue() / 100.0f);
-        inputStatusText = "RX: " + ltcInput.getCurrentDeviceName() + " Ch " + juce::String(ltcCh + 1);
-        populateAudioInputChannels();
-        if (outputThruEnabled) startThruOutput();
-    }
-    else { inputStatusText = "FAILED TO OPEN AUDIO DEVICE"; DBG("LTC Input: " + inputStatusText + " (" + entry.typeName + ": " + entry.deviceName + ")"); }
-}
-
-void MainComponent::stopLtcInput() { stopThruOutput(); ltcInput.stop(); }
-void MainComponent::restartLtcWithCurrentSettings() { startLtcInput(); saveSettings(); }
-
-void MainComponent::startThruOutput()
-{
-    stopThruOutput();
-    if (!ltcInput.getIsRunning() || !ltcInput.hasPassthruChannel())
-    {
-        thruOutStatusText = "WAITING FOR LTC INPUT";
-        DBG("Audio Thru: " + thruOutStatusText);
-        return;
-    }
-
-    ltcInput.resetPassthruCounters();  // Reset xrun counters for fresh monitoring
-    ltcInput.syncPassthruReadPosition(); // Snap read pos to write pos for fresh data
-
-    auto entry = getSelectedThruOutput();
-    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
-    { cmbThruOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedThruOutput(); }
-
-    if (entry.deviceName.isEmpty()) { thruOutStatusText = "NO AUDIO DEVICE"; DBG("Audio Thru: " + thruOutStatusText); return; }
-
-    if (outputLtcEnabled && ltcOutput.getIsRunning()
-        && ltcOutput.getCurrentDeviceName() == entry.deviceName
-        && ltcOutput.getCurrentTypeName() == entry.typeName)
-    { thruOutStatusText = "CONFLICT: same device as LTC OUT"; DBG("Audio Thru: " + thruOutStatusText); return; }
-
-    int outCh = getChannelFromCombo(cmbThruOutputChannel);
-
-    if (audioThru.start(entry.typeName, entry.deviceName, outCh, &ltcInput,
-                        getPreferredSampleRate(), getPreferredBufferSize()))
-    {
-        audioThru.setOutputGain((float)sldThruOutputGain.getValue() / 100.0f);
-        juce::String chName = (outCh == -1) ? "Ch 1 + Ch 2" : ("Ch " + juce::String(outCh + 1));
-        thruOutStatusText = "THRU: " + audioThru.getCurrentDeviceName() + " " + chName;
-        populateThruOutputChannels();
-
-        // Warn if sample rates don't match between input and output devices --
-        // without resampling the passthrough audio will play at wrong speed
-        double inRate  = ltcInput.getActualSampleRate();
-        double outRate = audioThru.getActualSampleRate();
-        if (std::abs(inRate - outRate) > 1.0)
-            thruOutStatusText += " [RATE MISMATCH: " + juce::String((int)inRate) + "/" + juce::String((int)outRate) + "]";
-    }
-    else { thruOutStatusText = "FAILED TO OPEN"; DBG("Audio Thru: " + thruOutStatusText + " (" + entry.typeName + ": " + entry.deviceName + ")"); }
-}
-
-void MainComponent::stopThruOutput() { audioThru.stop(); thruOutStatusText = ""; }
-
-void MainComponent::startMtcOutput()
-{
-    stopMtcOutput();
-    int sel = cmbMidiOutputDevice.getSelectedId() - 1;
-    if (sel < 0 && mtcOutput.getDeviceCount() > 0) sel = 0;
-
-    if (sel >= 0 && mtcOutput.start(sel))
-    {
-        mtcOutput.setFrameRate(getEffectiveOutputFps());
-        mtcOutStatusText = "TX: " + mtcOutput.getCurrentDeviceName();
-        cmbMidiOutputDevice.setSelectedId(sel + 1, juce::dontSendNotification);
-    }
-    else
-    {
-        mtcOutStatusText = sel < 0 ? "NO MIDI DEVICE" : "FAILED TO OPEN";
-        DBG("MTC Output: " + mtcOutStatusText);
-    }
-}
-
-void MainComponent::stopMtcOutput() { mtcOutput.stop(); mtcOutStatusText = ""; }
-
-void MainComponent::startArtnetOutput()
-{
-    stopArtnetOutput();
-    int sel = cmbArtnetOutputInterface.getSelectedId() - 1;
-    artnetOutput.refreshNetworkInterfaces();
-
-    if (artnetOutput.start(sel, 6454))
-    {
-        artnetOutput.setFrameRate(getEffectiveOutputFps());
-        artnetOutStatusText = "TX: " + artnetOutput.getBroadcastIp() + ":6454";
-        if (sel >= 0)
-            cmbArtnetOutputInterface.setSelectedId(sel + 1, juce::dontSendNotification);
-    }
-    else
-    {
-        artnetOutStatusText = "FAILED TO BIND";
-        DBG("Art-Net Output: " + artnetOutStatusText);
-    }
-}
-
-void MainComponent::stopArtnetOutput() { artnetOutput.stop(); artnetOutStatusText = ""; }
-
-void MainComponent::startLtcOutput()
-{
-    stopLtcOutput();
-    auto entry = getSelectedAudioOutput();
-    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
-    { cmbAudioOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioOutput(); }
-
-    if (entry.deviceName.isEmpty()) { ltcOutStatusText = "NO AUDIO DEVICE AVAILABLE"; DBG("LTC Output: " + ltcOutStatusText); return; }
-
-    if (audioThru.getIsRunning()
-        && audioThru.getCurrentDeviceName() == entry.deviceName
-        && audioThru.getCurrentTypeName() == entry.typeName)
-    { stopThruOutput(); thruOutStatusText = "CONFLICT: same device as LTC OUT"; }
-
-    int channel = getChannelFromCombo(cmbAudioOutputChannel);
-
-    if (ltcOutput.start(entry.typeName, entry.deviceName, channel,
-                        getPreferredSampleRate(), getPreferredBufferSize()))
-    {
-        ltcOutput.setFrameRate(getEffectiveOutputFps());
-        ltcOutput.setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f);
-        juce::String chName = (channel == -1) ? "Ch 1 + Ch 2" : ("Ch " + juce::String(channel + 1));
-        ltcOutStatusText = "TX: " + ltcOutput.getCurrentDeviceName() + " " + chName;
-        populateAudioOutputChannels();
-
-        // Restart thru if it was stopped due to a previous device conflict
-        if (outputThruEnabled && !audioThru.getIsRunning())
-        {
-            auto thruEntry = getSelectedThruOutput();
-            if (thruEntry.deviceName.isNotEmpty()
-                && !(thruEntry.deviceName == entry.deviceName && thruEntry.typeName == entry.typeName))
-                startThruOutput();
-        }
-    }
-    else { ltcOutStatusText = "FAILED TO OPEN AUDIO DEVICE"; DBG("LTC Output: " + ltcOutStatusText + " (" + entry.typeName + ": " + entry.deviceName + ")"); }
-}
-
-void MainComponent::stopLtcOutput() { ltcOutput.stop(); ltcOutStatusText = ""; }
-
 void MainComponent::populateAudioInputChannels()
 {
+    auto& eng = currentEngine();
     int prevLtcCh = cmbAudioInputChannel.getSelectedId();
     int prevThru = cmbThruInputChannel.getSelectedId();
     cmbAudioInputChannel.clear(juce::dontSendNotification);
     cmbThruInputChannel.clear(juce::dontSendNotification);
 
-    int n = juce::jmax(2, ltcInput.getChannelCount());
+    int n = juce::jmax(2, eng.getLtcInput().getChannelCount());
     for (int i = 0; i < n; i++)
     {
         auto nm = "Ch " + juce::String(i + 1);
@@ -1331,9 +1712,10 @@ void MainComponent::populateAudioInputChannels()
 
 void MainComponent::populateAudioOutputChannels()
 {
+    auto& eng = currentEngine();
     int prev = cmbAudioOutputChannel.getSelectedId();
     cmbAudioOutputChannel.clear(juce::dontSendNotification);
-    int n = juce::jmax(2, ltcOutput.getChannelCount());
+    int n = juce::jmax(2, eng.getLtcOutput().getChannelCount());
     if (n >= 2) cmbAudioOutputChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
     for (int i = 0; i < n; i++) cmbAudioOutputChannel.addItem("Ch " + juce::String(i+1), i+1);
     if (prev == kStereoItemId && n >= 2) cmbAudioOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
@@ -1343,9 +1725,11 @@ void MainComponent::populateAudioOutputChannels()
 
 void MainComponent::populateThruOutputChannels()
 {
+    auto& eng = currentEngine();
+    if (!eng.getAudioThru()) return;
     int prev = cmbThruOutputChannel.getSelectedId();
     cmbThruOutputChannel.clear(juce::dontSendNotification);
-    int n = juce::jmax(2, audioThru.getChannelCount());
+    int n = juce::jmax(2, eng.getAudioThru()->getChannelCount());
     if (n >= 2) cmbThruOutputChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
     for (int i = 0; i < n; i++) cmbThruOutputChannel.addItem("Ch " + juce::String(i+1), i+1);
     if (prev == kStereoItemId && n >= 2) cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
@@ -1353,80 +1737,26 @@ void MainComponent::populateThruOutputChannels()
     else cmbThruOutputChannel.setSelectedId(n >= 2 ? kStereoItemId : 1, juce::dontSendNotification);
 }
 
-void MainComponent::updateOutputStates()
+int MainComponent::getChannelFromCombo(const juce::ComboBox& cmb) const
 {
-    if (outputMtcEnabled && !mtcOutput.getIsRunning()) startMtcOutput();
-    else if (!outputMtcEnabled && mtcOutput.getIsRunning()) stopMtcOutput();
-
-    if (outputArtnetEnabled && !artnetOutput.getIsRunning()) startArtnetOutput();
-    else if (!outputArtnetEnabled && artnetOutput.getIsRunning()) stopArtnetOutput();
-
-    if (outputLtcEnabled && !ltcOutput.getIsRunning() && !scannedAudioOutputs.isEmpty()) startLtcOutput();
-    else if (!outputLtcEnabled && ltcOutput.getIsRunning()) stopLtcOutput();
-
-    if (outputThruEnabled && !audioThru.getIsRunning())
-    {
-        // When enabling thru with LTC active, must restart LTC to configure passthru channel
-        if (activeInput == InputSource::LTC) restartLtcWithCurrentSettings(); else startThruOutput();
-    }
-    else if (!outputThruEnabled && audioThru.getIsRunning())
-    {
-        // When disabling thru, just stop thru output -- no need to restart LTC input
-        // (LTC input continues capturing unused thru channel harmlessly)
-        stopThruOutput();
-    }
-}
-
-void MainComponent::routeTimecodeToOutputs()
-{
-    // Apply FPS conversion if enabled (used in both active and paused paths).
-    // Offsets are applied AFTER rate conversion, in the output frame rate domain.
-    // This is intentional: an offset of +2 frames at 25fps should add 2 frames
-    // of 25fps time, not 2 frames of the input rate.
-    FrameRate outRate = getEffectiveOutputFps();
-    Timecode baseTc = fpsConvertEnabled
-                    ? convertTimecodeRate(currentTimecode, currentFps, outRate)
-                    : currentTimecode;
-    outputTimecode = baseTc;
-
-    if (sourceActive)
-    {
-        if (outputMtcEnabled && mtcOutput.getIsRunning())
-        {
-            mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));
-            mtcOutput.setPaused(false);
-        }
-        if (outputArtnetEnabled && artnetOutput.getIsRunning())
-        {
-            artnetOutput.setTimecode(offsetTimecode(baseTc, artnetOutputOffset, outRate));
-            artnetOutput.setPaused(false);
-        }
-        if (outputLtcEnabled && ltcOutput.getIsRunning())
-        {
-            ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
-            ltcOutput.setPaused(false);
-        }
-    }
-    else
-    {
-        if (outputMtcEnabled && mtcOutput.getIsRunning()) mtcOutput.setPaused(true);
-        if (outputArtnetEnabled && artnetOutput.getIsRunning()) artnetOutput.setPaused(true);
-        if (outputLtcEnabled && ltcOutput.getIsRunning()) ltcOutput.setPaused(true);
-    }
+    int id = cmb.getSelectedId();
+    if (id == kStereoItemId) return -1;
+    return id - 1;
 }
 
 //==============================================================================
-// VISIBILITY (updated for collapse state)
+// VISIBILITY (updated for collapse + engine)
 //==============================================================================
 void MainComponent::updateDeviceSelectorVisibility()
 {
-    bool showMidiIn   = (activeInput == InputSource::MTC)    && inputConfigExpanded;
-    bool showArtnetIn = (activeInput == InputSource::ArtNet)  && inputConfigExpanded;
-    bool showLtcIn    = (activeInput == InputSource::LTC)     && inputConfigExpanded;
-    bool showAudioOut = (outputLtcEnabled || outputThruEnabled);
-    bool hasInputConfig = (activeInput != InputSource::SystemTime);
+    auto& eng = currentEngine();
+    auto input = eng.getActiveInput();
+    bool showMidiIn   = (input == InputSource::MTC)    && inputConfigExpanded;
+    bool showArtnetIn = (input == InputSource::ArtNet)  && inputConfigExpanded;
+    bool showLtcIn    = (input == InputSource::LTC)     && inputConfigExpanded;
+    bool showAudioOut = (eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled()));
+    bool hasInputConfig = (input != InputSource::SystemTime);
 
-    // Input collapse button: visible when input has config
     btnCollapseInput.setVisible(hasInputConfig);
     updateCollapseButtonText(btnCollapseInput, inputConfigExpanded);
 
@@ -1434,30 +1764,29 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbArtnetInputInterface.setVisible(showArtnetIn); lblArtnetInputInterface.setVisible(showArtnetIn);
 
     cmbAudioInputTypeFilter.setVisible(showLtcIn);    lblAudioInputTypeFilter.setVisible(showLtcIn);
-    cmbSampleRate.setVisible(showLtcIn);
-    lblSampleRate.setVisible(showLtcIn);
-    cmbBufferSize.setVisible(showLtcIn);
-    lblBufferSize.setVisible(showLtcIn);
+    cmbSampleRate.setVisible(showLtcIn);              lblSampleRate.setVisible(showLtcIn);
+    cmbBufferSize.setVisible(showLtcIn);              lblBufferSize.setVisible(showLtcIn);
     cmbAudioInputDevice.setVisible(showLtcIn);        lblAudioInputDevice.setVisible(showLtcIn);
     cmbAudioInputChannel.setVisible(showLtcIn);       lblAudioInputChannel.setVisible(showLtcIn);
     sldLtcInputGain.setVisible(showLtcIn);            lblLtcInputGain.setVisible(showLtcIn);
     mtrLtcInput.setVisible(showLtcIn);
-    cmbThruInputChannel.setVisible(showLtcIn && outputThruEnabled);  lblThruInputChannel.setVisible(showLtcIn && outputThruEnabled);
-    sldThruInputGain.setVisible(showLtcIn && outputThruEnabled);     lblThruInputGain.setVisible(showLtcIn && outputThruEnabled);
-    mtrThruInput.setVisible(showLtcIn && outputThruEnabled);
+
+    bool showThruInput = showLtcIn && eng.isPrimary() && eng.isOutputThruEnabled();
+    cmbThruInputChannel.setVisible(showThruInput);  lblThruInputChannel.setVisible(showThruInput);
+    sldThruInputGain.setVisible(showThruInput);     lblThruInputGain.setVisible(showThruInput);
+    mtrThruInput.setVisible(showThruInput);
     lblInputStatus.setVisible(true);
 
-    // Output sections: visible = enabled, config visible = enabled && expanded
-    bool showMtcConfig    = outputMtcEnabled    && mtcOutExpanded;
-    bool showArtnetConfig = outputArtnetEnabled && artnetOutExpanded;
-    bool showLtcConfig    = outputLtcEnabled    && ltcOutExpanded;
-    bool showThruConfig   = outputThruEnabled   && thruOutExpanded;
+    // Output sections
+    bool showMtcConfig    = eng.isOutputMtcEnabled()    && mtcOutExpanded;
+    bool showArtnetConfig = eng.isOutputArtnetEnabled() && artnetOutExpanded;
+    bool showLtcConfig    = eng.isOutputLtcEnabled()    && ltcOutExpanded;
+    bool showThruConfig   = eng.isPrimary() && eng.isOutputThruEnabled() && thruOutExpanded;
 
-    // Collapse buttons visible when output is enabled
-    btnCollapseMtcOut.setVisible(outputMtcEnabled);
-    btnCollapseArtnetOut.setVisible(outputArtnetEnabled);
-    btnCollapseLtcOut.setVisible(outputLtcEnabled);
-    btnCollapseThruOut.setVisible(outputThruEnabled);
+    btnCollapseMtcOut.setVisible(eng.isOutputMtcEnabled());
+    btnCollapseArtnetOut.setVisible(eng.isOutputArtnetEnabled());
+    btnCollapseLtcOut.setVisible(eng.isOutputLtcEnabled());
+    btnCollapseThruOut.setVisible(eng.isPrimary() && eng.isOutputThruEnabled());
     updateCollapseButtonText(btnCollapseMtcOut, mtcOutExpanded);
     updateCollapseButtonText(btnCollapseArtnetOut, artnetOutExpanded);
     updateCollapseButtonText(btnCollapseLtcOut, ltcOutExpanded);
@@ -1465,11 +1794,11 @@ void MainComponent::updateDeviceSelectorVisibility()
 
     cmbMidiOutputDevice.setVisible(showMtcConfig);       lblMidiOutputDevice.setVisible(showMtcConfig);
     sldMtcOffset.setVisible(showMtcConfig);              lblMtcOffset.setVisible(showMtcConfig);
-    lblOutputMtcStatus.setVisible(outputMtcEnabled);
+    lblOutputMtcStatus.setVisible(eng.isOutputMtcEnabled());
 
     cmbArtnetOutputInterface.setVisible(showArtnetConfig); lblArtnetOutputInterface.setVisible(showArtnetConfig);
     sldArtnetOffset.setVisible(showArtnetConfig);          lblArtnetOffset.setVisible(showArtnetConfig);
-    lblOutputArtnetStatus.setVisible(outputArtnetEnabled);
+    lblOutputArtnetStatus.setVisible(eng.isOutputArtnetEnabled());
 
     cmbAudioOutputTypeFilter.setVisible(showAudioOut && (showLtcConfig || showThruConfig));
     lblAudioOutputTypeFilter.setVisible(showAudioOut && (showLtcConfig || showThruConfig));
@@ -1479,15 +1808,18 @@ void MainComponent::updateDeviceSelectorVisibility()
     sldLtcOutputGain.setVisible(showLtcConfig);      lblLtcOutputGain.setVisible(showLtcConfig);
     mtrLtcOutput.setVisible(showLtcConfig);
     sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
-    lblOutputLtcStatus.setVisible(outputLtcEnabled);
+    lblOutputLtcStatus.setVisible(eng.isOutputLtcEnabled());
 
+    // AudioThru controls: only visible for primary engine
+    bool showThruSection = eng.isPrimary();
+    btnThruOut.setVisible(showThruSection);
     cmbThruOutputDevice.setVisible(showThruConfig);  lblThruOutputDevice.setVisible(showThruConfig);
     cmbThruOutputChannel.setVisible(showThruConfig); lblThruOutputChannel.setVisible(showThruConfig);
     sldThruOutputGain.setVisible(showThruConfig);    lblThruOutputGain.setVisible(showThruConfig);
     mtrThruOutput.setVisible(showThruConfig);
-    lblOutputThruStatus.setVisible(outputThruEnabled);
+    lblOutputThruStatus.setVisible(eng.isPrimary() && eng.isOutputThruEnabled());
 
-    bool anyDevice = (activeInput != InputSource::SystemTime) || outputMtcEnabled || outputArtnetEnabled || outputLtcEnabled || outputThruEnabled;
+    bool anyDevice = (input != InputSource::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
     btnRefreshDevices.setVisible(anyDevice);
 
     resized();
@@ -1495,46 +1827,43 @@ void MainComponent::updateDeviceSelectorVisibility()
 
 void MainComponent::updateStatusLabels()
 {
-    lblInputStatus.setText(inputStatusText, juce::dontSendNotification);
+    auto& eng = currentEngine();
+
+    lblInputStatus.setText(eng.getInputStatusText(), juce::dontSendNotification);
     lblInputStatus.setColour(juce::Label::textColourId,
-                             sourceActive ? getInputColour(activeInput) : textDim);
+                             eng.isSourceActive() ? getInputColour(eng.getActiveInput()) : textDim);
 
-    if (outputMtcEnabled && mtcOutput.getIsRunning())
-        lblOutputMtcStatus.setText(mtcOutput.isPaused() ? "PAUSED" : mtcOutStatusText,
-                                   juce::dontSendNotification);
+    if (eng.isOutputMtcEnabled() && eng.getMtcOutput().getIsRunning())
+        lblOutputMtcStatus.setText(eng.getMtcOutput().isPaused() ? "PAUSED" : eng.getMtcOutStatusText(), juce::dontSendNotification);
     else
-        lblOutputMtcStatus.setText(mtcOutStatusText, juce::dontSendNotification);
+        lblOutputMtcStatus.setText(eng.getMtcOutStatusText(), juce::dontSendNotification);
 
-    if (outputArtnetEnabled && artnetOutput.getIsRunning())
-        lblOutputArtnetStatus.setText(artnetOutput.isPaused() ? "PAUSED" : artnetOutStatusText,
-                                      juce::dontSendNotification);
+    if (eng.isOutputArtnetEnabled() && eng.getArtnetOutput().getIsRunning())
+        lblOutputArtnetStatus.setText(eng.getArtnetOutput().isPaused() ? "PAUSED" : eng.getArtnetOutStatusText(), juce::dontSendNotification);
     else
-        lblOutputArtnetStatus.setText(artnetOutStatusText, juce::dontSendNotification);
+        lblOutputArtnetStatus.setText(eng.getArtnetOutStatusText(), juce::dontSendNotification);
 
-    if (outputLtcEnabled)
+    if (eng.isOutputLtcEnabled())
     {
-        if (ltcOutput.getIsRunning())
-            lblOutputLtcStatus.setText(ltcOutput.isPaused() ? "PAUSED" : ltcOutStatusText,
-                                       juce::dontSendNotification);
+        if (eng.getLtcOutput().getIsRunning())
+            lblOutputLtcStatus.setText(eng.getLtcOutput().isPaused() ? "PAUSED" : eng.getLtcOutStatusText(), juce::dontSendNotification);
         else
-            lblOutputLtcStatus.setText(ltcOutStatusText, juce::dontSendNotification);
+            lblOutputLtcStatus.setText(eng.getLtcOutStatusText(), juce::dontSendNotification);
     }
 
-    if (outputThruEnabled)
+    if (eng.isPrimary() && eng.isOutputThruEnabled())
     {
-        juce::String thruStatus = thruOutStatusText;
-        // Show xrun counters when passthrough is active and has issues
-        if (audioThru.getIsRunning() && ltcInput.getIsRunning())
+        juce::String thruStatus = eng.getThruOutStatusText();
+        if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning() && eng.getLtcInput().getIsRunning())
         {
-            uint32_t under = ltcInput.getPassthruUnderruns();
-            uint32_t over  = ltcInput.getPassthruOverruns();
+            uint32_t under = eng.getLtcInput().getPassthruUnderruns();
+            uint32_t over  = eng.getLtcInput().getPassthruOverruns();
             if (under > 0 || over > 0)
                 thruStatus += " [XRUNS: " + juce::String(under + over) + "]";
 
-            // Show estimated round-trip latency when buffer sizes differ enough to notice
-            double inBuf  = (double)ltcInput.getActualBufferSize();
-            double outBuf = (double)audioThru.getActualBufferSize();
-            double sr     = ltcInput.getActualSampleRate();
+            double inBuf  = (double)eng.getLtcInput().getActualBufferSize();
+            double outBuf = (double)eng.getAudioThru()->getActualBufferSize();
+            double sr     = eng.getLtcInput().getActualSampleRate();
             if (sr > 0.0)
             {
                 double latencyMs = (inBuf + outBuf) / sr * 1000.0;
@@ -1547,10 +1876,108 @@ void MainComponent::updateStatusLabels()
 }
 
 //==============================================================================
+// MINI STRIP — compact timecode monitors for non-selected engines
+//==============================================================================
+int MainComponent::getMiniStripHeight() const
+{
+    if (engines.size() <= 1) return 0;
+    return (int)(engines.size() - 1) * kMiniStripRowH + 8;
+}
+
+void MainComponent::paintMiniStrip(juce::Graphics& g)
+{
+    if (engines.size() <= 1) return;
+
+    int rowY = miniStripArea.getY() + 4;
+    int centerX = miniStripArea.getCentreX();
+    int counterW = juce::jmin(320, miniStripArea.getWidth() - 20);
+
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        if (i == selectedEngine) continue;
+
+        auto& eng = *engines[(size_t)i];
+        auto src = eng.getActiveInput();
+        auto tc = eng.getCurrentTimecode();
+        bool active = eng.isSourceActive();
+        juce::Colour srcColour = getInputColour(src);
+
+        int x = centerX - counterW / 2;
+        auto rowRect = juce::Rectangle<int>(x, rowY, counterW, kMiniStripRowH - 4);
+
+        // Background
+        g.setColour(juce::Colour(0xFF0D0E12).withAlpha(0.8f));
+        g.fillRoundedRectangle(rowRect.toFloat(), 4.0f);
+
+        // Border (subtle, source-colored when active)
+        g.setColour(active ? srcColour.withAlpha(0.3f) : borderCol);
+        g.drawRoundedRectangle(rowRect.toFloat(), 4.0f, 1.0f);
+
+        int innerX = rowRect.getX() + 8;
+        int innerY = rowRect.getY();
+        int innerH = rowRect.getHeight();
+
+        // Status dot
+        juce::Colour dotCol = active ? srcColour : textDim;
+        g.setColour(dotCol);
+        g.fillEllipse((float)innerX, (float)(innerY + innerH / 2 - 3), 6.0f, 6.0f);
+        innerX += 12;
+
+        // Engine name
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::bold)));
+        g.setColour(active ? textBright : textMid);
+        g.drawText(eng.getName(), innerX, innerY, 80, innerH, juce::Justification::centredLeft);
+        innerX += 82;
+
+        // Timecode (big monospace) — use '.' before frames to match main display
+        juce::String tcStr = juce::String(tc.hours).paddedLeft('0', 2) + ":"
+                           + juce::String(tc.minutes).paddedLeft('0', 2) + ":"
+                           + juce::String(tc.seconds).paddedLeft('0', 2) + "."
+                           + juce::String(tc.frames).paddedLeft('0', 2);
+
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 13.0f, juce::Font::bold)));
+        g.setColour(active ? juce::Colour(0xFF00E676) : textDim);
+        g.drawText(tcStr, innerX, innerY, 120, innerH, juce::Justification::centredLeft);
+        innerX += 122;
+
+        // Source type label
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 8.0f, juce::Font::plain)));
+        g.setColour(active ? srcColour.withAlpha(0.7f) : textDim.withAlpha(0.5f));
+        g.drawText(TimecodeEngine::getInputName(src), innerX, innerY, 50, innerH, juce::Justification::centredLeft);
+
+        rowY += kMiniStripRowH;
+    }
+}
+
+void MainComponent::mouseDown(const juce::MouseEvent& e)
+{
+    if (engines.size() <= 1) return;
+    if (!miniStripArea.contains(e.getPosition())) return;
+
+    int rowY = miniStripArea.getY() + 4;
+
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        if (i == selectedEngine) continue;
+
+        auto rowRect = juce::Rectangle<int>(miniStripArea.getX(), rowY,
+                                             miniStripArea.getWidth(), kMiniStripRowH);
+        if (rowRect.contains(e.getPosition()))
+        {
+            selectEngine(i);
+            return;
+        }
+        rowY += kMiniStripRowH;
+    }
+}
+
+//==============================================================================
 // PAINT
 //==============================================================================
 void MainComponent::paint(juce::Graphics& g)
 {
+    if (engines.empty()) return;  // guard: same as resized()
+
     g.fillAll(bgDark);
     auto bounds = getLocalBounds();
     int panelWidth = 240;
@@ -1560,13 +1987,13 @@ void MainComponent::paint(juce::Graphics& g)
     g.setColour(bgPanel); g.fillRect(leftPanel);
     g.setColour(borderCol); g.drawLine((float)leftPanel.getRight(), 0.0f, (float)leftPanel.getRight(), (float)getHeight(), 1.0f);
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::bold)));
-    g.drawText(">> SOURCE INPUT", leftPanel.withHeight(40).reduced(16, 0), juce::Justification::centredLeft);
+    g.drawText(">> SOURCE INPUT", leftPanel.withHeight(40).translated(0, 32).reduced(16, 0), juce::Justification::centredLeft);
 
     // Right panel background
     auto rightPanel = bounds.removeFromRight(panelWidth);
     g.setColour(bgPanel); g.fillRect(rightPanel);
     g.setColour(borderCol); g.drawLine((float)rightPanel.getX(), 0.0f, (float)rightPanel.getX(), (float)getHeight(), 1.0f);
-    g.setColour(textDim); g.drawText(">> OUTPUTS", rightPanel.withHeight(40).reduced(16, 0), juce::Justification::centredLeft);
+    g.setColour(textDim); g.drawText(">> OUTPUTS", rightPanel.withHeight(40).translated(0, 32).reduced(16, 0), juce::Justification::centredLeft);
 
     // Top bar
     g.setColour(bgDarker); g.fillRect(0, 0, getWidth(), 32);
@@ -1574,47 +2001,93 @@ void MainComponent::paint(juce::Graphics& g)
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
     g.drawText("SUPER TIMECODE CONVERTER", juce::Rectangle<int>(0, 0, getWidth(), 32), juce::Justification::centred);
 
+    // Tab bar (below top bar)
+    g.setColour(bgDarker); g.fillRect(0, 32, getWidth(), kTabBarHeight);
+    g.setColour(borderCol); g.drawLine(0.0f, (float)(32 + kTabBarHeight), (float)getWidth(), (float)(32 + kTabBarHeight), 1.0f);
+
     // Bottom bar
     int bbH = 24;
     g.setColour(bgDarker); g.fillRect(0, getHeight() - bbH, getWidth(), bbH);
     g.setColour(borderCol); g.drawLine(0.0f, (float)(getHeight() - bbH), (float)getWidth(), (float)(getHeight() - bbH), 1.0f);
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)));
-    g.drawText(juce::String("STC v1.3  |  Fiverecords ") + juce::String::charToString(0x00A9) + " 2026",
+    juce::String verStr = "STC v" + juce::JUCEApplication::getInstance()->getApplicationVersion()
+                        + "  |  Fiverecords " + juce::String::charToString(0x00A9) + " 2026";
+    g.drawText(verStr,
                juce::Rectangle<int>(10, getHeight() - bbH, 280, bbH), juce::Justification::centredLeft);
 
+    auto& eng = currentEngine();
     juce::String statusText; juce::Colour statusColour;
-    if (sourceActive) { statusText = getInputName(activeInput) + " ACTIVE"; statusColour = getInputColour(activeInput); }
-    else if (isInputStarted()) { statusText = getInputName(activeInput) + " PAUSED"; statusColour = juce::Colour(0xFFFFAB00); }
-    else { statusText = getInputName(activeInput) + " STOPPED"; statusColour = textDim; }
-    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(getWidth() - 180, getHeight() - bbH, 170, bbH), juce::Justification::centredRight);
+    if (eng.isSourceActive()) { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " ACTIVE"; statusColour = getInputColour(eng.getActiveInput()); }
+    else if (eng.isInputStarted()) { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " PAUSED"; statusColour = juce::Colour(0xFFFFAB00); }
+    else { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " STOPPED"; statusColour = textDim; }
 
-    // Frame rate labels — offsets mirror the geometry in resized() exactly:
-    //   fpsY        = getHeight() - bbH - 156   (input buttons top)
-    //   toggleY     = fpsY + 38                  (toggle top)
-    //   outLabelY   = toggleY + 24 + 6           (output fps label top)
+    // Show engine name in status if multiple engines
+    if (engines.size() > 1)
+        statusText = "[" + eng.getName() + "] " + statusText;
+
+    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(getWidth() - 280, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
+
+    // Frame rate labels
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::bold)));
     auto centerArea = getLocalBounds().reduced(panelWidth, 0);
-    int fpsLabelBase = getHeight() - bbH - (fpsConvertEnabled ? 172 : 90);
-    g.drawText(fpsConvertEnabled ? "INPUT FPS" : "FRAME RATE", centerArea.getX(), fpsLabelBase, centerArea.getWidth(), 14, juce::Justification::centred);
+    int fpsLabelBase = getHeight() - bbH - (eng.isFpsConvertEnabled() ? 172 : 90);
+    g.drawText(eng.isFpsConvertEnabled() ? "INPUT FPS" : "FRAME RATE", centerArea.getX(), fpsLabelBase, centerArea.getWidth(), 14, juce::Justification::centred);
 
-    if (fpsConvertEnabled)
+    if (eng.isFpsConvertEnabled())
     {
         g.setColour(accentCyan);
         g.drawText("OUTPUT FPS", centerArea.getX(), fpsLabelBase + 84, centerArea.getWidth(), 14, juce::Justification::centred);
     }
+
+    // Mini timecode strip for non-selected engines
+    paintMiniStrip(g);
 }
 
 //==============================================================================
-// RESIZED -- Interleaved layout
+// RESIZED
 //==============================================================================
 void MainComponent::resized()
 {
+    if (engines.empty()) return;  // guard: resized() can fire before engines are created
+
     auto bounds = getLocalBounds();
     int panelWidth = 240, topBar = 32, bottomBar = 24;
+    int tabBar = kTabBarHeight;
+
+    // ===== TAB BAR (full window width — the bar sits above the side panels) =====
+    {
+        int numTabs = (int)tabButtons.size();
+        int addBtnW = 30;
+        int tabGap = 4;
+        int pad = 16;
+
+        int availableW = getWidth() - pad * 2;
+        int addBtnTotal = tabGap + addBtnW;
+
+        int maxTabW = 120;
+        int tabW = maxTabW;
+        if (numTabs > 0)
+        {
+            int spaceForTabs = availableW - addBtnTotal - juce::jmax(0, numTabs - 1) * tabGap;
+            tabW = juce::jmin(maxTabW, spaceForTabs / numTabs);
+            tabW = juce::jmax(50, tabW);
+        }
+
+        int totalW = numTabs * tabW + juce::jmax(0, numTabs - 1) * tabGap + addBtnTotal;
+        int tabX = (getWidth() - totalW) / 2;
+        tabX = juce::jmax(pad, tabX);
+
+        for (int i = 0; i < numTabs; i++)
+        {
+            tabButtons[(size_t)i]->setBounds(tabX, topBar + 2, tabW, tabBar - 4);
+            tabX += tabW + tabGap;
+        }
+        btnAddEngine.setBounds(tabX, topBar + 2, addBtnW, tabBar - 4);
+    }
 
     // ===== LEFT PANEL =====
     auto leftPanel = bounds.removeFromLeft(panelWidth);
-    leftPanel.removeFromTop(topBar + 40);
+    leftPanel.removeFromTop(topBar + tabBar + 40);
     leftPanel.removeFromBottom(bottomBar);
     leftPanel = leftPanel.reduced(12, 0);
 
@@ -1636,19 +2109,14 @@ void MainComponent::resized()
     };
 
     // Input buttons
+    auto& eng = currentEngine();
     struct IBI { juce::TextButton* btn; InputSource src; };
     IBI iBtns[] = { {&btnMtcIn,InputSource::MTC}, {&btnArtnetIn,InputSource::ArtNet}, {&btnSysTime,InputSource::SystemTime}, {&btnLtcIn,InputSource::LTC} };
     for (auto& ib : iBtns) { ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
 
-    // Collapse button for input config
     if (btnCollapseInput.isVisible())
-    {
-        leftPanel.removeFromTop(2);
-        btnCollapseInput.setBounds(leftPanel.removeFromTop(18));
-        leftPanel.removeFromTop(4);
-    }
+    { leftPanel.removeFromTop(2); btnCollapseInput.setBounds(leftPanel.removeFromTop(18)); leftPanel.removeFromTop(4); }
 
-    // Input config (if expanded)
     if (cmbMidiInputDevice.isVisible()) layCombo(lblMidiInputDevice, cmbMidiInputDevice, leftPanel);
     if (cmbArtnetInputInterface.isVisible()) layCombo(lblArtnetInputInterface, cmbArtnetInputInterface, leftPanel);
     if (cmbAudioInputDevice.isVisible())
@@ -1656,18 +2124,12 @@ void MainComponent::resized()
         layCombo(lblAudioInputTypeFilter, cmbAudioInputTypeFilter, leftPanel);
         if (cmbSampleRate.isVisible())
         {
-            lblSampleRate.setBounds(leftPanel.removeFromTop(14));
-            leftPanel.removeFromTop(2);
+            lblSampleRate.setBounds(leftPanel.removeFromTop(14)); leftPanel.removeFromTop(2);
             auto srRow = leftPanel.removeFromTop(24);
             cmbSampleRate.setBounds(srRow.removeFromLeft(srRow.getWidth() / 2 - 2));
             srRow.removeFromLeft(4);
             cmbBufferSize.setBounds(srRow);
             leftPanel.removeFromTop(3);
-            // lblBufferSize has no visible area: the buffer-size combo shares
-            // the same row as the sample-rate combo (both labelled via
-            // lblSampleRate as "SAMPLE RATE / BUFFER:"). The label widget is
-            // kept to satisfy the addAndMakeVisible bookkeeping but is
-            // intentionally rendered at zero size.
             lblBufferSize.setBounds(0, 0, 0, 0);
         }
         layCombo(lblAudioInputDevice, cmbAudioInputDevice, leftPanel);
@@ -1684,60 +2146,49 @@ void MainComponent::resized()
 
     lblInputStatus.setBounds(leftPanel.removeFromTop(14));
 
-    // ===== RIGHT PANEL - scrollable via Viewport =====
+    // ===== RIGHT PANEL =====
     auto rightPanelBounds = bounds.removeFromRight(panelWidth);
-    rightPanelBounds.removeFromTop(topBar + 40);
+    rightPanelBounds.removeFromTop(topBar + tabBar + 40);
     rightPanelBounds.removeFromBottom(bottomBar);
     rightViewport.setBounds(rightPanelBounds);
 
-    // Layout controls inside rightContent's local coordinate space
     int contentW = rightPanelBounds.getWidth();
     int scrollW = rightViewport.getScrollBarThickness();
     int usableW = contentW - scrollW;
-    auto rp = juce::Rectangle<int>(12, 0, usableW - 24, 10000);  // tall scratch area
+    auto rp = juce::Rectangle<int>(12, 0, usableW - 24, 10000);
+    int colBtnW = 26;
 
-    int colBtnW = 26;  // collapse button width
-
-    // --- MTC OUT section ---
+    // MTC OUT
     {
         auto row = rp.removeFromTop(btnH);
-        if (btnCollapseMtcOut.isVisible())
-        { btnCollapseMtcOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
-        btnMtcOut.setBounds(row);
-        rp.removeFromTop(2);
-
+        if (btnCollapseMtcOut.isVisible()) { btnCollapseMtcOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
+        btnMtcOut.setBounds(row); rp.removeFromTop(2);
         if (cmbMidiOutputDevice.isVisible()) layCombo(lblMidiOutputDevice, cmbMidiOutputDevice, rp);
         if (sldMtcOffset.isVisible()) laySlider(lblMtcOffset, sldMtcOffset, rp);
         if (lblOutputMtcStatus.isVisible()) layStatus(lblOutputMtcStatus, rp);
         rp.removeFromTop(2);
     }
 
-    // --- ART-NET OUT section ---
+    // ART-NET OUT
     {
         auto row = rp.removeFromTop(btnH);
-        if (btnCollapseArtnetOut.isVisible())
-        { btnCollapseArtnetOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
-        btnArtnetOut.setBounds(row);
-        rp.removeFromTop(2);
-
+        if (btnCollapseArtnetOut.isVisible()) { btnCollapseArtnetOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
+        btnArtnetOut.setBounds(row); rp.removeFromTop(2);
         if (cmbArtnetOutputInterface.isVisible()) layCombo(lblArtnetOutputInterface, cmbArtnetOutputInterface, rp);
         if (sldArtnetOffset.isVisible()) laySlider(lblArtnetOffset, sldArtnetOffset, rp);
         if (lblOutputArtnetStatus.isVisible()) layStatus(lblOutputArtnetStatus, rp);
         rp.removeFromTop(2);
     }
 
-    // --- Shared audio driver filter (between ART-NET and LTC sections) ---
+    // Shared audio driver filter
     if (cmbAudioOutputTypeFilter.isVisible())
         layCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, rp);
 
-    // --- LTC OUT section ---
+    // LTC OUT
     {
         auto row = rp.removeFromTop(btnH);
-        if (btnCollapseLtcOut.isVisible())
-        { btnCollapseLtcOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
-        btnLtcOut.setBounds(row);
-        rp.removeFromTop(2);
-
+        if (btnCollapseLtcOut.isVisible()) { btnCollapseLtcOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
+        btnLtcOut.setBounds(row); rp.removeFromTop(2);
         if (cmbAudioOutputDevice.isVisible())
         {
             layCombo(lblAudioOutputDevice, cmbAudioOutputDevice, rp);
@@ -1750,14 +2201,12 @@ void MainComponent::resized()
         rp.removeFromTop(2);
     }
 
-    // --- AUDIO THRU section ---
+    // AUDIO THRU (primary engine only)
+    if (btnThruOut.isVisible())
     {
         auto row = rp.removeFromTop(btnH);
-        if (btnCollapseThruOut.isVisible())
-        { btnCollapseThruOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
-        btnThruOut.setBounds(row);
-        rp.removeFromTop(2);
-
+        if (btnCollapseThruOut.isVisible()) { btnCollapseThruOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
+        btnThruOut.setBounds(row); rp.removeFromTop(2);
         if (cmbThruOutputDevice.isVisible())
         {
             layCombo(lblThruOutputDevice, cmbThruOutputDevice, rp);
@@ -1769,42 +2218,48 @@ void MainComponent::resized()
         rp.removeFromTop(2);
     }
 
-    // Refresh button pinned after content
     if (btnRefreshDevices.isVisible())
-    {
-        rp.removeFromTop(4);
-        btnRefreshDevices.setBounds(rp.removeFromTop(26));
-    }
+    { rp.removeFromTop(4); btnRefreshDevices.setBounds(rp.removeFromTop(26)); }
 
-    // Set rightContent height to fit all controls (or at least viewport height)
     int usedHeight = rp.getY() + 8;
     rightContent.setSize(contentW, juce::jmax(rightPanelBounds.getHeight(), usedHeight));
 
-    // ===== CENTER -- Timecode + FPS =====
+    // ===== CENTER =====
     auto centerArea = bounds;
-    centerArea.removeFromTop(topBar);
+    centerArea.removeFromTop(topBar + tabBar);
     centerArea.removeFromBottom(bottomBar);
 
-    auto fpsArea = centerArea.removeFromBottom(fpsConvertEnabled ? 186 : 100);
+    auto fpsArea = centerArea.removeFromBottom(eng.isFpsConvertEnabled() ? 186 : 100);
+
+    // Mini strip for non-selected engines (between display and FPS)
+    int miniH = getMiniStripHeight();
+    if (miniH > 0)
+    {
+        miniStripArea = juce::Rectangle<int>(centerArea.getX(), centerArea.getBottom() - miniH,
+                                              centerArea.getWidth(), miniH);
+        centerArea.removeFromBottom(miniH);
+    }
+    else
+    {
+        miniStripArea = {};
+    }
     fpsArea.removeFromTop(20);
     int fpsBW = 58, fpsGap = 6, totalW = fpsBW * 5 + fpsGap * 4;
     int fpsX = fpsArea.getCentreX() - totalW / 2, fpsY = fpsArea.getY() + 10;
     juce::TextButton* fB[] = {&btnFps2398,&btnFps24,&btnFps25,&btnFps2997,&btnFps30};
     FrameRate fV[] = {FrameRate::FPS_2398,FrameRate::FPS_24,FrameRate::FPS_25,FrameRate::FPS_2997,FrameRate::FPS_30};
-    for (int i = 0; i < 5; i++) { fB[i]->setBounds(fpsX + i * (fpsBW + fpsGap), fpsY, fpsBW, 32); styleFpsButton(*fB[i], currentFps == fV[i]); }
+    for (int i = 0; i < 5; i++) { fB[i]->setBounds(fpsX + i * (fpsBW + fpsGap), fpsY, fpsBW, 32); styleFpsButton(*fB[i], eng.getCurrentFps() == fV[i]); }
 
-    // FPS Convert toggle — 6px gap below input buttons (buttons end at fpsY+32, toggle at fpsY+42)
     int toggleW = 140, toggleH = 24;
-    int toggleY = fpsY + 32 + 6;                          // fpsY + 38
+    int toggleY = fpsY + 32 + 6;
     btnFpsConvert.setBounds(fpsArea.getCentreX() - toggleW / 2, toggleY, toggleW, toggleH);
 
-    // Output FPS buttons — label 6px below toggle, buttons 4px below label
     juce::TextButton* oB[] = {&btnOutFps2398,&btnOutFps24,&btnOutFps25,&btnOutFps2997,&btnOutFps30};
-    FrameRate effectiveOut = getEffectiveOutputFps();
-    if (fpsConvertEnabled)
+    FrameRate effectiveOut = eng.getEffectiveOutputFps();
+    if (eng.isFpsConvertEnabled())
     {
-        int outLabelY  = toggleY + toggleH + 6;           // 6px gap after toggle
-        int outFpsY    = outLabelY + 14 + 6;              // 14px label + 6px gap
+        int outLabelY = toggleY + toggleH + 6;
+        int outFpsY   = outLabelY + 14 + 6;
         for (int i = 0; i < 5; i++) { oB[i]->setBounds(fpsX + i * (fpsBW + fpsGap), outFpsY, fpsBW, 32); styleFpsButton(*oB[i], effectiveOut == fV[i]); oB[i]->setVisible(true); }
     }
     else
@@ -1813,9 +2268,12 @@ void MainComponent::resized()
     }
 
     timecodeDisplay.setBounds(centerArea);
+    btnGitHub.setBounds(getWidth() / 2 - 160, getHeight() - bottomBar, 320, bottomBar);
+    btnCheckUpdates.setBounds(getWidth() - 170, 2, 150, 28);
 
-    // GitHub link in bottom bar
-    btnGitHub.setBounds(290, getHeight() - bottomBar, 320, bottomBar);
+    // Update notification — in top bar, replacing check button
+    if (btnUpdateAvailable.isVisible())
+        btnUpdateAvailable.setBounds(getWidth() - 220, 2, 200, 28);
 }
 
 //==============================================================================
@@ -1823,235 +2281,158 @@ void MainComponent::resized()
 //==============================================================================
 void MainComponent::timerCallback()
 {
-    switch (activeInput)
-    {
-        case InputSource::SystemTime:
-            updateSystemTime();
-            sourceActive = true;
-            inputStatusText = "SYSTEM CLOCK";
-            break;
+    if (engines.empty()) return;  // guard
 
-        case InputSource::MTC:
-            if (mtcInput.getIsRunning())
-            {
-                currentTimecode = mtcInput.getCurrentTimecode();
-                bool rx = mtcInput.isReceiving();
-                if (rx)
-                {
-                    auto d = mtcInput.getDetectedFrameRate();
-                    if (d != currentFps) { setFrameRate(d); saveSettings(); }
-                    inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
-                }
-                else
-                    inputStatusText = "PAUSED - " + mtcInput.getCurrentDeviceName();
-                sourceActive = rx;
-            }
-            else { sourceActive = false; inputStatusText = "WAITING FOR DEVICE..."; }
-            break;
+    // Tick ALL engines (not just selected).
+    // NOTE: tick() feeds timecode values to the output protocol handlers.
+    // MTC and ArtNet outputs use their own HighResolutionTimers (1ms) for
+    // actual transmission timing, so the 60Hz UI timer only updates the
+    // target timecode — it does NOT limit output precision.  LTC output
+    // uses its own audio-callback-driven auto-increment, so it's similarly
+    // decoupled.  If UI stalls (resize, modal dialog), outputs continue
+    // transmitting the last-known timecode until the next tick() updates it.
+    for (auto& eng : engines)
+        eng->tick();
 
-        case InputSource::ArtNet:
-            if (artnetInput.getIsRunning())
-            {
-                currentTimecode = artnetInput.getCurrentTimecode();
-                bool rx = artnetInput.isReceiving();
-                if (rx)
-                {
-                    auto d = artnetInput.getDetectedFrameRate();
-                    if (d != currentFps) { setFrameRate(d); saveSettings(); }
-                    inputStatusText = "RX ON " + artnetInput.getBindInfo();
-                }
-                else
-                    inputStatusText = "PAUSED - " + artnetInput.getBindInfo();
-                sourceActive = rx;
-            }
-            else { sourceActive = false; inputStatusText = "NOT LISTENING"; }
-            break;
+    // Update UI for selected engine
+    auto& eng = currentEngine();
 
-        case InputSource::LTC:
-            if (ltcInput.getIsRunning())
-            {
-                currentTimecode = ltcInput.getCurrentTimecode();
-                bool rx = ltcInput.isReceiving();
-                if (rx)
-                {
-                    auto d = ltcInput.getDetectedFrameRate();
-                    // LTC cannot distinguish 23.976 from 24, nor 29.97 NDF from 30.
-                    // If the user has manually forced one of these ambiguous rates,
-                    // honour their choice and don't let auto-detection revert it.
-                    bool ambiguousOverride = userOverrodeLtcFps
-                        && ((currentFps == FrameRate::FPS_2398 && d == FrameRate::FPS_24)
-                         || (currentFps == FrameRate::FPS_2997 && d == FrameRate::FPS_30));
-                    if (d != currentFps && !ambiguousOverride)
-                    {
-                        // Switching to a genuinely different rate — clear the override
-                        // so we don't get stuck if the source actually changes.
-                        if (d != FrameRate::FPS_24 && d != FrameRate::FPS_30)
-                            userOverrodeLtcFps = false;
-                        setFrameRate(d); saveSettings();
-                    }
-                    inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
-                                    + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1);
-                }
-                else
-                    inputStatusText = "PAUSED - " + ltcInput.getCurrentDeviceName();
-                sourceActive = rx;
-            }
-            else { sourceActive = false; inputStatusText = "WAITING FOR DEVICE..."; }
-            break;
-    }
-
-    routeTimecodeToOutputs();
     updateStatusLabels();
 
-    timecodeDisplay.setTimecode(currentTimecode);
-    timecodeDisplay.setFrameRate(currentFps);
-    timecodeDisplay.setRunning(sourceActive);
-    timecodeDisplay.setSourceName(getInputName(activeInput));
-    timecodeDisplay.setFpsConvertEnabled(fpsConvertEnabled);
-    timecodeDisplay.setOutputTimecode(outputTimecode);
-    timecodeDisplay.setOutputFrameRate(getEffectiveOutputFps());
+    timecodeDisplay.setTimecode(eng.getCurrentTimecode());
+    timecodeDisplay.setFrameRate(eng.getCurrentFps());
+    timecodeDisplay.setRunning(eng.isSourceActive());
+    timecodeDisplay.setSourceName(TimecodeEngine::getInputName(eng.getActiveInput()));
+    timecodeDisplay.setFpsConvertEnabled(eng.isFpsConvertEnabled());
+    timecodeDisplay.setOutputTimecode(eng.getOutputTimecode());
+    timecodeDisplay.setOutputFrameRate(eng.getEffectiveOutputFps());
 
-    // Update level meters (with decay for smooth visual)
-    auto decayLevel = [](float current, float target, float decay = 0.85f) {
-        return target > current ? target : current * decay;
-    };
-    float ltcInLvl  = ltcInput.getIsRunning()  ? ltcInput.getLtcPeakLevel()  : 0.0f;
-    float thruInLvl = ltcInput.getIsRunning()  ? ltcInput.getThruPeakLevel() : 0.0f;
-    float ltcOutLvl = (ltcOutput.getIsRunning() && !ltcOutput.isPaused()) ? ltcOutput.getPeakLevel() : 0.0f;
-    float thruOutLvl = audioThru.getIsRunning() ? audioThru.getPeakLevel()   : 0.0f;
+    // Update VU meters for selected engine
+    mtrLtcInput.setLevel(eng.getSmoothedLtcInLevel());
+    mtrThruInput.setLevel(eng.getSmoothedThruInLevel());
+    mtrLtcOutput.setLevel(eng.getSmoothedLtcOutLevel());
+    mtrThruOutput.setLevel(eng.getSmoothedThruOutLevel());
 
-    sLtcIn  = decayLevel(sLtcIn,  ltcInLvl);
-    sThruIn = decayLevel(sThruIn, thruInLvl);
-    sLtcOut = decayLevel(sLtcOut, ltcOutLvl);
-    sThruOut = decayLevel(sThruOut, thruOutLvl);
+    // Auto-update FPS button states when the frame rate changes
+    // (e.g. from protocol auto-detection in MTC/ArtNet/LTC inputs)
+    {
+        FrameRate curFps = eng.getCurrentFps();
+        FrameRate curOutFps = eng.getEffectiveOutputFps();
+        if (curFps != lastDisplayedFps)
+        {
+            lastDisplayedFps = curFps;
+            updateFpsButtonStates();
+        }
+        if (curOutFps != lastDisplayedOutFps)
+        {
+            lastDisplayedOutFps = curOutFps;
+            updateOutputFpsButtonStates();
+        }
+    }
 
-    mtrLtcInput.setLevel(sLtcIn);
-    mtrThruInput.setLevel(sThruIn);
-    mtrLtcOutput.setLevel(sLtcOut);
-    mtrThruOutput.setLevel(sThruOut);
+    // Repaint mini strip so non-selected engine timecodes update live
+    if (engines.size() > 1 && !miniStripArea.isEmpty())
+        repaint(miniStripArea);
 
-    // Debounced settings save (single-shot: only runs once after last saveSettings() call)
+    // Debounced settings save
     if (settingsDirty)
     {
         if (--settingsSaveCountdown <= 0)
-            flushSettings();  // sets settingsDirty = false - no more writes until next change
+            flushSettings();
     }
 
-    // Only repaint the bottom status bar when state actually changes
-    // (timecodeDisplay repaints itself via setTimecode/setRunning/etc. when values change)
-    juce::String currentBottomStatus = getInputName(activeInput);
-    if (currentBottomStatus != lastBottomBarStatus || sourceActive != lastBottomBarActive)
+    // --- Update checker ---
+    if (updateCheckDelay > 0)
+    {
+        if (--updateCheckDelay == 0)
+        {
+            auto appVer = juce::JUCEApplication::getInstance()->getApplicationVersion();
+            updateChecker.checkAsync(appVer);
+        }
+    }
+    else if (!updateNotificationShown && updateChecker.hasResult())
+    {
+        updateNotificationShown = true;
+        if (updateChecker.isUpdateAvailable())
+        {
+            juce::String label = "Update available: v" + updateChecker.getLatestVersion();
+            btnUpdateAvailable.setButtonText(label);
+            btnUpdateAvailable.setURL(juce::URL(updateChecker.getReleaseUrl()));
+            btnUpdateAvailable.setVisible(true);
+            btnCheckUpdates.setVisible(false);
+            // Position directly in top bar
+            btnUpdateAvailable.setBounds(getWidth() - 220, 2, 200, 28);
+        }
+        else if (updateChecker.didCheckFail())
+        {
+            btnCheckUpdates.setButtonText("Check failed - retry?");
+            btnCheckUpdates.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFFF8A65));  // orange
+            btnCheckUpdates.setVisible(true);
+            // Reset text after ~4 seconds (240 ticks at 60Hz)
+            updateResetCountdown = 240;
+        }
+        else
+        {
+            btnCheckUpdates.setButtonText("Up to date " + juce::String::charToString(0x2713));
+            btnCheckUpdates.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF66BB6A));  // green
+            btnCheckUpdates.setVisible(true);
+            // Reset text after ~4 seconds
+            updateResetCountdown = 240;
+        }
+    }
+
+    // Reset "check for updates" button text after countdown
+    if (updateResetCountdown > 0)
+    {
+        if (--updateResetCountdown == 0)
+        {
+            btnCheckUpdates.setButtonText("Check for updates");
+            btnCheckUpdates.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF546E7A));
+        }
+    }
+
+    // Bottom bar repaint when state changes
+    juce::String currentBottomStatus = TimecodeEngine::getInputName(eng.getActiveInput());
+    if (currentBottomStatus != lastBottomBarStatus || eng.isSourceActive() != lastBottomBarActive)
     {
         lastBottomBarStatus = currentBottomStatus;
-        lastBottomBarActive = sourceActive;
+        lastBottomBarActive = eng.isSourceActive();
         repaint(0, getHeight() - 24, getWidth(), 24);
     }
 }
 
-void MainComponent::updateSystemTime()
-{
-    auto now = juce::Time::getCurrentTime();
-    // Milliseconds since midnight
-    double msSinceMidnight = (double)now.getHours() * 3600000.0
-                           + (double)now.getMinutes() * 60000.0
-                           + (double)now.getSeconds() * 1000.0
-                           + (double)now.getMilliseconds();
-    currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
-}
-
-void MainComponent::setInputSource(InputSource source)
-{
-    switch (activeInput)
-    {
-        case InputSource::MTC:    stopMtcInput();    break;
-        case InputSource::ArtNet: stopArtnetInput(); break;
-        case InputSource::LTC:    stopLtcInput();    break;
-        default: break;
-    }
-
-    // Changing source resets any manual fps override so the new source
-    // can auto-detect freely when LTC is selected again.
-    userOverrodeLtcFps = false;
-
-    activeInput = source;
-    sourceActive = false;
-
-    switch (source)
-    {
-        case InputSource::MTC:        startMtcInput();     break;
-        case InputSource::ArtNet:     startArtnetInput();  break;
-        case InputSource::SystemTime: sourceActive = true; break;
-        case InputSource::LTC:
-            if (!scannedAudioInputs.isEmpty()) startLtcInput();
-            break;
-    }
-
-    updateInputButtonStates();
-    updateDeviceSelectorVisibility();
-    repaint();
-}
-
-void MainComponent::setFrameRate(FrameRate fps)
-{
-    currentFps = fps;
-
-    // When conversion is off, outputs follow the input rate
-    FrameRate outRate = getEffectiveOutputFps();
-    mtcOutput.setFrameRate(outRate);
-    artnetOutput.setFrameRate(outRate);
-    ltcOutput.setFrameRate(outRate);
-
-    updateFpsButtonStates();
-    updateOutputFpsButtonStates();
-    repaint();
-}
-
-void MainComponent::setOutputFrameRate(FrameRate fps)
-{
-    outputFps = fps;
-
-    FrameRate outRate = getEffectiveOutputFps();
-    mtcOutput.setFrameRate(outRate);
-    artnetOutput.setFrameRate(outRate);
-    ltcOutput.setFrameRate(outRate);
-
-    updateOutputFpsButtonStates();
-    repaint();
-}
-
-FrameRate MainComponent::getEffectiveOutputFps() const
-{
-    return fpsConvertEnabled ? outputFps : currentFps;
-}
-
-void MainComponent::updateOutputFpsButtonStates()
-{
-    FrameRate v[] = {FrameRate::FPS_2398, FrameRate::FPS_24, FrameRate::FPS_25, FrameRate::FPS_2997, FrameRate::FPS_30};
-    juce::TextButton* b[] = {&btnOutFps2398, &btnOutFps24, &btnOutFps25, &btnOutFps2997, &btnOutFps30};
-    FrameRate effective = getEffectiveOutputFps();
-    for (int i = 0; i < 5; i++)
-    {
-        styleFpsButton(*b[i], effective == v[i]);
-        b[i]->setEnabled(fpsConvertEnabled);
-        b[i]->setAlpha(fpsConvertEnabled ? 1.0f : 0.4f);
-    }
-}
-
 //==============================================================================
-// BUTTON STATES
+// BUTTON STATE UPDATES
 //==============================================================================
 void MainComponent::updateInputButtonStates()
 {
+    auto& eng = currentEngine();
+    auto active = eng.getActiveInput();
     struct I { juce::TextButton* b; InputSource s; };
     I bs[] = { {&btnMtcIn,InputSource::MTC}, {&btnArtnetIn,InputSource::ArtNet}, {&btnSysTime,InputSource::SystemTime}, {&btnLtcIn,InputSource::LTC} };
-    for (auto& i : bs) styleInputButton(*i.b, activeInput == i.s, getInputColour(i.s));
+    for (auto& i : bs) styleInputButton(*i.b, active == i.s, getInputColour(i.s));
 }
 
 void MainComponent::updateFpsButtonStates()
 {
+    auto& eng = currentEngine();
     FrameRate v[] = {FrameRate::FPS_2398,FrameRate::FPS_24,FrameRate::FPS_25,FrameRate::FPS_2997,FrameRate::FPS_30};
     juce::TextButton* b[] = {&btnFps2398,&btnFps24,&btnFps25,&btnFps2997,&btnFps30};
-    for (int i = 0; i < 5; i++) styleFpsButton(*b[i], currentFps == v[i]);
+    for (int i = 0; i < 5; i++) styleFpsButton(*b[i], eng.getCurrentFps() == v[i]);
+}
+
+void MainComponent::updateOutputFpsButtonStates()
+{
+    auto& eng = currentEngine();
+    FrameRate v[] = {FrameRate::FPS_2398, FrameRate::FPS_24, FrameRate::FPS_25, FrameRate::FPS_2997, FrameRate::FPS_30};
+    juce::TextButton* b[] = {&btnOutFps2398, &btnOutFps24, &btnOutFps25, &btnOutFps2997, &btnOutFps30};
+    FrameRate effective = eng.getEffectiveOutputFps();
+    for (int i = 0; i < 5; i++)
+    {
+        styleFpsButton(*b[i], effective == v[i]);
+        b[i]->setEnabled(eng.isFpsConvertEnabled());
+        b[i]->setAlpha(eng.isFpsConvertEnabled() ? 1.0f : 0.4f);
+    }
 }
 
 juce::Colour MainComponent::getInputColour(InputSource s) const
@@ -2066,32 +2447,8 @@ juce::Colour MainComponent::getInputColour(InputSource s) const
     }
 }
 
-juce::String MainComponent::getInputName(InputSource s) const
-{
-    switch (s)
-    {
-        case InputSource::MTC:        return "MTC";
-        case InputSource::ArtNet:     return "ART-NET";
-        case InputSource::SystemTime: return "SYSTEM";
-        case InputSource::LTC:        return "LTC";
-        default:                      return "---";
-    }
-}
-
-bool MainComponent::isInputStarted() const
-{
-    switch (activeInput)
-    {
-        case InputSource::SystemTime: return true;
-        case InputSource::MTC:        return mtcInput.getIsRunning();
-        case InputSource::ArtNet:     return artnetInput.getIsRunning();
-        case InputSource::LTC:        return ltcInput.getIsRunning();
-        default:                      return false;
-    }
-}
-
 //==============================================================================
-// STYLING
+// STYLING (same as v1.3)
 //==============================================================================
 void MainComponent::styleInputButton(juce::TextButton& btn, bool active, juce::Colour colour)
 {
@@ -2103,7 +2460,7 @@ void MainComponent::styleInputButton(juce::TextButton& btn, bool active, juce::C
 
 void MainComponent::styleFpsButton(juce::TextButton& btn, bool active)
 {
-    auto c = getInputColour(activeInput);
+    auto c = getInputColour(currentEngine().getActiveInput());
     btn.setColour(juce::TextButton::buttonColourId, active ? c.withAlpha(0.15f) : juce::Colour(0xFF1A1D23));
     btn.setColour(juce::TextButton::textColourOffId, active ? juce::Colour(0xFFE0F7FA) : textMid);
 }
@@ -2168,6 +2525,6 @@ void MainComponent::styleCollapseButton(juce::TextButton& btn)
 
 void MainComponent::updateCollapseButtonText(juce::TextButton& btn, bool expanded)
 {
-    btn.setButtonText(expanded ? juce::String::charToString(0x25BE)   // down triangle
-                               : juce::String::charToString(0x25B8)); // right triangle
+    btn.setButtonText(expanded ? juce::String::charToString(0x25BE)
+                               : juce::String::charToString(0x25B8));
 }

@@ -6,22 +6,24 @@
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
 #include "TimecodeDisplay.h"
-#include "MtcInput.h"
-#include "MtcOutput.h"
-#include "ArtnetInput.h"
-#include "ArtnetOutput.h"
-#include "LtcInput.h"
-#include "LtcOutput.h"
-#include "AudioThru.h"
+#include "TimecodeEngine.h"
 #include "AppSettings.h"
 #include "CustomLookAndFeel.h"
 #include "LevelMeter.h"
+#include "NetworkUtils.h"
+#include "UpdateChecker.h"
+#include <vector>
+#include <memory>
 
 //==============================================================================
 class GainSlider : public juce::Slider
 {
 public:
-    GainSlider() { setDoubleClickReturnValue(true, 100.0); }
+    GainSlider()
+    {
+        setDoubleClickReturnValue(true, 100.0);
+        setTooltip("Right-click or double-click to reset");
+    }
     void mouseDown(const juce::MouseEvent& e) override
     {
         if (e.mods.isRightButtonDown() || e.mods.isPopupMenu())
@@ -31,16 +33,13 @@ public:
 };
 
 //==============================================================================
-// Content component for scrollable right panel
-//==============================================================================
 class PanelContent : public juce::Component
 {
 public:
     PanelContent() { setOpaque(false); }
     void setContentHeight(int h)
     {
-        if (getHeight() != h)
-            setSize(getWidth(), h);
+        if (getHeight() != h) setSize(getWidth(), h);
     }
 };
 
@@ -56,7 +55,6 @@ public:
     void resized() override;
     void timerCallback() override;
 
-    // Called by background scan thread when complete
     void onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
                              const juce::Array<AudioDeviceEntry>& outputs);
 
@@ -69,6 +67,9 @@ private:
     public:
         AudioScanThread(MainComponent* owner);
         void run() override;
+        // Created on message thread before startThread() — JUCE 8.x requires
+        // AudioDeviceManager construction on the message thread.
+        std::unique_ptr<juce::AudioDeviceManager> tempManager;
     private:
         juce::Component::SafePointer<MainComponent> safeOwner;
     };
@@ -76,11 +77,8 @@ private:
     std::unique_ptr<AudioScanThread> scanThread;
     bool settingsLoaded = false;
 
-    // Scanned audio device entries
     juce::Array<AudioDeviceEntry> scannedAudioInputs;
     juce::Array<AudioDeviceEntry> scannedAudioOutputs;
-
-    // Filtered index arrays
     juce::Array<int> filteredInputIndices;
     juce::Array<int> filteredOutputIndices;
 
@@ -101,76 +99,100 @@ private:
     juce::Colour accentGreen { 0xFF2E7D32 };
     juce::Colour accentPurple{ 0xFF6A1B9A };
     juce::Colour accentCyan  { 0xFF00838F };
+    juce::Colour accentBlue  { 0xFF1565C0 };
 
-    // --- State ---
-    enum class InputSource { MTC, ArtNet, SystemTime, LTC };
-    InputSource activeInput = InputSource::SystemTime;
-    FrameRate currentFps = FrameRate::FPS_30;
-    Timecode currentTimecode;
-    bool sourceActive = true;
+    //==============================================================================
+    // ENGINE MANAGEMENT
+    //==============================================================================
+    std::vector<std::unique_ptr<TimecodeEngine>> engines;
+    int selectedEngine = 0;
 
-    // When the user manually selects a frame rate while LTC is the active input,
-    // we suppress auto-detection for ambiguous pairs (24↔23.976, 30↔29.97)
-    // because LTC cannot carry that distinction in its bitstream.
-    bool userOverrodeLtcFps = false;
+    TimecodeEngine& currentEngine() { return *engines[(size_t)selectedEngine]; }
+    const TimecodeEngine& currentEngine() const { return *engines[(size_t)selectedEngine]; }
 
-    // FPS conversion
-    bool fpsConvertEnabled = false;
-    FrameRate outputFps = FrameRate::FPS_30;
-    Timecode outputTimecode;
+    void addEngine();
+    void removeEngine(int index);
+    void selectEngine(int index);
+    void renameEngine(int index);
 
-    bool outputMtcEnabled    = false;
-    bool outputArtnetEnabled = false;
-    bool outputLtcEnabled    = false;
-    bool outputThruEnabled   = false;
+    //==============================================================================
+    // TAB BAR
+    //==============================================================================
+    class TabButton : public juce::TextButton
+    {
+    public:
+        TabButton(const juce::String& name) : juce::TextButton(name) {}
+        std::function<void()> onRightClick;
+        void mouseDown(const juce::MouseEvent& e) override
+        {
+            if (e.mods.isRightButtonDown() || e.mods.isPopupMenu())
+            { if (onRightClick) onRightClick(); return; }
+            juce::TextButton::mouseDown(e);
+        }
+    };
 
-    int mtcOutputOffset      = 0;
-    int artnetOutputOffset   = 0;
-    int ltcOutputOffset      = 0;
+    std::vector<std::unique_ptr<TabButton>> tabButtons;
+    juce::TextButton btnAddEngine { "+" };
+    static constexpr int kTabBarHeight = 28;
+    static constexpr int kMiniStripRowH = 30;
 
-    // VU meter decay state
-    float sLtcIn = 0.0f, sThruIn = 0.0f, sLtcOut = 0.0f, sThruOut = 0.0f;
+    void rebuildTabButtons();
+    void updateTabAppearance();
+    void showTabContextMenu(int index);
+    int getMiniStripHeight() const;
+    juce::Rectangle<int> miniStripArea;  // cached from resized()
+    void paintMiniStrip(juce::Graphics& g);
+    void mouseDown(const juce::MouseEvent& e) override;
+
+    //==============================================================================
+    // SYNC UI <-> ENGINE
+    //==============================================================================
+    // Prevents onChange callbacks from firing during sync
+    bool syncing = false;
+
+    void syncUIFromEngine();      // Load engine state into UI controls
+    void syncEngineFromUI();      // Save UI state into engine settings
+
+    //==============================================================================
+    // UI COMPONENTS (single set, bound to selected engine)
+    //==============================================================================
+    TimecodeDisplay timecodeDisplay;
 
     // Bottom bar repaint tracking
     juce::String lastBottomBarStatus;
     bool lastBottomBarActive = false;
 
-    // --- Collapse state ---
+    // FPS auto-detect change tracking (for button state updates)
+    FrameRate lastDisplayedFps    = FrameRate::FPS_30;
+    FrameRate lastDisplayedOutFps = FrameRate::FPS_30;
+
+    // --- Collapse state (per-view, not per-engine) ---
     bool inputConfigExpanded  = true;
     bool mtcOutExpanded       = true;
     bool artnetOutExpanded    = true;
     bool ltcOutExpanded       = true;
     bool thruOutExpanded      = true;
 
-    // --- Protocol engines ---
-    MtcInput mtcInput;
-    MtcOutput mtcOutput;
-    ArtnetInput artnetInput;
-    ArtnetOutput artnetOutput;
-    LtcInput ltcInput;
-    LtcOutput ltcOutput;
-    AudioThru audioThru;
-
-    // --- Components ---
-    TimecodeDisplay timecodeDisplay;
-
+    // --- Input buttons ---
     juce::TextButton btnMtcIn    { "MTC" };
     juce::TextButton btnArtnetIn { "ART-NET" };
     juce::TextButton btnSysTime  { "SYSTEM" };
     juce::TextButton btnLtcIn    { "LTC" };
 
+    // --- Output toggles ---
     juce::ToggleButton btnMtcOut    { "MTC OUT" };
     juce::ToggleButton btnArtnetOut { "ART-NET OUT" };
     juce::ToggleButton btnLtcOut    { "LTC OUT" };
     juce::ToggleButton btnThruOut   { "AUDIO THRU" };
 
+    // --- FPS buttons ---
     juce::TextButton btnFps2398 { "23.976" };
     juce::TextButton btnFps24   { "24" };
     juce::TextButton btnFps25   { "25" };
     juce::TextButton btnFps2997 { "29.97" };
     juce::TextButton btnFps30   { "30" };
 
-    // FPS conversion controls
+    // --- FPS conversion ---
     juce::ToggleButton btnFpsConvert { "FPS CONVERT" };
     juce::TextButton btnOutFps2398 { "23.976" };
     juce::TextButton btnOutFps24   { "24" };
@@ -185,7 +207,7 @@ private:
     juce::TextButton btnCollapseLtcOut    { "" };
     juce::TextButton btnCollapseThruOut   { "" };
 
-    // Left panel
+    // --- Left panel (input config) ---
     juce::ComboBox cmbAudioInputTypeFilter;  juce::Label lblAudioInputTypeFilter;
     juce::ComboBox cmbSampleRate;            juce::Label lblSampleRate;
     juce::ComboBox cmbBufferSize;            juce::Label lblBufferSize;
@@ -200,11 +222,10 @@ private:
     LevelMeter mtrThruInput;
     juce::Label lblInputStatus;
 
-    // Right panel - scrollable
+    // --- Right panel (scrollable) ---
     juce::Viewport rightViewport;
     PanelContent rightContent;
 
-    // Right panel controls
     juce::ComboBox cmbAudioOutputTypeFilter; juce::Label lblAudioOutputTypeFilter;
     juce::ComboBox cmbMidiOutputDevice;      juce::Label lblMidiOutputDevice;
     juce::ComboBox cmbArtnetOutputInterface; juce::Label lblArtnetOutputInterface;
@@ -228,17 +249,22 @@ private:
     juce::HyperlinkButton btnGitHub { "github.com/fiverecords/SuperTimecodeConverter",
                                        juce::URL("https://github.com/fiverecords/SuperTimecodeConverter") };
 
-    juce::String inputStatusText = "SYSTEM CLOCK";
-    juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText;
+    // --- Update checker ---
+    UpdateChecker updateChecker;
+    juce::HyperlinkButton btnUpdateAvailable { "", juce::URL() };
+    juce::TextButton btnCheckUpdates { "Check for updates" };
+    int updateCheckDelay = 0;               // ticks to wait before checking
+    bool updateNotificationShown = false;    // true once UI is updated
+    int updateResetCountdown = 0;            // ticks to reset button text
 
     AppSettings settings;
     static constexpr int kStereoItemId = 10000;
-    static constexpr int kPlaceholderItemId = 10001;  // "Scanning..." / "No devices" placeholder
+    static constexpr int kPlaceholderItemId = 10001;
 
     // --- Save debounce ---
     bool settingsDirty = false;
     int settingsSaveCountdown = 0;
-    static constexpr int kSaveDelayTicks = 30;  // ~500ms at 60fps
+    static constexpr int kSaveDelayTicks = 30;
 
     // --- Methods ---
     void startAudioDeviceScan();
@@ -247,6 +273,7 @@ private:
     void populateTypeFilterCombos();
     void populateFilteredInputDeviceCombo();
     void populateFilteredOutputDeviceCombos();
+    juce::String getDeviceInUseMarker(const juce::String& devName, const juce::String& typeName, bool isInput);
     juce::StringArray getUniqueTypeNames(const juce::Array<AudioDeviceEntry>& entries) const;
     juce::String getInputTypeFilter() const;
     juce::String getOutputTypeFilter() const;
@@ -267,43 +294,34 @@ private:
     AudioDeviceEntry getSelectedAudioOutput() const;
     AudioDeviceEntry getSelectedThruOutput() const;
 
-    void updateInputButtonStates();
-    void updateFpsButtonStates();
-    void updateSystemTime();
-    void setInputSource(InputSource source);
-    void setFrameRate(FrameRate fps);
-    void setOutputFrameRate(FrameRate fps);
-    void updateOutputFpsButtonStates();
-    FrameRate getEffectiveOutputFps() const;
-    void routeTimecodeToOutputs();
+    // Engine-level start/stop (gathers params from UI, calls engine methods)
+    void startCurrentMtcInput();
+    void startCurrentArtnetInput();
+    void startCurrentLtcInput();
+    void startCurrentThruOutput();
+    void startCurrentMtcOutput();
+    void startCurrentArtnetOutput();
+    void startCurrentLtcOutput();
+    void updateCurrentOutputStates();
 
-    void startMtcInput();    void stopMtcInput();
-    void startArtnetInput(); void stopArtnetInput();
-    void startLtcInput();    void stopLtcInput();
-    void restartLtcWithCurrentSettings();
-    void startMtcOutput();   void stopMtcOutput();
-    void startArtnetOutput(); void stopArtnetOutput();
-    void startLtcOutput();   void stopLtcOutput();
-    void startThruOutput();  void stopThruOutput();
-    void updateOutputStates();
     void populateAudioInputChannels();
     void populateAudioOutputChannels();
     void populateThruOutputChannels();
     int getChannelFromCombo(const juce::ComboBox& cmb) const;
 
+    void updateInputButtonStates();
+    void updateFpsButtonStates();
+    void updateOutputFpsButtonStates();
     void updateDeviceSelectorVisibility();
     void updateStatusLabels();
+
     void layoutLeftPanel();
     void layoutRightPanel();
     void saveSettings();
     void flushSettings();
     int findDeviceByName(const juce::ComboBox& cmb, const juce::String& name);
 
-    juce::Colour getInputColour(InputSource source) const;
-    juce::String getInputName(InputSource source) const;
-    bool isInputStarted() const;
-    juce::String inputSourceToString(InputSource src) const;
-    InputSource stringToInputSource(const juce::String& s) const;
+    juce::Colour getInputColour(TimecodeEngine::InputSource source) const;
 
     void styleInputButton(juce::TextButton& btn, bool active, juce::Colour colour);
     void styleFpsButton(juce::TextButton& btn, bool active);

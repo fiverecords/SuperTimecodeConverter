@@ -5,16 +5,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
-#include "CustomLookAndFeel.h"  // getMonoFontName()
-
-// Replacement for the deprecated juce::Font::getStringWidthFloat().
-// JUCE now recommends using GlyphArrangement to measure text layouts.
-static inline float measureStringWidth(const juce::Font& font, const juce::String& text)
-{
-    juce::GlyphArrangement ga;
-    ga.addLineOfText(font, text, 0.0f, 0.0f);
-    return ga.getBoundingBox(0, -1, true).getWidth();
-}
+#include "CustomLookAndFeel.h"  // getMonoFontName(), measureStringWidth()
 
 class TimecodeDisplay : public juce::Component
 {
@@ -140,7 +131,7 @@ public:
         g.setColour(statusColour);
         g.fillEllipse(bounds.getCentreX() - 40.0f, statusY, 6.0f, 6.0f);
 
-        g.setColour(juce::Colour(0xFF546E7A));
+        g.setColour(running ? juce::Colour(0xFF66BB6A) : juce::Colour(0xFF546E7A));
         g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
         g.drawText(running ? "RUNNING" : "STOPPED",
                    juce::Rectangle<float>(bounds.getCentreX() - 30.0f, statusY - 2.0f, 80.0f, 14.0f),
@@ -151,9 +142,12 @@ public:
         juce::Font tcFont(juce::FontOptions(getMonoFontName(), fontSize, juce::Font::bold));
         g.setFont(tcFont);
 
+        // Timecode colour: bright green when running, muted gray when stopped
+        auto tcColour = running ? juce::Colour(0xFF00E676) : juce::Colour(0xFF546E7A);
+
         if (fpsConvertActive)
         {
-            // Split rendering: main TC in white, "/FF" suffix in cyan
+            // Split rendering: main TC in running colour, "/FF" suffix in cyan/dimmed
             juce::String outFrameStr = juce::String::formatted("%02d",
                 juce::jlimit(0, 29, outTimecode.frames));
             juce::String fullText = tcText + "/" + outFrameStr;
@@ -164,22 +158,22 @@ public:
             float suffixW = fullW - mainW;
             float textStartX = bounds.getCentreX() - fullW / 2.0f;
 
-            // Draw main TC (input) — standard bright colour
-            g.setColour(juce::Colour(0xFFE0F7FA));
+            // Draw main TC (input)
+            g.setColour(tcColour);
             g.drawText(tcText,
                        juce::Rectangle<float>(textStartX, tcY, mainW, tcHeight),
                        juce::Justification::centredLeft);
 
-            // Draw "/FF" suffix — cyan accent
-            g.setColour(juce::Colour(0xFF00ACC1));
+            // Draw "/FF" suffix — cyan when running, dimmer when stopped
+            g.setColour(running ? juce::Colour(0xFF00ACC1) : juce::Colour(0xFF37474F));
             g.drawText("/" + outFrameStr,
                        juce::Rectangle<float>(textStartX + mainW, tcY, suffixW, tcHeight),
                        juce::Justification::centredLeft);
         }
         else
         {
-            // Standard display — single colour
-            g.setColour(juce::Colour(0xFFE0F7FA));
+            // Standard display
+            g.setColour(tcColour);
             g.drawText(tcText,
                        juce::Rectangle<float>(bounds.getX(), tcY, bounds.getWidth(), tcHeight),
                        juce::Justification::centred);

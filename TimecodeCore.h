@@ -102,10 +102,20 @@ inline juce::String frameRateToString(FrameRate fps)
 // Increment a timecode by one frame, wrapping at 24h.
 // For 29.97 drop-frame: skips frames 0 and 1 at the start of each
 // minute that is NOT a multiple of 10 (SMPTE 12M standard).
+// NOTE: 23.976fps (FPS_2398) is always non-drop-frame.  There is no
+// SMPTE-standard drop-frame variant for 23.976; the ~0.1% drift vs.
+// wall-clock is accepted in cinema/digital workflows.
 //==============================================================================
 inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
 {
     int maxFrames = frameRateToInt(fps);
+
+    // Validate input — callers must supply a valid timecode.
+    jassert(tc.hours >= 0 && tc.hours < 24);
+    jassert(tc.minutes >= 0 && tc.minutes < 60);
+    jassert(tc.seconds >= 0 && tc.seconds < 60);
+    jassert(tc.frames >= 0 && tc.frames < maxFrames);
+
     Timecode r = tc;
     r.frames++;
     if (r.frames >= maxFrames) { r.frames = 0; r.seconds++; }
@@ -247,7 +257,14 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
     }
     else
     {
-        // Non-drop-frame: straightforward conversion
+        // Non-drop-frame: split into integer seconds + fractional frame.
+        // This correctly handles 23.976fps where 24 frames span slightly
+        // more than 1 wall-clock second (1001/1000 s).  Using a total
+        // frame count with % maxFrames would drift vs second boundaries.
+        //
+        // Precision note: double has ~15 significant digits.  At 24h
+        // (86400s), the fractional part retains ~10 digits of precision —
+        // far more than needed for sub-frame accuracy at any supported rate.
         double fpsVal = frameRateToDouble(fps);
         int maxFrames = frameRateToInt(fps);
         double secondsTotal = msSinceMidnight / 1000.0;

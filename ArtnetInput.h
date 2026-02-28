@@ -40,6 +40,7 @@ public:
 
     juce::String getBindInfo() const { return bindIp + ":" + juce::String(listenPort); }
     bool didFallBackToAllInterfaces() const { return bindFellBack.load(std::memory_order_relaxed); }
+    int getSelectedInterface() const { return selectedInterface; }
 
     //==============================================================================
     bool start(int interfaceIndex = 0, int port = 6454)
@@ -130,14 +131,22 @@ private:
     {
         uint8_t buffer[1024];
 
-        while (!threadShouldExit() && isRunningFlag.load(std::memory_order_relaxed) && socket != nullptr)
+        while (!threadShouldExit() && isRunningFlag.load(std::memory_order_relaxed))
         {
+            // Capture local pointer: stop() may nullify `socket` from another thread
+            // after calling socket->shutdown().  The shutdown unblocks waitUntilReady,
+            // and then the while-condition will fail on the next iteration.  The local
+            // pointer ensures we don't dereference a null between the check and use.
+            auto* sock = socket.get();
+            if (sock == nullptr)
+                break;
+
             // Wait up to 100ms for data -- allows periodic threadShouldExit() checks
             // so the thread can shut down cleanly even if no packets are arriving
-            if (!socket->waitUntilReady(true, 100))
+            if (!sock->waitUntilReady(true, 100))
                 continue;
 
-            int bytesRead = socket->read(buffer, sizeof(buffer), false);
+            int bytesRead = sock->read(buffer, sizeof(buffer), false);
 
             if (bytesRead >= 19)
                 parseArtNetPacket(buffer, bytesRead);
@@ -189,7 +198,14 @@ private:
 
         switch (rateCode)
         {
-            case 0: detectedFps.store(FrameRate::FPS_24, std::memory_order_relaxed);   break;
+            case 0:
+                // Art-Net rate code 0 means "24fps".  Like MTC, Art-Net has
+                // no dedicated code for 23.976, so if the user has already
+                // selected FPS_2398 we preserve it rather than silently
+                // overwriting with FPS_24.
+                if (detectedFps.load(std::memory_order_relaxed) != FrameRate::FPS_2398)
+                    detectedFps.store(FrameRate::FPS_24, std::memory_order_relaxed);
+                break;
             case 1: detectedFps.store(FrameRate::FPS_25, std::memory_order_relaxed);   break;
             case 2: detectedFps.store(FrameRate::FPS_2997, std::memory_order_relaxed); break;
             case 3: detectedFps.store(FrameRate::FPS_30, std::memory_order_relaxed);   break;

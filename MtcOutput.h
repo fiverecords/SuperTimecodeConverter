@@ -10,10 +10,7 @@
 class MtcOutput : public juce::HighResolutionTimer
 {
 public:
-    MtcOutput()
-    {
-        refreshDeviceList();
-    }
+    MtcOutput() = default;
 
     ~MtcOutput() override
     {

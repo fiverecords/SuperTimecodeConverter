@@ -10,10 +10,7 @@
 class MtcInput : public juce::MidiInputCallback
 {
 public:
-    MtcInput()
-    {
-        refreshDeviceList();
-    }
+    MtcInput() = default;
 
     ~MtcInput() override
     {

@@ -33,6 +33,7 @@ public:
         selectedChannel.store(ltcChannel, std::memory_order_relaxed);
         passthruChannel.store(thruChannel, std::memory_order_relaxed);
         currentDeviceName = devName;
+        currentTypeName   = typeName;
 
         deviceManager.closeAudioDevice();
 
@@ -103,6 +104,7 @@ public:
     //==============================================================================
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
+    juce::String getCurrentTypeName() const  { return currentTypeName; }
     int getSelectedChannel() const { return selectedChannel.load(std::memory_order_relaxed); }
     int getPassthruChannel() const { return passthruChannel.load(std::memory_order_relaxed); }
     int getChannelCount() const { return numChannelsAvailable; }
@@ -190,6 +192,7 @@ public:
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
+    juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
     std::atomic<int> selectedChannel { 0 };
     std::atomic<int> passthruChannel { -1 };
@@ -388,7 +391,11 @@ private:
 
             float thruPeak = 0.0f;
 
-            // Reserve 1 slot to distinguish full from empty; require >= 2 free slots to write
+            // Reserve 1 sentinel slot to distinguish full from empty.
+            // Need freeSlots >= 2 because 1 is the sentinel — only (freeSlots-1)
+            // are actually writable.  Effective ring capacity is RING_SIZE-1
+            // (32767 samples ≈ 682ms @48kHz), which is plenty for bridging
+            // the latency between input and AudioThru output callbacks.
             int toWrite = (freeSlots >= 2)
                         ? (int)juce::jmin((uint32_t)numSamples, freeSlots - 1)
                         : 0;

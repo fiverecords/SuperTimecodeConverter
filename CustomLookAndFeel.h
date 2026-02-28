@@ -40,11 +40,24 @@ inline juce::String getMonoFontName()
 #endif
 }
 
+// Replacement for the deprecated juce::Font::getStringWidthFloat().
+// JUCE 8.x recommends using GlyphArrangement to measure text layouts.
+inline float measureStringWidth(const juce::Font& font, const juce::String& text)
+{
+    juce::GlyphArrangement ga;
+    ga.addLineOfText(font, text, 0.0f, 0.0f);
+    return ga.getBoundingBox(0, -1, true).getWidth();
+}
+
 class CustomLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
     CustomLookAndFeel()
     {
+        // Pre-cache the monospace font name so the first paint() call
+        // doesn't trigger an expensive findAllTypefaceNames() scan.
+        (void)getMonoFontName();
+
         setColour(juce::PopupMenu::backgroundColourId, bg);
         setColour(juce::PopupMenu::highlightedBackgroundColourId, bgHover);
         setColour(juce::PopupMenu::textColourId, textBright);
@@ -238,15 +251,90 @@ public:
             return;
         }
 
+        // Detect marker patterns:
+        //   " ●"          → current engine active device (cyan dot)
+        //   " [ENGINE N]" → other engine using this device (amber tag)
+        static const juce::String dotChar = juce::String::charToString(0x25CF);
+
+        bool hasActiveDot = text.endsWith(dotChar);
+        int markerStart = -1;
+
+        if (!hasActiveDot)
+        {
+            int bracketClose = text.lastIndexOf("]");
+            int bracketOpen  = text.lastIndexOf(" [");
+            if (bracketClose == text.length() - 1 && bracketOpen > 0)
+                markerStart = bracketOpen;
+        }
+
+        bool hasMarker = hasActiveDot || (markerStart >= 0);
+
+        // Background — tinted for in-use items
         if (isHighlighted && isActive)
         {
             g.setColour(bgHover);
             g.fillRoundedRectangle(area.toFloat().reduced(2, 1), 3.0f);
         }
+        else if (hasMarker && isActive)
+        {
+            // Subtle background tint for marked items (even when not hovered)
+            auto tintColour = hasActiveDot ? juce::Colour(0xFF00BCD4).withAlpha(0.06f)   // cyan tint
+                                           : juce::Colour(0xFFFFB74D).withAlpha(0.06f);  // amber tint
+            g.setColour(tintColour);
+            g.fillRoundedRectangle(area.toFloat().reduced(2, 1), 3.0f);
+        }
 
-        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
-        g.setColour(isActive ? textBright : textDim);
-        g.drawText(text, area.reduced(12, 0), juce::Justification::centredLeft);
+        // Left accent bar for marked items
+        if (hasMarker && isActive)
+        {
+            auto barColour = hasActiveDot ? juce::Colour(0xFF00BCD4)    // cyan
+                                          : juce::Colour(0xFFFFB74D);   // amber
+            g.setColour(barColour);
+            g.fillRoundedRectangle(area.toFloat().getX() + 2.0f,
+                                   area.toFloat().getY() + 3.0f,
+                                   3.0f,
+                                   area.toFloat().getHeight() - 6.0f, 1.5f);
+        }
+
+        auto font = juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain));
+        g.setFont(font);
+
+        auto textArea = area.reduced(hasMarker ? 16 : 12, 0);  // extra indent for bar
+
+        if (hasActiveDot && isActive)
+        {
+            // Current engine active: draw device name + cyan dot
+            auto basePart = text.substring(0, text.length() - (dotChar.length() + 1)); // strip " ●"
+            g.setColour(textBright);
+            g.drawText(basePart, textArea, juce::Justification::centredLeft, false);
+
+            // Draw the dot in cyan
+            float baseWidth = measureStringWidth(font, basePart + " ");
+            auto dotArea = textArea.withTrimmedLeft((int)baseWidth);
+            g.setColour(juce::Colour(0xFF00BCD4));  // cyan
+            g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 13.0f, juce::Font::bold)));
+            g.drawText(dotChar, dotArea, juce::Justification::centredLeft, false);
+        }
+        else if (markerStart >= 0 && isActive)
+        {
+            // Other engine marker: draw base text + amber tag
+            auto basePart   = text.substring(0, markerStart);
+            auto markerPart = text.substring(markerStart);
+
+            g.setColour(textBright);
+            g.drawText(basePart, textArea, juce::Justification::centredLeft, false);
+
+            float baseWidth = measureStringWidth(font, basePart);
+            auto markerArea = textArea.withTrimmedLeft((int)baseWidth);
+            g.setColour(juce::Colour(0xFFFFB74D)); // amber
+            g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
+            g.drawText(markerPart, markerArea, juce::Justification::centredLeft, false);
+        }
+        else
+        {
+            g.setColour(isActive ? textBright : textDim);
+            g.drawText(text, textArea, juce::Justification::centredLeft);
+        }
 
         if (isTicked)
         {

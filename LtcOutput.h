@@ -315,12 +315,11 @@ private:
                 halfCellIndex = 0;
                 samplePositionInHalfBit = 0.0;
                 needNewFrame = false;
-                // Do NOT invert currentLevel here. In biphase-mark encoding
-                // the mandatory transition at the start of each bit cell is
-                // already handled by the halfCellIndex == 0 branch below.
-                // An extra inversion here would create a double-transition
-                // (no-transition) at the frame boundary, causing biphase
-                // parity errors on strict LTC decoders.
+                // Do NOT invert currentLevel here — the mandatory start-of-bit
+                // transition for bit 0 was already applied when the previous
+                // frame's last bit completed (halfCellIndex 1 → 0 branch).
+                // An extra inversion here would cancel it out, creating a
+                // biphase parity error.
             }
 
             float sample = currentLevel * amplitude;
@@ -345,10 +344,12 @@ private:
                     halfCellIndex = 0;
                     currentBitIndex++;
 
+                    // Mandatory biphase-mark transition at start of every
+                    // bit cell — including bit 0 of the next frame.
+                    currentLevel = -currentLevel;
+
                     if (currentBitIndex >= LTC_FRAME_BITS)
                         needNewFrame = true;
-                    else
-                        currentLevel = -currentLevel;
                 }
             }
         }

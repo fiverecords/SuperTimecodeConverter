@@ -81,8 +81,11 @@ public:
     {
         if (isRunningFlag.load(std::memory_order_relaxed))
         {
+            // Null the source pointer BEFORE removing the callback so that
+            // any in-flight callback will see nullptr and exit early.  The
+            // release ordering pairs with the acquire load in the callback.
+            sourceInput.store(nullptr, std::memory_order_release);
             deviceManager.removeAudioCallback(this);
-            sourceInput.store(nullptr, std::memory_order_relaxed);
             deviceManager.closeAudioDevice();
             isRunningFlag.store(false, std::memory_order_relaxed);
         }
