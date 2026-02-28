@@ -2,12 +2,12 @@
 
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Ideal for live events, broadcast, post-production, and AV installations.
 
-[![Windows](https://img.shields.io/badge/platform-Windows-blue)](https://img.shields.io/badge/platform-Windows-blue)
-[![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)](https://img.shields.io/badge/platform-macOS-lightgrey)
-[![Linux](https://img.shields.io/badge/platform-Linux-yellow)](https://img.shields.io/badge/platform-Linux-yellow)
-[![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)](https://img.shields.io/badge/language-C%2B%2B17-orange)
-[![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)](https://img.shields.io/badge/framework-JUCE%208-green)
-[![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://img.shields.io/badge/license-MIT-brightgreen)
+![Windows](https://img.shields.io/badge/platform-Windows-blue)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![Linux](https://img.shields.io/badge/platform-Linux-yellow)
+![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)
+![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
+[![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 
 ---
 
@@ -37,7 +37,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
 - **LTC Out** — generate LTC audio signal on any audio output device and channel
-- **Audio Thru** — passthrough audio from the LTC input device to a separate output device (independent routing)
+- **Audio Thru** — passthrough audio from the LTC input device to a separate output device (Engine 1 only, since it shares the audio device with LTC input)
 
 ### Frame Rate Support
 
@@ -70,7 +70,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **Check for updates** — manually check for new versions from the title bar, with automatic check on startup
 - **Refresh Devices** — scan for newly connected interfaces without losing existing configuration
 - **Collapsible UI panels** to reduce clutter and focus on active sections
-- **Persistent settings** — all configuration saved automatically and restored on launch
+- **Persistent settings** — all configuration saved automatically per engine and restored on launch
 - **Dark theme UI** with a clean, professional look
 
 ---
@@ -85,7 +85,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 ### Prerequisites
 
-- **JUCE Framework 7.x or 8.x** — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
+- **JUCE Framework 8.x** — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
 
 #### Windows
 
@@ -102,7 +102,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 - Ubuntu 22.04+ / Debian 12+ (or equivalent)
 - GCC 11+ or Clang 14+
-- Development packages: `libfreetype-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libfontconfig1-dev libasound2-dev`
+- Development packages: `libfreetype-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libfontconfig1-dev libasound2-dev libcurl4-openssl-dev`
 
 ### Build Instructions
 
@@ -144,7 +144,6 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
    target_compile_definitions(SuperTimecodeConverter PRIVATE
        JUCE_WEB_BROWSER=0
-       JUCE_USE_CURL=0
        JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_PRODUCT_NAME>"
        JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
    )
@@ -231,21 +230,21 @@ The application is built around a modular, header-only architecture:
 | Component | Description |
 |-----------|-------------|
 | `TimecodeCore.h` | Core timecode types, frame rate utilities, SMPTE drop-frame logic, atomic pack/unpack helpers |
-| `TimecodeDisplay.h` | Real-time timecode display widget |
-| `LevelMeter.h` | Real-time VU meter component with clipping indicator |
-| `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
+| `TimecodeEngine.h` | Per-engine state container: input/output routing, device assignments, offsets, and frame rate |
 | `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) with interpolation |
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
 | `ArtnetOutput.h` | Art-Net timecode broadcaster (UDP) with drift-free timing |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC) |
 | `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
-| `AudioThru.h` | Audio passthrough with independent device routing |
-| `CustomLookAndFeel.h` | Dark theme UI styling and cross-platform font selection |
-| `TimecodeEngine.h` | Per-engine state container: input/output routing, device assignments, offsets, and frame rate |
+| `AudioThru.h` | Audio passthrough with independent device routing (Engine 1 only) |
+| `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
+| `TimecodeDisplay.h` | Real-time timecode display widget |
+| `LevelMeter.h` | Real-time VU meter component with clipping indicator |
+| `CustomLookAndFeel.h` | Dark theme UI styling, device conflict markers, and cross-platform font selection |
 | `UpdateChecker.h` | GitHub release version checker (automatic on startup + manual) |
 | `AppSettings.h` | JSON-based persistent settings with backward-compatible loading and per-engine storage |
-| `MainComponent.*` | Main UI, routing logic, and device management |
+| `MainComponent.*` | Main UI, engine tab management, routing logic, and device management |
 
 ### Key Design Decisions
 
@@ -255,6 +254,7 @@ The application is built around a modular, header-only architecture:
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** non-audio settings are applied immediately; audio device settings are applied after the background scan completes
+- **Cross-engine device conflict detection:** custom popup menu rendering highlights devices in use with colour-coded markers (cyan for current engine, amber with engine name for others)
 - **Cross-platform:** built with JUCE for native performance on Windows, macOS, and Linux
 
 ---
