@@ -388,6 +388,8 @@ The Pro DJ Link protocol implementation in this project is based on independent 
 
 **Use at your own risk.** This software communicates with DJ hardware using an undocumented protocol. While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
 
+Ableton Link™ is a trademark of Ableton AG. This project is not affiliated with, endorsed by, or associated with Ableton AG. The Link SDK is used under the terms of the Ableton Link License.
+
 ---
 
 ## Credits
