@@ -8,6 +8,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 ![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)
 ![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
+![Ableton Link](https://img.shields.io/badge/Ableton_Link-Supported-brightgreen)
 
 ---
 
