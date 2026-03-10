@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #include <JuceHeader.h>
@@ -11,7 +11,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.4"; }
+    const juce::String getApplicationVersion() override { return "1.5"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
@@ -41,7 +41,7 @@ public:
             setContentOwned(new MainComponent(), true);
 
             setResizable(true, true);
-            setResizeLimits(800, 550, 1920, 1080);
+            setResizeLimits(800, 550, 2560, 1440);
             centreWithSize(getWidth(), getHeight());
 
             setVisible(true);

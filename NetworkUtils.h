@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once

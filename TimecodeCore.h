@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -15,7 +15,7 @@ static_assert(std::atomic<double>::is_always_lock_free,
 
 enum class FrameRate
 {
-    FPS_2398  = 0,  // 23.976 (24000/1001) — cinema/digital workflows
+    FPS_2398  = 0,  // 23.976 (24000/1001) -- cinema/digital workflows
     FPS_24    = 1,
     FPS_25    = 2,
     FPS_2997  = 3,
@@ -110,13 +110,15 @@ inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
 {
     int maxFrames = frameRateToInt(fps);
 
-    // Validate input — callers must supply a valid timecode.
-    jassert(tc.hours >= 0 && tc.hours < 24);
-    jassert(tc.minutes >= 0 && tc.minutes < 60);
-    jassert(tc.seconds >= 0 && tc.seconds < 60);
-    jassert(tc.frames >= 0 && tc.frames < maxFrames);
-
+    // Clamp input -- during FPS conversion frames may be out of range
+    // for the target rate (e.g. frame 29 from 30fps -> 25fps output).
     Timecode r = tc;
+    if (r.frames < 0)          r.frames = 0;
+    if (r.frames >= maxFrames) r.frames = maxFrames - 1;
+    if (r.seconds < 0 || r.seconds >= 60) r.seconds = 0;
+    if (r.minutes < 0 || r.minutes >= 60) r.minutes = 0;
+    if (r.hours < 0   || r.hours >= 24)   r.hours = 0;
+
     r.frames++;
     if (r.frames >= maxFrames) { r.frames = 0; r.seconds++; }
     if (r.seconds >= 60)       { r.seconds = 0; r.minutes++; }
@@ -179,7 +181,7 @@ inline Timecode offsetTimecode(const Timecode& tc, int offsetFrames, FrameRate f
 
     // The linear-frame arithmetic below is exact only for small offsets.
     // Drop-frame timecode has non-uniform frame distribution, so converting
-    // linear→DF→linear for large offsets accumulates error. The UI sliders
+    // linear->DF->linear for large offsets accumulates error. The UI sliders
     // are constrained to ±30 frames; assert here to catch any future misuse.
     jassert(std::abs(offsetFrames) <= 30);
 
@@ -226,7 +228,9 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         // Drop-frame: 29.97fps = 30000/1001 frames per second
         // Total frames elapsed = ms * 29.97 / 1000
         double exactFps = 30000.0 / 1001.0;
-        int64_t totalFrames = (int64_t)(msSinceMidnight / 1000.0 * exactFps);
+        // Epsilon guards against FP truncation at frame boundaries
+        // (e.g. 33.3667ms * 29.97/1000 = 0.99999... → should be frame 1)
+        int64_t totalFrames = (int64_t)(msSinceMidnight / 1000.0 * exactFps + 1e-9);
 
         // SMPTE drop-frame algorithm:
         // In DF counting, every minute (except every 10th) drops 2 frame numbers.
@@ -263,7 +267,7 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         // frame count with % maxFrames would drift vs second boundaries.
         //
         // Precision note: double has ~15 significant digits.  At 24h
-        // (86400s), the fractional part retains ~10 digits of precision —
+        // (86400s), the fractional part retains ~10 digits of precision --
         // far more than needed for sub-frame accuracy at any supported rate.
         double fpsVal = frameRateToDouble(fps);
         int maxFrames = frameRateToInt(fps);
@@ -276,7 +280,11 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         tc.hours   = (int)((totalSeconds / 3600) % 24);
         tc.minutes = (int)((totalSeconds / 60) % 60);
         tc.seconds = (int)(totalSeconds % 60);
-        tc.frames  = (int)(fractional * fpsVal) % maxFrames;
+        // Guard against floating-point truncation at frame boundaries:
+        // e.g. at 30fps, 33.333ms → fractional*30 = 0.99999... truncates to 0
+        // instead of 1.  An epsilon of 1e-9 (~1ns) fixes boundary rounding
+        // without risk of pushing legitimate values past the next frame.
+        tc.frames  = (int)(fractional * fpsVal + 1e-9) % maxFrames;
         return tc;
     }
 }
@@ -317,6 +325,35 @@ inline double timecodeToMs(const Timecode& tc, FrameRate fps)
         return (tc.hours * 3600.0 + tc.minutes * 60.0 + tc.seconds) * 1000.0
              + ((double)tc.frames / fpsVal) * 1000.0;
     }
+}
+
+//==============================================================================
+// Apply a large timecode offset (for TrackMap -- no ±30 frame limit).
+// Adds offset HH:MM:SS:FF to the input timecode, wrapping at 24h.
+// Uses milliseconds as intermediate representation for exact drop-frame
+// arithmetic (same proven approach as convertTimecodeRate).
+//
+// tcFps     -- frame rate of the input timecode and of the result
+// offsetFps -- frame rate used to interpret the offset fields
+//             (may differ if the offset was authored at a different rate)
+//==============================================================================
+inline Timecode applyTimecodeOffset(const Timecode& tc, FrameRate tcFps,
+                                    int offH, int offM, int offS, int offF,
+                                    FrameRate offsetFps)
+{
+    double tcMs  = timecodeToMs(tc, tcFps);
+
+    Timecode offTc { offH, offM, offS, offF };
+    double offMs = timecodeToMs(offTc, offsetFps);
+
+    double totalMs = tcMs + offMs;
+
+    // Wrap at 24 hours
+    constexpr double kMsPerDay = 24.0 * 3600.0 * 1000.0;
+    totalMs = std::fmod(totalMs, kMsPerDay);
+    if (totalMs < 0.0) totalMs += kMsPerDay;
+
+    return wallClockToTimecode(totalMs, tcFps);
 }
 
 //==============================================================================

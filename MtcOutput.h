@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -133,6 +133,19 @@ public:
 
     bool isPaused() const { return paused.load(std::memory_order_relaxed); }
 
+    /// Force immediate Full Frame re-sync.
+    /// Call on seek/hot cue/track change so receivers know the new position
+    /// instantly instead of waiting 8 QFs (2 frames) to reconstruct it.
+    void forceResync()
+    {
+        if (!isRunningFlag.load(std::memory_order_relaxed)
+            || paused.load(std::memory_order_relaxed))
+            return;
+        // Reset QF cycle to start fresh from the new position
+        currentQFIndex.store(0, std::memory_order_relaxed);
+        sendFullFrame();
+    }
+
     //==============================================================================
     void sendFullFrame()
     {
@@ -145,7 +158,7 @@ public:
             tc = pendingTimecode;
         }
 
-        // Single atomic read — guarantees maxFrames and rateCode are consistent
+        // Single atomic read -- guarantees maxFrames and rateCode are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
 
         // Validate ranges -- don't send corrupt data to MIDI devices
@@ -177,12 +190,16 @@ private:
             || paused.load(std::memory_order_relaxed))
             return;
 
-        // Single atomic read — guarantees QF interval and rate code are consistent
+        // Single atomic read -- guarantees QF interval and rate code are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
 
         // Fractional accumulator: compare real elapsed time against ideal QF interval
         // to eliminate drift caused by integer-ms timer resolution
         double now = juce::Time::getMillisecondCounterHiRes();
+        // MTC is a digital protocol -- always send QFs at nominal frame rate.
+        // The timecode VALUES advance slower at low pitch (PLL handles that),
+        // which produces repeated frames. This is correct and keeps receivers
+        // in sync. Scaling the interval caused MA3 to lose lock at low pitch.
         double qfInterval = 1000.0 / (frameRateToDouble(fps) * 4.0);
 
         // Guard against sending too many QFs if the timer fires in a burst

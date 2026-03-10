@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -10,8 +10,12 @@
 #include "AppSettings.h"
 #include "CustomLookAndFeel.h"
 #include "LevelMeter.h"
+#include "TrackMapEditor.h"
+#include "MixerMapEditor.h"
 #include "NetworkUtils.h"
 #include "UpdateChecker.h"
+#include "MediaDisplay.h"
+#include "ProDJLinkView.h"
 #include <vector>
 #include <memory>
 
@@ -41,6 +45,40 @@ public:
     {
         if (getHeight() != h) setSize(getWidth(), h);
     }
+
+    /// Add a section separator at the given Y position with optional label.
+    void addSectionSeparator(int y, const juce::String& label = {})
+    {
+        sectionSeps.push_back({ y, label });
+    }
+
+    /// Clear all separators (call at start of resized before re-adding)
+    void clearSectionSeparators() { sectionSeps.clear(); }
+
+    void paint(juce::Graphics& g) override
+    {
+        for (auto& sep : sectionSeps)
+        {
+            if (sep.label.isNotEmpty())
+            {
+                // Labeled separator: draw label text only (acts as visual divider)
+                g.setColour(juce::Colour(0xFF37474F));
+                g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::bold)));
+                g.drawText(sep.label, 12, sep.y + 2, getWidth() - 24, 12,
+                           juce::Justification::centredLeft);
+            }
+            else
+            {
+                // Unlabeled separator: subtle horizontal line
+                g.setColour(juce::Colour(0xFF1E2028));
+                g.drawHorizontalLine(sep.y, 12.0f, (float)(getWidth() - 12));
+            }
+        }
+    }
+
+private:
+    struct SectionSep { int y; juce::String label; };
+    std::vector<SectionSep> sectionSeps;
 };
 
 //==============================================================================
@@ -67,7 +105,7 @@ private:
     public:
         AudioScanThread(MainComponent* owner);
         void run() override;
-        // Created on message thread before startThread() — JUCE 8.x requires
+        // Created on message thread before startThread() -- JUCE 8.x requires
         // AudioDeviceManager construction on the message thread.
         std::unique_ptr<juce::AudioDeviceManager> tempManager;
     private:
@@ -106,6 +144,9 @@ private:
     //==============================================================================
     std::vector<std::unique_ptr<TimecodeEngine>> engines;
     int selectedEngine = 0;
+    ProDJLinkInput sharedProDJLinkInput;  // shared across all engines
+    MixerMap       sharedMixerMap;        // shared DJM parameter mapping
+    DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
 
     TimecodeEngine& currentEngine() { return *engines[(size_t)selectedEngine]; }
     const TimecodeEngine& currentEngine() const { return *engines[(size_t)selectedEngine]; }
@@ -178,6 +219,7 @@ private:
     juce::TextButton btnArtnetIn { "ART-NET" };
     juce::TextButton btnSysTime  { "SYSTEM" };
     juce::TextButton btnLtcIn    { "LTC" };
+    juce::TextButton btnProDJLinkIn { "PRO DJ LINK" };
 
     // --- Output toggles ---
     juce::ToggleButton btnMtcOut    { "MTC OUT" };
@@ -213,6 +255,52 @@ private:
     juce::ComboBox cmbBufferSize;            juce::Label lblBufferSize;
     juce::ComboBox cmbMidiInputDevice;       juce::Label lblMidiInputDevice;
     juce::ComboBox cmbArtnetInputInterface;  juce::Label lblArtnetInputInterface;
+    // Pro DJ Link controls
+    juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
+    juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
+    juce::Label lblProDJLinkTrackInfo;
+    juce::Label lblProDJLinkMetadata;
+    juce::Label lblMixerStatus;  // DJM model + fader values
+    ArtworkDisplay artworkDisplay;               // Phase 2c: album art from CDJ
+    WaveformDisplay waveformDisplay;             // Phase 3: color waveform from CDJ
+    uint32_t displayedWaveformTrackId = 0;       // currently displayed waveform track
+    int waveformRetryCounter = 0;                // throttle for waveform re-request
+    uint32_t displayedArtworkId = 0;             // currently displayed artwork ID
+
+    // Features: TrackMap, MIDI Clock, OSC BPM, Ableton Link
+    juce::ToggleButton btnTrackMap { "TRACK MAP" };
+    juce::TextButton   btnTrackMapEdit { "Track Map" };
+    juce::ToggleButton btnMidiClock { "MIDI CLOCK" };
+    juce::ToggleButton btnOscFwdBpm     { "OSC BPM FWD" };
+    juce::TextEditor   edOscFwdBpmAddr;
+    juce::Label        lblOscFwdBpmAddr;
+    juce::ToggleButton btnOscMixerFwd   { "OSC MIXER FWD" };
+    juce::ToggleButton btnMidiMixerFwd  { "MIDI MIXER FWD" };
+    juce::ToggleButton btnArtnetMixerFwd { "ARTNET MIXER FWD" };
+    juce::ComboBox     cmbArtMixNet, cmbArtMixSub, cmbArtMixUni;
+    juce::Label        lblArtMixAddr;
+    juce::ComboBox     cmbMidiMixCCCh;
+    juce::Label        lblMidiMixCCCh;
+    juce::ComboBox     cmbMidiMixNoteCh;
+    juce::Label        lblMidiMixNoteCh;
+    juce::ToggleButton btnLink { "ABLETON LINK" };
+    juce::Label        lblLinkStatus;
+
+    juce::Component::SafePointer<juce::DialogWindow> trackMapWindow;
+    juce::TextButton btnMixerMapEdit { "Mixer Map" };
+    juce::Component::SafePointer<juce::DialogWindow> mixerMapWindow;
+    juce::TextButton btnProDJLinkView { "PDL View" };
+    std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
+
+    // Track change triggers
+    juce::ToggleButton btnTriggerMidi { "MIDI Trigger" };
+    juce::ComboBox cmbTriggerMidiDevice;
+    juce::ToggleButton btnTriggerOsc { "OSC Trigger" };
+    juce::TextEditor edOscIp;
+    juce::TextEditor edOscPort;
+    juce::ToggleButton btnArtnetTrigger { "ARTNET Trigger" };
+    juce::ComboBox cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni;
+    juce::Label    lblArtTrigAddr;
     juce::ComboBox cmbAudioInputDevice;      juce::Label lblAudioInputDevice;
     juce::ComboBox cmbAudioInputChannel;     juce::Label lblAudioInputChannel;
     GainSlider sldLtcInputGain;              juce::Label lblLtcInputGain;
@@ -221,6 +309,10 @@ private:
     GainSlider sldThruInputGain;             juce::Label lblThruInputGain;
     LevelMeter mtrThruInput;
     juce::Label lblInputStatus;
+
+    // --- Left panel (scrollable, like right) ---
+    juce::Viewport leftViewport;
+    PanelContent leftContent;
 
     // --- Right panel (scrollable) ---
     juce::Viewport rightViewport;
@@ -298,6 +390,12 @@ private:
     void startCurrentMtcInput();
     void startCurrentArtnetInput();
     void startCurrentLtcInput();
+    void startCurrentProDJLinkInput();
+    void openTrackMapEditor();
+    void openMixerMapEditor();
+    void openProDJLinkView();
+    void applyTriggerSettings();
+    void propagateGlobalSettings();
     void startCurrentThruOutput();
     void startCurrentMtcOutput();
     void startCurrentArtnetOutput();
@@ -332,6 +430,26 @@ private:
     void styleOffsetSlider(GainSlider& sld);
     void styleCollapseButton(juce::TextButton& btn);
     void updateCollapseButtonText(juce::TextButton& btn, bool expanded);
+
+    // Art-Net port-address helpers (15-bit: Net[7] | Subnet[4] | Universe[4])
+    static int packArtNetAddress(int net, int sub, int uni)
+    {
+        return ((net & 0x7F) << 8) | ((sub & 0x0F) << 4) | (uni & 0x0F);
+    }
+    static void unpackArtNetAddress(int addr, int& net, int& sub, int& uni)
+    {
+        net = (addr >> 8) & 0x7F;
+        sub = (addr >> 4) & 0x0F;
+        uni = addr & 0x0F;
+    }
+    void setupArtNetAddressCombos(juce::ComboBox& cmbNet, juce::ComboBox& cmbSub,
+                                   juce::ComboBox& cmbUni, juce::Label& lbl,
+                                   const juce::String& labelText,
+                                   std::function<void()> onChange);
+    void setArtNetCombosFromAddress(juce::ComboBox& cmbNet, juce::ComboBox& cmbSub,
+                                     juce::ComboBox& cmbUni, int portAddress);
+    int  getArtNetAddressFromCombos(const juce::ComboBox& cmbNet, const juce::ComboBox& cmbSub,
+                                     const juce::ComboBox& cmbUni);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

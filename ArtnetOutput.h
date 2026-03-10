@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -162,6 +162,75 @@ public:
 
     bool isPaused() const { return paused.load(std::memory_order_relaxed); }
 
+    /// Force immediate ArtTimeCode frame send.
+    /// Call on seek/hot cue/track change so receivers update instantly
+    /// instead of waiting for the next timer tick (up to 1 frame latency).
+    void forceResync()
+    {
+        if (!isRunningFlag.load(std::memory_order_relaxed)
+            || paused.load(std::memory_order_relaxed)
+            || socket == nullptr)
+            return;
+        FrameRate fps = currentFps.load(std::memory_order_relaxed);
+        sendArtTimeCode(fps);
+    }
+
+    //==============================================================================
+    // Art-Net DMX output (OpDmx 0x5000)
+    //
+    // Sends a DMX512 frame using the same socket/interface as timecode output.
+    // Can be called independently of timecode pause state -- mixer data flows
+    // regardless of whether timecode is active.
+    //
+    // dmxData: up to 512 bytes of DMX channel values (channel 1 at index 0)
+    // numChannels: how many channels to send (1-512, will be rounded up to even)
+    // universe: Art-Net universe (0-32767, default 0)
+    //==============================================================================
+    void sendDmxFrame(const uint8_t* dmxData, int numChannels, int universe = 0)
+    {
+        if (!isRunningFlag.load(std::memory_order_relaxed) || socket == nullptr)
+            return;
+
+        numChannels = juce::jlimit(2, 512, numChannels);
+        if (numChannels % 2 != 0) numChannels++;  // Art-Net requires even length
+
+        uint8_t packet[530] = {};  // 18 header + 512 max data
+
+        // Art-Net header
+        packet[0] = 'A'; packet[1] = 'r'; packet[2] = 't'; packet[3] = '-';
+        packet[4] = 'N'; packet[5] = 'e'; packet[6] = 't'; packet[7] = 0;
+
+        // OpDmx = 0x5000 (little-endian)
+        packet[8] = 0x00;
+        packet[9] = 0x50;
+
+        // Protocol version 14 (big-endian)
+        packet[10] = 0x00;
+        packet[11] = 0x0E;
+
+        // Sequence (incrementing, 1-255, 0 = disable sequencing)
+        dmxSequence = (dmxSequence % 255) + 1;
+        packet[12] = dmxSequence;
+
+        // Physical port
+        packet[13] = 0;
+
+        // Universe (little-endian, 15-bit)
+        packet[14] = uint8_t(universe & 0xFF);
+        packet[15] = uint8_t((universe >> 8) & 0x7F);
+
+        // Length (big-endian)
+        packet[16] = uint8_t((numChannels >> 8) & 0xFF);
+        packet[17] = uint8_t(numChannels & 0xFF);
+
+        // DMX data
+        std::memcpy(packet + 18, dmxData, (size_t)numChannels);
+
+        int written = socket->write(broadcastIp, destPort, packet, 18 + numChannels);
+        if (written < 0)
+            sendErrors.fetch_add(1, std::memory_order_relaxed);
+    }
+
 private:
     void hiResTimerCallback() override
     {
@@ -170,12 +239,16 @@ private:
             || socket == nullptr)
             return;
 
-        // Single atomic read — guarantees frame interval and packet rate code are consistent
+        // Single atomic read -- guarantees frame interval and packet rate code are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
 
         // Fractional accumulator: compare real elapsed time against ideal frame interval
         // to eliminate drift caused by integer-ms timer resolution
         double now = juce::Time::getMillisecondCounterHiRes();
+        // ArtNet TimeCode is a digital protocol -- always send at nominal frame rate.
+        // The timecode VALUES advance slower at low pitch (PLL handles that),
+        // producing repeated frames, which is correct. Scaling the interval
+        // caused receivers to lose sync or stop at low pitch.
         double frameInterval = 1000.0 / frameRateToDouble(fps);
 
         // Allow up to 2 catch-up sends per callback to handle jitter
@@ -224,8 +297,8 @@ private:
 
         packet[10] = 0x00;  // ProtVer Hi (big-endian)
         packet[11] = 0x0E;  // ProtVer Lo = 14 (Art-Net 4 standard)
-        packet[12] = 0;     // Filler1 — reserved, must be 0 (Art-Net 4 spec §12)
-        packet[13] = 0;     // Filler2 — reserved, must be 0 (Art-Net 4 spec §12)
+        packet[12] = 0;     // Filler1 -- reserved, must be 0 (Art-Net 4 spec §12)
+        packet[13] = 0;     // Filler2 -- reserved, must be 0 (Art-Net 4 spec §12)
 
         packet[14] = (uint8_t)tc.frames;
         packet[15] = (uint8_t)tc.seconds;
@@ -262,6 +335,7 @@ private:
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
+    uint8_t dmxSequence = 0;  // incrementing 1-255 for OpDmx sequencing
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetOutput)
 };

@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -181,7 +181,7 @@ private:
 
         // Art-Net 4 spec: bits 2-7 of the Type field are reserved and must be 0.
         // Log a warning if they are non-zero (malformed sender), but still
-        // process the packet — the frame-rate bits 0-1 remain valid.
+        // process the packet -- the frame-rate bits 0-1 remain valid.
         if ((data[18] & 0xFC) != 0)
         {
             DBG("ArtTimeCode: reserved bits in Type field are non-zero (0x"

@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -104,6 +104,16 @@ public:
     }
 
     void setFrameRate(FrameRate fps)  { pendingFps.store(fps, std::memory_order_relaxed); }
+    void setPitchMultiplier(double p) { pitchMultiplier.store(p, std::memory_order_relaxed); }
+
+    /// Force encoder to re-seed from current pendingTc on next audio callback.
+    /// Call when resuming from pause to avoid continuing a stale half-encoded frame.
+    void reseed()
+    {
+        needNewFrame = true;
+        encoderSeeded = false;
+    }
+
     void setPaused(bool p)
     {
         paused.store(p, std::memory_order_relaxed);
@@ -136,6 +146,7 @@ private:
     std::atomic<bool> paused { false };
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };
+    std::atomic<double> pitchMultiplier { 1.0 };
 
     // LTC encoder state -- audio-callback-thread-only (no synchronisation needed)
     static constexpr int LTC_FRAME_BITS = 80;
@@ -168,7 +179,10 @@ private:
     void updateSamplesPerBit()
     {
         double fps = frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
-        samplesPerHalfBit = currentSampleRate / (fps * LTC_FRAME_BITS * 2.0);
+        double pitch = pitchMultiplier.load(std::memory_order_relaxed);
+        if (pitch <= 0.0) pitch = 1.0;
+        // Scale bit duration by pitch: faster pitch -> shorter bits -> more frames/sec
+        samplesPerHalfBit = currentSampleRate / (fps * pitch * LTC_FRAME_BITS * 2.0);
     }
 
     void packFrame()
@@ -178,7 +192,6 @@ private:
 
         if (!encoderSeeded)
         {
-            // First frame: seed from UI
             encoderTc = pendingTc;
             encoderSeeded = true;
         }
@@ -315,9 +328,9 @@ private:
                 halfCellIndex = 0;
                 samplePositionInHalfBit = 0.0;
                 needNewFrame = false;
-                // Do NOT invert currentLevel here — the mandatory start-of-bit
+                // Do NOT invert currentLevel here -- the mandatory start-of-bit
                 // transition for bit 0 was already applied when the previous
-                // frame's last bit completed (halfCellIndex 1 → 0 branch).
+                // frame's last bit completed (halfCellIndex 1 -> 0 branch).
                 // An extra inversion here would cancel it out, creating a
                 // biphase parity error.
             }
@@ -345,7 +358,7 @@ private:
                     currentBitIndex++;
 
                     // Mandatory biphase-mark transition at start of every
-                    // bit cell — including bit 0 of the next frame.
+                    // bit cell -- including bit 0 of the next frame.
                     currentLevel = -currentLevel;
 
                     if (currentBitIndex >= LTC_FRAME_BITS)

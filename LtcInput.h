@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -305,7 +305,7 @@ private:
             double measuredFps = 1.0 / framePeriodSec;
 
             FrameRate detected = FrameRate::FPS_25;
-            // NOTE: LTC cannot distinguish 23.976fps from 24fps — both use 80 bits
+            // NOTE: LTC cannot distinguish 23.976fps from 24fps -- both use 80 bits
             // per frame with no drop-frame flag.  The ~0.1% rate difference is too
             // small to measure reliably from frame-to-frame period.  If 23.976 support
             // is needed, the user must manually select the frame rate.
@@ -392,7 +392,7 @@ private:
             float thruPeak = 0.0f;
 
             // Reserve 1 sentinel slot to distinguish full from empty.
-            // Need freeSlots >= 2 because 1 is the sentinel — only (freeSlots-1)
+            // Need freeSlots >= 2 because 1 is the sentinel -- only (freeSlots-1)
             // are actually writable.  Effective ring capacity is RING_SIZE-1
             // (32767 samples ≈ 682ms @48kHz), which is plenty for bridging
             // the latency between input and AudioThru output callbacks.

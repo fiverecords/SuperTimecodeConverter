@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -61,7 +61,7 @@ public:
     bool isUpdateAvailable()  const { return updateAvailable.load(std::memory_order_relaxed); }
     bool didCheckFail()       const { return checkFailed.load(std::memory_order_relaxed); }
 
-    // Only valid after hasResult() returns true — the acquire/release pair on
+    // Only valid after hasResult() returns true -- the acquire/release pair on
     // resultReady guarantees these non-atomic String members are fully visible.
     juce::String getLatestVersion() const { jassert(hasResult()); return latestVer; }
     juce::String getReleaseUrl()    const { jassert(hasResult()); return releaseUrl; }
@@ -119,7 +119,7 @@ private:
             return;
         }
 
-        // Strip leading 'v' or 'V' from tag  (e.g. "v1.5" → "1.5")
+        // Strip leading 'v' or 'V' from tag  (e.g. "v1.5" -> "1.5")
         juce::String remoteVersion = tagName.trimCharactersAtStart("vV");
 
         latestVer    = remoteVersion;
@@ -165,7 +165,7 @@ private:
     //--------------------------------------------------------------------------
     juce::String currentVer;
 
-    // Results — written by background thread, read by UI thread
+    // Results -- written by background thread, read by UI thread
     std::atomic<bool> resultReady     { false };
     std::atomic<bool> updateAvailable { false };
     std::atomic<bool> checkFailed     { false };

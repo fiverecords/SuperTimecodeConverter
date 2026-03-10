@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -31,7 +31,7 @@ public:
         auto intBounds = getLocalBounds();
         float cornerSize = 2.0f;
 
-        // Background — fill the full component area first
+        // Background -- fill the full component area first
         g.setColour(juce::Colour(0xFF0D0E12));
         g.fillRoundedRectangle(intBounds.toFloat(), cornerSize);
 

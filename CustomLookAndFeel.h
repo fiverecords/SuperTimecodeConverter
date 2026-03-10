@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -18,7 +18,7 @@ inline juce::String getMonoFontName()
 #else
     // On Linux, JUCE's getDefaultMonospacedFontName() can return a generic
     // name not present on all distros. Try common monospace fonts first.
-    // Result is cached after the first call — findAllTypefaceNames() scans
+    // Result is cached after the first call -- findAllTypefaceNames() scans
     // the system font database and is too expensive to call from paint().
     static juce::String cached;
     if (cached.isNotEmpty())
@@ -252,8 +252,8 @@ public:
         }
 
         // Detect marker patterns:
-        //   " ●"          → current engine active device (cyan dot)
-        //   " [ENGINE N]" → other engine using this device (amber tag)
+        //   " ●"          -> current engine active device (cyan dot)
+        //   " [ENGINE N]" -> other engine using this device (amber tag)
         static const juce::String dotChar = juce::String::charToString(0x25CF);
 
         bool hasActiveDot = text.endsWith(dotChar);
@@ -269,7 +269,7 @@ public:
 
         bool hasMarker = hasActiveDot || (markerStart >= 0);
 
-        // Background — tinted for in-use items
+        // Background -- tinted for in-use items
         if (isHighlighted && isActive)
         {
             g.setColour(bgHover);
@@ -340,7 +340,7 @@ public:
         {
             g.setColour(textBright);
             auto tickArea = area.withTrimmedLeft(area.getWidth() - 24).reduced(6);
-            g.drawText(juce::String::charToString(0x2713), tickArea, juce::Justification::centred);
+            g.drawText("*", tickArea, juce::Justification::centred);
         }
     }
 

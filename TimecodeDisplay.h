@@ -1,5 +1,5 @@
 // Super Timecode Converter
-// Copyright (c) 2026 Fiverecords — MIT License
+// Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #pragma once
@@ -164,7 +164,7 @@ public:
                        juce::Rectangle<float>(textStartX, tcY, mainW, tcHeight),
                        juce::Justification::centredLeft);
 
-            // Draw "/FF" suffix — cyan when running, dimmer when stopped
+            // Draw "/FF" suffix -- cyan when running, dimmer when stopped
             g.setColour(running ? juce::Colour(0xFF00ACC1) : juce::Colour(0xFF37474F));
             g.drawText("/" + outFrameStr,
                        juce::Rectangle<float>(textStartX + mainW, tcY, suffixW, tcHeight),
@@ -194,11 +194,11 @@ public:
             // Character layout: HH:MM:SS.FF/FF = 14 chars
             // Positions:         01 2 34 5 67 8 9A B CD
             // Centre of each group:
-            //   HRS = chars 0-1  → centre at char 1.0
-            //   MIN = chars 3-4  → centre at char 3.5
-            //   SEC = chars 6-7  → centre at char 6.5
-            //   FRM = chars 9-10 → centre at char 9.5
-            //   OUT = chars 12-13→ centre at char 12.5
+            //   HRS = chars 0-1  -> centre at char 1.0
+            //   MIN = chars 3-4  -> centre at char 3.5
+            //   SEC = chars 6-7  -> centre at char 6.5
+            //   FRM = chars 9-10 -> centre at char 9.5
+            //   OUT = chars 12-13-> centre at char 12.5
             float charW = tcWidth / displayChars;
             float posHrs = startX + 1.0f  * charW;
             float posMn  = startX + 3.5f  * charW;
@@ -241,7 +241,7 @@ public:
             // Show both input and output rates with arrow
             juce::String inLabel  = "SOURCE: " + sourceName + "  |  "
                                   + frameRateToString(currentFps);
-            juce::String arrow    = juce::String::fromUTF8(" \xe2\x86\x92 ");  // " → "
+            juce::String arrow    = " -> ";
             juce::String outLabel = frameRateToString(outFps) + " FPS";
 
             // Measure to centre the full composite string
