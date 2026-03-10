@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ and DJM hardware** via native Pro DJ Link integration — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
@@ -20,6 +20,7 @@ Run **up to 8 independent timecode engines** simultaneously. Each engine has its
 - Route system clock to MTC on one engine while converting LTC input to Art-Net on another
 - Feed the same source to multiple outputs with different frame offsets
 - Run independent MTC, Art-Net, and LTC pipelines side by side — each with its own device assignments
+- Monitor different CDJ players on separate engines — each generating independent timecode streams
 
 Engines are managed through the tab bar at the top of the window. Click **+** to add a new engine, right-click a tab to rename or remove it. The dashboard in the centre shows all engines at a glance with their current timecodes and status.
 
@@ -27,6 +28,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 ### Inputs (select one per engine)
 
+- **Pro DJ Link** — connect directly to Pioneer CDJ/XDJ/DJM hardware on the network (see below)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
@@ -38,6 +40,80 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
 - **LTC Out** — generate LTC audio signal on any audio output device and channel
 - **Audio Thru** — passthrough audio from the LTC input device to a separate output device (Engine 1 only, since it shares the audio device with LTC input)
+
+### Pro DJ Link Integration
+
+STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtual CDJ, converting the DJ's playhead position into frame-accurate SMPTE timecode in real time.
+
+**Tested hardware:** CDJ-3000 + DJM-900NXS2. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, DJM-V10, etc.) should work but has not been verified yet — please report any issues on GitHub.
+
+**Player tracking:**
+- Automatic player discovery on the Pro DJ Link network
+- Absolute position tracking from CDJ-3000 (30Hz, millisecond precision)
+- Beat-derived position for NXS2 and older models
+- Play state detection: Playing, Paused, Cued, Looping, Seeking, End of Track
+- BPM, pitch fader, actual playback speed (including motor ramp)
+- On-air status, master player detection, beat position
+- Per-player monitoring: any engine can follow any of 6 players independently
+
+**Smooth timecode generation (PLL):**
+- Phase-locked loop driven by CDJ actual motor speed — no frame skipping or jitter
+- Smooth output during acceleration ramps, jog wheel adjustments, and pitch changes
+- Instant resync on seek, hot cue, or track load
+- Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
+
+**DJM mixer integration:**
+- Real-time mixer data: per-channel faders, trim, EQ, color/FX, CUE buttons, crossfader, master fader, booth, headphones, beat FX, color FX, mic EQ (58 parameters total)
+- VU meters: 6-channel peak metering (CH1-CH4 mono + Master L/R stereo), 15 segments per channel
+- Per-channel on-air status
+
+**Track metadata (via dbserver):**
+- Artist, title, album, genre, key, BPM, duration
+- Album artwork
+- Color preview waveform (ThreeBand and ColorNxs2 formats)
+
+### Track Map
+
+Map Pioneer Track IDs to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ, STC automatically applies the timecode offset and fires the configured triggers.
+
+- Per-track timecode offset (HH:MM:SS:FF) with independent frame rate
+- Learn mode: capture tracks live from any CDJ player
+- Auto-fill artist/title from CDJ metadata
+
+**Per-track triggers (any combination, fired simultaneously on track change):**
+- MIDI Note On (+ immediate Note Off)
+- MIDI CC (controller + value)
+- MIDI Program Change
+- OSC (address + typed arguments with variable expansion)
+- Art-Net DMX (channel + value, configurable universe)
+
+### Mixer Map
+
+Configurable mapping from every DJM mixer parameter to show control protocols. Each of the 58 parameters can be independently routed to any combination of:
+
+- **OSC** — normalized float 0.0–1.0, configurable address per parameter
+- **MIDI CC** — 0–127, configurable CC number and channel
+- **MIDI Note** — 0–127 velocity (for grandMA2/MA3 executor faders)
+- **Art-Net DMX** — 0–255, configurable DMX channel and universe
+
+Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed.
+
+### PDL View
+
+External window showing the full Pro DJ Link network state at 30Hz:
+
+- 4-deck display: artwork, color waveform with playhead, track info, BPM, play state, engine assignments
+- Mixer strip: channel faders with segmented VU meters, crossfader, master fader with stereo VU
+- On-air, master, and beat indicators per player
+
+### Ableton Link
+
+BPM from the selected CDJ player is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically.
+
+### MIDI Clock & OSC BPM Forward
+
+- **MIDI Clock:** 24ppqn clock driven by CDJ BPM
+- **OSC BPM:** sends current BPM as float to configurable OSC address (default: Resolume tempo controller)
 
 ### Frame Rate Support
 
@@ -122,7 +198,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.4)
+   project(SuperTimecodeConverter VERSION 1.5)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -132,7 +208,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.4"
+       VERSION "1.5"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -184,6 +260,17 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 3. Add the ASIO SDK path to your project's header search paths.
 4. Enable `JUCE_ASIO=1` in the project preprocessor definitions.
 
+### Ableton Link (Optional)
+
+To enable Ableton Link tempo sync:
+
+1. Clone the Link SDK: `git clone --recurse-submodules https://github.com/Ableton/link.git`
+2. Add include paths: `<link_repo>/include` and `<link_repo>/modules/asio-standalone/asio/include`
+3. Define `STC_ENABLE_LINK=1` (plus `LINK_PLATFORM_WINDOWS=1`, `_WIN32_WINNT=0x0602`, `NOMINMAX=1` on Windows)
+4. Link against `ws2_32`, `iphlpapi`, `winmm` on Windows (no extra libraries on macOS/Linux)
+
+Without these steps, Link is compiled as a no-op stub and the rest of the app works normally.
+
 ---
 
 ## Usage
@@ -191,11 +278,21 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 ### Basic Workflow
 
 1. **Engine 1** is ready by default. Click **+** in the tab bar to add more engines (up to 8).
-2. **Select an input source** from the left panel (MTC, Art-Net, System, or LTC).
+2. **Select an input source** from the left panel (Pro DJ Link, MTC, Art-Net, System, or LTC).
 3. **Enable one or more outputs** from the right panel.
 4. **Select the frame rate** or let it auto-detect from the input signal.
 5. The timecode display in the centre shows the current time in real-time.
 6. Switch between engines via the tab bar. The dashboard shows all engines at a glance.
+
+### Pro DJ Link Workflow
+
+1. Connect your computer to the same network as your CDJ/DJM setup.
+2. Select **Pro DJ Link** as input source and choose the network interface.
+3. STC will discover players automatically. Select which player (1–6) to follow.
+4. Timecode is generated from the CDJ playhead position — load a track, press play, and timecode flows.
+5. Open **PDL View** for a full network overview with waveforms, artwork, and mixer state.
+6. Open **Track Map** to assign timecode offsets and triggers per track.
+7. Open **Mixer Map** to route DJM fader data to OSC, MIDI, or DMX.
 
 ### Output Frame Rate Conversion
 
@@ -230,28 +327,40 @@ The application is built around a modular, header-only architecture:
 | Component | Description |
 |-----------|-------------|
 | `TimecodeCore.h` | Core timecode types, frame rate utilities, SMPTE drop-frame logic, atomic pack/unpack helpers |
-| `TimecodeEngine.h` | Per-engine state container: input/output routing, device assignments, offsets, and frame rate |
+| `TimecodeEngine.h` | Per-engine state container: input/output routing, PLL, TrackMap/MixerMap forwarding |
+| `ProDJLinkInput.h` | Native Pro DJ Link protocol: player discovery, status, absolute position, DJM mixer/VU data |
+| `DbServerClient.h` | Background TCP client for CDJ metadata queries (title, artist, artwork, waveform) |
 | `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) with interpolation |
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
-| `ArtnetOutput.h` | Art-Net timecode broadcaster (UDP) with drift-free timing |
+| `ArtnetOutput.h` | Art-Net timecode and DMX broadcaster (UDP) with drift-free timing |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC) |
 | `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
 | `AudioThru.h` | Audio passthrough with independent device routing (Engine 1 only) |
 | `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
+| `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
+| `MixerMap.h` | DJM parameter → OSC / MIDI CC / MIDI Note / Art-Net DMX mapping |
+| `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
+| `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
+| `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
+| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters |
+| `MediaDisplay.h` | Color waveform renderer (ThreeBand and ColorNxs2 formats) |
+| `TrackMapEditor.h` | Table editor for Track ID → timecode offset + trigger mapping |
+| `MixerMapEditor.h` | Table editor for DJM parameter → protocol output mapping |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
 | `LevelMeter.h` | Real-time VU meter component with clipping indicator |
 | `CustomLookAndFeel.h` | Dark theme UI styling, device conflict markers, and cross-platform font selection |
 | `UpdateChecker.h` | GitHub release version checker (automatic on startup + manual) |
-| `AppSettings.h` | JSON-based persistent settings with backward-compatible loading and per-engine storage |
 | `MainComponent.*` | Main UI, engine tab management, routing logic, and device management |
 
 ### Key Design Decisions
 
 - **Multi-engine architecture:** each engine encapsulates its own input/output state, enabling up to 8 independent timecode pipelines
 - **Lock-free audio:** LTC decode and audio passthrough use lock-free ring buffers (SPSC) for real-time safety
+- **Thread safety:** atomics with explicit memory ordering for cross-thread data, SpinLocks for composite structures, SPSC queues for producer-consumer patterns
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
+- **PLL-based timecode:** Pro DJ Link input uses a phase-locked loop driven by CDJ actual motor speed for jitter-free timecode generation
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** non-audio settings are applied immediately; audio device settings are applied after the background scan completes
 - **Cross-engine device conflict detection:** custom popup menu rendering highlights devices in use with colour-coded markers (cyan for current engine, amber with engine name for others)
@@ -271,17 +380,30 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
+## Disclaimer
+
+This project is **not affiliated with, endorsed by, or associated with AlphaTheta Corporation or Pioneer DJ** in any way. PRO DJ LINK™ is a trademark of AlphaTheta Corporation. Pioneer DJ is a trademark of Pioneer Corporation, used under license by AlphaTheta Corporation. All other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
+
+The Pro DJ Link protocol implementation in this project is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. This project has not been developed using any proprietary documentation, SDK, or confidential information from AlphaTheta Corporation.
+
+**Use at your own risk.** This software communicates with DJ hardware using an undocumented protocol. While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+
+---
+
 ## Credits
 
 Developed by **Joaquin Villodre** — [github.com/fiverecords](https://github.com/fiverecords)
 
 Built with [JUCE](https://juce.com/) — the cross-platform C++ framework for audio applications.
 
+The Pro DJ Link implementation would not have been possible without the incredible protocol documentation by **Deep Symmetry** — their [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) provided the foundation for understanding the Pioneer protocol and paved the way for this integration.
+
 ---
 
 ## Links
 
 - [GitHub Repository](https://github.com/fiverecords/SuperTimecodeConverter)
+- [Deep Symmetry — DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/)
 - [JUCE Framework](https://juce.com/)
 - [Art-Net Protocol](https://art-net.org.uk/)
 - [MIDI Time Code Specification](https://en.wikipedia.org/wiki/MIDI_timecode)
