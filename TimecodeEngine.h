@@ -129,6 +129,8 @@ public:
             trackMapped = false;
             cachedTrackId = 0;
             cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+            cachedBpmMultiplier = 0;
+            bpmPlayerOverride = kBpmNoOverride;
             cachedTrackArtist.clear();
             cachedTrackTitle.clear();
             // Disable Link to avoid publishing stale tempo on the network
@@ -221,7 +223,21 @@ public:
     void setSharedProDJLinkInput(ProDJLinkInput* shared) { sharedProDJLink = shared; }
     void setDbServerClient(DbServerClient* client) { dbClient = client; }
     int  getProDJLinkPlayer() const     { return proDJLinkPlayer; }
-    void setProDJLinkPlayer(int p)      { proDJLinkPlayer = juce::jlimit(1, ProDJLink::kMaxPlayers, p); pll.reset(); pdlTcFrozen = false; }
+    /// Returns the physical player (1-6) actually being followed.
+    /// In fixed mode: same as proDJLinkPlayer. In XF mode: the resolved player.
+    int  getEffectivePlayer() const
+    {
+        return isXfMode() ? resolvedXfPlayer : proDJLinkPlayer;
+    }
+    void setProDJLinkPlayer(int p)
+    {
+        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, p);
+        resolvedXfPlayer = 0;  // force re-resolve on next tick
+        resetProDJLinkCache();
+        bpmPlayerOverride = kBpmNoOverride;
+        lastSentClockBpm = -1.0f;
+        lastSentOscBpm   = -1.0f;
+    }
 
     AudioThru*    getAudioThru()    { return audioThru.get(); }
 
@@ -316,9 +332,10 @@ public:
         // LTC direct mode is now toggled dynamically per tick
         // (direct in transient, auto-increment in stable)
 
-        proDJLinkPlayer = juce::jlimit(1, ProDJLink::kMaxPlayers, player);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
+        resolvedXfPlayer = 0;  // force resolve on first tick
 
-        if (sharedProDJLink != nullptr)
+        if (sharedProDJLink != nullptr && !isXfMode())
             lastSeenTrackVersion = sharedProDJLink->getTrackVersion(proDJLinkPlayer);
 
         if (sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
@@ -370,17 +387,20 @@ public:
             // Reset offset state only -- keep cachedTrackId for trigger use
             trackMapped = false;
             cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+            cachedBpmMultiplier = 0;
+            lastSentClockBpm = -1.0f;
+            lastSentOscBpm   = -1.0f;
         }
         else if (trackMapPtr && activeInput == InputSource::ProDJLink
                  && sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
         {
-            lastSeenTrackVersion = sharedProDJLink->getTrackVersion(proDJLinkPlayer);
+            lastSeenTrackVersion = sharedProDJLink->getTrackVersion(getEffectivePlayer());
 
-            uint32_t id = (cachedTrackId != 0) ? cachedTrackId : sharedProDJLink->getTrackID(proDJLinkPlayer);
+            uint32_t id = (cachedTrackId != 0) ? cachedTrackId : sharedProDJLink->getTrackID(getEffectivePlayer());
             if (id != 0)
             {
                 cachedTrackId = id;
-                auto tinfo = sharedProDJLink->getTrackInfo(proDJLinkPlayer);
+                auto tinfo = sharedProDJLink->getTrackInfo(getEffectivePlayer());
                 cachedTrackArtist = tinfo.artist;
                 cachedTrackTitle  = tinfo.title;
 
@@ -395,7 +415,7 @@ public:
                         // Propagate track duration to player state (NXS2 needs this
                         // since it doesn't report duration in protocol packets)
                         if (meta.durationSeconds > 0 && sharedProDJLink != nullptr)
-                            sharedProDJLink->setTrackLengthSec(proDJLinkPlayer,
+                            sharedProDJLink->setTrackLengthSec(getEffectivePlayer(),
                                 (uint32_t)meta.durationSeconds);
                     }
                     else
@@ -404,7 +424,7 @@ public:
                     }
                 }
 
-                lookupTrackInMap(id);
+                lookupTrackInMap();
             }
         }
     }
@@ -470,8 +490,8 @@ public:
     /// Force a re-lookup of the current track (e.g., after editing TrackMap)
     void refreshTrackMapLookup()
     {
-        if (!trackMapPtr || cachedTrackId == 0) return;
-        lookupTrackInMap(cachedTrackId);
+        if (!trackMapPtr || cachedTrackArtist.isEmpty()) return;
+        lookupTrackInMap();
     }
 
     /// Re-request metadata for the current track (used when waveform data
@@ -686,22 +706,34 @@ public:
             case InputSource::ProDJLink:
                 if (sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
                 {
+                    // --- XF-A/XF-B auto-follow: resolve physical player ---
+                    if (isXfMode())
+                        resolveXfPlayer();
+                    const int ep = getEffectivePlayer();
+                    if (ep < 1 || ep > ProDJLink::kMaxPlayers)
+                    {
+                        sourceActive = false;
+                        juce::String sideLabel = (proDJLinkPlayer == kPlayerXfA) ? "XF-A" : "XF-B";
+                        inputStatusText = sideLabel + ": NO PLAYER ON SIDE";
+                        break;
+                    }
+
                     // One-shot diagnostic
                     if (!pdlTickDiagDone)
                     {
                         pdlTickDiagDone = true;
                         DBG("TimecodeEngine[" + engineName + "]: ProDJLink tick active"
-                            " -- monitoring player " + juce::String(proDJLinkPlayer)
+                            " -- monitoring player " + juce::String(ep)
                             + " dbClient=" + juce::String(dbClient != nullptr ? "valid" : "null")
                             + " dbRunning=" + juce::String(dbClient != nullptr && dbClient->getIsRunning() ? "yes" : "no"));
                     }
                     // Feed PLL with CDJ actual speed (offset 152).
-                    // No faderPitch or isMoving needed — actualSpeed already
+                    // No faderPitch or isMoving needed -- actualSpeed already
                     // includes motor ramp, jog, and all speed changes.
                     pll.tick(
-                        sharedProDJLink->getPlayheadMs(proDJLinkPlayer),
-                        sharedProDJLink->getAbsPositionTs(proDJLinkPlayer),
-                        sharedProDJLink->getActualSpeed(proDJLinkPlayer)
+                        sharedProDJLink->getPlayheadMs(ep),
+                        sharedProDJLink->getAbsPositionTs(ep),
+                        sharedProDJLink->getActualSpeed(ep)
                     );
 
                     // Use engine's output fps (user-configurable), not ProDJLinkInput's static default
@@ -711,9 +743,9 @@ public:
                     // The CDJ freezes actualSpeed at the last playing value on END_TRACK,
                     // so the PLL keeps advancing while position correction fights back,
                     // causing frame flicker.  Snapshot the timecode and hold it stable.
-                    // Pause is NOT frozen: actualSpeed ramps 0.88→0 in ~4-5s and the
+                    // Pause is NOT frozen: actualSpeed ramps 0.88->0 in ~4-5s and the
                     // PLL follows that deceleration smoothly.
-                    bool isEOT = sharedProDJLink->isEndOfTrack(proDJLinkPlayer);
+                    bool isEOT = sharedProDJLink->isEndOfTrack(ep);
                     if (!isEOT)
                     {
                         pdlTcFrozen = false;
@@ -742,48 +774,43 @@ public:
                     // Resync only on seek (handled by packFrame's >1 frame check).
 
                     // --- Track change detection ---
-                    uint32_t pdlTrackVer = sharedProDJLink->getTrackVersion(proDJLinkPlayer);
+                    uint32_t pdlTrackVer = sharedProDJLink->getTrackVersion(ep);
                     if (pdlTrackVer != lastSeenTrackVersion)
                     {
                         lastSeenTrackVersion = pdlTrackVer;
-                        uint32_t newId = sharedProDJLink->getTrackID(proDJLinkPlayer);
+                        uint32_t newId = sharedProDJLink->getTrackID(ep);
                         if (newId != 0 && newId != cachedTrackId)
                         {
                             cachedTrackId = newId;
-                            auto tinfo = sharedProDJLink->getTrackInfo(proDJLinkPlayer);
+                            auto tinfo = sharedProDJLink->getTrackInfo(ep);
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
 
-                            DBG("TimecodeEngine: track changed to id=" + juce::String(newId)
-                                + " title=\"" + cachedTrackTitle + "\""
-                                + " player=" + juce::String(proDJLinkPlayer));
+                            DBG("TimecodeEngine: track changed -- "
+                                + cachedTrackArtist + " - " + cachedTrackTitle
+                                + " (cdj_id=" + juce::String(newId) + ")"
+                                + " player=" + juce::String(ep));
 
-                            // Phase 2: request metadata from dbserver (async)
+                            // Request metadata from dbserver (async) -- needed to resolve
+                            // "Track #12345" into real artist/title for TrackMap lookup
                             requestDbMetadata(newId);
 
-                            const auto* entry = lookupTrackInMap(newId);
-                            if (entry != nullptr && entry->hasAnyTrigger())
-                            {
-                                triggerOutput.fire(*entry);
+                            // Attempt TrackMap lookup (succeeds immediately if CDJ provides
+                            // real artist/title; deferred until dbserver resolves if not)
+                            const auto* entry = lookupTrackInMap();
 
-                                // Art-Net DMX trigger: set channel value in persistent
-                                // buffer and send frame. Previous trigger values persist
-                                // until overwritten by another track's trigger.
-                                if (artnetTriggerEnabled && entry->hasArtnetTrigger() && artnetOutput.getIsRunning())
-                                {
-                                    int ch = entry->artnetCh;
-                                    trigDmxBuffer[ch - 1] = uint8_t(entry->artnetVal);
-                                    if (ch > trigDmxHighWater) trigDmxHighWater = ch;
-                                    artnetOutput.sendDmxFrame(trigDmxBuffer, trigDmxHighWater,
-                                                              artnetTriggerUniverse);
-                                }
-                            }
+                            // Reset session override on track change
+                            bpmPlayerOverride = kBpmNoOverride;
+                            lastSentClockBpm = -1.0f;
+                            lastSentOscBpm   = -1.0f;
+                            fireTrackTrigger(entry);
                         }
                     }
 
                     // Phase 2: poll dbClient cache for async metadata results.
-                    // Once the background thread resolves "Track #12345" -> real artist/title,
-                    // update the cached values so UI and TrackMap auto-fill get the real names.
+                    // When "Track #12345" resolves to real artist/title, update cache
+                    // and re-run TrackMap lookup (the first attempt on track change would
+                    // have failed because we didn't have real metadata yet).
                     if (dbClient != nullptr && cachedTrackId != 0
                         && cachedTrackTitle.startsWith("Track #"))
                     {
@@ -792,23 +819,13 @@ public:
                         {
                             cachedTrackArtist = meta.artist;
                             cachedTrackTitle  = meta.title;
-                            // Propagate track duration to player state (NXS2 needs this)
                             if (meta.durationSeconds > 0 && sharedProDJLink != nullptr)
-                                sharedProDJLink->setTrackLengthSec(proDJLinkPlayer,
+                                sharedProDJLink->setTrackLengthSec(ep,
                                     (uint32_t)meta.durationSeconds);
-                            // Re-run auto-fill on the TrackMap entry now that we have real names
-                            if (trackMapPtr && trackMapped)
-                            {
-                                auto* entry = trackMapPtr->find(cachedTrackId);
-                                if (entry != nullptr && entry->artist.isEmpty()
-                                    && cachedTrackArtist.isNotEmpty())
-                                {
-                                    entry->artist = cachedTrackArtist;
-                                    entry->title  = cachedTrackTitle;
-                                    trackMapDirty = true;
-                                    trackMapAutoFilled = true;
-                                }
-                            }
+
+                            // NOW we have real artist+title -- do the TrackMap lookup
+                            const auto* entry = lookupTrackInMap();
+                            fireTrackTrigger(entry);
                         }
                     }
 
@@ -826,7 +843,7 @@ public:
                         currentTimecode = applyTimecodeOffset(
                             currentTimecode, currentFps,
                             cachedOffH, cachedOffM, cachedOffS, cachedOffF,
-                            cachedOffFps);
+                            currentFps);
                     }
 
                     bool pdlRx = sharedProDJLink->isReceiving();
@@ -835,32 +852,34 @@ public:
                         // Note: no fps auto-detection for ProDJLink -- CDJ sends ms,
                         // not frames. The user's fps selection IS the frame rate.
 
-                        bool pdlHasTC = sharedProDJLink->hasTimecodeData(proDJLinkPlayer);
+                        bool pdlHasTC = sharedProDJLink->hasTimecodeData(ep);
                         if (pdlHasTC)
                         {
-                            juce::String pdlModel = sharedProDJLink->getPlayerModel(proDJLinkPlayer);
-                            inputStatusText = "RX P" + juce::String(proDJLinkPlayer);
+                            juce::String pdlModel = sharedProDJLink->getPlayerModel(ep);
+                            inputStatusText = isXfMode()
+                                ? ((proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
+                                   + juce::String(" P") + juce::String(ep))
+                                : ("RX P" + juce::String(ep));
                             if (pdlModel.isNotEmpty())
                                 inputStatusText += " " + pdlModel;
 
-                            // Show position source: ABS (CDJ-3000) or BEAT (NXS2)
-                            inputStatusText += " [" + sharedProDJLink->getPositionSourceString(proDJLinkPlayer) + "]";
+                            if (!sharedProDJLink->isPositionMoving(ep))
+                                inputStatusText += " " + sharedProDJLink->getPlayStateString(ep);
 
-                            if (!sharedProDJLink->isPositionMoving(proDJLinkPlayer))
-                                inputStatusText += " " + sharedProDJLink->getPlayStateString(proDJLinkPlayer);
-
-                            double pdlBpm = sharedProDJLink->getBPM(proDJLinkPlayer);
+                            double pdlBpm = sharedProDJLink->getBPM(ep);
                             if (pdlBpm > 0.0)
                                 inputStatusText += " | " + juce::String(pdlBpm, 1) + " BPM";
                         }
                         else
                         {
-                            inputStatusText = "P" + juce::String(proDJLinkPlayer)
-                                + " " + sharedProDJLink->getPlayStateString(proDJLinkPlayer)
+                            inputStatusText = "P" + juce::String(ep)
+                                + " " + sharedProDJLink->getPlayStateString(ep)
                                 + " - NO POSITION DATA";
                         }
 
-                        if (pdlHasTC && trackMapEnabled && cachedTrackId != 0)
+                        if (pdlHasTC && trackMapEnabled
+                            && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty()
+                            && !cachedTrackTitle.startsWith("Track #"))
                         {
                             if (trackMapped)
                                 inputStatusText += " | MAP: " + cachedTrackTitle;
@@ -884,30 +903,33 @@ public:
                     // --- MIDI Clock ---
                     if (pdlRx && midiClockEnabled && triggerOutput.isMidiClockRunning())
                     {
-                        float pdlClkBpm = (float)sharedProDJLink->getMasterBPM();
-                        if (pdlClkBpm > 0.0f && std::abs(pdlClkBpm - lastSentClockBpm) > 0.05f)
+                        double pdlClkBpm = sharedProDJLink->getMasterBPM();
+                        pdlClkBpm = applyBpmMultiplier(pdlClkBpm, getEffectiveBpmMultiplier());
+                        if (pdlClkBpm > 0.0 && std::abs((float)pdlClkBpm - lastSentClockBpm) > 0.05f)
                         {
-                            triggerOutput.updateMidiClockBpm((double)pdlClkBpm);
-                            lastSentClockBpm = pdlClkBpm;
+                            triggerOutput.updateMidiClockBpm(pdlClkBpm);
+                            lastSentClockBpm = (float)pdlClkBpm;
                         }
                     }
 
                     // --- Ableton Link ---
                     if (pdlRx && linkBridge.isEnabled())
                     {
-                        float pdlLnkBpm = (float)sharedProDJLink->getMasterBPM();
-                        if (pdlLnkBpm > 0.0f)
-                            linkBridge.setTempo((double)pdlLnkBpm);
+                        double pdlLnkBpm = sharedProDJLink->getMasterBPM();
+                        pdlLnkBpm = applyBpmMultiplier(pdlLnkBpm, getEffectiveBpmMultiplier());
+                        if (pdlLnkBpm > 0.0)
+                            linkBridge.setTempo(pdlLnkBpm);
                     }
 
                     // --- OSC BPM Forward ---
                     if (pdlRx && oscForwardEnabled && triggerOutput.isOscConnected())
                     {
-                        float pdlOscBpm = (float)sharedProDJLink->getMasterBPM();
-                        if (pdlOscBpm > 0.0f && std::abs(pdlOscBpm - lastSentOscBpm) > kOscBpmThreshold)
+                        double pdlOscBpm = sharedProDJLink->getMasterBPM();
+                        pdlOscBpm = applyBpmMultiplier(pdlOscBpm, getEffectiveBpmMultiplier());
+                        if (pdlOscBpm > 0.0 && std::abs((float)pdlOscBpm - lastSentOscBpm) > kOscBpmThreshold)
                         {
-                            triggerOutput.sendOscFloat(oscFwdBpmAddr, pdlOscBpm);
-                            lastSentOscBpm = pdlOscBpm;
+                            triggerOutput.sendOscFloat(oscFwdBpmAddr, (float)pdlOscBpm);
+                            lastSentOscBpm = (float)pdlOscBpm;
                         }
                     }
 
@@ -925,13 +947,13 @@ public:
                     // sourceActive: determined directly from CDJ playState + actualSpeed.
                     //
                     //   PLAYING/LOOPING/CUE_PLAY: active while actualSpeed >= minimum
-                    //     (includes acceleration ramp — output starts as speed ramps up)
-                    //   PAUSED: actualSpeed ramps target→0 in ~4-5s. Output naturally
+                    //     (includes acceleration ramp -- output starts as speed ramps up)
+                    //   PAUSED: actualSpeed ramps target->0 in ~4-5s. Output naturally
                     //     stops when speed drops below kMinEncodingPitch. No special case.
                     //   END_TRACK: CDJ freezes actualSpeed (never ramps to 0).
-                    //     playState == END_TRACK tells us directly → force inactive.
-                    //   NO_TRACK/LOADING/SEEKING: no useful timecode → inactive.
-                    bool pdlHasData = sharedProDJLink->hasTimecodeData(proDJLinkPlayer);
+                    //     playState == END_TRACK tells us directly -> force inactive.
+                    //   NO_TRACK/LOADING/SEEKING: no useful timecode -> inactive.
+                    bool pdlHasData = sharedProDJLink->hasTimecodeData(ep);
                     double speed = (pll.actualSpeed > pll.kDeadZone)
                                  ? pll.actualSpeed
                                  : std::abs(pll.smoothVelocity);
@@ -1036,11 +1058,17 @@ public:
         return 4;
     }
 
-    static FrameRate indexToFps(int i)
+    static FrameRate indexToFps(int index)
     {
-        constexpr FrameRate v[] = { FrameRate::FPS_2398, FrameRate::FPS_24,
-                                    FrameRate::FPS_25, FrameRate::FPS_2997, FrameRate::FPS_30 };
-        return v[juce::jlimit(0, 4, i)];
+        switch (index)
+        {
+            case 0: return FrameRate::FPS_2398;
+            case 1: return FrameRate::FPS_24;
+            case 2: return FrameRate::FPS_25;
+            case 3: return FrameRate::FPS_2997;
+            case 4: return FrameRate::FPS_30;
+        }
+        return FrameRate::FPS_30;
     }
 
 private:
@@ -1080,7 +1108,94 @@ private:
     LtcOutput    ltcOutput;
     ProDJLinkInput* sharedProDJLink = nullptr;  // shared across engines
     DbServerClient* dbClient       = nullptr;  // shared across engines (Phase 2)
-    int             proDJLinkPlayer = 1;        // per-engine player selection (1..6)
+    int             proDJLinkPlayer = 1;        // per-engine player selection (1..6, 7=XF-A, 8=XF-B)
+
+    // Crossfader auto-follow (XF-A / XF-B mode)
+    static constexpr int kPlayerXfA = 7;        // auto-follow crossfader side A
+    static constexpr int kPlayerXfB = 8;        // auto-follow crossfader side B
+    int  resolvedXfPlayer = 0;                  // physical player (1-4) currently followed in XF mode
+
+    bool isXfMode() const { return proDJLinkPlayer >= kPlayerXfA; }
+
+    /// Resolve which physical player to follow in XF-A/XF-B mode.
+    /// Sticky: stays on current player while it has on-air flag.
+    /// Falls back to another player on the same XF side when current loses on-air.
+    void resolveXfPlayer()
+    {
+        if (!sharedProDJLink || !sharedProDJLink->hasMixerFaderData())
+            return;
+
+        uint8_t targetSide = (proDJLinkPlayer == kPlayerXfA) ? 1 : 2; // 1=A, 2=B
+
+        // Sticky: keep current if still assigned to our side AND on-air
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 4)
+        {
+            uint8_t xf = sharedProDJLink->getChannelXfAssign(resolvedXfPlayer);
+            bool onAir = sharedProDJLink->isPlayerOnAir(resolvedXfPlayer);
+            if (xf == targetSide && onAir)
+                return;  // still valid
+        }
+
+        // Current player lost on-air or wrong side -- find replacement
+        // Prefer on-air players on our side
+        for (int ch = 1; ch <= 4; ++ch)
+        {
+            uint8_t xf = sharedProDJLink->getChannelXfAssign(ch);
+            if (xf == targetSide && sharedProDJLink->isPlayerOnAir(ch))
+            {
+                switchResolvedPlayer(ch);
+                return;
+            }
+        }
+
+        // No on-air player -- keep current if still on right side (just faded out)
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 4)
+        {
+            uint8_t xf = sharedProDJLink->getChannelXfAssign(resolvedXfPlayer);
+            if (xf == targetSide)
+                return;
+        }
+
+        // Find any player on this side (not on-air but assigned)
+        for (int ch = 1; ch <= 4; ++ch)
+        {
+            uint8_t xf = sharedProDJLink->getChannelXfAssign(ch);
+            if (xf == targetSide)
+            {
+                switchResolvedPlayer(ch);
+                return;
+            }
+        }
+
+        // No player assigned to this side at all
+        if (resolvedXfPlayer != 0)
+        {
+            resolvedXfPlayer = 0;
+            pll.reset(); pdlTcFrozen = false;
+        }
+    }
+
+    /// Switch the resolved player with a mini-reset (PLL + track cache)
+    void switchResolvedPlayer(int newPlayer)
+    {
+        if (newPlayer == resolvedXfPlayer) return;
+        DBG("TimecodeEngine[" + engineName + "]: XF resolved player "
+            + juce::String(resolvedXfPlayer) + " -> " + juce::String(newPlayer));
+        resolvedXfPlayer = newPlayer;
+        // Reset PLL and track cache so we start clean on the new player
+        pll.reset(); pdlTcFrozen = false;
+        cachedTrackId = 0;
+        cachedTrackArtist.clear();
+        cachedTrackTitle.clear();
+        trackMapped = false;
+        cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+        cachedBpmMultiplier = 0;
+        lastSeenTrackVersion = 0;
+        lastSentClockBpm = -1.0f;
+        lastSentOscBpm   = -1.0f;
+        bpmPlayerOverride = kBpmNoOverride;
+        ltcOutput.setPitchMultiplier(1.0);
+    }
 
     //==========================================================================
     // Playhead PLL -- smooth timecode generation from CDJ data.
@@ -1090,8 +1205,8 @@ private:
     // new packet arrives, we gently correct the clock toward the CDJ's real position.
     //
     // CDJ actual speed (offset 152) is the real playback rate including:
-    //   - Motor ramp on play (0 → target over ~0.5s)
-    //   - Motor ramp on pause (target → 0 over ~4-5s)
+    //   - Motor ramp on play (0 -> target over ~0.5s)
+    //   - Motor ramp on pause (target -> 0 over ~4-5s)
     //   - Jog wheel adjustments
     //   - Pitch fader changes
     //
@@ -1138,13 +1253,13 @@ private:
         //
         //   Position input:
         //     CDJ-3000:   absolute playhead at 30Hz (type 0x0b) -- ms precision
-        //     NXS2/older: beat-derived at ~5Hz (beatCount × 60000/BPM from status)
+        //     NXS2/older: beat-derived at ~5Hz (beatCount x 60000/BPM from status)
         //
         //   Drive velocity: actualSpeed from CDJ status (offset 152).
-        //     Includes motor ramp, jog, pitch changes — everything.
+        //     Includes motor ramp, jog, pitch changes -- everything.
         //     Fallback to dp/dt if actualSpeed is 0 (non-CDJ-3000 models).
         //
-        //   Position correction: 25% of error per packet → converges in ~3 packets.
+        //   Position correction: 25% of error per packet -> converges in ~3 packets.
         //     Hard reset on >500ms error (seek/track change).
 
         void tick(uint32_t cdjPlayheadMs, double cdjPacketTs, double cdjActualSpeed)
@@ -1262,7 +1377,6 @@ private:
     uint32_t  lastSeenTrackVersion = 0;     // per-engine version counter for track change detection
     bool      pdlTickDiagDone = false;        // one-shot diagnostic flag
     int       cachedOffH = 0, cachedOffM = 0, cachedOffS = 0, cachedOffF = 0;
-    FrameRate cachedOffFps = FrameRate::FPS_30;   // frame rate the offset was authored at
     juce::String cachedTrackArtist, cachedTrackTitle;
 
     // Track change triggers
@@ -1271,6 +1385,12 @@ private:
     // MIDI Clock (BPM), OSC Forward (BPM)
     bool midiClockEnabled = false;     // MIDI Clock (24ppqn) for BPM
     float lastSentClockBpm = -1.0f;    // dedup: last BPM sent to clock
+
+    // BPM multiplier: session-level per-player override (set by UI buttons, not persisted)
+    // 0=1x (passthrough override), 1=x2, 2=x4, -1=/2, -2=/4, kBpmNoOverride(-99)=no override
+    int  bpmPlayerOverride   = -99;  // = kBpmNoOverride (literal avoids forward-ref with MSVC)
+    // BPM multiplier: cached from TrackMap entry on track change
+    int  cachedBpmMultiplier = 0;
 
     bool oscForwardEnabled    = false;
     bool oscMixerForwardEnabled  = false;
@@ -1314,6 +1434,59 @@ public:
         lastSentClockBpm = -1.0f;
     }
     bool isMidiClockEnabled() const { return midiClockEnabled; }
+
+    // Sentinel value: "no session override active" (falls through to TrackMap).
+    static constexpr int kBpmNoOverride = -99;
+
+    // BPM multiplier -- session-level per-player override (not persisted).
+    // Valid values: 0=1x (passthrough), 1=x2, 2=x4, -1=/2, -2=/4.
+    // Use kBpmNoOverride to clear the override (falls through to TrackMap).
+    // Session override takes priority over TrackMap value.
+    void setBpmPlayerOverride(int mult)
+    {
+        if (mult == kBpmNoOverride)
+        {
+            bpmPlayerOverride = kBpmNoOverride;
+        }
+        else
+        {
+            static const int kValid[] = { -2, -1, 0, 1, 2 };
+            bool ok = false;
+            for (int v : kValid) if (v == mult) { ok = true; break; }
+            bpmPlayerOverride = ok ? mult : kBpmNoOverride;
+        }
+        lastSentClockBpm = -1.0f;   // force resend
+        lastSentOscBpm   = -1.0f;
+    }
+    int getBpmPlayerOverride() const { return bpmPlayerOverride; }
+
+    // Allows external code (e.g. ProDJLinkView double-click save) to sync the
+    // cached TrackMap value without waiting for the next lookupTrackInMap call.
+    void setCachedBpmMultiplier(int mult)
+    {
+        cachedBpmMultiplier = mult;
+        lastSentClockBpm = -1.0f;
+        lastSentOscBpm   = -1.0f;
+    }
+
+    // Returns the effective multiplier: session override if set, else TrackMap value.
+    int getEffectiveBpmMultiplier() const
+    {
+        return (bpmPlayerOverride != kBpmNoOverride) ? bpmPlayerOverride : cachedBpmMultiplier;
+    }
+
+    // Helper: apply effective multiplier to a raw BPM value
+    static double applyBpmMultiplier(double bpm, int mult)
+    {
+        switch (mult)
+        {
+            case  1: return bpm * 2.0;
+            case  2: return bpm * 4.0;
+            case -1: return bpm * 0.5;
+            case -2: return bpm * 0.25;
+            default: return bpm;
+        }
+    }
 
     void setOscForward(bool enabled,
                        const juce::String& bpmAddr = "/composition/tempocontroller/tempo")
@@ -1375,10 +1548,13 @@ private:
         if (dbClient == nullptr || !dbClient->getIsRunning()) return;
         if (sharedProDJLink == nullptr || !sharedProDJLink->getIsRunning()) return;
 
-        uint8_t srcPlayer = sharedProDJLink->getLoadedPlayer(proDJLinkPlayer);
-        if (srcPlayer == 0) srcPlayer = (uint8_t)proDJLinkPlayer;
+        int effP = getEffectivePlayer();
+        if (effP < 1) return;
+
+        uint8_t srcPlayer = sharedProDJLink->getLoadedPlayer(effP);
+        if (srcPlayer == 0) srcPlayer = (uint8_t)effP;
         juce::String srcIP = sharedProDJLink->getPlayerIP((int)srcPlayer);
-        uint8_t slot = sharedProDJLink->getLoadedSlot(proDJLinkPlayer);
+        uint8_t slot = sharedProDJLink->getLoadedSlot(effP);
 
         if (srcIP.isEmpty() || slot == 0)
         {
@@ -1402,22 +1578,21 @@ private:
         dbClient->requestMetadata(srcIP, slot, 1, trackId, dbCtx, model);
     }
 
-    /// Lookup a Track ID in the TrackMap and cache the offset values.
-    /// Called when a track change is detected.
-    /// Returns the matched entry pointer (or nullptr if not found/malformed)
-    /// so callers can use it directly without a redundant hash lookup.
-    const TrackMapEntry* lookupTrackInMap(uint32_t trackId)
+    /// Lookup a track in the TrackMap by artist+title and cache the offset values.
+    /// Called when a track change is detected or metadata is resolved.
+    /// Returns the matched entry pointer (or nullptr if not found/malformed).
+    const TrackMapEntry* lookupTrackInMap()
     {
-        if (!trackMapPtr)
+        if (!trackMapPtr || cachedTrackArtist.isEmpty() || cachedTrackTitle.isEmpty()
+            || cachedTrackTitle.startsWith("Track #"))
         {
             trackMapped = false;
             return nullptr;
         }
 
-        auto* entry = trackMapPtr->find(trackId);
+        auto* entry = trackMapPtr->find(cachedTrackArtist, cachedTrackTitle);
         if (entry)
         {
-            // Parse the offset string once and cache the fields
             int h, m, s, f;
             if (TrackMapEntry::parseTimecodeString(entry->timecodeOffset, h, m, s, f))
             {
@@ -1425,35 +1600,49 @@ private:
                 cachedOffM = m;
                 cachedOffS = s;
                 cachedOffF = f;
-                cachedOffFps = indexToFps(entry->frameRate);
                 trackMapped = true;
 
-                // Auto-fill artist/title from player if the map entry is blank.
-                // Sets dirty flag so the caller can persist the change.
-                if (entry->artist.isEmpty() && cachedTrackArtist.isNotEmpty())
-                {
-                    entry->artist = cachedTrackArtist;
-                    entry->title  = cachedTrackTitle;
-                    trackMapDirty = true;
-                    trackMapAutoFilled = true;
-                }
-
+                cachedBpmMultiplier = entry->bpmMultiplier;
+                lastSentClockBpm = -1.0f;
+                lastSentOscBpm   = -1.0f;
                 return entry;
             }
             else
             {
-                // Malformed offset string -- treat as unmapped
                 trackMapped = false;
                 cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+                cachedBpmMultiplier = 0;
                 return nullptr;
             }
         }
         else
         {
-            // Track not in map -- pass through raw TC (no offset)
             trackMapped = false;
             cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+            cachedBpmMultiplier = 0;
             return nullptr;
+        }
+    }
+
+    /// Fire track-change triggers (MIDI/OSC/Art-Net DMX) for a TrackMap entry.
+    /// Null-safe: does nothing if entry is nullptr or has no triggers.
+    /// Art-Net DMX channel is bounds-checked to [1,512] before buffer access.
+    void fireTrackTrigger(const TrackMapEntry* entry)
+    {
+        if (!entry || !entry->hasAnyTrigger()) return;
+
+        triggerOutput.fire(*entry);
+
+        if (artnetTriggerEnabled && entry->hasArtnetTrigger() && artnetOutput.getIsRunning())
+        {
+            int ch = entry->artnetCh;
+            if (ch > 0 && ch <= 512)
+            {
+                trigDmxBuffer[ch - 1] = uint8_t(entry->artnetVal);
+                if (ch > trigDmxHighWater) trigDmxHighWater = ch;
+                artnetOutput.sendDmxFrame(trigDmxBuffer, trigDmxHighWater,
+                                          artnetTriggerUniverse);
+            }
         }
     }
 
@@ -1517,7 +1706,7 @@ private:
         }
 
         // Send Art-Net DMX frame.
-        // Always use the persistent high-water mark for frame length — not just
+        // Always use the persistent high-water mark for frame length -- not just
         // the channels changed this tick. Otherwise channels beyond the current
         // dirty set get dropped by the receiver.
         //
@@ -1649,7 +1838,7 @@ private:
         else
         {
             // --- Clean stop ---
-            // On active→inactive transition, send one final frame at the
+            // On active->inactive transition, send one final frame at the
             // stopped position before pausing. This gives receivers the exact
             // stop point instead of leaving them with an incomplete QF cycle
             // or stale position.

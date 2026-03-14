@@ -36,14 +36,14 @@ public:
     juce::String getMidiDeviceName(int index) const
     {
         if (index >= 0 && index < (int)midiDevices.size())
-            return midiDevices[(size_t)index].name;
+            return midiDevices[index].name;
         return {};
     }
 
     int findMidiDeviceByName(const juce::String& name) const
     {
         for (int i = 0; i < (int)midiDevices.size(); ++i)
-            if (midiDevices[(size_t)i].name == name)
+            if (midiDevices[i].name == name)
                 return i;
         return -1;
     }
@@ -54,10 +54,10 @@ public:
         if (deviceIndex < 0 || deviceIndex >= (int)midiDevices.size())
             return false;
 
-        midiOutput = juce::MidiOutput::openDevice(midiDevices[(size_t)deviceIndex].identifier);
+        midiOutput = juce::MidiOutput::openDevice(midiDevices[deviceIndex].identifier);
         if (midiOutput)
         {
-            currentMidiDeviceName = midiDevices[(size_t)deviceIndex].name;
+            currentMidiDeviceName = midiDevices[deviceIndex].name;
             return true;
         }
         return false;
@@ -73,12 +73,48 @@ public:
     void stopMidi()
     {
         clockTimer.stop();
-        midiOutput.reset();
+        sharedMidiOut = nullptr;   // release borrowed pointer (not owned)
+        midiOutput.reset();        // close own device if open
         currentMidiDeviceName.clear();
     }
 
-    bool isMidiOpen() const { return midiOutput != nullptr; }
+    bool isMidiOpen() const { return getActiveMidi() != nullptr; }
+    bool hasOwnMidiOpen() const { return midiOutput != nullptr; }
     juce::String getCurrentMidiDeviceName() const { return currentMidiDeviceName; }
+
+    //--------------------------------------------------------------------------
+    // Shared MIDI output -- allows TriggerOutput to piggyback on MtcOutput's
+    // open device handle when both target the same MIDI port.
+    // juce::MidiOutput::sendMessageNow() is thread-safe (internal CriticalSection).
+    //--------------------------------------------------------------------------
+
+    /// Set an external MidiOutput to use instead of (or alongside) our own.
+    /// Pass nullptr to clear and fall back to own device.
+    void setSharedMidiOutput(juce::MidiOutput* shared)
+    {
+        sharedMidiOut = shared;
+        // If sharing and clock is running, redirect it to the shared output
+        if (shared && clockTimer.isTimerRunning())
+            clockTimer.updateOutput(shared);
+    }
+
+    /// Close our OWN MidiOutput handle (if open) without affecting the shared pointer.
+    /// Used before MtcOutput opens the same device to avoid double-open conflict.
+    void releaseOwnMidi()
+    {
+        if (midiOutput)
+        {
+            // If clock was using our own output, redirect to shared (if available)
+            if (clockTimer.isTimerRunning())
+            {
+                if (sharedMidiOut)
+                    clockTimer.updateOutput(sharedMidiOut);
+                else
+                    clockTimer.stop();
+            }
+            midiOutput.reset();
+        }
+    }
 
     //--------------------------------------------------------------------------
     // OSC destination management
@@ -138,10 +174,10 @@ public:
         if (oscEnabled)
             fireOsc(entry);
 
-        lastFiredTrackId = entry.trackId;
+        lastFiredTrackKey = entry.key();
     }
 
-    uint32_t getLastFiredTrackId() const { return lastFiredTrackId; }
+    std::string getLastFiredTrackKey() const { return lastFiredTrackKey; }
 
     //--------------------------------------------------------------------------
     // Continuous control forwarding (crossfader, BPM)
@@ -153,12 +189,13 @@ public:
     /// CC forward has its own enable).
     void sendCC(int channel, int cc, int value)
     {
-        if (!midiOutput) return;
+        auto* midi = getActiveMidi();
+        if (!midi) return;
         auto msg = juce::MidiMessage::controllerEvent(
             juce::jlimit(1, 16, channel),
             juce::jlimit(0, 127, cc),
             juce::jlimit(0, 127, value));
-        midiOutput->sendMessageNow(msg);
+        midi->sendMessageNow(msg);
     }
 
     /// Send a MIDI Note On message for continuous fader control.
@@ -168,12 +205,13 @@ public:
     /// sending Note Off would reset the receiver to an undefined state.
     void sendNote(int channel, int note, int velocity)
     {
-        if (!midiOutput) return;
+        auto* midi = getActiveMidi();
+        if (!midi) return;
         auto msg = juce::MidiMessage::noteOn(
             juce::jlimit(1, 16, channel),
             juce::jlimit(0, 127, note),
             (uint8_t)juce::jlimit(0, 127, velocity));
-        midiOutput->sendMessageNow(msg);
+        midi->sendMessageNow(msg);
     }
 
     /// Send a raw OSC message with a single float value.
@@ -192,8 +230,9 @@ public:
 
     void startMidiClock(double bpm)
     {
-        if (!midiOutput) return;
-        clockTimer.start(bpm, midiOutput.get());
+        auto* midi = getActiveMidi();
+        if (!midi) return;
+        clockTimer.start(bpm, midi);
     }
 
     void stopMidiClock()
@@ -242,6 +281,11 @@ private:
                 pulsesPerMs.store(bpm * 24.0 / 60000.0, std::memory_order_relaxed);
         }
 
+        /// Redirect clock output to a different MidiOutput (e.g. when switching
+        /// from own device to shared MtcOutput device).  Thread-safe because
+        /// hiResTimerCallback only reads midiOut after null-check.
+        void updateOutput(juce::MidiOutput* newOut) { midiOut = newOut; }
+
         void hiResTimerCallback() override
         {
             double ppms = pulsesPerMs.load(std::memory_order_relaxed);
@@ -267,7 +311,8 @@ private:
     //--------------------------------------------------------------------------
     void fireMidi(const TrackMapEntry& entry)
     {
-        if (!midiOutput || !entry.hasMidiTrigger()) return;
+        auto* midi = getActiveMidi();
+        if (!midi || !entry.hasMidiTrigger()) return;
 
         int ch = juce::jlimit(0, 15, entry.midiChannel) + 1;  // 1-based for JUCE
 
@@ -277,8 +322,8 @@ private:
         {
             int note = juce::jlimit(0, 127, entry.midiNoteNum);
             int vel  = juce::jlimit(0, 127, entry.midiNoteVel);
-            midiOutput->sendMessageNow(juce::MidiMessage::noteOn(ch, note, (uint8_t)vel));
-            midiOutput->sendMessageNow(juce::MidiMessage::noteOff(ch, note));
+            midi->sendMessageNow(juce::MidiMessage::noteOn(ch, note, (uint8_t)vel));
+            midi->sendMessageNow(juce::MidiMessage::noteOff(ch, note));
         }
 
         // Control Change
@@ -286,14 +331,7 @@ private:
         {
             int cc  = juce::jlimit(0, 127, entry.midiCCNum);
             int val = juce::jlimit(0, 127, entry.midiCCVal);
-            midiOutput->sendMessageNow(juce::MidiMessage::controllerEvent(ch, cc, val));
-        }
-
-        // Program Change
-        if (entry.midiPC >= 0)
-        {
-            int pc = juce::jlimit(0, 127, entry.midiPC);
-            midiOutput->sendMessageNow(juce::MidiMessage::programChange(ch, pc));
+            midi->sendMessageNow(juce::MidiMessage::controllerEvent(ch, cc, val));
         }
     }
 
@@ -305,12 +343,10 @@ private:
         if (!oscSender.isConnected() || !entry.hasOscTrigger()) return;
 
         // Expand built-in variables in oscArgs:
-        //   {trackId}  -> track ID as integer
         //   {artist}   -> artist string (quoted for space safety)
         //   {title}    -> title string (quoted for space safety)
         //   {offset}   -> timecode offset string
         juce::String args = entry.oscArgs;
-        args = args.replace("{trackId}", "i:" + juce::String(entry.trackId));
         args = args.replace("{artist}",  "s:\"" + entry.artist + "\"");
         args = args.replace("{title}",   "s:\"" + entry.title + "\"");
         args = args.replace("{offset}",  "s:\"" + entry.timecodeOffset + "\"");
@@ -322,10 +358,17 @@ private:
     // Members
     //--------------------------------------------------------------------------
     // MIDI
-    std::unique_ptr<juce::MidiOutput> midiOutput;
+    std::unique_ptr<juce::MidiOutput> midiOutput;     // own device (when not sharing)
+    juce::MidiOutput* sharedMidiOut = nullptr;         // borrowed from MtcOutput (not owned)
     juce::Array<juce::MidiDeviceInfo> midiDevices;
     juce::String currentMidiDeviceName;
     bool midiEnabled = false;
+
+    /// Returns the active MidiOutput: shared if set, else own.
+    juce::MidiOutput* getActiveMidi() const
+    {
+        return sharedMidiOut ? sharedMidiOut : midiOutput.get();
+    }
 
     // OSC
     OscSender oscSender;
@@ -333,7 +376,7 @@ private:
     int oscPort = 53000;
     bool oscEnabled = false;
 
-    uint32_t lastFiredTrackId = 0;
+    std::string lastFiredTrackKey;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TriggerOutput)
 };

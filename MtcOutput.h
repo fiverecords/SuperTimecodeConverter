@@ -82,6 +82,11 @@ public:
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
 
+    /// Raw pointer to the open MidiOutput device (for sharing with TriggerOutput).
+    /// Returns nullptr if not running.  Thread-safe: juce::MidiOutput::sendMessageNow()
+    /// uses an internal CriticalSection.
+    juce::MidiOutput* getMidiOutputPtr() const { return midiOutput.get(); }
+
     //==============================================================================
     // Called from UI thread - thread-safe via SpinLock
     void setTimecode(const Timecode& tc)

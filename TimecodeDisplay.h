@@ -125,16 +125,25 @@ public:
         float contentY = bounds.getY() + (usableH - contentH) / 2.0f;
         contentY = juce::jmax(bounds.getY() + 10.0f, contentY);  // don't go above top
 
-        // --- Status indicator (centered in block) ---
+        // --- Status indicator (dot + label, centred as a unit) ---
         float statusY = contentY;
 
+        juce::String statusText = running ? "RUNNING" : "STOPPED";
+        juce::Font statusFont(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain));
+        float dotSize   = 6.0f;
+        float dotGap    = 6.0f;
+        float textW     = measureStringWidth(statusFont, statusText);
+        float groupW    = dotSize + dotGap + textW;
+        float groupX    = bounds.getCentreX() - groupW / 2.0f;
+
         g.setColour(statusColour);
-        g.fillEllipse(bounds.getCentreX() - 40.0f, statusY, 6.0f, 6.0f);
+        float textMidY = statusY + statusH / 2.0f;
+        g.fillEllipse(groupX, textMidY - dotSize / 2.0f - 1.0f, dotSize, dotSize);
 
         g.setColour(running ? juce::Colour(0xFF66BB6A) : juce::Colour(0xFF546E7A));
-        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
-        g.drawText(running ? "RUNNING" : "STOPPED",
-                   juce::Rectangle<float>(bounds.getCentreX() - 30.0f, statusY - 2.0f, 80.0f, 14.0f),
+        g.setFont(statusFont);
+        g.drawText(statusText,
+                   juce::Rectangle<float>(groupX + dotSize + dotGap, statusY, textW + 4.0f, statusH),
                    juce::Justification::centredLeft);
 
         // --- Timecode text ---

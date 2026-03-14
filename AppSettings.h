@@ -5,20 +5,19 @@
 #pragma once
 #include <JuceHeader.h>
 #include <unordered_map>
+#include <string>
 
 //==============================================================================
-// TrackMap -- maps Track IDs to timecode offsets
+// TrackMap -- maps tracks (by artist|title) to timecode offsets and triggers
 //==============================================================================
 
-/// A single entry mapping a track (identified by Track ID) to a
+/// A single entry mapping a track (identified by artist + title) to a
 /// timecode offset that will be applied when that track is detected as playing.
 struct TrackMapEntry
 {
-    uint32_t     trackId         = 0;
     juce::String artist;
     juce::String title;
     juce::String timecodeOffset  = "00:00:00:00";   // HH:MM:SS:FF
-    int          frameRate       = 4;                // 0=23.976, 1=24, 2=25, 3=29.97, 4=30
     juce::String notes;
 
     // MIDI triggers (independent -- any combination can fire simultaneously)
@@ -27,7 +26,6 @@ struct TrackMapEntry
     int          midiNoteVel     = 127;     // Note On: velocity (0-127)
     int          midiCCNum       = -1;      // CC: controller number (-1 = disabled, 0-127)
     int          midiCCVal       = 127;     // CC: value (0-127)
-    int          midiPC          = -1;      // Program Change number (-1 = disabled, 0-127)
 
     // OSC trigger (per-track: what to send when this track becomes active)
     juce::String oscAddress;                // e.g. "/cue/1/go", empty = no OSC trigger
@@ -37,10 +35,24 @@ struct TrackMapEntry
     int          artnetCh        = 0;       // DMX channel (0 = disabled, 1-512)
     int          artnetVal       = 255;     // DMX value (0-255)
 
+    // BPM multiplier (per-track: applied to MIDI Clock, Ableton Link, OSC BPM forward)
+    // 0 = off (pass-through), 1 = x2, 2 = x4, -1 = /2, -2 = /4
+    int          bpmMultiplier   = 0;
+
+    //------------------------------------------------------------------
+    // Key generation -- case-insensitive artist|title
+    //------------------------------------------------------------------
+    static std::string makeKey(const juce::String& a, const juce::String& t)
+    {
+        return (a.toLowerCase().trim() + "|" + t.toLowerCase().trim()).toStdString();
+    }
+    std::string key() const { return makeKey(artist, title); }
+    bool hasValidKey() const { return artist.isNotEmpty() && title.isNotEmpty(); }
+
     //------------------------------------------------------------------
     // Trigger queries
     //------------------------------------------------------------------
-    bool hasMidiTrigger()   const { return midiNoteNum >= 0 || midiCCNum >= 0 || midiPC >= 0; }
+    bool hasMidiTrigger()   const { return midiNoteNum >= 0 || midiCCNum >= 0; }
     bool hasOscTrigger()    const { return oscAddress.isNotEmpty(); }
     bool hasArtnetTrigger() const { return artnetCh > 0; }
     bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
@@ -49,11 +61,9 @@ struct TrackMapEntry
     juce::var toVar() const
     {
         auto* obj = new juce::DynamicObject();
-        obj->setProperty("trackId",        (int64_t)trackId);
         obj->setProperty("artist",         artist);
         obj->setProperty("title",          title);
         obj->setProperty("timecodeOffset", timecodeOffset);
-        obj->setProperty("frameRate",      frameRate);
         obj->setProperty("notes",          notes);
 
         // MIDI triggers (independent)
@@ -62,7 +72,6 @@ struct TrackMapEntry
         obj->setProperty("midiNoteVel",  midiNoteVel);
         obj->setProperty("midiCCNum",    midiCCNum);
         obj->setProperty("midiCCVal",    midiCCVal);
-        obj->setProperty("midiPC",       midiPC);
 
         // OSC trigger
         if (oscAddress.isNotEmpty())
@@ -79,6 +88,10 @@ struct TrackMapEntry
             obj->setProperty("artnetVal", artnetVal);
         }
 
+        // BPM multiplier (0 = off, only write if set)
+        if (bpmMultiplier != 0)
+            obj->setProperty("bpmMultiplier", bpmMultiplier);
+
         return juce::var(obj);
     }
 
@@ -86,10 +99,6 @@ struct TrackMapEntry
     {
         auto* obj = v.getDynamicObject();
         if (!obj) return;
-
-        // Track ID stored as int64 in JSON to avoid uint32 overflow in juce::var
-        auto idVal = obj->getProperty("trackId");
-        trackId = idVal.isVoid() ? 0u : (uint32_t)(int64_t)idVal;
 
         auto getString = [&](const char* key, const juce::String& def = {}) {
             auto val = obj->getProperty(key);
@@ -104,6 +113,15 @@ struct TrackMapEntry
         title          = getString("title");
         notes          = getString("notes");
 
+        // Legacy migration: if entry has trackId but no title, generate a placeholder
+        // so imported v1.5 entries don't vanish (user can edit them later).
+        if (title.isEmpty())
+        {
+            auto idVal = obj->getProperty("trackId");
+            if (!idVal.isVoid() && (int64_t)idVal != 0)
+                title = "Track #" + juce::String((int64_t)idVal);
+        }
+
         // Validate timecodeOffset: must parse as valid HH:MM:SS:FF
         {
             juce::String rawOffset = getString("timecodeOffset", "00:00:00:00");
@@ -114,20 +132,15 @@ struct TrackMapEntry
                 timecodeOffset = "00:00:00:00";  // reset malformed offsets
         }
 
-        auto frVal = obj->getProperty("frameRate");
-        frameRate = frVal.isVoid() ? 4 : juce::jlimit(0, 4, (int)frVal);
-
         // MIDI triggers (independent fields, v1.5+)
         auto newNoteField = obj->getProperty("midiNoteNum");
         if (!newNoteField.isVoid())
         {
-            // New format: independent fields
             midiChannel = juce::jlimit(0, 15, getInt("midiChannel", 0));
             midiNoteNum = juce::jlimit(-1, 127, getInt("midiNoteNum", -1));
             midiNoteVel = juce::jlimit(0, 127, getInt("midiNoteVel", 127));
             midiCCNum   = juce::jlimit(-1, 127, getInt("midiCCNum", -1));
             midiCCVal   = juce::jlimit(0, 127, getInt("midiCCVal", 127));
-            midiPC      = juce::jlimit(-1, 127, getInt("midiPC", -1));
         }
         else
         {
@@ -138,13 +151,11 @@ struct TrackMapEntry
             int v2 = juce::jlimit(0, 127, getInt("midiValue2", 127));
             midiNoteNum = -1;  midiNoteVel = 127;
             midiCCNum = -1;    midiCCVal = 127;
-            midiPC = -1;
             switch (legacyType)
             {
-                case 1: midiNoteNum = v1; midiNoteVel = v2; break;  // NoteOn
-                case 2: midiPC = v1; break;                          // ProgramChange
-                case 3: midiCCNum = v1; midiCCVal = v2; break;      // ControlChange
-                default: break;                                       // None
+                case 1: midiNoteNum = v1; midiNoteVel = v2; break;
+                case 3: midiCCNum = v1; midiCCVal = v2; break;
+                default: break;
             }
         }
 
@@ -152,9 +163,15 @@ struct TrackMapEntry
         oscAddress = getString("oscAddress");
         oscArgs    = getString("oscArgs");
 
-        // Art-Net DMX trigger (new in v1.5, absent in legacy files → defaults to disabled)
+        // Art-Net DMX trigger
         artnetCh  = juce::jlimit(0, 512, getInt("artnetCh", 0));
         artnetVal = juce::jlimit(0, 255, getInt("artnetVal", 255));
+
+        // BPM multiplier
+        {
+            int raw = getInt("bpmMultiplier", 0);
+            bpmMultiplier = (raw == 1 || raw == 2 || raw == -1 || raw == -2) ? raw : 0;
+        }
     }
 
     //------------------------------------------------------------------
@@ -194,7 +211,7 @@ struct TrackMapEntry
 };
 
 //==============================================================================
-// TrackMap -- O(1) lookup by Track ID, persisted as separate JSON file
+// TrackMap -- O(1) lookup by artist|title, persisted as separate JSON file
 //==============================================================================
 class TrackMap
 {
@@ -216,10 +233,10 @@ public:
     void save() const
     {
         auto* root = new juce::DynamicObject();
-        root->setProperty("version", 1);
+        root->setProperty("version", 2);  // v2 = artist|title keyed
 
         juce::Array<juce::var> arr;
-        for (auto& [id, entry] : entries)
+        for (auto& [k, entry] : entries)
             arr.add(entry.toVar());
 
         root->setProperty("tracks", arr);
@@ -246,8 +263,8 @@ public:
             {
                 TrackMapEntry e;
                 e.fromVar(item);
-                if (e.trackId != 0)
-                    entries[e.trackId] = std::move(e);
+                if (e.hasValidKey())
+                    entries[e.key()] = std::move(e);
             }
         }
         ++generation;
@@ -258,44 +275,44 @@ public:
     // Lookup
     //------------------------------------------------------------------
 
-    /// Find entry by Track ID -- returns nullptr if not found
-    const TrackMapEntry* find(uint32_t trackId) const
+    /// Find entry by artist + title -- returns nullptr if not found
+    const TrackMapEntry* find(const juce::String& artist, const juce::String& title) const
     {
-        auto it = entries.find(trackId);
+        auto it = entries.find(TrackMapEntry::makeKey(artist, title));
         return (it != entries.end()) ? &it->second : nullptr;
     }
 
     /// Mutable find (for editing in-place)
-    TrackMapEntry* find(uint32_t trackId)
+    TrackMapEntry* find(const juce::String& artist, const juce::String& title)
     {
-        auto it = entries.find(trackId);
+        auto it = entries.find(TrackMapEntry::makeKey(artist, title));
         return (it != entries.end()) ? &it->second : nullptr;
     }
 
-    /// Check if a track ID exists in the map
-    bool contains(uint32_t trackId) const
+    /// Check if an artist+title exists in the map
+    bool contains(const juce::String& artist, const juce::String& title) const
     {
-        return entries.count(trackId) > 0;
+        return entries.count(TrackMapEntry::makeKey(artist, title)) > 0;
     }
 
     //------------------------------------------------------------------
     // Mutation
     //------------------------------------------------------------------
 
-    /// Add or update an entry (key = entry.trackId)
+    /// Add or update an entry (key = artist|title)
     void addOrUpdate(const TrackMapEntry& entry)
     {
-        if (entry.trackId != 0)
+        if (entry.hasValidKey())
         {
-            entries[entry.trackId] = entry;
+            entries[entry.key()] = entry;
             ++generation;
         }
     }
 
-    /// Remove by Track ID -- returns true if found and removed
-    bool remove(uint32_t trackId)
+    /// Remove by artist+title -- returns true if found and removed
+    bool remove(const juce::String& artist, const juce::String& title)
     {
-        bool erased = entries.erase(trackId) > 0;
+        bool erased = entries.erase(TrackMapEntry::makeKey(artist, title)) > 0;
         if (erased) ++generation;
         return erased;
     }
@@ -309,51 +326,50 @@ public:
     size_t size() const { return entries.size(); }
     bool   empty() const { return entries.empty(); }
 
-    /// Get all entries as a sorted vector (by Track ID) for UI display
+    /// Get all entries as a sorted vector (by artist then title) for UI display
     std::vector<TrackMapEntry> getAllSorted() const
     {
         std::vector<TrackMapEntry> result;
         result.reserve(entries.size());
-        for (auto& [id, entry] : entries)
+        for (auto& [k, entry] : entries)
             result.push_back(entry);
 
         std::sort(result.begin(), result.end(),
                   [](const TrackMapEntry& a, const TrackMapEntry& b) {
-                      return a.trackId < b.trackId;
+                      int cmp = a.artist.compareIgnoreCase(b.artist);
+                      return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
                   });
         return result;
     }
 
     /// Lightweight variant returning const pointers -- avoids copying strings.
     /// IMPORTANT: Pointers are invalidated by ANY mutation of the TrackMap
-    /// (addOrUpdate, remove, clear, importFromFile). Callers MUST call
-    /// rebuildRows() / refresh() after any mutation before accessing these pointers.
     std::vector<const TrackMapEntry*> getAllSortedPtrs() const
     {
         std::vector<const TrackMapEntry*> result;
         result.reserve(entries.size());
-        for (auto& [id, entry] : entries)
+        for (auto& [k, entry] : entries)
             result.push_back(&entry);
 
         std::sort(result.begin(), result.end(),
                   [](const TrackMapEntry* a, const TrackMapEntry* b) {
-                      return a->trackId < b->trackId;
+                      int cmp = a->artist.compareIgnoreCase(b->artist);
+                      return cmp != 0 ? cmp < 0 : a->title.compareIgnoreCase(b->title) < 0;
                   });
         return result;
     }
 
     //------------------------------------------------------------------
-    // Import / Export (for Step 3d UI, but API ready now)
+    // Import / Export
     //------------------------------------------------------------------
 
-    /// Export to a user-chosen file
     bool exportToFile(const juce::File& file) const
     {
         auto* root = new juce::DynamicObject();
-        root->setProperty("version", 1);
+        root->setProperty("version", 2);
 
         juce::Array<juce::var> arr;
-        for (auto& [id, entry] : entries)
+        for (auto& [k, entry] : entries)
             arr.add(entry.toVar());
 
         root->setProperty("tracks", arr);
@@ -363,7 +379,6 @@ public:
     }
 
     /// Import from a user-chosen file -- merges with existing entries.
-    /// Returns number of entries imported.
     int importFromFile(const juce::File& file)
     {
         if (!file.existsAsFile()) return 0;
@@ -380,9 +395,9 @@ public:
         {
             TrackMapEntry e;
             e.fromVar(item);
-            if (e.trackId != 0)
+            if (e.hasValidKey())
             {
-                entries[e.trackId] = std::move(e);
+                entries[e.key()] = std::move(e);
                 ++count;
             }
         }
@@ -393,15 +408,13 @@ public:
     //------------------------------------------------------------------
     // Direct access to the map (for advanced iteration)
     //------------------------------------------------------------------
-    const std::unordered_map<uint32_t, TrackMapEntry>& getEntries() const { return entries; }
+    const std::unordered_map<std::string, TrackMapEntry>& getEntries() const { return entries; }
 
-    /// Mutation generation counter -- incremented on every structural change.
-    /// Used by TrackMapEditor to detect stale pointer vectors in debug builds.
     uint64_t getGeneration() const { return generation; }
 
 private:
-    std::unordered_map<uint32_t, TrackMapEntry> entries;
-    uint64_t generation = 0;   // bumped by every mutation that could invalidate pointers
+    std::unordered_map<std::string, TrackMapEntry> entries;
+    uint64_t generation = 0;
 };
 
 //==============================================================================
@@ -428,6 +441,7 @@ struct EngineSettings
     bool artnetMixerForward = false;
     int  artnetMixerUniverse = 0;   // 0-32767
     int  artnetTriggerUniverse = 1; // 0-32767 (separate from mixer, default 1)
+    int  artnetDmxInterface = -1;  // -1 = All Interfaces (Broadcast), 0+ = specific NIC
     bool linkEnabled = false;
     juce::String audioInputDevice = "";
     juce::String audioInputType = "";
@@ -500,6 +514,7 @@ struct EngineSettings
         obj->setProperty("artnetMixerForward",  artnetMixerForward);
         obj->setProperty("artnetMixerUniverse", artnetMixerUniverse);
         obj->setProperty("artnetTriggerUniverse", artnetTriggerUniverse);
+        obj->setProperty("artnetDmxInterface", artnetDmxInterface);
         obj->setProperty("linkEnabled", linkEnabled);
         obj->setProperty("audioInputDevice", audioInputDevice);
         obj->setProperty("audioInputType", audioInputType);
@@ -568,7 +583,7 @@ struct EngineSettings
         inputSource          = getString("inputSource", "SystemTime");
         midiInputDevice      = getString("midiInputDevice");
         artnetInputInterface = getInt("artnetInputInterface", 0);
-        proDJLinkPlayer      = juce::jlimit(1, 6, getInt("proDJLinkPlayer", 1));
+        proDJLinkPlayer      = juce::jlimit(1, 8, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
         oscBpmAddr           = getString("oscBpmAddr", getString("tcnetOscBpmAddr", "/composition/tempocontroller/tempo"));
@@ -593,6 +608,7 @@ struct EngineSettings
         artnetMixerForward   = getBool("artnetMixerForward", false);
         artnetMixerUniverse  = juce::jlimit(0, 32767, getInt("artnetMixerUniverse", 0));
         artnetTriggerUniverse = juce::jlimit(0, 32767, getInt("artnetTriggerUniverse", 1));
+        artnetDmxInterface   = getInt("artnetDmxInterface", -1);  // -1 = All Interfaces
         linkEnabled          = getBool("linkEnabled", getBool("tcnetLinkEnabled", false));
         audioInputDevice     = getString("audioInputDevice");
         audioInputType       = getString("audioInputType");
@@ -654,6 +670,16 @@ struct AppSettings
     // Global Pro DJ Link settings (shared connection, not per-engine)
     int  proDJLinkInterface = 0;
 
+    // Window positions/sizes (persisted as "x y w h" strings, empty = default)
+    juce::String mainWindowBounds;
+    juce::String pdlViewBounds;
+    juce::String trackMapBounds;
+    juce::String mixerMapBounds;
+
+    // PDL View layout state
+    bool pdlViewHorizontal = false;
+    bool pdlViewShowMixer  = true;
+
     // Per-engine settings
     std::vector<EngineSettings> engines;
 
@@ -684,6 +710,13 @@ struct AppSettings
         obj->setProperty("preferredBufferSize", preferredBufferSize);
         obj->setProperty("selectedEngine", selectedEngine);
         obj->setProperty("proDJLinkInterface", proDJLinkInterface);
+
+        if (mainWindowBounds.isNotEmpty()) obj->setProperty("mainWindowBounds", mainWindowBounds);
+        if (pdlViewBounds.isNotEmpty())   obj->setProperty("pdlViewBounds",   pdlViewBounds);
+        if (trackMapBounds.isNotEmpty())   obj->setProperty("trackMapBounds",  trackMapBounds);
+        if (mixerMapBounds.isNotEmpty())   obj->setProperty("mixerMapBounds",  mixerMapBounds);
+        obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
+        obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
 
         juce::Array<juce::var> engineArray;
         for (auto& eng : engines)
@@ -729,6 +762,13 @@ struct AppSettings
             preferredBufferSize   = getInt("preferredBufferSize", 0);
             selectedEngine        = getInt("selectedEngine", 0);
             proDJLinkInterface    = getInt("proDJLinkInterface", 0);
+
+            mainWindowBounds = getString("mainWindowBounds");
+            pdlViewBounds   = getString("pdlViewBounds");
+            trackMapBounds  = getString("trackMapBounds");
+            mixerMapBounds  = getString("mixerMapBounds");
+            pdlViewHorizontal = getInt("pdlViewHorizontal", 0) != 0;
+            pdlViewShowMixer  = getInt("pdlViewShowMixer", 1) != 0;
 
             engines.clear();
             auto* engArray = obj->getProperty("engines").getArray();

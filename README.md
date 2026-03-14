@@ -56,6 +56,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - BPM, pitch fader, actual playback speed (including motor ramp)
 - On-air status, master player detection, beat position
 - Per-player monitoring: any engine can follow any of 6 players independently
+- **Crossfader auto-follow (XF-A / XF-B):** instead of monitoring a fixed player, an engine can follow whichever deck is live on crossfader side A or B. When the DJ swaps decks, timecode seamlessly switches to the new player. Ideal for two-engine setups where each engine tracks one side of the crossfader.
 
 **Smooth timecode generation (PLL):**
 - Phase-locked loop driven by CDJ actual motor speed — no frame skipping or jitter
@@ -75,16 +76,16 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 
 ### Track Map
 
-Map Pioneer Track IDs to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ, STC automatically applies the timecode offset and fires the configured triggers.
+Map tracks by **artist + title** to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ, STC automatically applies the timecode offset and fires the configured triggers. Tracks are identified universally regardless of which USB/SD they are loaded from.
 
-- Per-track timecode offset (HH:MM:SS:FF) with independent frame rate
+- Per-track timecode offset (HH:MM:SS:FF)
+- Per-track BPM multiplier (/4, /2, 1x, x2, x4) — applied to MIDI Clock, Ableton Link, and OSC BPM forward
 - Learn mode: capture tracks live from any CDJ player
 - Auto-fill artist/title from CDJ metadata
 
 **Per-track triggers (any combination, fired simultaneously on track change):**
 - MIDI Note On (+ immediate Note Off)
 - MIDI CC (controller + value)
-- MIDI Program Change
 - OSC (address + typed arguments with variable expansion)
 - Art-Net DMX (channel + value, configurable universe)
 
@@ -103,9 +104,22 @@ Table editor with per-parameter enable/disable, editable addresses and CC/Note/D
 
 External window showing the full Pro DJ Link network state at 30Hz:
 
-- 4-deck display: artwork, color waveform with playhead, track info, BPM, play state, engine assignments
+- 4-deck display: artwork, color waveform with playhead, track info, BPM (with multiplied value when active), play state, engine assignments
+- Per-deck BPM multiplier buttons (single click for session override, double click to save to Track Map)
 - Mixer strip: channel faders with segmented VU meters, crossfader, master fader with stereo VU
 - On-air, master, and beat indicators per player
+
+### BPM Multiplier
+
+Scale the BPM sent to MIDI Clock, Ableton Link, and OSC before forwarding — useful for half-time, double-time, or genre-specific workflows where the DJ's BPM doesn't match the lighting or video system's expected tempo.
+
+- **5 multiplier values:** /4, /2, 1x (passthrough), x2, x4
+- **Single click** — temporary session override (cleared on next track load)
+- **Double click** — save to Track Map (automatically applied every time the track is loaded on any engine)
+- **Double click on 1x** — clears any saved multiplier from the Track Map
+- Available in both the engine panel and PDL View
+- Visual feedback: active multiplier highlighted in blue, saved Track Map value always shown in gold text
+- Effective (multiplied) BPM displayed next to the original BPM in both views: `128.0 BPM → 256.0 (x2)`
 
 ### Ableton Link
 
@@ -115,6 +129,10 @@ BPM from the selected CDJ player is published to an Ableton Link session. Any Li
 
 - **MIDI Clock:** 24ppqn clock driven by CDJ BPM
 - **OSC BPM:** sends current BPM as float to configurable OSC address (default: Resolume tempo controller)
+
+### Shared MIDI Output
+
+When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port, STC automatically shares the connection. No configuration needed — both features work simultaneously on a single port, even on Windows where MIDI ports allow only one handle at a time.
 
 ### Frame Rate Support
 
@@ -199,7 +217,7 @@ BPM from the selected CDJ player is published to an Ableton Link session. Any Li
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.5)
+   project(SuperTimecodeConverter VERSION 1.5.1)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -209,7 +227,7 @@ BPM from the selected CDJ player is published to an Ableton Link session. Any Li
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.5"
+       VERSION "1.5.1"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -346,7 +364,7 @@ The application is built around a modular, header-only architecture:
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
 | `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters |
 | `MediaDisplay.h` | Color waveform renderer (ThreeBand and ColorNxs2 formats) |
-| `TrackMapEditor.h` | Table editor for Track ID → timecode offset + trigger mapping |
+| `TrackMapEditor.h` | Table editor for artist+title → timecode offset + trigger mapping |
 | `MixerMapEditor.h` | Table editor for DJM parameter → protocol output mapping |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
 | `LevelMeter.h` | Real-time VU meter component with clipping indicator |

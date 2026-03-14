@@ -39,6 +39,7 @@ public:
         colorEntryCount = entryCount;
         colorBytesPerEntry = bytesPerEntry;
         hasColorData = (entryCount > 0 && (int)data.size() >= entryCount * bytesPerEntry);
+        invalidateCache();
         repaint();
     }
 
@@ -50,6 +51,7 @@ public:
         colorEntryCount = 0;
         colorBytesPerEntry = 0;
         playPosition = 0.0f;
+        invalidateCache();
         repaint();
     }
 
@@ -91,10 +93,16 @@ public:
 
         if (hasColorData && !colorWaveformData.empty() && colorEntryCount > 0)
         {
-            if (colorBytesPerEntry == 3)
-                paintThreeBandWaveform(g, bounds);
-            else
-                paintColorWaveform(g, bounds);
+            // Ensure cached waveform image is up to date (regenerates only
+            // when data changes or component size changes -- the expensive
+            // per-pixel bar rendering is skipped on every other frame).
+            ensureCachedImage();
+
+            if (cachedWaveformImg.isValid())
+            {
+                g.drawImageAt(cachedWaveformImg, 0, 0);
+                paintOverlay(g, bounds, colorEntryCount);
+            }
             return;
         }
 
@@ -105,10 +113,54 @@ public:
     }
 
 private:
-    /// Render CDJ-3000 3-band waveform (PWV6: 3 bytes per entry = mid, high, low)
-    /// Per beat-link: byte[0]=mid, byte[1]=high, byte[2]=low
-    /// Rendered in classic CDJ blue/white style (no multicolor, no peak bars).
-    void paintThreeBandWaveform(juce::Graphics& g, juce::Rectangle<float> bounds)
+    //----------------------------------------------------------------------
+    // Cached waveform image -- regenerated only when data or size changes.
+    // This eliminates hundreds of setColour()+drawVerticalLine() calls per
+    // frame on macOS CoreGraphics, which was the root cause of stuttering.
+    //----------------------------------------------------------------------
+    juce::Image cachedWaveformImg;
+    int cachedW = 0, cachedH = 0;
+    bool cacheValid = false;
+
+    void invalidateCache() { cacheValid = false; }
+
+    void ensureCachedImage()
+    {
+        int w = getWidth();
+        int h = getHeight();
+        if (w <= 0 || h <= 0) return;
+
+        // Regenerate if size changed or cache was invalidated
+        if (cacheValid && cachedW == w && cachedH == h)
+            return;
+
+        cachedWaveformImg = juce::Image(juce::Image::ARGB, w, h, true);
+        juce::Graphics ig(cachedWaveformImg);
+
+        // Background
+        auto bounds = getLocalBounds().toFloat();
+        ig.setColour(juce::Colour(0xFF0D1117));
+        ig.fillRoundedRectangle(bounds, 3.0f);
+
+        if (colorBytesPerEntry == 3)
+            renderThreeBandBars(ig, bounds);
+        else
+            renderColorBars(ig, bounds);
+
+        // Center line (static, part of cached image)
+        float inset = 2.0f;
+        float drawH = bounds.getHeight() - inset * 2;
+        float midY = inset + drawH * 0.5f;
+        ig.setColour(juce::Colour(0x40FFFFFF));
+        ig.drawHorizontalLine((int)midY, inset, bounds.getWidth() - inset);
+
+        cachedW = w;
+        cachedH = h;
+        cacheValid = true;
+    }
+
+    /// Render CDJ-3000 3-band waveform bars into a Graphics context (cached).
+    void renderThreeBandBars(juce::Graphics& g, juce::Rectangle<float> bounds)
     {
         float w = bounds.getWidth();
         float inset = 2.0f;
@@ -153,16 +205,14 @@ private:
             float avgHigh = sumHigh / (float)count;
             float avgLow  = sumLow  / (float)count;
 
-            // Use only the mid band as the main amplitude (no peak layer)
             float amplitude = avgMid;
             if (amplitude < 1.0f) continue;
 
             float barH = amplitude * hScale;
             float x = inset + (float)px;
 
-            // Blend blue -> white based on relative high-frequency content
             float total = avgLow + avgMid + avgHigh + 0.001f;
-            float highRatio = avgHigh / total;  // 0 = pure blue, 1 = white
+            float highRatio = avgHigh / total;
             float blueR = 0.0f  + highRatio * 1.0f;
             float blueG = 0.45f + highRatio * 0.55f;
             float blueB = 1.0f;
@@ -171,14 +221,10 @@ private:
             g.drawVerticalLine((int)x, midY - barH, midY);
             g.drawVerticalLine((int)x, midY, midY + barH);
         }
-
-        paintOverlay(g, bounds, colorEntryCount, true);
     }
 
-    /// Render CDJ NXS2+ color waveform (PWV4: 6 bytes per entry)
-    /// Per Deep Symmetry / jan2000: d3=red, d4=green, d5=blue+frontHeight
-    /// Rendered in classic CDJ blue/white style (no multicolor, no peak bars).
-    void paintColorWaveform(juce::Graphics& g, juce::Rectangle<float> bounds)
+    /// Render CDJ NXS2+ color waveform bars into a Graphics context (cached).
+    void renderColorBars(juce::Graphics& g, juce::Rectangle<float> bounds)
     {
         float w = bounds.getWidth();
         float inset = 2.0f;
@@ -190,7 +236,6 @@ private:
         const uint8_t* data = colorWaveformData.data();
         int totalBytes = (int)colorWaveformData.size();
 
-        // Find global peak for height normalization (use d5 = blue/front as main height)
         uint8_t globalPeak = 1;
         for (int i = 0; i < colorEntryCount; ++i)
         {
@@ -223,16 +268,14 @@ private:
             float avgD4 = sumD4 / (float)count;
             float avgD5 = sumD5 / (float)count;
 
-            // Use d5 (blue/front height) as amplitude — no peak overlay
             float amplitude = avgD5;
             if (amplitude < 1.0f) continue;
 
             float barH = amplitude * hScale;
             float x = inset + (float)px;
 
-            // Blend blue -> white based on relative d3 (treble/brightness) content
             float total = avgD3 + avgD4 + avgD5 + 0.001f;
-            float highRatio = avgD3 / total;  // 0 = pure blue, 1 = white
+            float highRatio = avgD3 / total;
             float blueR = 0.0f  + highRatio * 1.0f;
             float blueG = 0.45f + highRatio * 0.55f;
             float blueB = 1.0f;
@@ -241,23 +284,15 @@ private:
             g.drawVerticalLine((int)x, midY - barH, midY);
             g.drawVerticalLine((int)x, midY, midY + barH);
         }
-
-        paintOverlay(g, bounds, colorEntryCount, true);
     }
 
-    /// Paint cursor, center line, labels (shared by both render paths)
-    void paintOverlay(juce::Graphics& g, juce::Rectangle<float> bounds,
-                      int barCount, bool /*isColor*/)
+    /// Paint cursor and labels (lightweight -- called every frame over cached image)
+    void paintOverlay(juce::Graphics& g, juce::Rectangle<float> bounds, int barCount)
     {
         float w = bounds.getWidth();
         float inset = 2.0f;
         float drawW = w - inset * 2;
         float drawH = bounds.getHeight() - inset * 2;
-        float midY = inset + drawH * 0.5f;
-
-        // Center line
-        g.setColour(juce::Colour(0x40FFFFFF));
-        g.drawHorizontalLine((int)midY, inset, w - inset);
 
         // Play cursor
         if (playPosition >= 0.0f && playPosition <= 1.0f && hasWaveformData())

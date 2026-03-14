@@ -41,11 +41,10 @@ public:
         table.getHeader().setStretchToFitActive(true);
 
         auto& hdr = table.getHeader();
-        hdr.addColumn("Track ID",  ColTrackId,  80, 60, 120, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Artist",    ColArtist,  130, 80, 300, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Artist",    ColArtist,  140, 80, 300, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Title",     ColTitle,   130, 80, 300, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Offset",    ColOffset,  100, 80, 130, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("FPS",       ColFps,      50, 45,  70, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("BPM",       ColBpm,      46, 40,  70, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Trig",      ColTrig,     40, 30,  60, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Notes",     ColNotes,   100, 60, 400, juce::TableHeaderComponent::notSortable);
 
@@ -113,24 +112,10 @@ public:
             ed.setReadOnly(readOnly);
         };
 
-        addField(lblFormTrackId, edFormTrackId, "TRACK ID:", true);
         addField(lblFormArtist,  edFormArtist,  "ARTIST:");
         addField(lblFormTitle,   edFormTitle,   "TITLE:");
         addField(lblFormOffset,  edFormOffset,  "OFFSET (HH:MM:SS:FF):");
         addField(lblFormNotes,   edFormNotes,   "NOTES:");
-
-        formPanel.addAndMakeVisible(lblFormFps);
-        lblFormFps.setText("FPS:", juce::dontSendNotification);
-        lblFormFps.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)));
-        lblFormFps.setColour(juce::Label::textColourId, textDim);
-
-        formPanel.addAndMakeVisible(cmbFormFps);
-        cmbFormFps.addItem("23.976", 1);
-        cmbFormFps.addItem("24", 2);
-        cmbFormFps.addItem("25", 3);
-        cmbFormFps.addItem("29.97", 4);
-        cmbFormFps.addItem("30", 5);
-        cmbFormFps.setSelectedId(5, juce::dontSendNotification);
 
         // --- MIDI trigger fields (independent: Note, CC, PC can coexist) ---
         addField(lblFormMidiCh, edFormMidiCh, "MIDI CH:");
@@ -150,15 +135,18 @@ public:
         addField(lblFormMidiCCVal, edFormMidiCCVal, "VAL:");
         edFormMidiCCVal.setInputRestrictions(3, "0123456789");
 
-        addField(lblFormMidiPC, edFormMidiPC, "PC#:");
-        edFormMidiPC.setInputRestrictions(3, "-0123456789");
-        edFormMidiPC.setTextToShowWhenEmpty("--", textDim);
+        // --- Trigger section header ---
+        formPanel.addAndMakeVisible(lblTriggerSection);
+        lblTriggerSection.setText("TRIGGERS ON TRACK LOAD", juce::dontSendNotification);
+        lblTriggerSection.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::bold)));
+        lblTriggerSection.setColour(juce::Label::textColourId, accentCyan);
+        lblTriggerSection.setJustificationType(juce::Justification::centredLeft);
 
         // --- OSC trigger fields ---
         addField(lblFormOscAddr, edFormOscAddr, "OSC TRIGGER ADDRESS:");
         edFormOscAddr.setTextToShowWhenEmpty("/trigger/track", textDim);
         addField(lblFormOscArgs, edFormOscArgs, "OSC TRIGGER ARGS:");
-        edFormOscArgs.setTextToShowWhenEmpty("i:1 s:\"text\"  |  {trackId} {artist} {title}", textDim);
+        edFormOscArgs.setTextToShowWhenEmpty("i:1 s:\"text\"  |  {artist} {title}", textDim);
 
         // --- Art-Net DMX trigger fields ---
         addField(lblFormDmxCh, edFormDmxCh, "DMX CH:");
@@ -167,6 +155,24 @@ public:
 
         addField(lblFormDmxVal, edFormDmxVal, "DMX VAL:");
         edFormDmxVal.setInputRestrictions(3, "0123456789");
+
+        // BPM multiplier combo
+        formPanel.addAndMakeVisible(lblFormBpmMult);
+        lblFormBpmMult.setText("BPM MULT:", juce::dontSendNotification);
+        lblFormBpmMult.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)));
+        lblFormBpmMult.setColour(juce::Label::textColourId, textDim);
+        lblFormBpmMult.setJustificationType(juce::Justification::centredLeft);
+
+        formPanel.addAndMakeVisible(cmbFormBpmMult);
+        cmbFormBpmMult.addItem("--  (off)",   1);   // bpmMultiplier = 0
+        cmbFormBpmMult.addItem("x2  (double)",2);   // bpmMultiplier = 1
+        cmbFormBpmMult.addItem("x4  (quad)",  3);   // bpmMultiplier = 2
+        cmbFormBpmMult.addItem("/2  (half)",  4);   // bpmMultiplier = -1
+        cmbFormBpmMult.addItem("/4  (quarter)",5);  // bpmMultiplier = -2
+        cmbFormBpmMult.setSelectedId(1, juce::dontSendNotification);
+        cmbFormBpmMult.setColour(juce::ComboBox::backgroundColourId, bgDarker);
+        cmbFormBpmMult.setColour(juce::ComboBox::textColourId, textBright);
+        cmbFormBpmMult.setColour(juce::ComboBox::outlineColourId, borderCol);
 
         auto addFormBtn = [this](juce::TextButton& btn, const juce::String& text)
         {
@@ -203,9 +209,10 @@ public:
     //--------------------------------------------------------------------------
     // Set the active track ID (for visual highlighting in the table)
     //--------------------------------------------------------------------------
-    void setActiveTrackId(uint32_t id)
+    void setActiveTrack(const juce::String& artist, const juce::String& title)
     {
-        if (activeTrackId != id) { activeTrackId = id; table.repaint(); }
+        auto newKey = TrackMapEntry::makeKey(artist, title);
+        if (activeTrackKey != newKey) { activeTrackKey = newKey; table.repaint(); }
     }
 
     /// Set the Learn player combo to match the engine's current player.
@@ -292,7 +299,7 @@ public:
     {
         if (rowNumber < 0 || rowNumber >= (int)rows.size()) return;
 
-        bool isActive = (rows[(size_t)rowNumber]->trackId == activeTrackId && activeTrackId != 0);
+        bool isActive = (!activeTrackKey.empty() && rows[(size_t)rowNumber]->key() == activeTrackKey);
 
         if (isSelected)
             g.fillAll(accentCyan.withAlpha(0.15f));
@@ -309,18 +316,29 @@ public:
         jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
         const auto& entry = *rows[(size_t)rowNumber];
 
-        bool isActive = (entry.trackId == activeTrackId && activeTrackId != 0);
+        bool isActive = (!activeTrackKey.empty() && entry.key() == activeTrackKey);
         g.setColour(isActive ? accentGreen.brighter(0.3f) : textBright);
         g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
 
         juce::String text;
         switch (columnId)
         {
-            case ColTrackId: text = juce::String(entry.trackId); break;
             case ColArtist:  text = entry.artist; break;
             case ColTitle:   text = entry.title; break;
             case ColOffset:  text = entry.timecodeOffset; break;
-            case ColFps:     text = fpsIndexToString(entry.frameRate); break;
+            case ColBpm:
+            {
+                // Show compact BPM multiplier indicator
+                switch (entry.bpmMultiplier)
+                {
+                    case  1: text = "x2";  g.setColour(accentCyan.brighter(0.3f)); break;
+                    case  2: text = "x4";  g.setColour(accentCyan.brighter(0.3f)); break;
+                    case -1: text = "/2";  g.setColour(accentCyan.brighter(0.3f)); break;
+                    case -2: text = "/4";  g.setColour(accentCyan.brighter(0.3f)); break;
+                    default: text = "--";  break;
+                }
+                break;
+            }
             case ColTrig:
             {
                 // Show compact trigger indicators: M=MIDI, O=OSC, D=DMX
@@ -331,7 +349,7 @@ public:
                 if (t.isNotEmpty())
                 {
                     g.setColour(juce::Colour(0xFFFFAB00));  // amber accent
-                    g.drawText(t, 4, 0, width - 8, height, juce::Justification::centred, true);
+                    g.drawText(t, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
                 }
                 return;
             }
@@ -364,7 +382,7 @@ private:
 
     std::vector<const TrackMapEntry*> rows;   // sorted snapshot (ptrs into trackMap) for display
     uint64_t rowsGeneration = 0;               // generation at which rows were built
-    uint32_t activeTrackId = 0;
+    std::string activeTrackKey;  // artist|title key of currently playing track
     int editingRow = -1;               // -1 = adding new, >= 0 = editing existing
 
     //--------------------------------------------------------------------------
@@ -383,7 +401,7 @@ private:
     //--------------------------------------------------------------------------
     // Column IDs
     //--------------------------------------------------------------------------
-    enum { ColTrackId = 1, ColArtist, ColTitle, ColOffset, ColFps, ColTrig, ColNotes };
+    enum { ColArtist = 1, ColTitle, ColOffset, ColBpm, ColTrig, ColNotes };
 
     //--------------------------------------------------------------------------
     // UI components
@@ -396,17 +414,19 @@ private:
 
     // Edit form
     juce::Component formPanel;
-    static constexpr int kFormHeight = 283;   // 7 rows + spacing
+    static constexpr int kFormHeight = 300;   // track info + trigger section + buttons
 
-    juce::Label      lblFormTrackId, lblFormArtist, lblFormTitle, lblFormOffset, lblFormFps, lblFormNotes;
-    juce::TextEditor edFormTrackId, edFormArtist, edFormTitle, edFormOffset, edFormNotes;
-    juce::ComboBox   cmbFormFps;
+    juce::Label      lblFormArtist, lblFormTitle, lblFormOffset, lblFormNotes;
+    juce::TextEditor edFormArtist, edFormTitle, edFormOffset, edFormNotes;
 
-    // MIDI trigger (independent: Note, CC, PC can coexist)
+    // MIDI trigger (Note, CC)
     juce::Label      lblFormMidiCh, lblFormMidiNote, lblFormMidiNoteVel;
-    juce::Label      lblFormMidiCC, lblFormMidiCCVal, lblFormMidiPC;
+    juce::Label      lblFormMidiCC, lblFormMidiCCVal;
     juce::TextEditor edFormMidiCh, edFormMidiNote, edFormMidiNoteVel;
-    juce::TextEditor edFormMidiCC, edFormMidiCCVal, edFormMidiPC;
+    juce::TextEditor edFormMidiCC, edFormMidiCCVal;
+
+    // Trigger section header
+    juce::Label      lblTriggerSection;
 
     // OSC trigger
     juce::Label      lblFormOscAddr, lblFormOscArgs;
@@ -415,6 +435,10 @@ private:
     // Art-Net DMX trigger
     juce::Label      lblFormDmxCh, lblFormDmxVal;
     juce::TextEditor edFormDmxCh, edFormDmxVal;
+
+    // BPM multiplier (per-track)
+    juce::Label    lblFormBpmMult;
+    juce::ComboBox cmbFormBpmMult;
 
     juce::TextButton btnFormSave, btnFormCancel;
 
@@ -441,26 +465,21 @@ private:
     void updateStatusText()
     {
         juce::String s = "Tracks: " + juce::String(trackMap.size());
-        if (activeTrackId != 0)
+        if (!activeTrackKey.empty())
         {
-            const auto* entry = trackMap.find(activeTrackId);
-            s += " | Active: #" + juce::String(activeTrackId);
-            s += entry ? " (MAPPED)" : " (UNMAPPED)";
+            // Find the entry to show artist - title
+            for (auto& [k, entry] : trackMap.getEntries())
+            {
+                if (k == activeTrackKey)
+                {
+                    s += " | Active: " + entry.artist + " - " + entry.title + " (MAPPED)";
+                    break;
+                }
+            }
+            if (!s.contains("MAPPED"))
+                s += " | Active track (UNMAPPED)";
         }
         lblStatus.setText(s, juce::dontSendNotification);
-    }
-
-    static juce::String fpsIndexToString(int idx)
-    {
-        switch (idx)
-        {
-            case 0: return "23.976";
-            case 1: return "24";
-            case 2: return "25";
-            case 3: return "29.97";
-            case 4: return "30";
-        }
-        return "30";
     }
 
     //--------------------------------------------------------------------------
@@ -473,51 +492,41 @@ private:
         const int fieldH = 22;
         const int rowH   = labelH + fieldH;
 
-        // Row 1: Track ID, Offset, FPS
+        // Row 1: Artist, Title
         auto row1 = area.removeFromTop(rowH);
         {
-            auto seg = row1.removeFromLeft(140);
-            lblFormTrackId.setBounds(seg.removeFromTop(labelH));
-            edFormTrackId.setBounds(seg);
-            row1.removeFromLeft(8);
-
-            seg = row1.removeFromLeft(160);
-            lblFormOffset.setBounds(seg.removeFromTop(labelH));
-            edFormOffset.setBounds(seg);
-            row1.removeFromLeft(8);
-
-            seg = row1.removeFromLeft(80);
-            lblFormFps.setBounds(seg.removeFromTop(labelH));
-            cmbFormFps.setBounds(seg);
-        }
-
-        area.removeFromTop(4);
-
-        // Row 2: Artist, Title
-        auto row2 = area.removeFromTop(rowH);
-        {
-            int halfW = (row2.getWidth() - 8) / 2;
-            auto seg = row2.removeFromLeft(halfW);
+            int halfW = (row1.getWidth() - 8) / 2;
+            auto seg = row1.removeFromLeft(halfW);
             lblFormArtist.setBounds(seg.removeFromTop(labelH));
             edFormArtist.setBounds(seg);
+            row1.removeFromLeft(8);
+
+            lblFormTitle.setBounds(row1.removeFromTop(labelH));
+            edFormTitle.setBounds(row1);
+        }
+
+        area.removeFromTop(4);
+
+        // Row 2: Offset, Notes
+        auto row2 = area.removeFromTop(rowH);
+        {
+            auto seg = row2.removeFromLeft(160);
+            lblFormOffset.setBounds(seg.removeFromTop(labelH));
+            edFormOffset.setBounds(seg);
             row2.removeFromLeft(8);
 
-            lblFormTitle.setBounds(row2.removeFromTop(labelH));
-            edFormTitle.setBounds(row2);
+            lblFormNotes.setBounds(row2.removeFromTop(labelH));
+            edFormNotes.setBounds(row2);
         }
+
+        area.removeFromTop(6);
+
+        // ---- Trigger section header ----
+        lblTriggerSection.setBounds(area.removeFromTop(16));
 
         area.removeFromTop(4);
 
-        // Row 3: Notes (full width)
-        auto row3 = area.removeFromTop(rowH);
-        {
-            lblFormNotes.setBounds(row3.removeFromTop(labelH));
-            edFormNotes.setBounds(row3);
-        }
-
-        area.removeFromTop(4);
-
-        // Row 4: MIDI Trigger: Ch, Note, Vel, CC#, CCVal, PC# (all independent)
+        // Row 4: MIDI Trigger: Ch, Note, Vel, CC#, CCVal
         auto row4 = area.removeFromTop(rowH);
         {
             auto seg = row4.removeFromLeft(52);
@@ -543,11 +552,6 @@ private:
             seg = row4.removeFromLeft(52);
             lblFormMidiCCVal.setBounds(seg.removeFromTop(labelH));
             edFormMidiCCVal.setBounds(seg);
-            row4.removeFromLeft(12);
-
-            seg = row4.removeFromLeft(52);
-            lblFormMidiPC.setBounds(seg.removeFromTop(labelH));
-            edFormMidiPC.setBounds(seg);
         }
 
         area.removeFromTop(4);
@@ -568,7 +572,7 @@ private:
 
         area.removeFromTop(4);
 
-        // Row 6: Art-Net DMX trigger
+        // Row 6: Art-Net DMX trigger + BPM Multiplier
         auto row6 = area.removeFromTop(rowH);
         {
             auto seg = row6.removeFromLeft(80);
@@ -579,6 +583,11 @@ private:
             seg = row6.removeFromLeft(80);
             lblFormDmxVal.setBounds(seg.removeFromTop(labelH));
             edFormDmxVal.setBounds(seg);
+            row6.removeFromLeft(16);
+
+            seg = row6.removeFromLeft(180);
+            lblFormBpmMult.setBounds(seg.removeFromTop(labelH));
+            cmbFormBpmMult.setBounds(seg);
         }
 
         area.removeFromTop(6);
@@ -602,13 +611,12 @@ private:
         const auto& entry = *rows[(size_t)rowIndex];
         editingRow = rowIndex;
 
-        edFormTrackId.setReadOnly(true);
-        edFormTrackId.setText(juce::String(entry.trackId), false);
         edFormArtist.setText(entry.artist, false);
+        edFormArtist.setReadOnly(true);
         edFormTitle.setText(entry.title, false);
+        edFormTitle.setReadOnly(true);
         edFormOffset.setText(entry.timecodeOffset, false);
         edFormNotes.setText(entry.notes, false);
-        cmbFormFps.setSelectedId(entry.frameRate + 1, juce::dontSendNotification);
 
         // MIDI trigger (independent fields)
         edFormMidiCh.setText(juce::String(entry.midiChannel + 1), false);   // display 1-16
@@ -616,7 +624,6 @@ private:
         edFormMidiNoteVel.setText(juce::String(entry.midiNoteVel), false);
         edFormMidiCC.setText(entry.midiCCNum >= 0 ? juce::String(entry.midiCCNum) : "", false);
         edFormMidiCCVal.setText(juce::String(entry.midiCCVal), false);
-        edFormMidiPC.setText(entry.midiPC >= 0 ? juce::String(entry.midiPC) : "", false);
 
         // OSC trigger
         edFormOscAddr.setText(entry.oscAddress, false);
@@ -626,24 +633,32 @@ private:
         edFormDmxCh.setText(entry.artnetCh > 0 ? juce::String(entry.artnetCh) : "", false);
         edFormDmxVal.setText(juce::String(entry.artnetVal), false);
 
+        // BPM multiplier
+        {
+            int comboId = 1; // default: off
+            if      (entry.bpmMultiplier ==  1) comboId = 2;
+            else if (entry.bpmMultiplier ==  2) comboId = 3;
+            else if (entry.bpmMultiplier == -1) comboId = 4;
+            else if (entry.bpmMultiplier == -2) comboId = 5;
+            cmbFormBpmMult.setSelectedId(comboId, juce::dontSendNotification);
+        }
+
         formPanel.setVisible(true);
         resized();
         edFormOffset.grabKeyboardFocus();
     }
 
-    void openFormForNew(uint32_t trackId = 0,
-                        const juce::String& artist = {},
+    void openFormForNew(const juce::String& artist = {},
                         const juce::String& title = {})
     {
         editingRow = -1;
 
-        edFormTrackId.setText(trackId != 0 ? juce::String(trackId) : "", false);
-        edFormTrackId.setReadOnly(trackId != 0);
         edFormArtist.setText(artist, false);
+        edFormArtist.setReadOnly(false);
         edFormTitle.setText(title, false);
+        edFormTitle.setReadOnly(false);
         edFormOffset.setText("00:00:00:00", false);
         edFormNotes.setText("", false);
-        cmbFormFps.setSelectedId(5, juce::dontSendNotification);  // default 30fps
 
         // MIDI trigger defaults (all disabled)
         edFormMidiCh.setText("1", false);
@@ -651,7 +666,6 @@ private:
         edFormMidiNoteVel.setText("127", false);
         edFormMidiCC.setText("", false);
         edFormMidiCCVal.setText("127", false);
-        edFormMidiPC.setText("", false);
 
         // OSC trigger defaults
         edFormOscAddr.setText("", false);
@@ -661,13 +675,16 @@ private:
         edFormDmxCh.setText("", false);
         edFormDmxVal.setText("255", false);
 
+        // BPM multiplier default (off)
+        cmbFormBpmMult.setSelectedId(1, juce::dontSendNotification);
+
         formPanel.setVisible(true);
         resized();
 
-        if (trackId != 0)
+        if (artist.isNotEmpty())
             edFormOffset.grabKeyboardFocus();
         else
-            edFormTrackId.grabKeyboardFocus();
+            edFormArtist.grabKeyboardFocus();
     }
 
     void closeForm()
@@ -682,21 +699,13 @@ private:
     //--------------------------------------------------------------------------
     void onFormSave()
     {
-        // Parse track ID
-        uint32_t trackId = 0;
-        if (editingRow >= 0 && editingRow < (int)rows.size())
+        // Validate artist + title (required as composite key)
+        juce::String formArtist = edFormArtist.getText().trim();
+        juce::String formTitle  = edFormTitle.getText().trim();
+        if (formArtist.isEmpty() || formTitle.isEmpty())
         {
-            trackId = rows[(size_t)editingRow]->trackId;
-        }
-        else
-        {
-            auto idText = edFormTrackId.getText().trim();
-            trackId = (uint32_t)idText.getLargeIntValue();
-        }
-
-        if (trackId == 0)
-        {
-            edFormTrackId.grabKeyboardFocus();
+            if (formArtist.isEmpty()) edFormArtist.grabKeyboardFocus();
+            else                      edFormTitle.grabKeyboardFocus();
             return;
         }
 
@@ -709,18 +718,23 @@ private:
             edFormOffset.setHighlightedRegion(juce::Range<int>(0, offset.length()));
             return;
         }
-        // Normalize the offset string
         offset = TrackMapEntry::formatTimecodeString(h, m, s, f);
 
+        // If editing an existing row whose artist/title changed, remove the old entry
+        if (editingRow >= 0 && editingRow < (int)rows.size())
+        {
+            auto& oldEntry = *rows[(size_t)editingRow];
+            if (TrackMapEntry::makeKey(formArtist, formTitle) != oldEntry.key())
+                trackMap.remove(oldEntry.artist, oldEntry.title);
+        }
+
         TrackMapEntry entry;
-        entry.trackId        = trackId;
-        entry.artist         = edFormArtist.getText().trim();
-        entry.title          = edFormTitle.getText().trim();
+        entry.artist         = formArtist;
+        entry.title          = formTitle;
         entry.timecodeOffset = offset;
-        entry.frameRate      = juce::jlimit(0, 4, cmbFormFps.getSelectedId() - 1);
         entry.notes          = edFormNotes.getText().trim();
 
-        // MIDI trigger (independent fields)
+        // MIDI trigger
         entry.midiChannel = juce::jlimit(0, 15, edFormMidiCh.getText().getIntValue() - 1);
         {
             auto noteText = edFormMidiNote.getText().trim();
@@ -734,11 +748,6 @@ private:
                             : juce::jlimit(-1, 127, ccText.getIntValue());
         }
         entry.midiCCVal = juce::jlimit(0, 127, edFormMidiCCVal.getText().getIntValue());
-        {
-            auto pcText = edFormMidiPC.getText().trim();
-            entry.midiPC = (pcText.isEmpty() || pcText == "--") ? -1
-                         : juce::jlimit(-1, 127, pcText.getIntValue());
-        }
 
         // OSC trigger
         entry.oscAddress = edFormOscAddr.getText().trim();
@@ -752,6 +761,17 @@ private:
         }
         entry.artnetVal = juce::jlimit(0, 255, edFormDmxVal.getText().getIntValue());
 
+        // BPM multiplier
+        {
+            int comboId = cmbFormBpmMult.getSelectedId();
+            if      (comboId == 2) entry.bpmMultiplier =  1;
+            else if (comboId == 3) entry.bpmMultiplier =  2;
+            else if (comboId == 4) entry.bpmMultiplier = -1;
+            else if (comboId == 5) entry.bpmMultiplier = -2;
+            else                   entry.bpmMultiplier =  0;
+        }
+
+        auto savedKey = entry.key();
         trackMap.addOrUpdate(entry);
         closeForm();
         notifyChanged();
@@ -759,7 +779,7 @@ private:
         // Select the saved row
         for (int i = 0; i < (int)rows.size(); ++i)
         {
-            if (rows[(size_t)i]->trackId == trackId)
+            if (rows[(size_t)i]->key() == savedKey)
             {
                 table.selectRow(i);
                 break;
@@ -779,16 +799,16 @@ private:
     {
         if (!proDJLinkInput || !proDJLinkInput->getIsRunning()) return;
 
-        int player = cmbLearnLayer.getSelectedId();  // combo ID == player number (1-6)
-        uint32_t trackId = proDJLinkInput->getTrackID(player);
-        if (trackId == 0) return;
+        int player = cmbLearnLayer.getSelectedId();
+        uint32_t cdjId = proDJLinkInput->getTrackID(player);
+        if (cdjId == 0) return;
 
         auto tinfo = proDJLinkInput->getTrackInfo(player);
 
-        // Phase 2: enrich with dbClient cache if available
+        // Enrich with dbClient cache if available
         if (dbClient != nullptr)
         {
-            auto meta = dbClient->getCachedMetadataByTrackId(trackId);
+            auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
             if (meta.isValid())
             {
                 tinfo.artist = meta.artist;
@@ -796,14 +816,19 @@ private:
             }
         }
 
+        if (tinfo.artist.isEmpty() || tinfo.title.isEmpty()
+            || tinfo.title.startsWith("Track #"))
+            return;  // can't learn without real metadata
+
         // If entry already exists, open it for editing
-        if (trackMap.contains(trackId))
+        if (trackMap.contains(tinfo.artist, tinfo.title))
         {
             rebuildRows();
             table.updateContent();
+            auto targetKey = TrackMapEntry::makeKey(tinfo.artist, tinfo.title);
             for (int i = 0; i < (int)rows.size(); ++i)
             {
-                if (rows[(size_t)i]->trackId == trackId)
+                if (rows[(size_t)i]->key() == targetKey)
                 {
                     table.selectRow(i);
                     openFormForRow(i);
@@ -813,8 +838,7 @@ private:
         }
         else
         {
-            // Create new entry pre-filled with ProDJLink metadata
-            openFormForNew(trackId, tinfo.artist, tinfo.title);
+            openFormForNew(tinfo.artist, tinfo.title);
         }
     }
 
@@ -827,15 +851,12 @@ private:
     {
         auto selected = table.getSelectedRow();
         if (selected < 0 || selected >= (int)rows.size()) return;
-        jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
+        jassert(rowsGeneration == trackMap.getGeneration());
 
-        // Capture entry data by value before the async dialog.
         const auto& entry = *rows[(size_t)selected];
-        uint32_t deleteTrackId = entry.trackId;
-        juce::String msg = "Delete track #" + juce::String(deleteTrackId);
-        if (entry.artist.isNotEmpty())
-            msg += " (" + entry.artist + " - " + entry.title + ")";
-        msg += "?";
+        juce::String deleteArtist = entry.artist;
+        juce::String deleteTitle  = entry.title;
+        juce::String msg = "Delete \"" + deleteArtist + " - " + deleteTitle + "\"?";
 
         auto options = juce::MessageBoxOptions()
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
@@ -844,14 +865,12 @@ private:
             .withButton("Delete")
             .withButton("Cancel");
 
-        // showScopedAsync returns a ScopedMessageBox that must be kept alive
-        // until the callback fires.  Storing it as a member ensures this.
         deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
-            [this, deleteTrackId](int result)
+            [this, deleteArtist, deleteTitle](int result)
             {
-                if (result == 1)  // first button = Delete
+                if (result == 1)
                 {
-                    trackMap.remove(deleteTrackId);
+                    trackMap.remove(deleteArtist, deleteTitle);
                     closeForm();
                     notifyChanged();
                 }
@@ -883,15 +902,16 @@ private:
             {
                 TrackMapEntry e;
                 e.fromVar(item);
-                if (e.trackId != 0)
+                if (e.hasValidKey())
                     entries.push_back(std::move(e));
             }
             if (entries.empty()) return;
 
-            // Sort by Track ID
+            // Sort by artist then title
             std::sort(entries.begin(), entries.end(),
                 [](const TrackMapEntry& a, const TrackMapEntry& b) {
-                    return a.trackId < b.trackId;
+                    int cmp = a.artist.compareIgnoreCase(b.artist);
+                    return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
                 });
 
             showImportPreview(std::move(entries));
@@ -913,7 +933,7 @@ private:
 
             // Mark duplicates
             for (size_t i = 0; i < items.size(); ++i)
-                isDuplicate.push_back(existingMap.contains(items[i].trackId));
+                isDuplicate.push_back(existingMap.contains(items[i].artist, items[i].title));
 
             setSize(600, 400);
 
@@ -928,11 +948,10 @@ private:
 
             auto& hdr = table.getHeader();
             hdr.addColumn("",          1,  28, 28,  28, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Track ID",  2,  70, 50,  90, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Artist",    3, 140, 60, 250, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Title",     4, 150, 60, 300, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Offset",    5,  90, 70, 110, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Status",    6,  80, 60, 100, juce::TableHeaderComponent::notSortable);
+            hdr.addColumn("Artist",    2, 160, 60, 250, juce::TableHeaderComponent::notSortable);
+            hdr.addColumn("Title",     3, 170, 60, 300, juce::TableHeaderComponent::notSortable);
+            hdr.addColumn("Offset",    4,  90, 70, 110, juce::TableHeaderComponent::notSortable);
+            hdr.addColumn("Status",    5,  80, 60, 100, juce::TableHeaderComponent::notSortable);
 
             addAndMakeVisible(btnSelectAll);
             btnSelectAll.setButtonText("Select All");
@@ -1035,21 +1054,17 @@ private:
                 }
                 case 2:
                     g.setColour(sel ? juce::Colour(0xFFCFD8DC) : juce::Colour(0xFF546E7A));
-                    g.drawText(juce::String(e.trackId), 4, 0, w - 8, h, juce::Justification::centredLeft);
+                    g.drawText(e.artist, 4, 0, w - 8, h, juce::Justification::centredLeft, true);
                     break;
                 case 3:
                     g.setColour(sel ? juce::Colour(0xFFCFD8DC) : juce::Colour(0xFF546E7A));
-                    g.drawText(e.artist, 4, 0, w - 8, h, juce::Justification::centredLeft, true);
+                    g.drawText(e.title, 4, 0, w - 8, h, juce::Justification::centredLeft, true);
                     break;
                 case 4:
                     g.setColour(sel ? juce::Colour(0xFFCFD8DC) : juce::Colour(0xFF546E7A));
-                    g.drawText(e.title, 4, 0, w - 8, h, juce::Justification::centredLeft, true);
-                    break;
-                case 5:
-                    g.setColour(sel ? juce::Colour(0xFFCFD8DC) : juce::Colour(0xFF546E7A));
                     g.drawText(e.timecodeOffset, 4, 0, w - 8, h, juce::Justification::centredLeft);
                     break;
-                case 6:
+                case 5:
                     g.setColour(dup ? juce::Colour(0xFFE65100) : juce::Colour(0xFF2E7D32));
                     g.drawText(dup ? "overwrite" : "new", 4, 0, w - 8, h, juce::Justification::centredLeft);
                     break;
@@ -1148,7 +1163,7 @@ private:
         opts.dialogTitle = "Import -- Select Tracks";
         opts.dialogBackgroundColour = juce::Colour(0xFF12141A);
         opts.content.setOwned(preview);
-        opts.useNativeTitleBar = true;
+        opts.useNativeTitleBar = false;
         opts.resizable = true;
 
         importPreviewWindow = opts.launchAsync();

@@ -46,12 +46,211 @@ public:
         : proDJLink(pdl), dbClient(db), trackMap(tmap), engines(engs)
     {
         setSize(900, 680);
+
+        // --- Toolbar buttons ---
+        addAndMakeVisible(btnLayout);
+        btnLayout.setButtonText("4x1");
+        btnLayout.setColour(juce::TextButton::buttonColourId, bgDeck);
+        btnLayout.setColour(juce::TextButton::textColourOffId, textMid);
+        btnLayout.setClickingTogglesState(false);
+        btnLayout.onClick = [this]
+        {
+            layoutHorizontal = !layoutHorizontal;
+            btnLayout.setButtonText(layoutHorizontal ? "2x2" : "4x1");
+            resized();
+            repaint();
+            if (onLayoutChanged) onLayoutChanged();
+        };
+
+        addAndMakeVisible(btnShowMixer);
+        btnShowMixer.setButtonText("DJM");
+        btnShowMixer.setClickingTogglesState(true);
+        btnShowMixer.setToggleState(true, juce::dontSendNotification);
+        btnShowMixer.setColour(juce::ToggleButton::textColourId, textMid);
+        btnShowMixer.setColour(juce::ToggleButton::tickColourId, accentCyan);
+        btnShowMixer.onClick = [this]
+        {
+            showMixer = btnShowMixer.getToggleState();
+            resized();
+            repaint();
+            if (onLayoutChanged) onLayoutChanged();
+        };
+
         startTimerHz(30);
     }
 
     ~ProDJLinkViewComponent() override
     {
         stopTimer();
+    }
+
+    // Called when BPM multiplier is saved to TrackMap via double-click.
+    // Wire this to save settings and refresh engine lookups.
+    std::function<void()> onTrackMapChanged;
+
+    // Called when layout or mixer visibility changes (for settings persistence)
+    std::function<void()> onLayoutChanged;
+
+    void setLayoutHorizontal(bool h)
+    {
+        layoutHorizontal = h;
+        btnLayout.setButtonText(layoutHorizontal ? "2x2" : "4x1");
+        resized(); repaint();
+    }
+    void setShowMixer(bool m)
+    {
+        showMixer = m;
+        btnShowMixer.setToggleState(m, juce::dontSendNotification);
+        resized(); repaint();
+    }
+    bool getLayoutHorizontal() const { return layoutHorizontal; }
+    bool getShowMixer()        const { return showMixer; }
+
+private:
+    //==========================================================================
+    // Per-deck state cache (updated every timer tick)
+    //==========================================================================
+    struct DeckState
+    {
+        bool discovered = false;
+        juce::String model, ip, playState, posSource;
+        juce::String artist, title, key, offset;
+        double bpm = 0.0, faderPitch = 1.0;
+        bool isOnAir = false, isMaster = false, isPlaying = false, trackMapped = false;
+        uint8_t beatInBar = 0;
+        uint8_t xfAssign  = 0;   // 0=THRU, 1=A, 2=B (from DJM mixer data)
+        uint32_t playheadMs = 0, trackLenSec = 0, trackId = 0;
+        uint32_t artworkId = 0;
+        float posRatio = 0.0f;
+        juce::String fpsStr;
+        Timecode timecode {};
+        Timecode offsetTimecode {};    // timecode with TrackMap offset applied (running clock)
+        juce::StringArray engineNames;
+
+        // Per-deck waveform component (painted via translated Graphics context)
+        WaveformDisplay waveform;
+        juce::Image     cachedArtworkImg;  // cached from DbServerClient (avoid lock during paint)
+        uint32_t displayedWaveformTrackId = 0;
+        uint32_t displayedArtworkId = 0;
+        uint32_t prevTrackId = 0;
+        bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
+        int      metadataRequestTick = 0;   // tick counter for retry after ~3s
+
+        // BPM multiplier state (updated each tick from engine + TrackMap)
+        int  bpmSessionOverride = TimecodeEngine::kBpmNoOverride;  // from engine: kBpmNoOverride=none, 0=1x, 1=x2...
+        int  bpmTrackMapValue   = 0;  // from TrackMap entry: same encoding
+        // Cached button hit-test bounds (set during paint, used in mouseDown)
+        juce::Rectangle<int> bpmBtnBounds[5];  // order: /4 /2 1x x2 x4
+        // Per-deck double-click timing for BPM multiplier buttons
+        juce::int64 lastBpmClickMs   = 0;
+        int         lastBpmClickMult = -999;
+    };
+
+public:
+    // BPM multiplier button click handler with timing-based double-click detection.
+    // Single click: toggle session override (temporary, cleared on track change).
+    // Double click: persist to TrackMap (creates entry if track not mapped).
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        auto pos = e.getPosition();
+        for (int deck = 0; deck < 4; ++deck)
+        {
+            if (!deckBounds[deck].contains(pos)) continue;
+            auto& ds = deckState[deck];
+            int pn = deck + 1;
+
+            static const int kBpmValues[5] = { -2, -1, 0, 1, 2 };
+            for (int bi = 0; bi < 5; ++bi)
+            {
+                if (!ds.bpmBtnBounds[bi].contains(pos)) continue;
+                int clickedMult = kBpmValues[bi];
+
+                // Timing-based double-click detection (same approach as MainComponent)
+                auto now = (juce::int64)juce::Time::getMillisecondCounter();
+                bool isDouble = (clickedMult == ds.lastBpmClickMult
+                                 && (now - ds.lastBpmClickMs) < 400);
+                ds.lastBpmClickMs   = now;
+                ds.lastBpmClickMult = clickedMult;
+
+                if (isDouble)
+                {
+                    // Double click: persist to TrackMap (toggle)
+                    saveBpmToTrackMap(pn, ds, clickedMult);
+                }
+                else
+                {
+                    // Single click: set session override (skip if already effective)
+                    for (auto& eng : engines)
+                    {
+                        if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                            && eng->getEffectivePlayer() == pn)
+                        {
+                            if (eng->getEffectiveBpmMultiplier() == clickedMult)
+                                break;  // already active -- do nothing
+                            eng->setBpmPlayerOverride(clickedMult);
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
+            break;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Persist BPM multiplier to TrackMap.
+    // Toggle logic: if TrackMap already has this value, clear it; else set it.
+    // After saving, session override is cleared (TrackMap = source of truth).
+    // Creates a new TrackMap entry if the track isn't mapped yet.
+    //--------------------------------------------------------------------------
+    void saveBpmToTrackMap(int playerNum, DeckState& ds, int clickedMult)
+    {
+        if (ds.artist.isEmpty() || ds.title.isEmpty()) return;
+
+        auto* entry = trackMap.find(ds.artist, ds.title);
+        int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
+
+        // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
+        int newValue;
+        if (clickedMult == 0)
+            newValue = 0;                           // 1x = clear
+        else if (clickedMult == currentMapValue)
+            return;                                 // already saved, do nothing
+        else
+            newValue = clickedMult;                  // save new value
+
+        if (entry != nullptr)
+        {
+            entry->bpmMultiplier = newValue;
+        }
+        else if (newValue != 0)
+        {
+            TrackMapEntry newEntry;
+            newEntry.artist  = ds.artist;
+            newEntry.title   = ds.title;
+            newEntry.bpmMultiplier = newValue;
+            trackMap.addOrUpdate(newEntry);
+        }
+        else
+        {
+            return;  // no entry and clearing to 0 = nothing to do
+        }
+
+        // Clear session override: TrackMap is now the source of truth.
+        // Update engine's cachedBpmMultiplier so it takes effect immediately.
+        for (auto& eng : engines)
+        {
+            if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                && eng->getEffectivePlayer() == playerNum)
+            {
+                eng->setBpmPlayerOverride(TimecodeEngine::kBpmNoOverride);
+                eng->setCachedBpmMultiplier(newValue);
+                break;
+            }
+        }
+
+        if (onTrackMapChanged) onTrackMapChanged();
     }
 
     //==========================================================================
@@ -64,29 +263,59 @@ public:
     {
         auto bounds = getLocalBounds().reduced(6);
 
-        // Mixer strip at bottom (scales slightly with window height, min 44, max 64)
-        int mixerH = juce::jlimit(44, 64, bounds.getHeight() / 12);
-        auto mixerArea = bounds.removeFromBottom(mixerH);
-        bounds.removeFromBottom(4); // gap
+        // --- Toolbar (top) ---
+        auto toolbar = bounds.removeFromTop(22);
+        btnLayout.setBounds(toolbar.removeFromLeft(40));
+        toolbar.removeFromLeft(6);
+        btnShowMixer.setBounds(toolbar.removeFromLeft(60));
+        bounds.removeFromTop(4);
 
-        // 2x2 grid: two rows, two columns, 4px gaps
+        // --- Mixer panel (right side, conditional) ---
+        if (showMixer)
+        {
+            int mixerW = juce::jlimit(200, 280, bounds.getWidth() / 5);
+            bounds.removeFromRight(4);
+            mixerBounds = bounds.removeFromRight(mixerW);
+        }
+        else
+        {
+            mixerBounds = {};
+        }
+
+        // --- Deck layout ---
         int gapH = 4, gapV = 4;
-        int deckW = (bounds.getWidth() - gapH) / 2;
-        int deckH = (bounds.getHeight() - gapV) / 2;
 
-        auto topRow = bounds.removeFromTop(deckH);
-        bounds.removeFromTop(gapV);
-        auto bottomRow = bounds;
+        if (layoutHorizontal)
+        {
+            // 4x1: four decks side by side, evenly distributed
+            // Integer division spreads rounding pixels across all decks
+            int totalDeckW = bounds.getWidth() - gapH * 3;
 
-        deckBounds[0] = topRow.removeFromLeft(deckW);
-        topRow.removeFromLeft(gapH);
-        deckBounds[1] = topRow;
+            for (int i = 0; i < 4; ++i)
+            {
+                int w = totalDeckW * (i + 1) / 4 - totalDeckW * i / 4;
+                deckBounds[i] = bounds.removeFromLeft(w);
+                if (i < 3) bounds.removeFromLeft(gapH);
+            }
+        }
+        else
+        {
+            // 2x2 grid
+            int deckW = (bounds.getWidth() - gapH) / 2;
+            int deckH = (bounds.getHeight() - gapV) / 2;
 
-        deckBounds[2] = bottomRow.removeFromLeft(deckW);
-        bottomRow.removeFromLeft(gapH);
-        deckBounds[3] = bottomRow;
+            auto topRow = bounds.removeFromTop(deckH);
+            bounds.removeFromTop(gapV);
+            auto bottomRow = bounds;
 
-        mixerBounds = mixerArea;
+            deckBounds[0] = topRow.removeFromLeft(deckW);
+            topRow.removeFromLeft(gapH);
+            deckBounds[1] = topRow;
+
+            deckBounds[2] = bottomRow.removeFromLeft(deckW);
+            bottomRow.removeFromLeft(gapH);
+            deckBounds[3] = bottomRow;
+        }
     }
 
     //==========================================================================
@@ -107,6 +336,7 @@ public:
             ds.isMaster      = proDJLink.isPlayerMaster(pn);
             ds.isPlaying     = proDJLink.isPlayerPlaying(pn);
             ds.beatInBar     = proDJLink.getBeatInBar(pn);
+            ds.xfAssign      = proDJLink.hasMixerFaderData() ? proDJLink.getChannelXfAssign(pn) : 0;
             ds.playheadMs    = proDJLink.getPlayheadMs(pn);
             ds.trackLenSec   = proDJLink.getTrackLengthSec(pn);
             ds.trackId       = proDJLink.getTrackID(pn);
@@ -124,9 +354,10 @@ public:
             ds.trackMapped = false;
             ds.offset = "00:00:00:00";
             ds.offsetTimecode = {};
-            if (ds.trackId != 0)
+            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
+                && !ds.title.startsWith("Track #"))
             {
-                const auto* entry = trackMap.find(ds.trackId);
+                const auto* entry = trackMap.find(ds.artist, ds.title);
                 if (entry != nullptr)
                 {
                     ds.trackMapped = true;
@@ -136,22 +367,31 @@ public:
                     int oH, oM, oS, oF;
                     if (TrackMapEntry::parseTimecodeString(entry->timecodeOffset, oH, oM, oS, oF))
                     {
-                        FrameRate offsetFps = TimecodeEngine::indexToFps(entry->frameRate);
                         ds.offsetTimecode = applyTimecodeOffset(
-                            ds.timecode, fps, oH, oM, oS, oF, offsetFps);
+                            ds.timecode, fps, oH, oM, oS, oF, fps);
                     }
                 }
             }
 
             // Engine assignment: find which engines monitor this player
             ds.engineNames.clear();
+            ds.bpmSessionOverride = TimecodeEngine::kBpmNoOverride;
+            ds.bpmTrackMapValue   = 0;
             for (auto& eng : engines)
             {
                 if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
-                    && eng->getProDJLinkPlayer() == pn)
+                    && eng->getEffectivePlayer() == pn)
                 {
                     ds.engineNames.add(eng->getName());
+                    ds.bpmSessionOverride = eng->getBpmPlayerOverride();
                 }
+            }
+            // BPM multiplier from TrackMap (independent of engine)
+            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+            {
+                const auto* entry = trackMap.find(ds.artist, ds.title);
+                if (entry != nullptr)
+                    ds.bpmTrackMapValue = entry->bpmMultiplier;
             }
 
             // --- Track changed? ---
@@ -316,8 +556,9 @@ public:
         for (int deck = 0; deck < 4; ++deck)
             paintDeck(g, deckBounds[deck], deck);
 
-        // Paint mixer
-        paintMixer(g, mixerBounds);
+        // Paint mixer (only if visible)
+        if (showMixer && !mixerBounds.isEmpty())
+            paintMixer(g, mixerBounds);
     }
 
 private:
@@ -336,38 +577,15 @@ private:
     juce::Colour accentRed    { 0xFFFF5252 };
     juce::Colour tcGlow       { 0xFF00AAFF };
 
-    //==========================================================================
-    // Per-deck state cache (updated every timer tick)
-    //==========================================================================
-    struct DeckState
-    {
-        bool discovered = false;
-        juce::String model, ip, playState, posSource;
-        juce::String artist, title, key, offset;
-        double bpm = 0.0, faderPitch = 1.0;
-        bool isOnAir = false, isMaster = false, isPlaying = false, trackMapped = false;
-        uint8_t beatInBar = 0;
-        uint32_t playheadMs = 0, trackLenSec = 0, trackId = 0;
-        uint32_t artworkId = 0;
-        float posRatio = 0.0f;
-        juce::String fpsStr;
-        Timecode timecode {};
-        Timecode offsetTimecode {};    // timecode with TrackMap offset applied (running clock)
-        juce::StringArray engineNames;
-
-        // Per-deck waveform component (painted via translated Graphics context)
-        WaveformDisplay waveform;
-        juce::Image     cachedArtworkImg;  // cached from DbServerClient (avoid lock during paint)
-        uint32_t displayedWaveformTrackId = 0;
-        uint32_t displayedArtworkId = 0;
-        uint32_t prevTrackId = 0;
-        bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
-        int      metadataRequestTick = 0;   // tick counter for retry after ~3s
-    };
-
     DeckState deckState[4];
     juce::Rectangle<int> deckBounds[4];
     juce::Rectangle<int> mixerBounds;
+
+    // Layout state
+    bool layoutHorizontal = false;   // false = 2x2 grid, true = 4x1 horizontal
+    bool showMixer        = true;    // show DJM mixer strip
+    juce::TextButton   btnLayout;
+    juce::ToggleButton btnShowMixer;
 
     // Smoothed VU meter levels (decay-based, updated per timer tick)
     // Indices: 0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=MasterL, 5=MasterR
@@ -400,9 +618,9 @@ private:
         int deckH = inner.getHeight();
 
         // --- Proportional layout ---
-        // Fixed chrome: header(22) + gaps(~16) + map(16) + engine(16) = ~70px
+        // Fixed chrome: header(22) + gaps(~16) + map(16) + engine(16) + bpmRow(18) = ~88px
         // Flexible: infoRow, waveform, timecode scale with available height
-        constexpr int kFixedChrome = 70;
+        constexpr int kFixedChrome = 88;
         int flexH = juce::jmax(0, deckH - kFixedChrome);
 
         // Distribute flexible space: info 35%, waveform 45%, timecode 20%
@@ -429,6 +647,19 @@ private:
             g.drawText(juce::String(pn), badge, juce::Justification::centred);
         }
         headerRow.removeFromLeft(4);
+
+        // Crossfader assign badge (A/B from DJM, only when not THRU)
+        if (ds.xfAssign == 1 || ds.xfAssign == 2)
+        {
+            auto xfBadge = headerRow.removeFromLeft(16).toFloat().reduced(0, 3);
+            juce::Colour xfCol = (ds.xfAssign == 1) ? accentCyan : accentAmber;
+            g.setColour(xfCol.withAlpha(0.25f));
+            g.fillRoundedRectangle(xfBadge, 2.0f);
+            g.setColour(xfCol);
+            g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+            g.drawText(ds.xfAssign == 1 ? "A" : "B", xfBadge, juce::Justification::centred);
+            headerRow.removeFromLeft(2);
+        }
 
         // Model name + IP
         {
@@ -514,16 +745,38 @@ private:
             g.drawText(ds.artist.isNotEmpty() ? ds.artist : "",
                        artistRow, juce::Justification::centredLeft, true);
 
-            // BPM + Key
+            // BPM + Key + multiplied BPM if active
             auto bpmRow = infoArea.removeFromTop(lineH);
             juce::String bpmStr;
-            if (ds.bpm > 0.0) bpmStr += juce::String(ds.bpm, 1) + " BPM";
+            if (ds.bpm > 0.0)
+            {
+                bpmStr += juce::String(ds.bpm, 1) + " BPM";
+
+                // Show effective (multiplied) BPM if multiplier is active
+                int sess = ds.bpmSessionOverride;
+                int map  = ds.bpmTrackMapValue;
+                int eff  = (sess != TimecodeEngine::kBpmNoOverride) ? sess : map;
+                if (eff != 0)
+                {
+                    double multBpm = TimecodeEngine::applyBpmMultiplier(ds.bpm, eff);
+                    juce::String multLabel;
+                    switch (eff) {
+                        case  1: multLabel = "x2"; break;
+                        case  2: multLabel = "x4"; break;
+                        case -1: multLabel = "/2"; break;
+                        case -2: multLabel = "/4"; break;
+                        default: break;
+                    }
+                    bpmStr += "  " + juce::String::charToString(0x2192) + " "
+                            + juce::String(multBpm, 1) + " (" + multLabel + ")";
+                }
+            }
             if (ds.key.isNotEmpty()) bpmStr += "  " + ds.key;
             g.setFont(juce::Font(juce::FontOptions(detailFs)));
             g.setColour(accentCyan.brighter(0.3f));
             g.drawText(bpmStr, bpmRow, juce::Justification::centredLeft, true);
 
-            // Pitch (fader position — this is what the DJ sets)
+            // Pitch (fader position -- this is what the DJ sets)
             auto pitchRow = infoArea.removeFromTop(lineH);
             {
                 double pitchPct = (ds.faderPitch - 1.0) * 100.0;
@@ -641,6 +894,71 @@ private:
                 g.drawText("--", engRow, juce::Justification::centred);
             }
         }
+
+        inner.removeFromTop(2);
+
+        //----------------------------------------------------------------------
+        // BPM Multiplier row -- 5 buttons: /4  /2  1x  x2  x4
+        // Session override takes priority; TrackMap value shown dimmer when
+        // no session override is active.
+        //----------------------------------------------------------------------
+        auto bpmRow = inner.removeFromTop(16);
+        {
+            // Effective multiplier: session takes priority over TrackMap
+            int sess = ds.bpmSessionOverride;
+            int map  = ds.bpmTrackMapValue;
+            int eff  = (sess != TimecodeEngine::kBpmNoOverride) ? sess : map;
+
+            // Button definitions: label, multiplier value
+            struct BpmBtn { const char* label; int mult; };
+            static const BpmBtn kBtns[5] = {
+                { "/4", -2 }, { "/2", -1 }, { "1x", 0 }, { "x2", 1 }, { "x4", 2 }
+            };
+
+            int gap = 2;
+            int btnW = (bpmRow.getWidth() - gap * 4) / 5;
+            auto rowCopy = bpmRow;
+
+            for (int bi = 0; bi < 5; ++bi)
+            {
+                auto btnRect = (bi < 4) ? rowCopy.removeFromLeft(btnW) : rowCopy;
+                if (bi < 4) rowCopy.removeFromLeft(gap);
+
+                // Store for hit-testing in mouseDown
+                ds.bpmBtnBounds[bi] = btnRect;
+
+                int mult = kBtns[bi].mult;
+                bool active   = (eff == mult);
+                bool isSaved  = (map != 0 && map == mult);  // has TrackMap value on this button
+
+                // Background: active gets blue glow, inactive gets dim
+                juce::Colour bg, fg;
+                if (active)
+                {
+                    bg = accentCyan.withAlpha(0.30f);
+                    fg = accentCyan.brighter(0.3f);
+                }
+                else
+                {
+                    bg = bgDeck.brighter(0.05f);
+                    fg = textDim;
+                }
+
+                // Golden text always wins for saved TrackMap value
+                if (isSaved)
+                    fg = accentAmber;
+
+                auto bf = btnRect.toFloat();
+                g.setColour(bg);
+                g.fillRoundedRectangle(bf, 2.0f);
+                g.setColour(active ? accentCyan.withAlpha(0.6f) : borderCol);
+                g.drawRoundedRectangle(bf, 2.0f, 0.5f);
+
+                g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                g.setColour(fg);
+                g.drawText(kBtns[bi].label, btnRect, juce::Justification::centred);
+            }
+        }
     }
 
     //==========================================================================
@@ -733,7 +1051,7 @@ private:
     }
 
     //==========================================================================
-    // Mixer strip (DJM faders + crossfader)
+    // Mixer panel (DJM -- vertical side panel)
     //==========================================================================
     void paintMixer(juce::Graphics& g, juce::Rectangle<int> area)
     {
@@ -743,52 +1061,244 @@ private:
         g.setColour(borderCol);
         g.drawRoundedRectangle(af, 4.0f, 1.0f);
 
-        auto inner = area.reduced(8, 4);
+        auto inner = area.reduced(6, 4);
 
-        // DJM model label
+        // --- Header: DJM model ---
+        auto headerRow = inner.removeFromTop(16);
         juce::String djmModel = proDJLink.getDJMModel();
         if (djmModel.isEmpty()) djmModel = "DJM";
-        auto labelArea = inner.removeFromLeft(80);
         g.setFont(juce::Font(juce::FontOptions(10.0f, juce::Font::bold)));
         g.setColour(textMid);
-        g.drawText(djmModel, labelArea, juce::Justification::centredLeft);
+        g.drawText(djmModel, headerRow, juce::Justification::centred);
+        inner.removeFromTop(4);
 
         if (!proDJLink.hasMixerFaderData())
         {
             g.setColour(textDim);
             g.setFont(juce::Font(juce::FontOptions(9.0f)));
-            g.drawText("Waiting for bridge data...", inner, juce::Justification::centredLeft);
+            g.drawText("Waiting for\nbridge data...", inner,
+                        juce::Justification::centred);
             return;
         }
 
-        // Channel faders 1-4 with VU meters
-        int faderW = 60;
+        // --- Bottom section: crossfader + master (reserve space) ---
+        auto bottomSection = inner.removeFromBottom(90);
+        inner.removeFromBottom(4);
+
+        // --- Channel strips: 4 columns filling the remaining height ---
+        int gap = 3;
+        int totalW = inner.getWidth() - gap * 3;
+
         for (int ch = 1; ch <= 4; ++ch)
         {
-            auto faderArea = inner.removeFromLeft(faderW);
-            uint8_t val = proDJLink.getChannelFader(ch);
-            float vu = vuSmoothed[ch - 1];  // VU index 0-3 = CH1-CH4
-            paintFader(g, faderArea.toFloat(), val, "CH" + juce::String(ch),
-                       proDJLink.isPlayerOnAir(ch) ? accentGreen : accentCyan, vu);
-            inner.removeFromLeft(4);
+            int colW = totalW * ch / 4 - totalW * (ch - 1) / 4;
+            auto col = inner.removeFromLeft(colW);
+            if (ch < 4) inner.removeFromLeft(gap);
+
+            paintChannelStrip(g, col, ch);
         }
 
-        // Crossfader
-        inner.removeFromLeft(12);
-        {
-            auto xfArea = inner.removeFromLeft(80);
-            uint8_t val = proDJLink.getCrossfader();
-            paintCrossfader(g, xfArea.toFloat(), val);
-            inner.removeFromLeft(12);
-        }
+        // --- Crossfader ---
+        auto xfRow = bottomSection.removeFromTop(28);
+        paintCrossfader(g, xfRow.toFloat(), proDJLink.getCrossfader());
+        bottomSection.removeFromTop(4);
 
-        // Master fader with stereo VU (L+R)
+        // --- Master fader (horizontal) + stereo VU ---
         {
-            auto mfArea = inner.removeFromLeft(faderW + 8);  // slightly wider for stereo VU
-            uint8_t val = proDJLink.getMasterFader();
-            float vuL = vuSmoothed[4];  // MasterL
-            float vuR = vuSmoothed[5];  // MasterR
-            paintFader(g, mfArea.toFloat(), val, "MST", accentAmber, vuL, vuR);
+            auto mstRow = bottomSection;
+            auto labelArea = mstRow.removeFromTop(10);
+            g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+            g.setColour(accentAmber);
+            g.drawText("MASTER", labelArea, juce::Justification::centred);
+
+            // Horizontal master bar
+            auto barArea = mstRow.removeFromTop(8).reduced(4, 0);
+            g.setColour(juce::Colour(0xFF1A1D23));
+            g.fillRoundedRectangle(barArea.toFloat(), 2.0f);
+            float mstPct = proDJLink.getMasterFader() / 255.0f;
+            auto fillBar = barArea.toFloat().withWidth(barArea.getWidth() * mstPct);
+            g.setColour(accentAmber.withAlpha(0.7f));
+            g.fillRoundedRectangle(fillBar, 2.0f);
+
+            mstRow.removeFromTop(3);
+
+            // Stereo VU bars (horizontal)
+            auto vuRow = mstRow.removeFromTop(6).reduced(4, 0);
+            paintHorizontalVu(g, vuRow.removeFromTop(3), vuSmoothed[4]);
+            paintHorizontalVu(g, vuRow, vuSmoothed[5]);
+
+            mstRow.removeFromTop(3);
+
+            // Booth + Headphone info
+            auto infoRow = mstRow.removeFromTop(10);
+            g.setFont(juce::Font(juce::FontOptions(7.0f)));
+            g.setColour(textDim);
+            int boothPct = (int)std::round(proDJLink.getBoothLevel() / 255.0f * 100.0f);
+            int hpPct    = (int)std::round(proDJLink.getHpLevel() / 255.0f * 100.0f);
+            g.drawText("BOOTH " + juce::String(boothPct) + "%  HP " + juce::String(hpPct) + "%",
+                        infoRow, juce::Justification::centred);
+
+            // Beat FX info
+            auto fxRow = mstRow.removeFromTop(10);
+            static const char* fxNames[] = {
+                "DELAY","ECHO","PING PONG","SPIRAL","REVERB","TRANS",
+                "FILTER","FLANGER","PHASER","PITCH","SLIP ROLL","ROLL",
+                "V.BRAKE","HELIX"
+            };
+            int fxSel = proDJLink.getBeatFxSelect();
+            bool fxOn = proDJLink.getBeatFxOn() != 0;
+            juce::String fxStr = (fxSel >= 0 && fxSel < 14)
+                ? juce::String(fxNames[fxSel]) : "FX";
+            g.setColour(fxOn ? accentCyan : textDim);
+            g.setFont(juce::Font(juce::FontOptions(7.0f, fxOn ? juce::Font::bold : juce::Font::plain)));
+            g.drawText("FX: " + fxStr + (fxOn ? " ON" : ""), fxRow, juce::Justification::centred);
+        }
+    }
+
+    //==========================================================================
+    // Single channel strip (vertical: label, trim, EQ, color, CUE, fader+VU, XF)
+    //==========================================================================
+    void paintChannelStrip(juce::Graphics& g, juce::Rectangle<int> area, int ch)
+    {
+        bool onAir = proDJLink.isPlayerOnAir(ch);
+        juce::Colour chCol = onAir ? accentGreen : accentCyan;
+
+        // --- Channel label + on-air ---
+        auto labelRow = area.removeFromTop(12);
+        g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+        g.setColour(onAir ? accentGreen : textMid);
+        g.drawText(juce::String(ch), labelRow, juce::Justification::centred);
+        area.removeFromTop(2);
+
+        // --- Trim (small horizontal bar) ---
+        paintParamBar(g, area.removeFromTop(6), proDJLink.getChannelTrim(ch), textMid, "T");
+        area.removeFromTop(2);
+
+        // --- EQ HI / MID / LO (center-referenced bars) ---
+        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqHi(ch), accentAmber, "H");
+        area.removeFromTop(1);
+        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqMid(ch), accentAmber, "M");
+        area.removeFromTop(1);
+        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqLo(ch), accentAmber, "L");
+        area.removeFromTop(2);
+
+        // --- Color knob (horizontal bar) ---
+        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelColor(ch), accentCyan, "C");
+        area.removeFromTop(2);
+
+        // --- CUE button ---
+        {
+            bool cue = proDJLink.getChannelCue(ch) != 0;
+            auto cueRow = area.removeFromTop(10);
+            auto cueBox = cueRow.reduced(juce::jmax(0, (cueRow.getWidth() - 20) / 2), 0)
+                                 .withHeight(10);
+            g.setColour(cue ? juce::Colour(0xFFFF6D00) : juce::Colour(0xFF1A1D23));
+            g.fillRoundedRectangle(cueBox.toFloat(), 2.0f);
+            g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
+            g.setColour(cue ? juce::Colours::black : textDim);
+            g.drawText("CUE", cueBox, juce::Justification::centred);
+        }
+        area.removeFromTop(3);
+
+        // --- XF assign at bottom ---
+        auto xfRow = area.removeFromBottom(10);
+        uint8_t xfAssign = proDJLink.getChannelXfAssign(ch);
+        {
+            juce::String xfLabel = (xfAssign == 1) ? "A" : (xfAssign == 2) ? "B" : "-";
+            juce::Colour xfCol = (xfAssign == 1) ? accentCyan
+                               : (xfAssign == 2) ? accentAmber : textDim;
+            g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+            g.setColour(xfCol);
+            g.drawText(xfLabel, xfRow, juce::Justification::centred);
+        }
+        area.removeFromBottom(2);
+
+        // --- Fader + VU (fills remaining height) ---
+        paintFader(g, area.toFloat(), proDJLink.getChannelFader(ch),
+                   "", chCol, vuSmoothed[ch - 1]);
+    }
+
+    //==========================================================================
+    // Horizontal parameter bar (0-255 range, left to right fill)
+    //==========================================================================
+    void paintParamBar(juce::Graphics& g, juce::Rectangle<int> area,
+                       uint8_t val, juce::Colour color, const juce::String& label)
+    {
+        // Tiny label on left
+        if (label.isNotEmpty() && area.getWidth() > 20)
+        {
+            auto lbl = area.removeFromLeft(8);
+            g.setFont(juce::Font(juce::FontOptions(6.0f)));
+            g.setColour(textDim);
+            g.drawText(label, lbl, juce::Justification::centredRight);
+            area.removeFromLeft(1);
+        }
+        auto bar = area.toFloat();
+        g.setColour(juce::Colour(0xFF1A1D23));
+        g.fillRoundedRectangle(bar, 1.5f);
+        float pct = val / 255.0f;
+        g.setColour(color.withAlpha(0.6f));
+        g.fillRoundedRectangle(bar.withWidth(bar.getWidth() * pct), 1.5f);
+    }
+
+    //==========================================================================
+    // Horizontal EQ bar (center-referenced: 128=center, < left, > right)
+    //==========================================================================
+    void paintEqBar(juce::Graphics& g, juce::Rectangle<int> area,
+                    uint8_t val, juce::Colour color, const juce::String& label)
+    {
+        if (label.isNotEmpty() && area.getWidth() > 20)
+        {
+            auto lbl = area.removeFromLeft(8);
+            g.setFont(juce::Font(juce::FontOptions(6.0f)));
+            g.setColour(textDim);
+            g.drawText(label, lbl, juce::Justification::centredRight);
+            area.removeFromLeft(1);
+        }
+        auto bar = area.toFloat();
+        g.setColour(juce::Colour(0xFF1A1D23));
+        g.fillRoundedRectangle(bar, 1.5f);
+
+        float center = bar.getX() + bar.getWidth() * 0.5f;
+        float pct = (val - 128) / 128.0f;  // -1..+1
+
+        // Draw center tick
+        g.setColour(textDim.withAlpha(0.3f));
+        g.fillRect(center - 0.5f, bar.getY(), 1.0f, bar.getHeight());
+
+        // Draw deviation bar from center
+        float devW = std::abs(pct) * bar.getWidth() * 0.5f;
+        float devX = (pct >= 0) ? center : center - devW;
+        g.setColour(color.withAlpha(0.6f));
+        g.fillRoundedRectangle(devX, bar.getY(), devW, bar.getHeight(), 1.0f);
+    }
+
+    //==========================================================================
+    // Horizontal VU bar (for master section)
+    //==========================================================================
+    void paintHorizontalVu(juce::Graphics& g, juce::Rectangle<int> area, float level)
+    {
+        auto bar = area.toFloat();
+        g.setColour(juce::Colour(0xFF0A0C10));
+        g.fillRoundedRectangle(bar, 1.0f);
+        if (level <= 0.001f) return;
+
+        constexpr float kVuGain = 3.0f;
+        float boosted = juce::jlimit(0.0f, 1.0f, level * kVuGain);
+        float scaled  = (boosted > 0.0f)
+            ? juce::jlimit(0.0f, 1.0f, std::log10(1.0f + boosted * 9.0f))
+            : 0.0f;
+
+        // Fill with green-yellow-red gradient
+        float fillW = scaled * bar.getWidth();
+        for (float x = 0; x < fillW; x += 2.0f)
+        {
+            float t = x / bar.getWidth();
+            juce::Colour col = (t < 0.65f) ? accentGreen.withAlpha(0.75f)
+                             : (t < 0.85f) ? accentAmber.withAlpha(0.80f)
+                             : accentRed.withAlpha(0.85f);
+            g.setColour(col);
+            g.fillRect(bar.getX() + x, bar.getY(), 1.5f, bar.getHeight());
         }
     }
 
@@ -797,42 +1307,26 @@ private:
     //==========================================================================
     void paintFader(juce::Graphics& g, juce::Rectangle<float> area,
                     uint8_t val, const juce::String& label, juce::Colour color,
-                    float vuLevel = -1.0f, float vuLevel2 = -1.0f)
+                    float vuLevel = -1.0f)
     {
-        // Label on top
-        auto labelArea = area.removeFromTop(12.0f);
-        g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
-        g.setColour(textMid);
-        g.drawText(label, labelArea, juce::Justification::centred);
-
-        // Value text on bottom (reserve space first)
-        auto valueArea = area.removeFromBottom(9.0f);
-
-        // VU meter(s) on the right side of the fader area
-        bool hasVu  = (vuLevel  >= 0.0f);
-        bool hasVu2 = (vuLevel2 >= 0.0f);  // stereo: second VU bar (Master R)
-
-        float vuBarW = 3.0f;
-        float vuGap  = 2.0f;
-
-        juce::Rectangle<float> vuArea1, vuArea2;
-        if (hasVu2)
+        if (label.isNotEmpty())
         {
-            // Stereo: two VU bars on the right
-            auto vuStrip = area.removeFromRight(vuBarW * 2.0f + vuGap + 1.0f);
-            vuArea2 = vuStrip.removeFromRight(vuBarW);
-            vuStrip.removeFromRight(vuGap);
-            vuArea1 = vuStrip.removeFromRight(vuBarW);
+            auto labelArea = area.removeFromTop(12.0f);
+            g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+            g.setColour(textMid);
+            g.drawText(label, labelArea, juce::Justification::centred);
         }
-        else if (hasVu)
+
+        bool hasVu = (vuLevel >= 0.0f);
+        float vuBarW = 3.0f;
+        juce::Rectangle<float> vuArea1;
+        if (hasVu)
         {
-            // Mono: one VU bar on the right
             area.removeFromRight(1.0f);
             vuArea1 = area.removeFromRight(vuBarW);
         }
 
-        // Fader track fills the remaining space
-        float trackW = 8.0f;
+        float trackW = juce::jmin(8.0f, area.getWidth() * 0.6f);
         float trackX = area.getCentreX() - trackW * 0.5f;
         float trackH = area.getHeight();
         float trackY = area.getY();
@@ -841,25 +1335,16 @@ private:
         g.setColour(juce::Colour(0xFF1A1D23));
         g.fillRoundedRectangle(trackRect, 2.0f);
 
-        // Fill from bottom
         float fillH = (val / 255.0f) * trackH;
         auto fillRect = juce::Rectangle<float>(trackX, trackY + trackH - fillH, trackW, fillH);
         g.setColour(color.withAlpha(0.7f));
         g.fillRoundedRectangle(fillRect, 2.0f);
 
-        // Draw VU bars
-        if (hasVu)  paintVuBar(g, vuArea1, vuLevel);
-        if (hasVu2) paintVuBar(g, vuArea2, vuLevel2);
-
-        // Value text
-        int pct = (int)std::round((val / 255.0f) * 100.0f);
-        g.setFont(juce::Font(juce::FontOptions(7.0f)));
-        g.setColour(textDim);
-        g.drawText(juce::String(pct) + "%", valueArea, juce::Justification::centred);
+        if (hasVu) paintVuBar(g, vuArea1, vuLevel);
     }
 
     //==========================================================================
-    // Single VU meter bar (vertical, bottom-up, green-yellow-red gradient)
+    // Vertical VU meter bar (bottom-up, green-yellow-red segmented)
     //==========================================================================
     void paintVuBar(juce::Graphics& g, juce::Rectangle<float> area, float level)
     {
@@ -868,26 +1353,22 @@ private:
         float x = area.getX();
         float y = area.getY();
 
-        // Background
         g.setColour(juce::Colour(0xFF0A0C10));
         g.fillRoundedRectangle(area, 1.0f);
-
         if (level <= 0.001f) return;
 
-        // Fill from bottom with segmented green→yellow→red
         constexpr float kVuGain = 3.0f;
-		float boosted = juce::jlimit(0.0f, 1.0f, level * kVuGain);
-		float scaled  = (boosted > 0.0f)
-			? juce::jlimit(0.0f, 1.0f, std::log10(1.0f + boosted * 9.0f))
-			: 0.0f;
-		float fillH = scaled * h;
-        float segH = h / 15.0f;  // 15 visual segments matching DJM VU
-		for (int seg = 0; seg < 15; ++seg)
+        float boosted = juce::jlimit(0.0f, 1.0f, level * kVuGain);
+        float scaled  = (boosted > 0.0f)
+            ? juce::jlimit(0.0f, 1.0f, std::log10(1.0f + boosted * 9.0f))
+            : 0.0f;
+        float fillH = scaled * h;
+        float segH = h / 15.0f;
+        for (int seg = 0; seg < 15; ++seg)
         {
             float segBottom = y + h - (seg + 1) * segH;
-            if (segBottom < y + h - fillH) continue;  // not reached yet
+            if (segBottom < y + h - fillH) continue;
 
-            // Color gradient: 0-9 green, 10-12 yellow, 13-14 red
             juce::Colour segCol;
             if (seg < 10)      segCol = accentGreen.withAlpha(0.75f);
             else if (seg < 13) segCol = accentAmber.withAlpha(0.80f);
@@ -916,11 +1397,11 @@ private:
         g.setColour(juce::Colour(0xFF1A1D23));
         g.fillRoundedRectangle(trackRect, 2.0f);
 
-        // Thumb position: 0=side-A (left), 255=side-B (right) — already corrected
+        // Thumb position: 0=side-A (left), 255=side-B (right) -- already corrected
         float thumbW = 12.0f;
         float thumbH = 14.0f;
         float range = area.getWidth() - thumbW;
-        float normPos = val / 255.0f;  // 0(A)=left, 255(B)=right — direct mapping
+        float normPos = val / 255.0f;  // 0(A)=left, 255(B)=right -- direct mapping
         float thumbX = area.getX() + normPos * range;
         float thumbY = area.getCentreY() - thumbH * 0.5f;
 
@@ -974,12 +1455,14 @@ public:
                         DbServerClient& db,
                         TrackMap& tmap,
                         std::vector<std::unique_ptr<TimecodeEngine>>& engines)
-        : DocumentWindow("PRO DJ LINK VIEW",
+        : DocumentWindow("PDL VIEW",
                           juce::Colour(0xFF0D0E12),
-                          DocumentWindow::allButtons)
+                          DocumentWindow::closeButton | DocumentWindow::maximiseButton)
     {
         setContentOwned(new ProDJLinkViewComponent(pdl, db, tmap, engines), true);
-        setUsingNativeTitleBar(true);
+        setUsingNativeTitleBar(false);
+        setTitleBarHeight(20);
+        setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
         setResizable(true, true);
         centreWithSize(getWidth(), getHeight());
         setVisible(true);
@@ -988,10 +1471,77 @@ public:
 
     void closeButtonPressed() override
     {
-        // Stop the timer before hiding (avoids 30Hz CPU burn while invisible)
+        // Save bounds before hiding
+        if (onBoundsCapture) onBoundsCapture();
         if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
             content->stopTimer();
         setVisible(false);
+    }
+
+    std::function<void()> onBoundsCapture;
+
+    void setOnTrackMapChanged(std::function<void()> cb)
+    {
+        if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
+            content->onTrackMapChanged = std::move(cb);
+    }
+
+    void setOnLayoutChanged(std::function<void()> cb)
+    {
+        if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
+            content->onLayoutChanged = std::move(cb);
+    }
+
+    // --- Bounds persistence ---
+    juce::String getBoundsString() const
+    {
+        auto b = getBounds();
+        return juce::String(b.getX()) + " " + juce::String(b.getY()) + " "
+             + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+    }
+
+    void restoreFromBoundsString(const juce::String& s)
+    {
+        auto parts = juce::StringArray::fromTokens(s, " ", "");
+        if (parts.size() == 4)
+        {
+            auto b = juce::Rectangle<int>(parts[0].getIntValue(), parts[1].getIntValue(),
+                                           parts[2].getIntValue(), parts[3].getIntValue());
+            if (b.getWidth() >= 200 && b.getHeight() >= 150)
+            {
+                // Check the centre point is on a valid display (guard against off-screen restore)
+                auto centre = b.getCentre();
+                bool onScreen = false;
+                for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
+                    if (disp.userArea.contains(centre)) { onScreen = true; break; }
+                if (onScreen)
+                    setBounds(b);
+            }
+        }
+    }
+
+    // --- Layout state ---
+    void setLayoutState(bool horizontal, bool mixer)
+    {
+        if (auto* c = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
+        {
+            c->setLayoutHorizontal(horizontal);
+            c->setShowMixer(mixer);
+        }
+    }
+
+    bool getLayoutHorizontal() const
+    {
+        if (auto* c = dynamic_cast<const ProDJLinkViewComponent*>(getContentComponent()))
+            return c->getLayoutHorizontal();
+        return false;
+    }
+
+    bool getShowMixer() const
+    {
+        if (auto* c = dynamic_cast<const ProDJLinkViewComponent*>(getContentComponent()))
+            return c->getShowMixer();
+        return true;
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProDJLinkViewWindow)

@@ -341,6 +341,8 @@ MainComponent::MainComponent()
     addLabelAndCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, "PLAYER:");
     for (int i = 1; i <= ProDJLink::kMaxPlayers; ++i)
         cmbProDJLinkPlayer.addItem("PLAYER " + juce::String(i), i);
+    cmbProDJLinkPlayer.addItem("XF-A", 7);
+    cmbProDJLinkPlayer.addItem("XF-B", 8);
     cmbProDJLinkPlayer.setSelectedId(1, juce::dontSendNotification);
     cmbProDJLinkPlayer.onChange = [this]
     {
@@ -349,7 +351,16 @@ MainComponent::MainComponent()
         {
             int player = cmbProDJLinkPlayer.getSelectedId();
             if (player >= 1)
+            {
                 currentEngine().setProDJLinkPlayer(player);
+                // Reset UI display so stale data from previous player doesn't linger
+                displayedArtworkId = 0;
+                artworkDisplay.clearImage();
+                displayedWaveformTrackId = 0;
+                waveformDisplay.clearWaveform();
+                lblProDJLinkTrackInfo.setText("", juce::dontSendNotification);
+                lblProDJLinkMetadata.setText("", juce::dontSendNotification);
+            }
             saveSettings();
         }
     };
@@ -359,7 +370,7 @@ MainComponent::MainComponent()
     lblProDJLinkMetadata.setVisible(false);
 
     leftContent.addAndMakeVisible(lblMixerStatus);
-    lblMixerStatus.setFont(juce::Font(juce::FontOptions(9.0f)));
+    lblMixerStatus.setFont(juce::Font(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 9.0f, juce::Font::plain)));
     lblMixerStatus.setColour(juce::Label::textColourId, juce::Colour(0xFF888888));
     lblMixerStatus.setVisible(false);
 
@@ -526,7 +537,7 @@ MainComponent::MainComponent()
         // If ArtNet timecode out is already running, this is a no-op.
         if (btnArtnetMixerFwd.getToggleState() && !currentEngine().getArtnetOutput().getIsRunning())
         {
-            int iface = -1;  // use whatever artnet timecode was configured for, or all interfaces
+            int iface = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
             currentEngine().startArtnetOutput(iface);
         }
         propagateGlobalSettings();
@@ -561,6 +572,49 @@ MainComponent::MainComponent()
     lblLinkStatus.setFont(juce::Font(juce::FontOptions(10.0f)));
     lblLinkStatus.setColour(juce::Label::textColourId, textMid);
     lblLinkStatus.setJustificationType(juce::Justification::centredLeft);
+
+    // --- BPM Multiplier buttons (per-player, ProDJLink only) ---
+    // Single click: session override (temporary). Double click: save to TrackMap (persistent).
+    {
+        auto setupBpmBtn = [this, pdlAccent](juce::TextButton& btn, int mult)
+        {
+            leftContent.addAndMakeVisible(btn);
+            btn.setVisible(false);
+            btn.setColour(juce::TextButton::buttonColourId,   bgPanel);
+            btn.setColour(juce::TextButton::textColourOffId,  textMid);
+            btn.setColour(juce::TextButton::buttonOnColourId, pdlAccent.withAlpha(0.30f));
+            btn.setColour(juce::TextButton::textColourOnId,   pdlAccent.brighter(0.3f));
+            btn.setClickingTogglesState(false);
+            btn.onClick = [this, mult]
+            {
+                if (syncing) return;
+                auto now = (juce::int64)juce::Time::getMillisecondCounter();
+                bool isDouble = (mult == lastBpmClickMult
+                                 && (now - lastBpmClickMs) < 400);
+                lastBpmClickMs   = now;
+                lastBpmClickMult = mult;
+
+                if (isDouble)
+                {
+                    // Double click: persist to TrackMap (toggle)
+                    saveBpmMultToTrackMap(mult);
+                }
+                else
+                {
+                    // Single click: set session override (skip if already effective)
+                    auto& eng = currentEngine();
+                    if (eng.getEffectiveBpmMultiplier() != mult)
+                        eng.setBpmPlayerOverride(mult);
+                }
+                updateBpmMultButtonStates();
+            };
+        };
+        setupBpmBtn(btnBpmOff,  0);
+        setupBpmBtn(btnBpmX2,  1);
+        setupBpmBtn(btnBpmX4,  2);
+        setupBpmBtn(btnBpmD2, -1);
+        setupBpmBtn(btnBpmD4, -2);
+    }
 
     // --- Track change trigger controls ---
     auto accentAmber = juce::Colour(0xFFFFAB00);
@@ -629,7 +683,7 @@ MainComponent::MainComponent()
         // Ensure ArtNet output is running if enabled
         if (btnArtnetTrigger.getToggleState() && !currentEngine().getArtnetOutput().getIsRunning())
         {
-            int iface = -1;
+            int iface = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
             currentEngine().startArtnetOutput(iface);
         }
         updateDeviceSelectorVisibility();
@@ -644,6 +698,23 @@ MainComponent::MainComponent()
     });
     // Default universe 1 (Net=0, Sub=0, Uni=1)
     cmbArtTrigUni.setSelectedId(2, juce::dontSendNotification);
+
+    // Art-Net DMX interface selector (for triggers and mixer forward)
+    addLabelAndCombo(lblArtnetDmxInterface, cmbArtnetDmxInterface, "ART-NET DMX INTERFACE:");
+    cmbArtnetDmxInterface.onChange = [this]
+    {
+        if (syncing) return;
+        auto& eng = currentEngine();
+        bool needsArtnet = eng.isArtnetMixerForwardEnabled() || eng.isArtnetTriggerEnabled();
+        if (needsArtnet)
+        {
+            int sel = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
+            // Restart ArtnetOutput on the new interface (only if timecode output isn't controlling it)
+            if (!eng.isOutputArtnetEnabled() || !eng.getArtnetOutput().getIsRunning())
+                eng.startArtnetOutput(sel);
+        }
+        saveSettings();
+    };
 
     addLabelAndCombo(lblAudioInputDevice, cmbAudioInputDevice, "AUDIO INPUT DEVICE:");
     cmbAudioInputDevice.onChange = [this]
@@ -689,10 +760,32 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (sel >= 0 && eng.isOutputMtcEnabled())
         {
+            // Clear sharing before stopping old MTC device
+            eng.getTriggerOutput().setSharedMidiOutput(nullptr);
             eng.stopMtcOutput();
+
+            // Release trigger's own handle if it matches the new device
             eng.getMtcOutput().refreshDeviceList();
+            auto mtcNames = eng.getMtcOutput().getDeviceNames();
+            if (sel < mtcNames.size()
+                && eng.getTriggerOutput().hasOwnMidiOpen()
+                && eng.getTriggerOutput().getCurrentMidiDeviceName() == mtcNames[sel])
+            {
+                eng.getTriggerOutput().releaseOwnMidi();
+            }
+
             eng.startMtcOutput(sel);
-            populateMidiAndNetworkCombos();  // refresh markers (auto-restores selections)
+
+            // Re-establish sharing if devices match
+            if (eng.getMtcOutput().getIsRunning())
+            {
+                auto trigDevName = stripComboMarker(cmbTriggerMidiDevice.getText());
+                if (trigDevName == eng.getMtcOutput().getCurrentDeviceName())
+                    eng.getTriggerOutput().setSharedMidiOutput(eng.getMtcOutput().getMidiOutputPtr());
+                else
+                    applyTriggerSettings();  // reopen trigger on its own device
+            }
+            populateMidiAndNetworkCombos();
             saveSettings();
         }
     };
@@ -865,16 +958,34 @@ MainComponent::~MainComponent()
         scanThread = nullptr;
     }
 
-    // 6. Close TrackMap editor window (it references settings.trackMap)
+    // 6. Capture window bounds before closing (delete doesn't call closeButtonPressed)
     if (trackMapWindow != nullptr)
+    {
+        auto b = trackMapWindow->getBounds();
+        settings.trackMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         delete trackMapWindow.getComponent();
+    }
 
-    // 6a. Close MixerMap editor window (it references sharedMixerMap)
     if (mixerMapWindow != nullptr)
+    {
+        auto b = mixerMapWindow->getBounds();
+        settings.mixerMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         delete mixerMapWindow.getComponent();
+    }
 
-    // 6b. Close ProDJLink View window (references shared objects)
-    proDJLinkViewWindow.reset();
+    if (proDJLinkViewWindow != nullptr)
+    {
+        auto b = proDJLinkViewWindow->getBounds();
+        settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                               + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+        settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
+        proDJLinkViewWindow.reset();
+    }
+
+    settings.save();
 
     // 7. Stop metadata client (before ProDJLink -- it queries player IPs)
     sharedDbClient.stop();
@@ -947,6 +1058,7 @@ void MainComponent::removeEngine(int index)
 
     // Explicitly stop all protocols on the engine being deleted BEFORE
     // erasing it, so destructors don't race with any pending callbacks.
+    engines[(size_t)index]->getTriggerOutput().setSharedMidiOutput(nullptr);
     engines[(size_t)index]->stopMtcOutput();
     engines[(size_t)index]->stopArtnetOutput();
     engines[(size_t)index]->stopLtcOutput();
@@ -1126,6 +1238,7 @@ void MainComponent::syncUIFromEngine()
 
     // Input buttons
     updateInputButtonStates();
+    updateBpmMultButtonStates();
 
     // FPS
     updateFpsButtonStates();
@@ -1203,11 +1316,19 @@ void MainComponent::syncUIFromEngine()
         setArtNetCombosFromAddress(cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni, eng.getArtnetTriggerUniverse());
         edOscFwdBpmAddr.setText(eng.getOscFwdBpmAddr(), false);
 
+        // Art-Net DMX interface (for trigger + mixer forward)
+        {
+            int artDmxId = es.artnetDmxInterface + 2;  // -1->1 (All), 0->2, 1->3...
+            if (artDmxId < 1) artDmxId = 1;
+            if (artDmxId <= cmbArtnetDmxInterface.getNumItems())
+                cmbArtnetDmxInterface.setSelectedId(artDmxId, juce::dontSendNotification);
+        }
+
         // Ableton Link toggle
         btnLink.setToggleState(eng.getLinkBridge().isEnabled(), juce::dontSendNotification);
 
         // Pro DJ Link (per-engine player)
-        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 6, es.proDJLinkPlayer), juce::dontSendNotification);
+        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 8, es.proDJLinkPlayer), juce::dontSendNotification);
         // ProDJLink interface (global)
         int pdlIfId = settings.proDJLinkInterface + 1;
         if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
@@ -1418,18 +1539,33 @@ void MainComponent::applyTriggerSettings()
                   || eng.isMidiMixerForwardEnabled();
     if (needsMidi)
     {
-        int sel = cmbTriggerMidiDevice.getSelectedId() - 1;
-        if (sel >= 0)
+        auto trigDevName = stripComboMarker(cmbTriggerMidiDevice.getText());
+
+        // Share MtcOutput's handle if it's already open on the same device
+        if (eng.getMtcOutput().getIsRunning()
+            && trigDevName == eng.getMtcOutput().getCurrentDeviceName())
         {
-            if (!trig.isMidiOpen()
-                || trig.getCurrentMidiDeviceName() != cmbTriggerMidiDevice.getText())
+            trig.releaseOwnMidi();
+            trig.setSharedMidiOutput(eng.getMtcOutput().getMidiOutputPtr());
+        }
+        else
+        {
+            // Different device or MTC not running -- open our own handle
+            trig.setSharedMidiOutput(nullptr);
+            int sel = cmbTriggerMidiDevice.getSelectedId() - 1;
+            if (sel >= 0)
             {
-                trig.startMidi(sel);
+                if (!trig.hasOwnMidiOpen()
+                    || trig.getCurrentMidiDeviceName() != trigDevName)
+                {
+                    trig.startMidi(sel);
+                }
             }
         }
     }
     else
     {
+        trig.setSharedMidiOutput(nullptr);
         trig.stopMidi();
     }
 
@@ -1507,7 +1643,10 @@ void MainComponent::openTrackMapEditor()
 
     auto* editor = new TrackMapEditor(settings.trackMap, &sharedProDJLinkInput);
     editor->setDbServerClient(&sharedDbClient);
-    editor->setActiveTrackId(eng.getActiveTrackId());
+    {
+        auto info = eng.getActiveTrackInfo();
+        editor->setActiveTrack(info.artist, info.title);
+    }
 
     editor->onChange = [this]
     {
@@ -1517,14 +1656,46 @@ void MainComponent::openTrackMapEditor()
             e->refreshTrackMapLookup();
     };
 
-    auto dialogOptions = juce::DialogWindow::LaunchOptions();
-    dialogOptions.dialogTitle = "Track Map Editor";
-    dialogOptions.dialogBackgroundColour = juce::Colour(0xFF12141A);
-    dialogOptions.content.setOwned(editor);
-    dialogOptions.useNativeTitleBar = true;
-    dialogOptions.resizable = true;
+    // Non-modal window (self-deleting on close so SafePointer auto-nulls)
+    struct FloatingWindow : juce::DocumentWindow
+    {
+        FloatingWindow(const juce::String& t, juce::Colour bg)
+            : DocumentWindow(t, bg, DocumentWindow::closeButton) {}
+        void closeButtonPressed() override { if (onClose) onClose(); delete this; }
+        std::function<void()> onClose;
+    };
 
-    trackMapWindow = dialogOptions.launchAsync();
+    auto* win = new FloatingWindow("Track Map Editor", juce::Colour(0xFF12141A));
+    win->setContentOwned(editor, true);
+    win->setUsingNativeTitleBar(false);
+    win->setTitleBarHeight(20);
+    win->setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
+    win->setResizable(true, true);
+    win->centreWithSize(editor->getWidth(), editor->getHeight());
+    if (settings.trackMapBounds.isNotEmpty())
+    {
+        auto parts = juce::StringArray::fromTokens(settings.trackMapBounds, " ", "");
+        if (parts.size() == 4)
+        {
+            auto b = juce::Rectangle<int>(parts[0].getIntValue(), parts[1].getIntValue(),
+                                           parts[2].getIntValue(), parts[3].getIntValue());
+            if (b.getWidth() >= 200 && b.getHeight() >= 150)
+            {
+                auto c = b.getCentre();
+                for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
+                    if (d.userArea.contains(c)) { win->setBounds(b); break; }
+            }
+        }
+    }
+    win->onClose = [this, win]()
+    {
+        auto b = win->getBounds();
+        settings.trackMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        saveSettings();
+    };
+    win->setVisible(true);
+    trackMapWindow = win;
 }
 
 void MainComponent::openMixerMapEditor()
@@ -1541,14 +1712,46 @@ void MainComponent::openMixerMapEditor()
         sharedMixerMap.save();
     };
 
-    auto dialogOptions = juce::DialogWindow::LaunchOptions();
-    dialogOptions.dialogTitle = "Mixer Map - DJM Parameter Routing";
-    dialogOptions.dialogBackgroundColour = juce::Colour(0xFF12141A);
-    dialogOptions.content.setOwned(editor);
-    dialogOptions.useNativeTitleBar = true;
-    dialogOptions.resizable = true;
+    // Non-modal window (self-deleting on close so SafePointer auto-nulls)
+    struct FloatingWindow : juce::DocumentWindow
+    {
+        FloatingWindow(const juce::String& t, juce::Colour bg)
+            : DocumentWindow(t, bg, DocumentWindow::closeButton) {}
+        void closeButtonPressed() override { if (onClose) onClose(); delete this; }
+        std::function<void()> onClose;
+    };
 
-    mixerMapWindow = dialogOptions.launchAsync();
+    auto* win = new FloatingWindow("Mixer Map - DJM Parameter Routing", juce::Colour(0xFF12141A));
+    win->setContentOwned(editor, true);
+    win->setUsingNativeTitleBar(false);
+    win->setTitleBarHeight(20);
+    win->setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
+    win->setResizable(true, true);
+    win->centreWithSize(editor->getWidth(), editor->getHeight());
+    if (settings.mixerMapBounds.isNotEmpty())
+    {
+        auto parts = juce::StringArray::fromTokens(settings.mixerMapBounds, " ", "");
+        if (parts.size() == 4)
+        {
+            auto b = juce::Rectangle<int>(parts[0].getIntValue(), parts[1].getIntValue(),
+                                           parts[2].getIntValue(), parts[3].getIntValue());
+            if (b.getWidth() >= 200 && b.getHeight() >= 150)
+            {
+                auto c = b.getCentre();
+                for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
+                    if (d.userArea.contains(c)) { win->setBounds(b); break; }
+            }
+        }
+    }
+    win->onClose = [this, win]()
+    {
+        auto b = win->getBounds();
+        settings.mixerMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        saveSettings();
+    };
+    win->setVisible(true);
+    mixerMapWindow = win;
 }
 
 void MainComponent::openProDJLinkView()
@@ -1563,6 +1766,46 @@ void MainComponent::openProDJLinkView()
     // Recreate window (simpler than restarting timer + resetting state)
     proDJLinkViewWindow = std::make_unique<ProDJLinkViewWindow>(
         sharedProDJLinkInput, sharedDbClient, settings.trackMap, engines);
+
+    // Restore layout state and window bounds
+    proDJLinkViewWindow->setLayoutState(settings.pdlViewHorizontal, settings.pdlViewShowMixer);
+    if (settings.pdlViewBounds.isNotEmpty())
+        proDJLinkViewWindow->restoreFromBoundsString(settings.pdlViewBounds);
+
+    proDJLinkViewWindow->setOnTrackMapChanged([this]
+    {
+        settings.trackMap.save();
+        for (auto& eng : engines)
+            eng->refreshTrackMapLookup();
+        updateBpmMultButtonStates();
+
+        if (trackMapWindow != nullptr)
+        {
+            if (auto* editor = dynamic_cast<TrackMapEditor*>(trackMapWindow->getContentComponent()))
+                editor->refresh();
+        }
+    });
+    proDJLinkViewWindow->setOnLayoutChanged([this]
+    {
+        if (proDJLinkViewWindow != nullptr)
+        {
+            settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+            settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
+            saveSettings();
+        }
+    });
+    proDJLinkViewWindow->onBoundsCapture = [this]
+    {
+        if (proDJLinkViewWindow != nullptr)
+        {
+            auto b = proDJLinkViewWindow->getBounds();
+            settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                   + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+            settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+            settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
+            saveSettings();
+        }
+    };
 }
 
 void MainComponent::startCurrentThruOutput()
@@ -1588,8 +1831,33 @@ void MainComponent::startCurrentThruOutput()
 void MainComponent::startCurrentMtcOutput()
 {
     auto& eng = currentEngine();
+    auto& trig = eng.getTriggerOutput();
     int sel = cmbMidiOutputDevice.getSelectedId() - 1;
+
+    // If TriggerOutput has its OWN handle open on the same device,
+    // release it before MtcOutput opens -- Windows forbids two handles.
+    if (trig.hasOwnMidiOpen() && sel >= 0)
+    {
+        eng.getMtcOutput().refreshDeviceList();
+        auto mtcNames = eng.getMtcOutput().getDeviceNames();
+        if (sel < mtcNames.size()
+            && trig.getCurrentMidiDeviceName() == mtcNames[sel])
+        {
+            trig.releaseOwnMidi();
+        }
+    }
+
     eng.startMtcOutput(sel);
+
+    // Share MtcOutput's open handle with TriggerOutput if same device
+    if (eng.getMtcOutput().getIsRunning())
+    {
+        auto trigDevName = stripComboMarker(cmbTriggerMidiDevice.getText());
+        if (trigDevName == eng.getMtcOutput().getCurrentDeviceName())
+            trig.setSharedMidiOutput(eng.getMtcOutput().getMidiOutputPtr());
+        else
+            trig.setSharedMidiOutput(nullptr);
+    }
 }
 
 void MainComponent::startCurrentArtnetOutput()
@@ -1635,7 +1903,14 @@ void MainComponent::updateCurrentOutputStates()
     auto& eng = currentEngine();
 
     if (eng.isOutputMtcEnabled() && !eng.getMtcOutput().getIsRunning()) startCurrentMtcOutput();
-    else if (!eng.isOutputMtcEnabled() && eng.getMtcOutput().getIsRunning()) eng.stopMtcOutput();
+    else if (!eng.isOutputMtcEnabled() && eng.getMtcOutput().getIsRunning())
+    {
+        // Clear sharing before stopping -- TriggerOutput must not hold a dangling pointer
+        eng.getTriggerOutput().setSharedMidiOutput(nullptr);
+        eng.stopMtcOutput();
+        // Re-open trigger's own device if it still needs MIDI
+        applyTriggerSettings();
+    }
 
     if (eng.isOutputArtnetEnabled() && !eng.getArtnetOutput().getIsRunning()) startCurrentArtnetOutput();
     else if (!eng.isOutputArtnetEnabled() && eng.getArtnetOutput().getIsRunning()) eng.stopArtnetOutput();
@@ -1986,6 +2261,7 @@ void MainComponent::populateMidiAndNetworkCombos()
     int savedMidiOut  = cmbMidiOutputDevice.getSelectedId();
     int savedArtIn    = cmbArtnetInputInterface.getSelectedId();
     int savedArtOut   = cmbArtnetOutputInterface.getSelectedId();
+    int savedArtDmx   = cmbArtnetDmxInterface.getSelectedId();
 
     // MIDI Input
     auto midiIns = juce::MidiInput::getAvailableDevices();
@@ -2009,6 +2285,7 @@ void MainComponent::populateMidiAndNetworkCombos()
     auto nets = getNetworkInterfaces();
     cmbArtnetInputInterface.clear(juce::dontSendNotification);
     cmbArtnetOutputInterface.clear(juce::dontSendNotification);
+    cmbArtnetDmxInterface.clear(juce::dontSendNotification);
 
     // Helper: check if an Art-Net interface combo ID is in use by another engine
     auto getArtnetMarker = [&](int comboId, bool isInput) -> juce::String
@@ -2044,25 +2321,16 @@ void MainComponent::populateMidiAndNetworkCombos()
 
     cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
     cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
+    cmbArtnetDmxInterface.addItem("All Interfaces (Broadcast)", 1);
     for (int i = 0; i < nets.size(); i++)
     {
         auto label = nets[i].name + " (" + nets[i].ip + ")";
         cmbArtnetInputInterface.addItem(label + getArtnetMarker(i + 2, true), i + 2);
         cmbArtnetOutputInterface.addItem(label + getArtnetMarker(i + 2, false), i + 2);
+        cmbArtnetDmxInterface.addItem(label, i + 2);
     }
 
     // Pro DJ Link interfaces
-    auto getProDJLinkMarker = [&](int comboId) -> juce::String
-    {
-        if (sharedProDJLinkInput.getIsRunning())
-        {
-            // ProDJLink doesn't have "All Interfaces" option -- comboId starts at 1
-            if (comboId == 1) // first interface
-                return juce::String(" ") + juce::String::charToString(0x25CF);
-        }
-        return {};
-    };
-
     int savedProDJLinkIf = cmbProDJLinkInterface.getSelectedId();
     cmbProDJLinkInterface.clear(juce::dontSendNotification);
     for (int i = 0; i < nets.size(); i++)
@@ -2081,6 +2349,10 @@ void MainComponent::populateMidiAndNetworkCombos()
         cmbArtnetInputInterface.setSelectedId(savedArtIn, juce::dontSendNotification);
     if (savedArtOut > 0 && savedArtOut <= cmbArtnetOutputInterface.getNumItems())
         cmbArtnetOutputInterface.setSelectedId(savedArtOut, juce::dontSendNotification);
+    if (savedArtDmx > 0 && savedArtDmx <= cmbArtnetDmxInterface.getNumItems())
+        cmbArtnetDmxInterface.setSelectedId(savedArtDmx, juce::dontSendNotification);
+    else if (cmbArtnetDmxInterface.getNumItems() > 0)
+        cmbArtnetDmxInterface.setSelectedId(1, juce::dontSendNotification);
 }
 
 void MainComponent::populateAudioCombos()
@@ -2180,8 +2452,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.getTriggerOutput().setMidiEnabled(es.triggerMidiEnabled);
         eng.getTriggerOutput().setOscEnabled(es.triggerOscEnabled);
 
-        // Open MIDI if any feature needs it (triggers or MIDI clock)
-        if ((es.triggerMidiEnabled || es.midiClockEnabled) && es.triggerMidiDevice.isNotEmpty())
+        // Open MIDI if any feature needs it (triggers, MIDI clock, or mixer forward)
+        if ((es.triggerMidiEnabled || es.midiClockEnabled || es.midiMixerForward) && es.triggerMidiDevice.isNotEmpty())
             eng.getTriggerOutput().startMidiByName(es.triggerMidiDevice);
 
         // Enable MIDI Clock after device is open
@@ -2205,8 +2477,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         // Ableton Link
         eng.getLinkBridge().setEnabled(es.linkEnabled);
 
-        // Connect OSC if any feature needs it (triggers OR OSC forward)
-        if (es.triggerOscEnabled || es.oscBpmForward)
+        // Connect OSC if any feature needs it (triggers, OSC BPM forward, or mixer forward)
+        if (es.triggerOscEnabled || es.oscBpmForward || es.oscMixerForward)
         {
             auto ip = es.oscDestIp.isNotEmpty() ? es.oscDestIp : juce::String("127.0.0.1");
             auto port = es.oscDestPort > 0 ? es.oscDestPort : 53000;
@@ -2217,14 +2489,31 @@ void MainComponent::loadAndApplyNonAudioSettings()
         if (es.mtcOutEnabled)
         {
             int idx = findDeviceByName(cmbMidiOutputDevice, es.midiOutputDevice);
+
+            // Release TriggerOutput's own handle if it matches the MTC device --
+            // Windows forbids two handles to the same MIDI port.
+            if (eng.getTriggerOutput().hasOwnMidiOpen()
+                && es.triggerMidiDevice == es.midiOutputDevice)
+            {
+                eng.getTriggerOutput().releaseOwnMidi();
+            }
+
             eng.startMtcOutput(idx);
+
+            // Share MtcOutput's handle with TriggerOutput if same device
+            if (eng.getMtcOutput().getIsRunning()
+                && es.triggerMidiDevice == eng.getMtcOutput().getCurrentDeviceName())
+            {
+                eng.getTriggerOutput().setSharedMidiOutput(
+                    eng.getMtcOutput().getMidiOutputPtr());
+            }
         }
         if (es.artnetOutEnabled)
             eng.startArtnetOutput(es.artnetOutputInterface - 1);  // saved as combo-1; ArtnetOutput needs -1=All, 0=firstNIC
         else if (es.artnetMixerForward && !eng.getArtnetOutput().getIsRunning())
-            eng.startArtnetOutput(-1);  // DMX mixer needs the socket even without timecode output
+            eng.startArtnetOutput(es.artnetDmxInterface);  // DMX mixer needs the socket even without timecode output
         else if (es.artnetTriggerEnabled && !eng.getArtnetOutput().getIsRunning())
-            eng.startArtnetOutput(-1);  // DMX triggers need the socket even without timecode output
+            eng.startArtnetOutput(es.artnetDmxInterface);  // DMX triggers need the socket even without timecode output
     }
 
     // Global settings
@@ -2379,6 +2668,7 @@ void MainComponent::flushSettings()
             es.artnetMixerForward  = eng.isArtnetMixerForwardEnabled();
             es.artnetMixerUniverse = eng.getArtnetMixerUniverse();
             es.artnetTriggerUniverse = eng.getArtnetTriggerUniverse();
+            es.artnetDmxInterface = cmbArtnetDmxInterface.getSelectedId() - 2;  // combo 1->-1(All), 2->0, 3->1...
             es.linkEnabled = eng.getLinkBridge().isEnabled();
 
             // Pro DJ Link
@@ -2478,6 +2768,28 @@ void MainComponent::flushSettings()
     // Pro DJ Link global settings
     settings.proDJLinkInterface = cmbProDJLinkInterface.getSelectedId() - 1;
     if (settings.proDJLinkInterface < 0) settings.proDJLinkInterface = 0;
+
+    // Capture window bounds (if windows are open and visible)
+    if (proDJLinkViewWindow != nullptr && proDJLinkViewWindow->isVisible())
+    {
+        auto b = proDJLinkViewWindow->getBounds();
+        settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                               + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+        settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+        settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
+    }
+    if (trackMapWindow != nullptr && trackMapWindow->isVisible())
+    {
+        auto b = trackMapWindow->getBounds();
+        settings.trackMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+    }
+    if (mixerMapWindow != nullptr && mixerMapWindow->isVisible())
+    {
+        auto b = mixerMapWindow->getBounds();
+        settings.mixerMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+    }
 
     settings.save();
 }
@@ -2621,6 +2933,11 @@ void MainComponent::updateDeviceSelectorVisibility()
     btnTrackMapEdit.setVisible(showProDJLinkIn);
     btnProDJLinkView.setVisible(showProDJLinkIn);
     btnMixerMapEdit.setVisible(showProDJLinkIn);
+    btnBpmOff.setVisible(showProDJLinkIn);
+    btnBpmX2.setVisible(showProDJLinkIn);
+    btnBpmX4.setVisible(showProDJLinkIn);
+    btnBpmD2.setVisible(showProDJLinkIn);
+    btnBpmD4.setVisible(showProDJLinkIn);
     btnMidiClock.setVisible(showProDJLinkIn);
     btnOscFwdBpm.setVisible(showProDJLinkIn);
     edOscFwdBpmAddr.setVisible(showProDJLinkIn && btnOscFwdBpm.getToggleState());
@@ -2657,6 +2974,12 @@ void MainComponent::updateDeviceSelectorVisibility()
         cmbArtTrigSub.setVisible(showArtTrig);
         cmbArtTrigUni.setVisible(showArtTrig);
         lblArtTrigAddr.setVisible(showArtTrig);
+    }
+    {
+        bool showArtDmxIface = showProDJLinkIn
+            && (btnArtnetMixerFwd.getToggleState() || btnArtnetTrigger.getToggleState());
+        cmbArtnetDmxInterface.setVisible(showArtDmxIface);
+        lblArtnetDmxInterface.setVisible(showArtDmxIface);
     }
     edOscIp.setVisible(showProDJLinkIn
         && (btnTriggerOsc.getToggleState() || btnOscFwdBpm.getToggleState()
@@ -2696,6 +3019,21 @@ void MainComponent::updateDeviceSelectorVisibility()
     {
         eng.setFpsConvertEnabled(false);
         btnFpsConvert.setToggleState(false, juce::dontSendNotification);
+    }
+
+    // Close TrackMap / MixerMap editor windows when no engine uses ProDJLink
+    // (these are shared windows -- keep open as long as any engine is on PDL)
+    {
+        bool anyPdl = false;
+        for (auto& e : engines)
+            if (e->getActiveInput() == InputSource::ProDJLink) { anyPdl = true; break; }
+        if (!anyPdl)
+        {
+            if (trackMapWindow != nullptr)
+                delete trackMapWindow.getComponent();
+            if (mixerMapWindow != nullptr)
+                delete mixerMapWindow.getComponent();
+        }
     }
 
     // Output sections
@@ -2909,23 +3247,17 @@ void MainComponent::paint(juce::Graphics& g)
     g.setColour(bgPanel); g.fillRect(leftPanel);
     g.setColour(borderCol); g.drawLine((float)leftPanel.getRight(), 0.0f, (float)leftPanel.getRight(), (float)getHeight(), 1.0f);
     g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 10.0f, juce::Font::bold)));
-    g.drawText(">> SOURCE INPUT", leftPanel.withHeight(40).translated(0, 32 + kTabBarHeight).reduced(16, 0), juce::Justification::centredLeft);
+    g.drawText(">> SOURCE INPUT", leftPanel.withHeight(40).translated(0, kTabBarHeight).reduced(16, 0), juce::Justification::centredLeft);
 
     // Right panel background
     auto rightPanel = bounds.removeFromRight(panelWidth);
     g.setColour(bgPanel); g.fillRect(rightPanel);
     g.setColour(borderCol); g.drawLine((float)rightPanel.getX(), 0.0f, (float)rightPanel.getX(), (float)getHeight(), 1.0f);
-    g.setColour(textDim); g.drawText(">> OUTPUTS", rightPanel.withHeight(40).translated(0, 32 + kTabBarHeight).reduced(16, 0), juce::Justification::centredLeft);
+    g.setColour(textDim); g.drawText(">> OUTPUTS", rightPanel.withHeight(40).translated(0, kTabBarHeight).reduced(16, 0), juce::Justification::centredLeft);
 
-    // Top bar
-    g.setColour(bgDarker); g.fillRect(0, 0, getWidth(), 32);
-    g.setColour(borderCol); g.drawLine(0.0f, 32.0f, (float)getWidth(), 32.0f, 1.0f);
-    g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
-    g.drawText("SUPER TIMECODE CONVERTER", juce::Rectangle<int>(0, 0, getWidth(), 32), juce::Justification::centred);
-
-    // Tab bar (below top bar)
-    g.setColour(bgDarker); g.fillRect(0, 32, getWidth(), kTabBarHeight);
-    g.setColour(borderCol); g.drawLine(0.0f, (float)(32 + kTabBarHeight), (float)getWidth(), (float)(32 + kTabBarHeight), 1.0f);
+    // Tab bar (top of content area)
+    g.setColour(bgDarker); g.fillRect(0, 0, getWidth(), kTabBarHeight);
+    g.setColour(borderCol); g.drawLine(0.0f, (float)kTabBarHeight, (float)getWidth(), (float)kTabBarHeight, 1.0f);
 
     // Bottom bar
     int bbH = 24;
@@ -2947,7 +3279,7 @@ void MainComponent::paint(juce::Graphics& g)
     if (engines.size() > 1)
         statusText = "[" + eng.getName() + "] " + statusText;
 
-    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(getWidth() - 280, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
+    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(getWidth() - 420, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
 
     // Center area: display background + frame rate labels
     auto centerArea = getLocalBounds().reduced(panelWidth, 0);
@@ -2955,7 +3287,7 @@ void MainComponent::paint(juce::Graphics& g)
     // Subtle background for the timecode display area
     {
         auto displayBg = centerArea;
-        displayBg.removeFromTop(32 + kTabBarHeight);
+        displayBg.removeFromTop(kTabBarHeight);
         displayBg.removeFromBottom(bbH);
         // Inner panel with very subtle rounded rect
         auto innerBg = displayBg.reduced(8, 4);
@@ -2993,7 +3325,7 @@ void MainComponent::resized()
     auto bounds = getLocalBounds();
     // Adaptive panel width: 240px at 800w, scales up to 290px at wider windows
     int panelWidth = juce::jlimit(240, 290, 240 + (getWidth() - 800) / 8);
-    int topBar = 32, bottomBar = 24;
+    int topBar = 0, bottomBar = 24;
     int tabBar = kTabBarHeight;
 
     // ===== TAB BAR (full window width -- the bar sits above the side panels) =====
@@ -3077,6 +3409,28 @@ void MainComponent::resized()
         layCombo(lblProDJLinkInterface, cmbProDJLinkInterface, leftPanel);
         layCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, leftPanel);
 
+        // BPM Multiplier row (5 equal buttons: 1x x2 x4 /2 /4)
+        if (btnBpmOff.isVisible())
+        {
+            leftContent.addSectionSeparator(leftPanel.getY(), "BPM MULT");
+            leftPanel.removeFromTop(16);
+            auto bpmRow = leftPanel.removeFromTop(22);
+            int gap = 3;
+            int bw = (bpmRow.getWidth() - gap * 4) / 5;
+            auto placBtn = [&](juce::TextButton& btn)
+            {
+                btn.setBounds(bpmRow.removeFromLeft(bw));
+                bpmRow.removeFromLeft(gap);
+            };
+            placBtn(btnBpmD4);
+            placBtn(btnBpmD2);
+            placBtn(btnBpmOff);
+            placBtn(btnBpmX2);
+            btnBpmX4.setBounds(bpmRow);  // last button takes remaining width
+            leftPanel.removeFromTop(3);
+            updateBpmMultButtonStates();
+        }
+
         if (artworkDisplay.isVisible())
         {
             // Side-by-side: artwork (56x56) | track info + metadata stacked
@@ -3141,11 +3495,6 @@ void MainComponent::resized()
             leftContent.addSectionSeparator(leftPanel.getY(), "MIDI");
             leftPanel.removeFromTop(16);
         }
-        if (cmbTriggerMidiDevice.isVisible())
-        {
-            cmbTriggerMidiDevice.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-        }
         if (btnMidiClock.isVisible())
         {
             btnMidiClock.setBounds(leftPanel.removeFromTop(22));
@@ -3172,20 +3521,17 @@ void MainComponent::resized()
             btnTriggerMidi.setBounds(leftPanel.removeFromTop(22));
             leftPanel.removeFromTop(3);
         }
+        if (cmbTriggerMidiDevice.isVisible())
+        {
+            cmbTriggerMidiDevice.setBounds(leftPanel.removeFromTop(22));
+            leftPanel.removeFromTop(3);
+        }
 
         // --- OSC section ---
         if (btnOscFwdBpm.isVisible() || btnTriggerOsc.isVisible())
         {
             leftContent.addSectionSeparator(leftPanel.getY(), "OSC");
             leftPanel.removeFromTop(16);
-        }
-        if (edOscIp.isVisible())
-        {
-            auto oscConfRow = leftPanel.removeFromTop(22);
-            edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
-            oscConfRow.removeFromLeft(4);
-            edOscPort.setBounds(oscConfRow);
-            leftPanel.removeFromTop(3);
         }
         if (btnOscFwdBpm.isVisible())
         {
@@ -3208,6 +3554,14 @@ void MainComponent::resized()
         if (btnTriggerOsc.isVisible())
         {
             btnTriggerOsc.setBounds(leftPanel.removeFromTop(22));
+            leftPanel.removeFromTop(3);
+        }
+        if (edOscIp.isVisible())
+        {
+            auto oscConfRow = leftPanel.removeFromTop(22);
+            edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
+            oscConfRow.removeFromLeft(4);
+            edOscPort.setBounds(oscConfRow);
             leftPanel.removeFromTop(3);
         }
 
@@ -3253,6 +3607,8 @@ void MainComponent::resized()
                 leftPanel.removeFromTop(3);
             }
         }
+        if (cmbArtnetDmxInterface.isVisible())
+            layCombo(lblArtnetDmxInterface, cmbArtnetDmxInterface, leftPanel);
 
         // --- Ableton Link ---
         if (btnLink.isVisible())
@@ -3444,11 +3800,11 @@ void MainComponent::resized()
 
     timecodeDisplay.setBounds(centerArea);
     btnGitHub.setBounds(getWidth() / 2 - 160, getHeight() - bottomBar, 320, bottomBar);
-    btnCheckUpdates.setBounds(getWidth() - 170, 2, 150, 28);
+    btnCheckUpdates.setBounds(getWidth() - 145, getHeight() - bottomBar, 140, bottomBar);
 
-    // Update notification -- in top bar, replacing check button
+    // Update notification -- replaces check button in bottom bar
     if (btnUpdateAvailable.isVisible())
-        btnUpdateAvailable.setBounds(getWidth() - 220, 2, 200, 28);
+        btnUpdateAvailable.setBounds(getWidth() - 245, getHeight() - bottomBar, 240, bottomBar);
 }
 
 //==============================================================================
@@ -3476,7 +3832,17 @@ void MainComponent::timerCallback()
 
     if (eng.getActiveInput() == InputSource::ProDJLink && sharedProDJLinkInput.isReceiving())
     {
-        int pdlPlayer = eng.getProDJLinkPlayer();
+        int pdlPlayer = eng.getEffectivePlayer();
+
+        // Guard: in XF mode, resolved player can be 0 (no player on this side)
+        if (pdlPlayer < 1)
+        {
+            lblProDJLinkTrackInfo.setText("", juce::dontSendNotification);
+            lblProDJLinkMetadata.setText("", juce::dontSendNotification);
+            lblMixerStatus.setText("", juce::dontSendNotification);
+        }
+        else
+        {
 
         // Phase 2: use engine's enriched track info (resolves "Track #12345" via dbClient)
         auto trackInfo = eng.getActiveTrackInfo();
@@ -3494,7 +3860,26 @@ void MainComponent::timerCallback()
         double pdlBpm = sharedProDJLinkInput.getBPM(pdlPlayer);
         juce::String pdlMeta;
         if (pdlBpm > 0.0)
+        {
             pdlMeta += juce::String(pdlBpm, 1) + " BPM";
+
+            // Show effective (multiplied) BPM if multiplier is active
+            int effMult = eng.getEffectiveBpmMultiplier();
+            if (effMult != 0)
+            {
+                double multBpm = TimecodeEngine::applyBpmMultiplier(pdlBpm, effMult);
+                juce::String multLabel;
+                switch (effMult) {
+                    case  1: multLabel = "x2"; break;
+                    case  2: multLabel = "x4"; break;
+                    case -1: multLabel = "/2"; break;
+                    case -2: multLabel = "/4"; break;
+                    default: break;
+                }
+                pdlMeta += "  " + juce::String::charToString(0x2192) + " "
+                         + juce::String(multBpm, 1) + " (" + multLabel + ")";
+            }
+        }
         double pdlPitch = sharedProDJLinkInput.getActualSpeed(pdlPlayer);
         if (pdlPitch > 0.01)
         {
@@ -3514,6 +3899,7 @@ void MainComponent::timerCallback()
             auto makeFaderBar = [](uint8_t val, int bars = 4) -> juce::String
             {
                 // val 0-255 -> filled blocks out of `bars`
+                // Using monospaced font on lblMixerStatus ensures equal-width chars
                 int filled = (int)std::round((val / 255.0f) * bars);
                 juce::String s;
                 for (int i = 0; i < bars; ++i)
@@ -3608,6 +3994,10 @@ void MainComponent::timerCallback()
             uint32_t totalMs = sharedProDJLinkInput.getTrackLengthSec(pdlPlayer) * 1000;
             waveformDisplay.setDebugPositionMs(posMs, totalMs);
         }
+
+        // Keep BPM multiplier buttons in sync (track load -> cached multiplier changes)
+        updateBpmMultButtonStates();
+        } // end pdlPlayer >= 1
     }
     else if (eng.getActiveInput() != InputSource::ProDJLink)
     {
@@ -3650,10 +4040,14 @@ void MainComponent::timerCallback()
     {
         if (auto* editor = dynamic_cast<TrackMapEditor*>(trackMapWindow->getContentComponent()))
         {
-            editor->setActiveTrackId(eng.getActiveTrackId());
+            auto ati = eng.getActiveTrackInfo();
+            editor->setActiveTrack(ati.artist, ati.title);
 
             if (eng.consumeTrackMapAutoFilled())
+            {
                 editor->refresh();
+                updateBpmMultButtonStates();  // TrackMap entry may have a bpmMultiplier
+            }
         }
     }
 
@@ -3719,7 +4113,7 @@ void MainComponent::timerCallback()
             btnUpdateAvailable.setVisible(true);
             btnCheckUpdates.setVisible(false);
             // Position directly in top bar
-            btnUpdateAvailable.setBounds(getWidth() - 220, 2, 200, 28);
+            btnUpdateAvailable.setBounds(getWidth() - 245, getHeight() - 24, 240, 24);
         }
         else if (updateChecker.didCheckFail())
         {
@@ -3762,6 +4156,110 @@ void MainComponent::timerCallback()
 //==============================================================================
 // BUTTON STATE UPDATES
 //==============================================================================
+void MainComponent::updateBpmMultButtonStates()
+{
+    auto& eng = currentEngine();
+    int eff  = eng.getEffectiveBpmMultiplier();   // 0=1x, 1=x2, 2=x4, -1=/2, -2=/4
+
+    // Get TrackMap value directly for secondary indicator
+    auto trackInfo = eng.getActiveTrackInfo();
+    int map = 0;
+    if (trackInfo.artist.isNotEmpty() && trackInfo.title.isNotEmpty())
+    {
+        auto* entry = settings.trackMap.find(trackInfo.artist, trackInfo.title);
+        if (entry != nullptr) map = entry->bpmMultiplier;
+    }
+
+    // Accent colours
+    auto lit    = juce::Colour(0xFF00AAFF);   // pdlAccent (active)
+    auto amber  = juce::Colour(0xFFFFAB00);   // saved TrackMap indicator
+    auto dim    = bgPanel;
+
+    // Helper: style a button with visual distinction for session vs TrackMap.
+    // Sets both textColourOffId and textColourOnId (hover) to the same value
+    // so the custom L&F doesn't override gold TrackMap text with blue on hover.
+    auto styleBtn = [&](juce::TextButton& btn, int mult)
+    {
+        bool active  = (eff == mult);
+        bool isSaved = (map != 0 && map == mult);  // has TrackMap value on this button
+
+        juce::Colour bgCol = active ? lit.withAlpha(0.30f) : dim;
+        btn.setColour(juce::TextButton::buttonColourId, bgCol);
+        btn.setColour(juce::TextButton::buttonOnColourId, bgCol.brighter(0.15f));  // subtle hover bg
+
+        // Golden text always wins for saved TrackMap value -- both normal and hover
+        juce::Colour txtCol = isSaved ? amber
+                            : (active ? lit.brighter(0.3f) : textMid);
+        btn.setColour(juce::TextButton::textColourOffId, txtCol);
+        btn.setColour(juce::TextButton::textColourOnId,  txtCol);
+    };
+
+    styleBtn(btnBpmOff,  0);
+    styleBtn(btnBpmX2,   1);
+    styleBtn(btnBpmX4,   2);
+    styleBtn(btnBpmD2,  -1);
+    styleBtn(btnBpmD4,  -2);
+}
+
+//==============================================================================
+// Save BPM multiplier to TrackMap (double-click from engine panel buttons).
+// Double-click on 1x clears saved value. Other values save without toggle.
+// After saving, session override is cleared (TrackMap = source of truth).
+//==============================================================================
+void MainComponent::saveBpmMultToTrackMap(int clickedMult)
+{
+    auto& eng = currentEngine();
+    auto info = eng.getActiveTrackInfo();
+    if (info.artist.isEmpty() || info.title.isEmpty()) return;
+
+    auto* entry = settings.trackMap.find(info.artist, info.title);
+    int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
+
+    // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
+    int newValue;
+    if (clickedMult == 0)
+        newValue = 0;                           // 1x = clear
+    else if (clickedMult == currentMapValue)
+        return;                                 // already saved, do nothing
+    else
+        newValue = clickedMult;                  // save new value
+
+    if (entry != nullptr)
+    {
+        entry->bpmMultiplier = newValue;
+    }
+    else if (newValue != 0)
+    {
+        // Create a new TrackMap entry with basic info + bpmMultiplier
+        TrackMapEntry newEntry;
+        newEntry.artist  = info.artist;
+        newEntry.title   = info.title;
+        newEntry.bpmMultiplier = newValue;
+        settings.trackMap.addOrUpdate(newEntry);
+    }
+    else
+    {
+        return;  // no entry exists and clearing to 0 = nothing to do
+    }
+
+    // Clear session override; TrackMap is now the source of truth
+    eng.setBpmPlayerOverride(TimecodeEngine::kBpmNoOverride);
+    eng.setCachedBpmMultiplier(newValue);
+
+    // Persist and refresh all engines (other engines on same track benefit too)
+    settings.trackMap.save();
+    for (auto& e : engines)
+        e->refreshTrackMapLookup();
+    updateBpmMultButtonStates();
+
+    // Refresh TrackMapEditor if open (entry may have been created/modified)
+    if (trackMapWindow != nullptr)
+    {
+        if (auto* editor = dynamic_cast<TrackMapEditor*>(trackMapWindow->getContentComponent()))
+            editor->refresh();
+    }
+}
+
 void MainComponent::updateInputButtonStates()
 {
     auto& eng = currentEngine();

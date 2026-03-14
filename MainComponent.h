@@ -96,6 +96,14 @@ public:
     void onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
                              const juce::Array<AudioDeviceEntry>& outputs);
 
+    /// Main window bounds persistence (called by MainWindow in Main.cpp)
+    juce::String getSavedMainWindowBounds() const { return settings.mainWindowBounds; }
+    void saveMainWindowBounds(const juce::String& bounds)
+    {
+        settings.mainWindowBounds = bounds;
+        settings.save();
+    }
+
 private:
     //==============================================================================
     // Background audio device scanner
@@ -258,13 +266,26 @@ private:
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
+
+    // BPM Multiplier buttons (per-player, ProDJLink only)
+    // Single click: session override (temporary, cleared on track change).
+    // Double click: save to TrackMap (persistent, auto-loaded on track change).
+    // 0=off, 1=x2, 2=x4, -1=/2, -2=/4.
+    juce::TextButton btnBpmOff  { "1x" };
+    juce::TextButton btnBpmX2   { "x2" };
+    juce::TextButton btnBpmX4   { "x4" };
+    juce::TextButton btnBpmD2   { "/2" };
+    juce::TextButton btnBpmD4   { "/4" };
+    void updateBpmMultButtonStates();
+    void saveBpmMultToTrackMap(int clickedMult);
+    juce::int64 lastBpmClickMs = 0;
+    int lastBpmClickMult = -999;
     juce::Label lblProDJLinkTrackInfo;
     juce::Label lblProDJLinkMetadata;
     juce::Label lblMixerStatus;  // DJM model + fader values
     ArtworkDisplay artworkDisplay;               // Phase 2c: album art from CDJ
     WaveformDisplay waveformDisplay;             // Phase 3: color waveform from CDJ
     uint32_t displayedWaveformTrackId = 0;       // currently displayed waveform track
-    int waveformRetryCounter = 0;                // throttle for waveform re-request
     uint32_t displayedArtworkId = 0;             // currently displayed artwork ID
 
     // Features: TrackMap, MIDI Clock, OSC BPM, Ableton Link
@@ -286,9 +307,9 @@ private:
     juce::ToggleButton btnLink { "ABLETON LINK" };
     juce::Label        lblLinkStatus;
 
-    juce::Component::SafePointer<juce::DialogWindow> trackMapWindow;
+    juce::Component::SafePointer<juce::DocumentWindow> trackMapWindow;
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
-    juce::Component::SafePointer<juce::DialogWindow> mixerMapWindow;
+    juce::Component::SafePointer<juce::DocumentWindow> mixerMapWindow;
     juce::TextButton btnProDJLinkView { "PDL View" };
     std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
 
@@ -301,6 +322,7 @@ private:
     juce::ToggleButton btnArtnetTrigger { "ARTNET Trigger" };
     juce::ComboBox cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni;
     juce::Label    lblArtTrigAddr;
+    juce::ComboBox cmbArtnetDmxInterface;     juce::Label lblArtnetDmxInterface;
     juce::ComboBox cmbAudioInputDevice;      juce::Label lblAudioInputDevice;
     juce::ComboBox cmbAudioInputChannel;     juce::Label lblAudioInputChannel;
     GainSlider sldLtcInputGain;              juce::Label lblLtcInputGain;
