@@ -1,5 +1,7 @@
 # Super Timecode Converter
 
+![Super Timecode Converter](docs/screenshotV1.5.png)
+
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ and DJM hardware** via native Pro DJ Link integration — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
@@ -173,12 +175,6 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 - **Collapsible UI panels** to reduce clutter and focus on active sections
 - **Persistent settings** — all configuration saved automatically per engine and restored on launch
 - **Dark theme UI** with a clean, professional look
-
----
-
-## Screenshot
-
-![Super Timecode Converter](docs/screenshotV1.4.png)
 
 ---
 
