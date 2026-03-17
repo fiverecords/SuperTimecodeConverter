@@ -2,13 +2,17 @@
 
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ and DJM hardware** via native Pro DJ Link integration — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
+[![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
+[![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
+[![GitHub Stars](https://img.shields.io/github/stars/fiverecords/SuperTimecodeConverter?style=flat&label=Stars&color=yellow)](https://github.com/fiverecords/SuperTimecodeConverter/stargazers)
+[![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-yellow)
 ![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)
 ![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
-[![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 ![Ableton Link](https://img.shields.io/badge/Ableton_Link-Supported-brightgreen)
+![Pro DJ Link](https://img.shields.io/badge/Pro_DJ_Link-Native-00BCD4)
 
 ---
 
