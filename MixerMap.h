@@ -32,6 +32,7 @@ struct MixerMapEntry
                                 // note = executor, velocity = fader position (0-127)
     int          artnetCh = 0;  // Art-Net DMX channel, 0 = disabled, 1-512
     bool         enabled = true;
+    bool         v10Only = false;  // V10-specific param (not serialized; set by buildDefaults)
 
     juce::var toVar() const
     {
@@ -174,41 +175,56 @@ private:
     void buildDefaults()
     {
         entries.clear();
-        entries.reserve(60);
+        entries.reserve(128);
 
-        // --- Per-channel parameters (x4) ---
-        // Default DMX layout: CH1 at DMX 1-6, CH2 at 7-12, CH3 at 13-18, CH4 at 19-24
-        for (int ch = 1; ch <= 4; ++ch)
+        // --- Per-channel parameters (up to 6 for V10 support) ---
+        // Default DMX layout: 6 params per channel, packed sequentially.
+        // CC layout: channels 1-4 use CCs 1-30, channels 5-6 use CCs 50-61.
+        static constexpr int kChCount = 6;  // max mixer channels (V10)
+        for (int ch = 1; ch <= kChCount; ++ch)
         {
             juce::String grp = "Channel " + juce::String(ch);
             juce::String pfx = "ch" + juce::String(ch);
             juce::String osc = "/mixer/ch" + juce::String(ch);
-            int ccBase = (ch - 1);  // ch1=0, ch2=1, ch3=2, ch4=3
-            int dmxBase = (ch - 1) * 6;  // ch1=0, ch2=6, ch3=12, ch4=18
+            int ccBase = (ch <= 4) ? (ch - 1) : (50 + (ch - 5) * 6);  // ch5=50, ch6=56
+            int dmxBase = (ch - 1) * 6;  // ch1=0, ch2=6, ... ch6=30
 
-            addEntry(pfx + "_fader",     "Fader",       grp, osc,             1 + ccBase,  dmxBase + 1, true);
-            addEntry(pfx + "_trim",      "Trim",        grp, osc + "/trim",   11 + ccBase, dmxBase + 2, true);
-            addEntry(pfx + "_eq_hi",     "EQ High",     grp, osc + "/eq_hi",  15 + ccBase, dmxBase + 3, true);
-            addEntry(pfx + "_eq_mid",    "EQ Mid",      grp, osc + "/eq_mid", 19 + ccBase, dmxBase + 4, true);
-            addEntry(pfx + "_eq_lo",     "EQ Low",      grp, osc + "/eq_lo",  23 + ccBase, dmxBase + 5, true);
-            addEntry(pfx + "_color",     "Color",       grp, osc + "/color",  27 + ccBase, dmxBase + 6, true);
+            int ccFader = (ch <= 4) ? (1 + (ch - 1))  : ccBase;
+            int ccTrim  = (ch <= 4) ? (11 + (ch - 1)) : ccBase + 1;
+            int ccEqHi  = (ch <= 4) ? (15 + (ch - 1)) : ccBase + 2;
+            int ccEqMid = (ch <= 4) ? (19 + (ch - 1)) : ccBase + 3;
+            int ccEqLo  = (ch <= 4) ? (23 + (ch - 1)) : ccBase + 4;
+            int ccColor = (ch <= 4) ? (27 + (ch - 1)) : ccBase + 5;
+
+            addEntry(pfx + "_fader",     "Fader",       grp, osc,             ccFader,  dmxBase + 1, true);
+            addEntry(pfx + "_trim",      "Trim",        grp, osc + "/trim",   ccTrim,   dmxBase + 2, true);
+            addEntry(pfx + "_eq_hi",     "EQ High",     grp, osc + "/eq_hi",  ccEqHi,   dmxBase + 3, true);
+            addEntry(pfx + "_eq_mid",    "EQ Mid",      grp, osc + "/eq_mid", ccEqMid,  dmxBase + 4, true);
+            addEntry(pfx + "_eq_lo",     "EQ Low",      grp, osc + "/eq_lo",  ccEqLo,   dmxBase + 5, true);
+            addEntry(pfx + "_color",     "Color",       grp, osc + "/color",  ccColor,  dmxBase + 6, true);
             addEntry(pfx + "_cue",       "CUE Button",  grp, osc + "/cue",    -1, 0, false);
             addEntry(pfx + "_input_src", "Input Source", grp, osc + "/input",  -1, 0, false);
             addEntry(pfx + "_xf_assign", "XF Assign",   grp, osc + "/xf_assign", -1, 0, false);
+            // V10 per-channel (0 on 900NXS2)
+            addEntry(pfx + "_comp",      "Compressor",  grp, osc + "/comp",       -1, 0, false, true);
+            addEntry(pfx + "_eq_lo_mid", "EQ Lo Mid",   grp, osc + "/eq_lo_mid",  -1, 0, false, true);
+            addEntry(pfx + "_send",      "Send",        grp, osc + "/send",       -1, 0, false, true);
+            addEntry(pfx + "_cue_b",     "CUE B",       grp, osc + "/cue_b",      -1, 0, false, true);
         }
 
-        // --- Master / Global faders --- (DMX 25-29)
-        addEntry("crossfader",    "Crossfader",    "Master", "/mixer/crossfader",  5,  25, true);
-        addEntry("master_fader",  "Master Fader",  "Master", "/mixer/master",      7,  26, true);
+        // --- Master / Global faders --- (DMX after all channels)
+        int masterDmxBase = kChCount * 6 + 1;  // 4ch=25, 6ch=37
+        addEntry("crossfader",    "Crossfader",    "Master", "/mixer/crossfader",  5,  masterDmxBase,     true);
+        addEntry("master_fader",  "Master Fader",  "Master", "/mixer/master",      7,  masterDmxBase + 1, true);
         addEntry("master_cue",    "Master CUE",    "Master", "/mixer/master_cue",  43, 0,  false);
         addEntry("fader_curve",   "Fader Curve",   "Master", "/mixer/fader_curve", -1, 0,  false);
         addEntry("xf_curve",      "XF Curve",      "Master", "/mixer/xf_curve",   -1, 0,  false);
 
-        // --- Monitoring --- (DMX 30-32)
-        addEntry("booth",         "Booth Level",   "Monitor", "/mixer/booth",       31, 30, false);
+        // --- Monitoring ---
+        addEntry("booth",         "Booth Level",   "Monitor", "/mixer/booth",       31, masterDmxBase + 5, false);
         addEntry("hp_cue_link",   "HP Cue Link",   "Monitor", "/mixer/hp_cue_link", -1, 0,  false);
-        addEntry("hp_mixing",     "HP Mixing",     "Monitor", "/mixer/hp_mixing",   33, 31, false);
-        addEntry("hp_level",      "HP Level",      "Monitor", "/mixer/hp_level",    34, 32, false);
+        addEntry("hp_mixing",     "HP Mixing",     "Monitor", "/mixer/hp_mixing",   33, masterDmxBase + 6, false);
+        addEntry("hp_level",      "HP Level",      "Monitor", "/mixer/hp_level",    34, masterDmxBase + 7, false);
 
         // --- Beat FX ---
         addEntry("beatfx_select", "Beat FX Select", "Beat FX", "/mixer/beatfx_select", 40, 0, false);
@@ -228,10 +244,35 @@ private:
         // --- Mic ---
         addEntry("mic_eq_hi",  "Mic EQ High", "Mic", "/mixer/mic_eq_hi", 38, 0, false);
         addEntry("mic_eq_lo",  "Mic EQ Low",  "Mic", "/mixer/mic_eq_lo", 39, 0, false);
+
+        // --- V10-specific globals (0 on 900NXS2) ---
+        addEntry("master_cue_b",     "Master CUE B",       "Master (V10)",   "/mixer/master_cue_b",      -1, 0, false, true);
+        addEntry("isolator_on",      "Isolator On",        "Isolator (V10)", "/mixer/isolator_on",       -1, 0, false, true);
+        addEntry("isolator_hi",      "Isolator Hi",        "Isolator (V10)", "/mixer/isolator_hi",       -1, 0, false, true);
+        addEntry("isolator_mid",     "Isolator Mid",       "Isolator (V10)", "/mixer/isolator_mid",      -1, 0, false, true);
+        addEntry("isolator_lo",      "Isolator Lo",        "Isolator (V10)", "/mixer/isolator_lo",       -1, 0, false, true);
+        addEntry("booth_eq_hi",      "Booth EQ Hi",        "Monitor (V10)",  "/mixer/booth_eq_hi",       -1, 0, false, true);
+        addEntry("booth_eq_lo",      "Booth EQ Lo",        "Monitor (V10)",  "/mixer/booth_eq_lo",       -1, 0, false, true);
+        addEntry("hp_b_cue_link",    "HP B Cue Link",      "Monitor (V10)",  "/mixer/hp_b_cue_link",     -1, 0, false, true);
+        addEntry("hp_b_mixing",      "HP B Mixing",        "Monitor (V10)",  "/mixer/hp_b_mixing",       -1, 0, false, true);
+        addEntry("hp_b_level",       "HP B Level",         "Monitor (V10)",  "/mixer/hp_b_level",        -1, 0, false, true);
+        addEntry("hp_pre_eq",        "HP Pre EQ",          "Monitor (V10)",  "/mixer/hp_pre_eq",         -1, 0, false, true);
+        addEntry("filter_lpf",       "Filter LPF",         "Filter (V10)",   "/mixer/filter_lpf",        -1, 0, false, true);
+        addEntry("filter_hpf",       "Filter HPF",         "Filter (V10)",   "/mixer/filter_hpf",        -1, 0, false, true);
+        addEntry("filter_resonance", "Filter Resonance",   "Filter (V10)",   "/mixer/filter_resonance",  -1, 0, false, true);
+        addEntry("send_ext1",        "Send Ext1",          "Sends (V10)",    "/mixer/send_ext1",         -1, 0, false, true);
+        addEntry("send_ext2",        "Send Ext2",          "Sends (V10)",    "/mixer/send_ext2",         -1, 0, false, true);
+        addEntry("master_mix_on",    "Master Mix On",      "Sends (V10)",    "/mixer/master_mix_on",     -1, 0, false, true);
+        addEntry("master_mix_size",  "Master Mix Size",    "Sends (V10)",    "/mixer/master_mix_size",   -1, 0, false, true);
+        addEntry("master_mix_time",  "Master Mix Time",    "Sends (V10)",    "/mixer/master_mix_time",   -1, 0, false, true);
+        addEntry("master_mix_tone",  "Master Mix Tone",    "Sends (V10)",    "/mixer/master_mix_tone",   -1, 0, false, true);
+        addEntry("master_mix_level", "Master Mix Level",   "Sends (V10)",    "/mixer/master_mix_level",  -1, 0, false, true);
+        addEntry("multi_io_select",  "Multi I/O Select",   "Multi I/O (V10)","/mixer/multi_io_select",   -1, 0, false, true);
+        addEntry("multi_io_level",   "Multi I/O Level",    "Multi I/O (V10)","/mixer/multi_io_level",    -1, 0, false, true);
     }
 
     void addEntry(const juce::String& id, const juce::String& name, const juce::String& group,
-                  const juce::String& osc, int cc, int dmxCh, bool enabled)
+                  const juce::String& osc, int cc, int dmxCh, bool enabled, bool v10 = false)
     {
         MixerMapEntry e;
         e.paramId     = id;
@@ -241,6 +282,7 @@ private:
         e.midiCC      = cc;
         e.artnetCh    = dmxCh;
         e.enabled     = enabled;
+        e.v10Only     = v10;
         entries.push_back(std::move(e));
     }
 };

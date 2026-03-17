@@ -677,8 +677,8 @@ struct AppSettings
     juce::String mixerMapBounds;
 
     // PDL View layout state
-    bool pdlViewHorizontal = false;
-    bool pdlViewShowMixer  = true;
+    bool pdlViewHorizontal  = false;
+    bool pdlViewShowMixer   = true;
 
     // Per-engine settings
     std::vector<EngineSettings> engines;
@@ -767,8 +767,8 @@ struct AppSettings
             pdlViewBounds   = getString("pdlViewBounds");
             trackMapBounds  = getString("trackMapBounds");
             mixerMapBounds  = getString("mixerMapBounds");
-            pdlViewHorizontal = getInt("pdlViewHorizontal", 0) != 0;
-            pdlViewShowMixer  = getInt("pdlViewShowMixer", 1) != 0;
+            pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
+            pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
 
             engines.clear();
             auto* engArray = obj->getProperty("engines").getArray();
@@ -863,6 +863,51 @@ private:
 
         engines.clear();
         engines.push_back(es);
+        return true;
+    }
+
+public:
+    //------------------------------------------------------------------
+    // Full configuration export/import (backup/restore)
+    //
+    // Bundles settings.json + trackmap.json + mixermap.json into a
+    // single JSON file.  Import overwrites all three and reloads.
+    //------------------------------------------------------------------
+    static juce::var readJsonFile(const juce::File& f)
+    {
+        if (!f.existsAsFile()) return {};
+        return juce::JSON::parse(f.loadFileAsString());
+    }
+
+    juce::var buildExportBundle() const
+    {
+        auto dir = getSettingsFile().getParentDirectory();
+        auto* root = new juce::DynamicObject();
+        root->setProperty("stc_backup_version", 1);
+        root->setProperty("settings", readJsonFile(getSettingsFile()));
+        root->setProperty("trackmap", readJsonFile(dir.getChildFile("trackmap.json")));
+        root->setProperty("mixermap", readJsonFile(dir.getChildFile("mixermap.json")));
+        return juce::var(root);
+    }
+
+    bool applyImportBundle(const juce::var& bundle)
+    {
+        auto* obj = bundle.getDynamicObject();
+        if (!obj) return false;
+
+        auto dir = getSettingsFile().getParentDirectory();
+        auto settingsVar = obj->getProperty("settings");
+        auto trackmapVar = obj->getProperty("trackmap");
+        auto mixermapVar = obj->getProperty("mixermap");
+
+        // Write each section back to its file (only if present in bundle)
+        if (!settingsVar.isVoid())
+            getSettingsFile().replaceWithText(juce::JSON::toString(settingsVar));
+        if (!trackmapVar.isVoid())
+            dir.getChildFile("trackmap.json").replaceWithText(juce::JSON::toString(trackmapVar));
+        if (!mixermapVar.isVoid())
+            dir.getChildFile("mixermap.json").replaceWithText(juce::JSON::toString(mixermapVar));
+
         return true;
     }
 };

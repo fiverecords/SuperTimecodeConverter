@@ -42,7 +42,7 @@ public:
         : engineIndex(index),
           engineName(name.isEmpty() ? ("ENGINE " + juce::String(index + 1)) : name)
     {
-        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
 
         // Only the primary engine (index 0) gets AudioThru
         if (index == kPrimaryEngineIndex)
@@ -103,7 +103,11 @@ public:
     //==========================================================================
     InputSource getActiveInput() const { return activeInput; }
     FrameRate getCurrentFps() const { return currentFps; }
-    Timecode getCurrentTimecode() const { return currentTimecode; }
+    Timecode getCurrentTimecode() const
+    {
+        const juce::SpinLock::ScopedLockType sl(timecodeLock);
+        return currentTimecode;
+    }
     bool isSourceActive() const { return sourceActive; }
     bool getUserOverrodeLtcFps() const { return userOverrodeLtcFps; }
 
@@ -160,6 +164,26 @@ public:
     bool isFpsConvertEnabled() const { return fpsConvertEnabled; }
     FrameRate getOutputFps() const { return outputFps; }
     Timecode getOutputTimecode() const { return outputTimecode; }
+
+    /// Playhead in ms from CDJ (for UI cursor / position display).
+    /// Reads directly from ProDJLinkInput — the CDJ-3000 sends clean
+    /// monotonic positions at ~30Hz, no smoothing needed.
+    uint32_t getSmoothedPlayheadMs() const
+    {
+        if (sharedProDJLink == nullptr) return 0;
+        int ep = getEffectivePlayer();
+        if (ep < 1) return 0;
+        return sharedProDJLink->getPlayheadMs(ep);
+    }
+
+    /// Play position as 0.0-1.0 ratio from CDJ (for waveform cursor).
+    float getSmoothedPlayPositionRatio() const
+    {
+        if (sharedProDJLink == nullptr) return 0.0f;
+        int ep = getEffectivePlayer();
+        if (ep < 1) return 0.0f;
+        return sharedProDJLink->getPlayPositionRatio(ep);
+    }
 
     FrameRate getEffectiveOutputFps() const
     {
@@ -309,10 +333,11 @@ public:
         trackMapped = false;
         cachedTrackId = 0;
         lastSeenTrackVersion = 0;
-        pdlTickDiagDone = false;        cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+        cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
-        pll.reset(); pdlTcFrozen = false;
+        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
         std::memset(trigDmxBuffer, 0, sizeof(trigDmxBuffer));
         trigDmxHighWater = 0;
@@ -350,7 +375,8 @@ public:
     void stopProDJLinkInput()
     {
         // Reset PLL and LTC encoder state so other sources start clean.
-        pll.reset(); pdlTcFrozen = false;
+        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
     }
 
@@ -374,7 +400,7 @@ public:
     void setMixerMap(MixerMap* map)
     {
         mixerMapPtr = map;
-        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
     }
 
     /// Enable or disable TrackMap offset application.
@@ -718,26 +744,45 @@ public:
                         break;
                     }
 
-                    // One-shot diagnostic
-                    if (!pdlTickDiagDone)
-                    {
-                        pdlTickDiagDone = true;
-                        DBG("TimecodeEngine[" + engineName + "]: ProDJLink tick active"
-                            " -- monitoring player " + juce::String(ep)
-                            + " dbClient=" + juce::String(dbClient != nullptr ? "valid" : "null")
-                            + " dbRunning=" + juce::String(dbClient != nullptr && dbClient->getIsRunning() ? "yes" : "no"));
-                    }
-                    // Feed PLL with CDJ actual speed (offset 152).
-                    // No faderPitch or isMoving needed -- actualSpeed already
-                    // includes motor ramp, jog, and all speed changes.
+                    // PLL runs only for pitch calculation (LTC bit-rate scaling).
+                    // It does NOT drive the displayed timecode — that comes directly
+                    // from the CDJ's playhead, which is clean and monotonic (~30Hz).
+                    double cdjSpeed = sharedProDJLink->getActualSpeed(ep);
                     pll.tick(
                         sharedProDJLink->getPlayheadMs(ep),
                         sharedProDJLink->getAbsPositionTs(ep),
-                        sharedProDJLink->getActualSpeed(ep)
+                        cdjSpeed,
+                        sharedProDJLink->isPositionMoving(ep)
                     );
 
-                    // Use engine's output fps (user-configurable), not ProDJLinkInput's static default
-                    currentTimecode = ProDJLink::playheadToTimecode(pll.getPositionMs(), getEffectiveOutputFps());
+                    // Smooth timecode display using interpolation between CDJ packets.
+                    uint32_t rawPlayheadMs = sharedProDJLink->getPlayheadMs(ep);
+                    double now = juce::Time::getMillisecondCounterHiRes();
+
+                    bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
+                    double displayMs = (double)rawPlayheadMs;  // default: raw
+
+                    if (isNewPacket)
+                    {
+                        // New CDJ data arrived — snap to real position
+                        pdlLastPlayheadMs = rawPlayheadMs;
+                        pdlSnapMs = (double)rawPlayheadMs;
+                        pdlSnapTime = now;
+                        pdlSnapSpeed = cdjSpeed;
+                        currentTimecode = ProDJLink::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
+                    }
+                    else if (pdlSnapSpeed > 0.01 && sharedProDJLink->isPlayerPlaying(ep))
+                    {
+                        // Between packets: interpolate forward using CDJ speed
+                        double elapsed = now - pdlSnapTime;
+                        double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
+                        double maxAdvance = 50.0 * pdlSnapSpeed;
+                        if (elapsed <= maxAdvance)
+                        {
+                            displayMs = interpMs;
+                            currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
+                        }
+                    }
 
                     // Freeze timecode on end-of-track only.
                     // The CDJ freezes actualSpeed at the last playing value on END_TRACK,
@@ -1079,6 +1124,7 @@ private:
     // Input state
     InputSource activeInput = InputSource::SystemTime;
     FrameRate currentFps = FrameRate::FPS_30;
+    mutable juce::SpinLock timecodeLock;  // protects currentTimecode (GL thread reads, message thread writes)
     Timecode currentTimecode;
     bool sourceActive = true;
     bool outputsWereActive = false;  // previous sourceActive state for transition detection
@@ -1171,7 +1217,8 @@ private:
         if (resolvedXfPlayer != 0)
         {
             resolvedXfPlayer = 0;
-            pll.reset(); pdlTcFrozen = false;
+            pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
     }
 
@@ -1183,7 +1230,8 @@ private:
             + juce::String(resolvedXfPlayer) + " -> " + juce::String(newPlayer));
         resolvedXfPlayer = newPlayer;
         // Reset PLL and track cache so we start clean on the new player
-        pll.reset(); pdlTcFrozen = false;
+        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         cachedTrackId = 0;
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
@@ -1227,6 +1275,7 @@ private:
         double pitch          = 0.0;  // effective speed for LTC encoding
         double smoothVelocity = 0.0;  // dp/dt fallback for non-CDJ-3000
         double actualSpeed    = 0.0;  // real playback speed (offset 152) -- includes motor ramp
+        bool   playing        = false; // CDJ play state (PLAYING/LOOPING/CUE_PLAY)
         bool   initialized    = false;
         bool   seekDetected   = false; // set when position jumps >500ms (seek/hot cue/track load)
 
@@ -1245,11 +1294,12 @@ private:
             pitch          = 0.0;
             smoothVelocity = 0.0;
             actualSpeed    = 0.0;
+            playing        = false;
             seekDetected   = false;
             initialized    = false;
         }
 
-        // Simple PLL driven by CDJ actual speed:
+        // State-aware PLL driven by CDJ actual speed:
         //
         //   Position input:
         //     CDJ-3000:   absolute playhead at 30Hz (type 0x0b) -- ms precision
@@ -1259,10 +1309,16 @@ private:
         //     Includes motor ramp, jog, pitch changes -- everything.
         //     Fallback to dp/dt if actualSpeed is 0 (non-CDJ-3000 models).
         //
-        //   Position correction: 25% of error per packet -> converges in ~3 packets.
-        //     Hard reset on >500ms error (seek/track change).
+        //   CDJ state determines correction strategy:
+        //     PLAYING:                 PLL interpolates, graduated correction (8-25%)
+        //     PAUSED but decelerating: PLL still drives (respects motor ramp)
+        //     PAUSED and stopped:      snap to CDJ position (zero oscillation)
+        //     END_OF_TRACK:            handled externally by pdlTcFrozen
+        //
+        //   Hard reset on >500ms error (seek/track change).
 
-        void tick(uint32_t cdjPlayheadMs, double cdjPacketTs, double cdjActualSpeed)
+        void tick(uint32_t cdjPlayheadMs, double cdjPacketTs, double cdjActualSpeed,
+                  bool cdjPlaying)
         {
             double now = juce::Time::getMillisecondCounterHiRes();
             double cdjPos = double(cdjPlayheadMs);
@@ -1276,6 +1332,7 @@ private:
                 actualSpeed    = cdjActualSpeed;
                 pitch          = 0.0;
                 smoothVelocity = 0.0;
+                playing        = cdjPlaying;
                 initialized    = true;
                 return;
             }
@@ -1284,6 +1341,7 @@ private:
             double elapsed = now - lastTickTime;
             lastTickTime = now;
             actualSpeed = cdjActualSpeed;
+            playing     = cdjPlaying;
 
             // When actualSpeed confirms the player is stopped, decay the dp/dt
             // fallback toward zero.  Without this, noise in the NXS2 beat-derived
@@ -1300,7 +1358,13 @@ private:
             // Fallback to dp/dt for models that don't report actualSpeed.
             double driveVelocity = (actualSpeed > kDeadZone) ? actualSpeed : smoothVelocity;
 
-            if (std::abs(driveVelocity) > kDeadZone && elapsed > 0.0 && elapsed < 200.0)
+            // When CDJ is not playing AND velocity is near zero, we're truly stopped.
+            // Don't interpolate -- just hold position and snap on next packet.
+            // This eliminates micro-oscillation from timer jitter (especially macOS).
+            bool trulyStopped = !playing && std::abs(driveVelocity) <= kDeadZone;
+
+            if (!trulyStopped && std::abs(driveVelocity) > kDeadZone
+                && elapsed > 0.0 && elapsed < 200.0)
                 positionMs += elapsed * driveVelocity;
 
             // Pitch for LTC encoder
@@ -1332,30 +1396,42 @@ private:
 
                 // --- Position correction ---
                 double error = cdjPos - positionMs;
-                if (std::abs(error) > 500.0)
+                double absErr = std::abs(error);
+                if (absErr > 500.0)
                 {
                     // Seek or track change: snap immediately
                     positionMs = cdjPos;
                     seekDetected = true;  // signal engine to resync outputs
                 }
+                else if (trulyStopped)
+                {
+                    // Stopped: snap directly to CDJ position.
+                    positionMs = cdjPos;
+                }
                 else
                 {
-                    // Gentle correction: 25% per packet
-                    // CDJ-3000 at 30Hz: converges in ~3 packets (~100ms)
-                    // NXS2 at 5Hz: converges in ~3 packets (~600ms)
-                    positionMs += error * 0.25;
+                    // Playing or decelerating: graduated correction.
+                    //   |error| 50-500ms -> 25% per packet (fast convergence)
+                    //   |error| < 50ms   -> 8% per packet  (gentle, avoids overshoot)
+                    double gain = (absErr > 50.0) ? 0.25 : 0.08;
+                    positionMs += error * gain;
                 }
             }
 
             if (positionMs < 0.0) positionMs = 0.0;
         }
 
-        uint32_t getPositionMs() const { return uint32_t(positionMs); }
+        uint32_t getPositionMs() const { return uint32_t(juce::jmax(0.0, positionMs)); }
     };
 
     PlayheadPLL pll;
     Timecode pdlFrozenTc {};          // frozen timecode on end-of-track (prevents flicker)
     bool pdlTcFrozen = false;         // true = outputting frozen timecode
+    uint32_t pdlLastPlayheadMs = 0;   // last CDJ playhead for change detection
+    double pdlSnapMs = 0.0;           // playhead ms at last CDJ packet (interpolation anchor)
+    double pdlSnapTime = 0.0;         // hi-res timestamp of last CDJ packet
+    double pdlSnapSpeed = 1.0;        // actualSpeed at last CDJ packet
+
     LinkBridge   linkBridge;
     std::unique_ptr<AudioThru> audioThru;  // Only for primary engine
 
@@ -1375,7 +1451,6 @@ private:
     bool      trackMapAutoFilled = false;   // UI-consumable: editor needs refresh
     uint32_t  cachedTrackId     = 0;        // currently tracked Track ID
     uint32_t  lastSeenTrackVersion = 0;     // per-engine version counter for track change detection
-    bool      pdlTickDiagDone = false;        // one-shot diagnostic flag
     int       cachedOffH = 0, cachedOffM = 0, cachedOffS = 0, cachedOffF = 0;
     juce::String cachedTrackArtist, cachedTrackTitle;
 
@@ -1415,8 +1490,9 @@ private:
 
     // Mixer fader dedup (last sent values, -1 = never sent)
     // MixerMap-driven dedup: one slot per MixerMap entry (max 64)
-    static constexpr int kMaxMixerEntries = 64;
+    static constexpr int kMaxMixerEntries = 128;  // 6ch x 13 params + ~45 globals
     int lastSentMixer[kMaxMixerEntries];  // initialised to -1 in constructor/reset
+    uint32_t lastMixerPktCount = 0;      // for dirty-flag skip in forwardMixerParams
 
 public:
     void setMidiClockEnabled(bool enabled)
@@ -1501,7 +1577,7 @@ public:
     void setOscMixerForward(bool enabled)
     {
         oscMixerForwardEnabled = enabled;
-        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
     }
     bool isOscMixerForwardEnabled() const { return oscMixerForwardEnabled; }
 
@@ -1510,7 +1586,7 @@ public:
         midiMixerForwardEnabled = enabled;
         midiMixerCCChannel = juce::jlimit(1, 16, ccChannel);
         midiMixerNoteChannel = juce::jlimit(1, 16, noteChannel);
-        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
     }
     bool isMidiMixerForwardEnabled() const { return midiMixerForwardEnabled; }
     int  getMidiMixerCCChannel()     const { return midiMixerCCChannel; }
@@ -1520,7 +1596,7 @@ public:
     {
         artnetMixerForwardEnabled = enabled;
         artnetMixerUniverse = juce::jlimit(0, 32767, universe);
-        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
         std::memset(dmxBuffer, 0, sizeof(dmxBuffer));
         dmxHighWaterMark = 0;
         lastDmxSendTime = 0.0;
@@ -1668,51 +1744,54 @@ private:
     {
         if (!sharedProDJLink || !mixerMapPtr) return;
 
-        const int n = std::min(mixerMapPtr->size(), kMaxMixerEntries);
-        const auto& entries = mixerMapPtr->getEntries();
-        const bool doOsc    = oscMixerForwardEnabled && triggerOutput.isOscConnected();
-        const bool doMidi   = midiMixerForwardEnabled && triggerOutput.isMidiOpen();
         const bool doArtnet = artnetMixerForwardEnabled && artnetOutput.getIsRunning();
-        const int ccCh      = midiMixerCCChannel;    // 1-based, matches sendCC()
-        const int noteCh    = midiMixerNoteChannel;   // 1-based, matches sendNote()
-        bool dmxDirty       = false;
+        bool dmxDirty = false;
 
-        for (int i = 0; i < n; ++i)
+        // Only iterate mixer values when a new 0x39 packet has arrived.
+        // At 60Hz tick rate with ~5Hz mixer packets, this skips ~92% of iterations.
+        uint32_t currentMixerPktCount = sharedProDJLink->getMixerPacketCount();
+        if (currentMixerPktCount != lastMixerPktCount)
         {
-            const auto& e = entries[(size_t)i];
-            if (!e.enabled) continue;
+            lastMixerPktCount = currentMixerPktCount;
 
-            int val = readMixerValue(i);
-            if (val < 0 || val == lastSentMixer[i]) continue;
+            const int n = std::min(mixerMapPtr->size(), kMaxMixerEntries);
+            const auto& entries = mixerMapPtr->getEntries();
+            const bool doOsc    = oscMixerForwardEnabled && triggerOutput.isOscConnected();
+            const bool doMidi   = midiMixerForwardEnabled && triggerOutput.isMidiOpen();
+            const int ccCh      = midiMixerCCChannel;
+            const int noteCh    = midiMixerNoteChannel;
 
-            if (doOsc && e.oscAddress.isNotEmpty())
-                triggerOutput.sendOscFloat(e.oscAddress, val / 255.0f);
-
-            if (doMidi && e.midiCC >= 0)
-                triggerOutput.sendCC(ccCh, e.midiCC, val >> 1);
-
-            if (doMidi && e.midiNote >= 0)
-                triggerOutput.sendNote(noteCh, e.midiNote, val >> 1);
-
-            if (doArtnet && e.artnetCh > 0 && e.artnetCh <= 512)
+            for (int i = 0; i < n; ++i)
             {
-                dmxBuffer[e.artnetCh - 1] = uint8_t(val);
-                dmxDirty = true;
-                if (e.artnetCh > dmxHighWaterMark)
-                    dmxHighWaterMark = e.artnetCh;
-            }
+                const auto& e = entries[(size_t)i];
+                if (!e.enabled) continue;
 
-            lastSentMixer[i] = val;
+                int val = readMixerValue(i);
+                if (val < 0 || val == lastSentMixer[i]) continue;
+
+                if (doOsc && e.oscAddress.isNotEmpty())
+                    triggerOutput.sendOscFloat(e.oscAddress, val / 255.0f);
+
+                if (doMidi && e.midiCC >= 0)
+                    triggerOutput.sendCC(ccCh, e.midiCC, val >> 1);
+
+                if (doMidi && e.midiNote >= 0)
+                    triggerOutput.sendNote(noteCh, e.midiNote, val >> 1);
+
+                if (doArtnet && e.artnetCh > 0 && e.artnetCh <= 512)
+                {
+                    dmxBuffer[e.artnetCh - 1] = uint8_t(val);
+                    dmxDirty = true;
+                    if (e.artnetCh > dmxHighWaterMark)
+                        dmxHighWaterMark = e.artnetCh;
+                }
+
+                lastSentMixer[i] = val;
+            }
         }
 
-        // Send Art-Net DMX frame.
-        // Always use the persistent high-water mark for frame length -- not just
-        // the channels changed this tick. Otherwise channels beyond the current
-        // dirty set get dropped by the receiver.
-        //
-        // Also re-send periodically (~10Hz) even when nothing changed to prevent
-        // Art-Net node DMX timeout (some nodes drop to blackout after 2-3s without
-        // fresh data). Standard DMX is 44Hz; 10Hz is a reasonable compromise.
+        // Art-Net DMX re-send: runs even when no new mixer data to prevent
+        // Art-Net node DMX timeout (some nodes blackout after 2-3s without data).
         if (doArtnet && dmxHighWaterMark > 0)
         {
             double now = juce::Time::getMillisecondCounterHiRes();
@@ -1727,23 +1806,23 @@ private:
     /// Read a DJM mixer parameter value (0-255) by MixerMap entry index.
     /// Returns -1 if the index is out of range.
     /// Entry order matches MixerMap::buildDefaults():
-    ///   [0-8]   CH1: fader,trim,eq_hi,eq_mid,eq_lo,color,cue,input_src,xf_assign
-    ///   [9-17]  CH2, [18-26] CH3, [27-35] CH4  (same 9-param pattern)
-    ///   [36-40] crossfader, master_fader, master_cue, fader_curve, xf_curve
-    ///   [41-44] booth, hp_cue_link, hp_mixing, hp_level
-    ///   [45-52] beatfx_select..send_return
-    ///   [53-55] colorfx_select, colorfx_param, colorfx_assign
-    ///   [56-57] mic_eq_hi, mic_eq_lo
+    ///   [0-12]  CH1: fader,trim,eq_hi,eq_mid,eq_lo,color,cue,input_src,xf_assign,
+    ///                 comp,eq_lo_mid,send,cue_b
+    ///   [13-25] CH2, [26-38] CH3, [39-51] CH4, [52-64] CH5, [65-77] CH6
+    ///   [78+]   globals (crossfader, master, monitor, fx, sends, isolator, etc.)
     int readMixerValue(int entryIndex) const
     {
         if (!sharedProDJLink) return -1;
         auto& pdl = *sharedProDJLink;
 
-        // Per-channel params (indices 0-35, 9 per channel)
-        if (entryIndex < 36)
+        // Per-channel params (13 per channel, up to 6 channels)
+        static constexpr int kParamsPerCh = 13;
+        static constexpr int kChBlock = kParamsPerCh * ProDJLink::kMaxMixerChannels;  // 78
+
+        if (entryIndex < kChBlock)
         {
-            int ch = (entryIndex / 9) + 1;   // 1-4
-            int p  =  entryIndex % 9;         // 0-8
+            int ch = (entryIndex / kParamsPerCh) + 1;   // 1-6
+            int p  =  entryIndex % kParamsPerCh;         // 0-12
             switch (p)
             {
                 case 0: return pdl.getChannelFader(ch);
@@ -1755,35 +1834,65 @@ private:
                 case 6: return pdl.getChannelCue(ch);
                 case 7: return pdl.getChannelInputSrc(ch);
                 case 8: return pdl.getChannelXfAssign(ch);
-                default: return -1;  // unreachable, but silences compiler warning
+                // V10 per-channel (0 on 900NXS2)
+                case  9: return pdl.getChannelComp(ch);
+                case 10: return pdl.getChannelEqLoMid(ch);
+                case 11: return pdl.getChannelSend(ch);
+                case 12: return pdl.getChannelCueB(ch);
+                default: return -1;
             }
         }
 
-        // Global params (indices 36+)
-        switch (entryIndex)
+        // Global params (indices kChBlock+)
+        int gi = entryIndex - kChBlock;
+        switch (gi)
         {
-            case 36: return pdl.getCrossfader();
-            case 37: return pdl.getMasterFader();
-            case 38: return pdl.getMasterCue();
-            case 39: return pdl.getFaderCurve();
-            case 40: return pdl.getXfCurve();
-            case 41: return pdl.getBoothLevel();
-            case 42: return pdl.getHpCueLink();
-            case 43: return pdl.getHpMixing();
-            case 44: return pdl.getHpLevel();
-            case 45: return pdl.getBeatFxSelect();
-            case 46: return pdl.getBeatFxLevel();
-            case 47: return pdl.getBeatFxOn();
-            case 48: return pdl.getBeatFxAssign();
-            case 49: return pdl.getFxFreqLo();
-            case 50: return pdl.getFxFreqMid();
-            case 51: return pdl.getFxFreqHi();
-            case 52: return pdl.getSendReturnLevel();
-            case 53: return pdl.getColorFxSelect();
-            case 54: return pdl.getColorFxParam();
-            case 55: return pdl.getColorFxAssign();
-            case 56: return pdl.getMicEqHi();
-            case 57: return pdl.getMicEqLo();
+            case  0: return pdl.getCrossfader();
+            case  1: return pdl.getMasterFader();
+            case  2: return pdl.getMasterCue();
+            case  3: return pdl.getFaderCurve();
+            case  4: return pdl.getXfCurve();
+            case  5: return pdl.getBoothLevel();
+            case  6: return pdl.getHpCueLink();
+            case  7: return pdl.getHpMixing();
+            case  8: return pdl.getHpLevel();
+            case  9: return pdl.getBeatFxSelect();
+            case 10: return pdl.getBeatFxLevel();
+            case 11: return pdl.getBeatFxOn();
+            case 12: return pdl.getBeatFxAssign();
+            case 13: return pdl.getFxFreqLo();
+            case 14: return pdl.getFxFreqMid();
+            case 15: return pdl.getFxFreqHi();
+            case 16: return pdl.getSendReturnLevel();
+            case 17: return pdl.getColorFxSelect();
+            case 18: return pdl.getColorFxParam();
+            case 19: return pdl.getColorFxAssign();
+            case 20: return pdl.getMicEqHi();
+            case 21: return pdl.getMicEqLo();
+            // V10 globals (0 on 900NXS2)
+            case 22: return pdl.getMasterCueB();
+            case 23: return pdl.getIsolatorOn();
+            case 24: return pdl.getIsolatorHi();
+            case 25: return pdl.getIsolatorMid();
+            case 26: return pdl.getIsolatorLo();
+            case 27: return pdl.getBoothEqHi();
+            case 28: return pdl.getBoothEqLo();
+            case 29: return pdl.getHpCueLinkB();
+            case 30: return pdl.getHpMixingB();
+            case 31: return pdl.getHpLevelB();
+            case 32: return pdl.getHpPreEq();
+            case 33: return pdl.getFilterLPF();
+            case 34: return pdl.getFilterHPF();
+            case 35: return pdl.getFilterResonance();
+            case 36: return pdl.getSendExt1();
+            case 37: return pdl.getSendExt2();
+            case 38: return pdl.getMasterMixOn();
+            case 39: return pdl.getMasterMixSize();
+            case 40: return pdl.getMasterMixTime();
+            case 41: return pdl.getMasterMixTone();
+            case 42: return pdl.getMasterMixLevel();
+            case 43: return pdl.getMultiIoSelect();
+            case 44: return pdl.getMultiIoLevel();
         }
         return -1;
     }

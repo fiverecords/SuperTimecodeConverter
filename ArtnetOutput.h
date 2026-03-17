@@ -237,7 +237,10 @@ private:
         if (!isRunningFlag.load(std::memory_order_relaxed)
             || paused.load(std::memory_order_relaxed)
             || socket == nullptr)
+        {
+            stopTimer();   // Don't spin at 1000Hz when there's nothing to send
             return;
+        }
 
         // Single atomic read -- guarantees frame interval and packet rate code are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);

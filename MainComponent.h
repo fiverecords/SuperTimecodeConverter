@@ -92,6 +92,7 @@ public:
     void paint(juce::Graphics&) override;
     void resized() override;
     void timerCallback() override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
     void onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
                              const juce::Array<AudioDeviceEntry>& outputs);
@@ -311,6 +312,10 @@ private:
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
     juce::Component::SafePointer<juce::DocumentWindow> mixerMapWindow;
     juce::TextButton btnProDJLinkView { "PDL View" };
+    juce::TextButton btnBackup  { "Backup" };
+    juce::TextButton btnRestore { "Restore" };
+    std::unique_ptr<juce::FileChooser> configFileChooser;
+    juce::ScopedMessageBox importConfirmBox;
     std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
 
     // Track change triggers
@@ -416,6 +421,8 @@ private:
     void openTrackMapEditor();
     void openMixerMapEditor();
     void openProDJLinkView();
+    void exportConfig();
+    void importConfig();
     void applyTriggerSettings();
     void propagateGlobalSettings();
     void startCurrentThruOutput();
@@ -472,6 +479,10 @@ private:
                                      juce::ComboBox& cmbUni, int portAddress);
     int  getArtNetAddressFromCombos(const juce::ComboBox& cmbNet, const juce::ComboBox& cmbSub,
                                      const juce::ComboBox& cmbUni);
+
+#if JUCE_WINDOWS
+    juce::OpenGLContext glContext;     // GPU-accelerated rendering (Windows only)
+#endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

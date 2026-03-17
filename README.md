@@ -46,11 +46,11 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtual CDJ, converting the DJ's playhead position into frame-accurate SMPTE timecode in real time.
 
-**Tested hardware:** CDJ-3000 + DJM-900NXS2. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, DJM-V10, etc.) should work but has not been verified yet — please report any issues on GitHub.
+**Tested hardware:** CDJ-3000, CDJ-3000X, DJM-900NXS2, DJM-V10. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, DJM-A9, etc.) should work but has not been verified yet -- please report any issues on GitHub.
 
 **Player tracking:**
 - Automatic player discovery on the Pro DJ Link network
-- Absolute position tracking from CDJ-3000 (30Hz, millisecond precision)
+- Absolute position tracking from CDJ-3000 / CDJ-3000X (30Hz, millisecond precision)
 - Beat-derived position for NXS2 and older models
 - Play state detection: Playing, Paused, Cued, Looping, Seeking, End of Track
 - BPM, pitch fader, actual playback speed (including motor ramp)
@@ -58,15 +58,17 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - Per-player monitoring: any engine can follow any of 6 players independently
 - **Crossfader auto-follow (XF-A / XF-B):** instead of monitoring a fixed player, an engine can follow whichever deck is live on crossfader side A or B. When the DJ swaps decks, timecode seamlessly switches to the new player. Ideal for two-engine setups where each engine tracks one side of the crossfader.
 
-**Smooth timecode generation (PLL):**
-- Phase-locked loop driven by CDJ actual motor speed — no frame skipping or jitter
-- Smooth output during acceleration ramps, jog wheel adjustments, and pitch changes
+**Smooth timecode generation:**
+- Direct CDJ playhead display with linear interpolation between packets (60Hz smooth output from 30Hz CDJ data)
+- PLL-driven pitch calculation for LTC bit-rate scaling
 - Instant resync on seek, hot cue, or track load
 - Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
 
 **DJM mixer integration:**
-- Real-time mixer data: per-channel faders, trim, EQ, color/FX, CUE buttons, crossfader, master fader, booth, headphones, beat FX, color FX, mic EQ (58 parameters total)
-- VU meters: 6-channel peak metering (CH1-CH4 mono + Master L/R stereo), 15 segments per channel
+- Real-time mixer data from DJM-900NXS2 and DJM-V10
+- **DJM-900NXS2:** per-channel faders, trim, EQ (3-band), color/FX, CUE buttons, crossfader, master fader, booth, headphones, beat FX, color FX, mic EQ (76 parameters)
+- **DJM-V10:** all of the above plus compressor, EQ (4-band), send, CUE A/B dual-cue, isolator, booth EQ, headphones A/B, filter, master mix (sends), multi I/O (123 parameters). Auto-detected from DJM model name.
+- VU meters: per-channel peak metering + Master L/R stereo, 15 segments per channel. 4-channel (900NXS2) or 6-channel (V10) layouts.
 - Per-channel on-air status
 
 **Track metadata (via dbserver):**
@@ -91,14 +93,14 @@ Map tracks by **artist + title** to timecode offsets and show control triggers. 
 
 ### Mixer Map
 
-Configurable mapping from every DJM mixer parameter to show control protocols. Each of the 58 parameters can be independently routed to any combination of:
+Configurable mapping from every DJM mixer parameter to show control protocols. Up to 123 parameters (DJM-V10) can be independently routed to any combination of:
 
-- **OSC** — normalized float 0.0–1.0, configurable address per parameter
-- **MIDI CC** — 0–127, configurable CC number and channel
-- **MIDI Note** — 0–127 velocity (for grandMA2/MA3 executor faders)
-- **Art-Net DMX** — 0–255, configurable DMX channel and universe
+- **OSC** -- normalized float 0.0-1.0, configurable address per parameter
+- **MIDI CC** -- 0-127, configurable CC number and channel
+- **MIDI Note** -- 0-127 velocity (for grandMA2/MA3 executor faders)
+- **Art-Net DMX** -- 0-255, configurable DMX channel and universe
 
-Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed.
+Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed. DJM model toggle (DJM-900NXS2 / DJM-V10) shows or hides V10-specific parameters. Export and import mixer maps as JSON files for backup or sharing between machines.
 
 ### PDL View
 
@@ -107,6 +109,7 @@ External window showing the full Pro DJ Link network state at 30Hz:
 - 4-deck display: artwork, color waveform with playhead, track info, BPM (with multiplied value when active), play state, engine assignments
 - Per-deck BPM multiplier buttons (single click for session override, double click to save to Track Map)
 - Mixer strip: channel faders with segmented VU meters, crossfader, master fader with stereo VU
+- DJM-V10 enhanced view: compressor, 4-band EQ, send knobs, dual CUE A/B buttons per channel
 - On-air, master, and beat indicators per player
 
 ### BPM Multiplier
@@ -217,7 +220,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.5.1)
+   project(SuperTimecodeConverter VERSION 1.5.2)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -227,7 +230,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.5.1"
+       VERSION "1.5.2"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -306,12 +309,13 @@ Without these steps, Link is compiled as a no-op stub and the rest of the app wo
 ### Pro DJ Link Workflow
 
 1. Connect your computer to the same network as your CDJ/DJM setup.
-2. Select **Pro DJ Link** as input source and choose the network interface.
-3. STC will discover players automatically. Select which player (1–6) to follow.
-4. Timecode is generated from the CDJ playhead position — load a track, press play, and timecode flows.
-5. Open **PDL View** for a full network overview with waveforms, artwork, and mixer state.
-6. Open **Track Map** to assign timecode offsets and triggers per track.
-7. Open **Mixer Map** to route DJM fader data to OSC, MIDI, or DMX.
+2. **macOS only:** make sure the firewall is disabled or STC is in the allowed list (see [Known Issues](#known-issues--platform-notes)).
+3. Select **Pro DJ Link** as input source and choose the network interface.
+4. STC will discover players automatically. Select which player (1–6) to follow.
+5. Timecode is generated from the CDJ playhead position — load a track, press play, and timecode flows.
+6. Open **PDL View** for a full network overview with waveforms, artwork, and mixer state.
+7. Open **Track Map** to assign timecode offsets and triggers per track.
+8. Open **Mixer Map** to route DJM fader data to OSC, MIDI, or DMX.
 
 ### Output Frame Rate Conversion
 
@@ -329,6 +333,10 @@ Routes audio from a channel on the LTC input device to a separate output device.
 
 The **Refresh Devices** button scans for newly connected MIDI devices, audio interfaces, and network interfaces without disrupting existing configuration. Already-configured devices remain selected if they are still present.
 
+### Configuration Backup & Restore
+
+The **Backup** and **Restore** buttons in the title bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, and Mixer Map mappings into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes.
+
 ### Settings
 
 All settings are automatically saved per engine to:
@@ -336,6 +344,35 @@ All settings are automatically saved per engine to:
 - **Windows:** `%APPDATA%\SuperTimecodeConverter\settings.json`
 - **macOS:** `~/Library/Application Support/SuperTimecodeConverter/settings.json`
 - **Linux:** `~/.local/share/SuperTimecodeConverter/settings.json`
+
+---
+
+## Known Issues & Platform Notes
+
+### macOS: Disable the Firewall for Pro DJ Link
+
+**This is critical for reliable timecode on macOS.** The macOS application firewall inspects every incoming UDP packet before delivering it to the application. STC's Pro DJ Link network thread receives hundreds of packets per second (CDJ status at 30Hz per player, beat data, DJM mixer/VU data). The firewall inspection adds latency to each packet, and under load the firewall thread itself consumes significant CPU -- enough to delay packet delivery to STC and cause timecode fluctuation, missed beats, and sluggish waveform cursor updates.
+
+**Workaround:** Disable the macOS firewall entirely, or add STC to the firewall's allowed applications list:
+
+1. Open **System Settings > Network > Firewall**
+2. Either turn the firewall **Off**, or click **Options...** and add Super Timecode Converter to the allowed list
+
+On Windows this is not an issue -- Windows Firewall prompts once on first launch and does not intercept packets after the rule is created.
+
+### macOS: Unsigned Application
+
+STC is open-source software and is not signed with an Apple Developer certificate. On first launch, macOS Gatekeeper will block the application. To open it:
+
+1. Right-click (or Control-click) the application and select **Open**
+2. Click **Open** in the confirmation dialog
+3. Alternatively: **System Settings > Privacy & Security > Security**, find the blocked app and click **Open Anyway**
+
+This is a one-time step -- macOS remembers the exception after the first launch.
+
+### macOS: DJM Subscribe Race Condition
+
+On macOS, the DJM-900NXS2 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
 
 ---
 
@@ -362,7 +399,7 @@ The application is built around a modular, header-only architecture:
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
-| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters |
+| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters (V10 enhanced) |
 | `MediaDisplay.h` | Color waveform renderer (ThreeBand and ColorNxs2 formats) |
 | `TrackMapEditor.h` | Table editor for artist+title → timecode offset + trigger mapping |
 | `MixerMapEditor.h` | Table editor for DJM parameter → protocol output mapping |
@@ -379,7 +416,9 @@ The application is built around a modular, header-only architecture:
 - **Thread safety:** atomics with explicit memory ordering for cross-thread data, SpinLocks for composite structures, SPSC queues for producer-consumer patterns
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
-- **PLL-based timecode:** Pro DJ Link input uses a phase-locked loop driven by CDJ actual motor speed for jitter-free timecode generation
+- **GPU-accelerated rendering (Windows):** OpenGL context offloads image compositing to GPU, reducing message-thread load. Disabled on macOS where JUCE's OpenGL adds texture-upload overhead through Apple's deprecated OpenGL-to-Metal layer -- CoreGraphics with native Metal compositing is faster
+- **PLL-based timecode:** Pro DJ Link input uses a phase-locked loop driven by CDJ actual motor speed for jitter-free LTC bit-rate scaling
+- **Interface-bound sockets:** Pro DJ Link UDP sockets are bound to the specific network interface IP, not INADDR_ANY, preventing duplicate packet delivery on multi-interface systems. Beat and status sockets avoid SO_REUSEPORT to prevent kernel packet distribution across stale/duplicate sockets on macOS
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** non-audio settings are applied immediately; audio device settings are applied after the background scan completes
 - **Cross-engine device conflict detection:** custom popup menu rendering highlights devices in use with colour-coded markers (cyan for current engine, amber with engine name for others)

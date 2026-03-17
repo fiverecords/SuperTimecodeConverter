@@ -94,6 +94,7 @@ MainComponent::MainComponent()
     engines[0]->setMixerMap(&sharedMixerMap);
 
     setSize(900, 700);
+    setWantsKeyboardFocus(true);  // enable Ctrl+D diagnostic shortcut
 
     // --- Tab bar ---
     addAndMakeVisible(btnAddEngine);
@@ -379,9 +380,6 @@ MainComponent::MainComponent()
     leftContent.addAndMakeVisible(waveformDisplay);
     waveformDisplay.setVisible(false);
 
-    leftContent.addAndMakeVisible(waveformDisplay);
-    waveformDisplay.setVisible(false);
-
     leftContent.addAndMakeVisible(lblProDJLinkTrackInfo);
     styleLabel(lblProDJLinkTrackInfo, 8.0f);
     lblProDJLinkTrackInfo.setVisible(false);
@@ -418,6 +416,16 @@ MainComponent::MainComponent()
     btnMixerMapEdit.setColour(juce::TextButton::buttonColourId, pdlAccent.withAlpha(0.15f));
     btnMixerMapEdit.setColour(juce::TextButton::textColourOffId, pdlAccent.brighter(0.3f));
     btnMixerMapEdit.onClick = [this] { openMixerMapEditor(); };
+
+    addAndMakeVisible(btnBackup);
+    btnBackup.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
+    btnBackup.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF66CC66));
+    btnBackup.onClick = [this] { exportConfig(); };
+
+    addAndMakeVisible(btnRestore);
+    btnRestore.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
+    btnRestore.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFFF9966));
+    btnRestore.onClick = [this] { importConfig(); };
 
     leftContent.addAndMakeVisible(btnMidiClock);
     btnMidiClock.setVisible(false);
@@ -930,10 +938,27 @@ MainComponent::MainComponent()
 
     startTimerHz(60);
     startAudioDeviceScan();
+
+    // GPU-accelerated rendering (Windows only).
+    // On Windows, JUCE's OpenGL context offloads image compositing from GDI
+    // to the GPU, reducing message-thread load from repaint().
+    // On macOS, this is DISABLED: JUCE still renders into software images
+    // and then uploads them as textures through Apple's deprecated
+    // OpenGL-to-Metal translation layer, which adds overhead rather than
+    // reducing it.  CoreGraphics already uses Metal internally for
+    // compositing, so native rendering is faster without OpenGL.
+#if JUCE_WINDOWS
+    glContext.attachTo(*this);
+#endif
 }
 
 MainComponent::~MainComponent()
 {
+    // 0. Detach OpenGL before destroying any components (Windows only)
+#if JUCE_WINDOWS
+    glContext.detach();
+#endif
+
     // 1. Stop our UI timer first -- no more timerCallback() after this
     stopTimer();
 
@@ -1706,7 +1731,8 @@ void MainComponent::openMixerMapEditor()
         return;
     }
 
-    auto* editor = new MixerMapEditor(sharedMixerMap);
+    auto* editor = new MixerMapEditor(sharedMixerMap,
+                                      sharedProDJLinkInput.getMixerChannelCount() > 4);
     editor->onChange = [this]
     {
         sharedMixerMap.save();
@@ -1806,6 +1832,97 @@ void MainComponent::openProDJLinkView()
             saveSettings();
         }
     };
+}
+
+//==============================================================================
+// CONFIGURATION BACKUP / RESTORE
+//==============================================================================
+void MainComponent::exportConfig()
+{
+    // Save current state to disk first so the export is up-to-date
+    saveSettings();
+    sharedMixerMap.save();
+
+    configFileChooser = std::make_unique<juce::FileChooser>(
+        "Export STC Configuration",
+        juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
+            .getChildFile("stc_backup.json"),
+        "*.json");
+
+    configFileChooser->launchAsync(
+        juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+        [this](const juce::FileChooser& fc)
+        {
+            auto file = fc.getResult();
+            if (file == juce::File()) return;
+
+            auto bundle = settings.buildExportBundle();
+            file.replaceWithText(juce::JSON::toString(bundle));
+        });
+}
+
+void MainComponent::importConfig()
+{
+    configFileChooser = std::make_unique<juce::FileChooser>(
+        "Import STC Configuration",
+        juce::File::getSpecialLocation(juce::File::userDesktopDirectory),
+        "*.json");
+
+    configFileChooser->launchAsync(
+        juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [this](const juce::FileChooser& fc)
+        {
+            auto file = fc.getResult();
+            if (file == juce::File() || !file.existsAsFile()) return;
+
+            auto parsed = juce::JSON::parse(file.loadFileAsString());
+            auto* obj = parsed.getDynamicObject();
+            if (!obj || !obj->hasProperty("stc_backup_version"))
+            {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon,
+                    "Import Failed",
+                    "This file is not a valid STC backup.");
+                return;
+            }
+
+            auto options = juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::QuestionIcon)
+                .withTitle("Import Configuration")
+                .withMessage("This will replace ALL current settings, track maps, and mixer maps. "
+                             "The application will need to restart to apply changes.\n\n"
+                             "Continue?")
+                .withButton("Import")
+                .withButton("Cancel");
+
+            importConfirmBox = juce::AlertWindow::showScopedAsync(options,
+                [this, parsed](int result)
+                {
+                    if (result != 1) return;
+
+                    if (settings.applyImportBundle(parsed))
+                    {
+                        // Reload settings into live state
+                        settings.load();
+                        sharedMixerMap.resetToDefaults();
+                        sharedMixerMap.load();
+
+                        juce::AlertWindow::showMessageBoxAsync(
+                            juce::MessageBoxIconType::InfoIcon,
+                            "Import Complete",
+                            "Configuration restored successfully.\n\n"
+                            "Please restart STC to fully apply all settings "
+                            "(engine configuration, audio devices, etc.).");
+                    }
+                    else
+                    {
+                        juce::AlertWindow::showMessageBoxAsync(
+                            juce::MessageBoxIconType::WarningIcon,
+                            "Import Failed",
+                            "Could not apply the backup file.");
+                    }
+                });
+        });
 }
 
 void MainComponent::startCurrentThruOutput()
@@ -2996,7 +3113,6 @@ void MainComponent::updateDeviceSelectorVisibility()
     lblMixerStatus.setVisible(showProDJLinkIn);
     artworkDisplay.setVisible(showProDJLinkIn);
     waveformDisplay.setVisible(showProDJLinkIn);
-    waveformDisplay.setVisible(showProDJLinkIn);
 
     cmbAudioInputTypeFilter.setVisible(showLtcIn);    lblAudioInputTypeFilter.setVisible(showLtcIn);
     cmbSampleRate.setVisible(showLtcIn);              lblSampleRate.setVisible(showLtcIn);
@@ -3333,9 +3449,15 @@ void MainComponent::resized()
         int numTabs = (int)tabButtons.size();
         int addBtnW = 30;
         int tabGap = 4;
-        int pad = 16;
+        int pad = 8;
 
-        int availableW = getWidth() - pad * 2;
+        // Backup/Restore buttons on the left edge
+        int bkBtnW = juce::jlimit(40, 60, (getWidth() - 400) / 10 + 40);
+        btnBackup.setBounds(pad, topBar + 2, bkBtnW, tabBar - 4);
+        btnRestore.setBounds(pad + bkBtnW + 2, topBar + 2, bkBtnW, tabBar - 4);
+        int leftUsed = pad + bkBtnW * 2 + 2 + tabGap * 2;
+
+        int availableW = getWidth() - leftUsed - pad;
         int addBtnTotal = tabGap + addBtnW;
 
         int maxTabW = 120;
@@ -3347,9 +3469,9 @@ void MainComponent::resized()
             tabW = juce::jmax(50, tabW);
         }
 
-        int totalW = numTabs * tabW + juce::jmax(0, numTabs - 1) * tabGap + addBtnTotal;
-        int tabX = (getWidth() - totalW) / 2;
-        tabX = juce::jmax(pad, tabX);
+        int totalTabsW = numTabs * tabW + juce::jmax(0, numTabs - 1) * tabGap + addBtnTotal;
+        int tabX = leftUsed + (availableW - totalTabsW) / 2;
+        tabX = juce::jmax(leftUsed, tabX);
 
         for (int i = 0; i < numTabs; i++)
         {
@@ -3896,29 +4018,40 @@ void MainComponent::timerCallback()
 
         // Mixer fader status line
         {
-            auto makeFaderBar = [](uint8_t val, int bars = 4) -> juce::String
+            // Pre-computed fader bar strings (avoids per-call charToString allocations)
+            static const juce::String kBar3[4] = {
+                juce::String::charToString(0x2591) + juce::String::charToString(0x2591) + juce::String::charToString(0x2591),
+                juce::String::charToString(0x2588) + juce::String::charToString(0x2591) + juce::String::charToString(0x2591),
+                juce::String::charToString(0x2588) + juce::String::charToString(0x2588) + juce::String::charToString(0x2591),
+                juce::String::charToString(0x2588) + juce::String::charToString(0x2588) + juce::String::charToString(0x2588)
+            };
+            static const juce::String kBar2[3] = {
+                juce::String::charToString(0x2591) + juce::String::charToString(0x2591),
+                juce::String::charToString(0x2588) + juce::String::charToString(0x2591),
+                juce::String::charToString(0x2588) + juce::String::charToString(0x2588)
+            };
+            static const juce::String kCrossSymbol = juce::String::charToString(0x2715);
+
+            auto faderBar = [](uint8_t val, int bars) -> const juce::String&
             {
-                // val 0-255 -> filled blocks out of `bars`
-                // Using monospaced font on lblMixerStatus ensures equal-width chars
                 int filled = (int)std::round((val / 255.0f) * bars);
-                juce::String s;
-                for (int i = 0; i < bars; ++i)
-                    s += (i < filled) ? juce::String::charToString(0x2588)   // FULL BLOCK
-                                      : juce::String::charToString(0x2591);  // LIGHT SHADE
-                return s;
+                return (bars <= 2) ? kBar2[juce::jlimit(0, 2, filled)]
+                                   : kBar3[juce::jlimit(0, 3, filled)];
             };
             if (sharedProDJLinkInput.hasMixerFaderData())
             {
                 juce::String djmModel = sharedProDJLinkInput.getDJMModel();
                 if (djmModel.isEmpty()) djmModel = "DJM";
+                int numCh = sharedProDJLinkInput.getMixerChannelCount();
+                // Cap model name and adjust bar width to fit panel
+                if (djmModel.length() > 7) djmModel = djmModel.substring(0, 7);
+                int bars = (numCh > 4) ? 2 : 3;  // narrower bars for 6-channel DJMs
                 auto& pdl = sharedProDJLinkInput;
-                juce::String mixStr = djmModel + "  "
-                    + "1:" + makeFaderBar(pdl.getChannelFader(1)) + "  "
-                    + "2:" + makeFaderBar(pdl.getChannelFader(2)) + "  "
-                    + "3:" + makeFaderBar(pdl.getChannelFader(3)) + "  "
-                    + "4:" + makeFaderBar(pdl.getChannelFader(4)) + "  "
-                    + juce::String::charToString(0x2715) + ":" + makeFaderBar(pdl.getCrossfader()) + "  "
-                    + "M:" + makeFaderBar(pdl.getMasterFader());
+                juce::String mixStr = djmModel;
+                for (int ch = 1; ch <= numCh; ++ch)
+                    mixStr += " " + juce::String(ch) + ":" + faderBar(pdl.getChannelFader(ch), bars);
+                mixStr += " " + kCrossSymbol + ":" + faderBar(pdl.getCrossfader(), bars)
+                        + " M:" + faderBar(pdl.getMasterFader(), bars);
                 lblMixerStatus.setText(mixStr, juce::dontSendNotification);
                 lblMixerStatus.setColour(juce::Label::textColourId,
                     juce::Colour(0xFF00AAFF).withAlpha(0.7f));
@@ -3984,15 +4117,14 @@ void MainComponent::timerCallback()
             displayedWaveformTrackId = 0;
         }
 
-        // Update waveform cursor position from CDJ playhead
+        // Update waveform cursor position from PLL-smoothed playhead.
+        // Using the engine's PLL output instead of raw CDJ packets avoids
+        // visible cursor jitter, especially on macOS where timer scheduling
+        // has more variance than Windows.
         if (waveformDisplay.hasWaveformData())
         {
-            float posRatio = sharedProDJLinkInput.getPlayPositionRatio(pdlPlayer);
+            float posRatio = eng.getSmoothedPlayPositionRatio();
             waveformDisplay.setPlayPosition(posRatio);
-            // Debug: show position/duration in overlay
-            uint32_t posMs = sharedProDJLinkInput.getPlayheadMs(pdlPlayer);
-            uint32_t totalMs = sharedProDJLinkInput.getTrackLengthSec(pdlPlayer) * 1000;
-            waveformDisplay.setDebugPositionMs(posMs, totalMs);
         }
 
         // Keep BPM multiplier buttons in sync (track load -> cached multiplier changes)
@@ -4082,9 +4214,19 @@ void MainComponent::timerCallback()
         }
     }
 
-    // Repaint mini strip so non-selected engine timecodes update live
+    // Repaint mini strip so non-selected engine timecodes update live.
+    // Skip if no non-selected engine is running (nothing to animate).
     if (engines.size() > 1 && !miniStripArea.isEmpty())
-        repaint(miniStripArea);
+    {
+        bool anyOtherActive = false;
+        for (int i = 0; i < (int)engines.size(); ++i)
+        {
+            if (i != selectedEngine && engines[(size_t)i]->isSourceActive())
+                { anyOtherActive = true; break; }
+        }
+        if (anyOtherActive)
+            repaint(miniStripArea);
+    }
 
     // Debounced settings save
     if (settingsDirty)
@@ -4151,6 +4293,30 @@ void MainComponent::timerCallback()
         lastBottomBarActive = eng.isSourceActive();
         repaint(0, getHeight() - 24, getWidth(), 24);
     }
+}
+
+//==============================================================================
+// KEYBOARD SHORTCUTS
+//==============================================================================
+bool MainComponent::keyPressed(const juce::KeyPress& key)
+{
+    // Ctrl+Shift+E (Cmd+Shift+E on Mac): export full configuration backup
+    if (key.getModifiers().isCommandDown() && key.getModifiers().isShiftDown()
+        && key.getKeyCode() == 'E')
+    {
+        exportConfig();
+        return true;
+    }
+
+    // Ctrl+Shift+I (Cmd+Shift+I on Mac): import full configuration backup
+    if (key.getModifiers().isCommandDown() && key.getModifiers().isShiftDown()
+        && key.getKeyCode() == 'I')
+    {
+        importConfig();
+        return true;
+    }
+
+    return false;
 }
 
 //==============================================================================

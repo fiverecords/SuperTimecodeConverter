@@ -127,14 +127,30 @@ private:
         Timecode offsetTimecode {};    // timecode with TrackMap offset applied (running clock)
         juce::StringArray engineNames;
 
-        // Per-deck waveform component (painted via translated Graphics context)
+        // Per-deck waveform component (painted LIVE by paintDeck).
+        // NOT a child component -- paint() is called manually with translated Graphics.
         WaveformDisplay waveform;
+        juce::Rectangle<int> wfLocalBounds;  // waveform area relative to deck (set during paintDeckStatic)
+        juce::Rectangle<int> tcLocalBounds;  // timecode row relative to deck (set during paintDeckStatic)
+        juce::Rectangle<int> mapLocalBounds; // offset timecode row relative to deck
         juce::Image     cachedArtworkImg;  // cached from DbServerClient (avoid lock during paint)
         uint32_t displayedWaveformTrackId = 0;
         uint32_t displayedArtworkId = 0;
         uint32_t prevTrackId = 0;
         bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
         int      metadataRequestTick = 0;   // tick counter for retry after ~3s
+
+        // Cached deck image -- Windows only (OpenGL composites efficiently).
+        // On macOS, painting directly preserves CoreGraphics subpixel AA.
+#if JUCE_WINDOWS
+        juce::Image cachedDeckImg;
+        int         cachedDeckW = 0, cachedDeckH = 0;
+        float       cachedDeckScale = 0.0f;
+        bool        deckImgValid = false;
+        void invalidateDeckImg() { deckImgValid = false; }
+#else
+        void invalidateDeckImg() { }  // no-op on macOS (no cache)
+#endif
 
         // BPM multiplier state (updated each tick from engine + TrackMap)
         int  bpmSessionOverride = TimecodeEngine::kBpmNoOverride;  // from engine: kBpmNoOverride=none, 0=1x, 1=x2...
@@ -144,6 +160,19 @@ private:
         // Per-deck double-click timing for BPM multiplier buttons
         juce::int64 lastBpmClickMs   = 0;
         int         lastBpmClickMult = -999;
+
+        // Snapshot of last-painted state -- used to skip repaint() when nothing changed
+        struct Snapshot
+        {
+            bool discovered = false, isOnAir = false, isMaster = false, isPlaying = false, trackMapped = false;
+            uint8_t beatInBar = 0, xfAssign = 0;
+            double bpm = -1.0, faderPitch = -1.0;
+            uint32_t playheadMs = 0xFFFFFFFF, trackId = 0;
+            int bpmSessionOverride = -999, bpmTrackMapValue = -999;
+            juce::String playState, artist, title, posSource, fpsStr;
+            Timecode timecode {}, offsetTimecode {};
+            juce::StringArray engineNames;
+        } snapshot;
     };
 
 public:
@@ -159,10 +188,14 @@ public:
             auto& ds = deckState[deck];
             int pn = deck + 1;
 
+            // Convert to deck-local coords (bpmBtnBounds are set in local space
+            // because paintDeckStatic receives {0,0,w,h} local coordinates)
+            auto localPos = pos - deckBounds[deck].getPosition();
+
             static const int kBpmValues[5] = { -2, -1, 0, 1, 2 };
             for (int bi = 0; bi < 5; ++bi)
             {
-                if (!ds.bpmBtnBounds[bi].contains(pos)) continue;
+                if (!ds.bpmBtnBounds[bi].contains(localPos)) continue;
                 int clickedMult = kBpmValues[bi];
 
                 // Timing-based double-click detection (same approach as MainComponent)
@@ -262,6 +295,10 @@ public:
     void resized() override
     {
         auto bounds = getLocalBounds().reduced(6);
+        if (bounds.getWidth() < 50 || bounds.getHeight() < 50) return;
+
+        for (auto& ds : deckState)
+            ds.invalidateDeckImg();
 
         // --- Toolbar (top) ---
         auto toolbar = bounds.removeFromTop(22);
@@ -271,7 +308,7 @@ public:
         bounds.removeFromTop(4);
 
         // --- Mixer panel (right side, conditional) ---
-        if (showMixer)
+        if (showMixer && bounds.getWidth() > 300)
         {
             int mixerW = juce::jlimit(200, 280, bounds.getWidth() / 5);
             bounds.removeFromRight(4);
@@ -288,8 +325,7 @@ public:
         if (layoutHorizontal)
         {
             // 4x1: four decks side by side, evenly distributed
-            // Integer division spreads rounding pixels across all decks
-            int totalDeckW = bounds.getWidth() - gapH * 3;
+            int totalDeckW = juce::jmax(0, bounds.getWidth() - gapH * 3);
 
             for (int i = 0; i < 4; ++i)
             {
@@ -301,8 +337,8 @@ public:
         else
         {
             // 2x2 grid
-            int deckW = (bounds.getWidth() - gapH) / 2;
-            int deckH = (bounds.getHeight() - gapV) / 2;
+            int deckW = juce::jmax(0, (bounds.getWidth() - gapH) / 2);
+            int deckH = juce::jmax(0, (bounds.getHeight() - gapV) / 2);
 
             auto topRow = bounds.removeFromTop(deckH);
             bounds.removeFromTop(gapV);
@@ -406,6 +442,7 @@ public:
                 ds.title.clear();
                 ds.key.clear();
                 ds.artworkId = 0;
+                ds.invalidateDeckImg();
                 ds.prevTrackId = ds.trackId;
                 ds.metadataRequested = false;  // reset so we request for new track
             }
@@ -461,6 +498,7 @@ public:
                             ds.waveform.setColorWaveformData(meta.waveformData,
                                 meta.waveformEntryCount, meta.waveformBytesPerEntry);
                             ds.displayedWaveformTrackId = ds.trackId;
+                            ds.invalidateDeckImg();
                         }
                     }
                     else
@@ -479,6 +517,7 @@ public:
                                 ds.waveform.setColorWaveformData(metaById.waveformData,
                                     metaById.waveformEntryCount, metaById.waveformBytesPerEntry);
                                 ds.displayedWaveformTrackId = ds.trackId;
+                                ds.invalidateDeckImg();
                             }
                         }
                     }
@@ -496,6 +535,7 @@ public:
                     {
                         ds.cachedArtworkImg = artImg;
                         ds.displayedArtworkId = ds.artworkId;
+                        ds.invalidateDeckImg();
                     }
                 }
             }
@@ -518,16 +558,13 @@ public:
 
             // Waveform cursor
             if (ds.waveform.hasWaveformData())
-            {
                 ds.waveform.setPlayPosition(ds.posRatio);
-                ds.waveform.setDebugPositionMs(ds.playheadMs, ds.trackLenSec * 1000);
-            }
         }
 
         // --- Smooth VU meters ---
         if (proDJLink.hasVuMeterData())
         {
-            for (int ch = 0; ch < 6; ++ch)
+            for (int ch = 0; ch < ProDJLink::kVuSlots; ++ch)
             {
                 float target = proDJLink.getVuPeakNorm(ch);
                 // Fast attack, slow decay (ballistic meter feel)
@@ -540,11 +577,145 @@ public:
         }
         else
         {
-            for (int ch = 0; ch < 6; ++ch)
+            for (int ch = 0; ch < ProDJLink::kVuSlots; ++ch)
                 vuSmoothed[ch] *= 0.9f;
         }
 
-        repaint();
+        // Two levels of dirty:
+        // - staticDirty: anything except timecode.frames changed -> invalidate cached deck image
+        // - frameDirty:  only timecode.frames changed -> repaint (timecode + waveform cursor overlay)
+        for (int deck = 0; deck < 4; ++deck)
+        {
+            auto& ds = deckState[deck];
+            auto& snap = ds.snapshot;
+
+            bool staticDirty = (ds.discovered        != snap.discovered
+                             || ds.isOnAir            != snap.isOnAir
+                             || ds.isMaster           != snap.isMaster
+                             || ds.isPlaying          != snap.isPlaying
+                             || ds.trackMapped        != snap.trackMapped
+                             || ds.beatInBar          != snap.beatInBar
+                             || ds.xfAssign           != snap.xfAssign
+                             || ds.trackId            != snap.trackId
+                             || ds.bpmSessionOverride != snap.bpmSessionOverride
+                             || ds.bpmTrackMapValue   != snap.bpmTrackMapValue
+                             || std::abs(ds.bpm        - snap.bpm)        > 0.005
+                             || std::abs(ds.faderPitch - snap.faderPitch) > 0.0001
+                             || ds.playState          != snap.playState
+                             || ds.artist             != snap.artist
+                             || ds.title              != snap.title
+                             || ds.posSource          != snap.posSource
+                             || ds.fpsStr             != snap.fpsStr
+                             || ds.timecode.hours     != snap.timecode.hours
+                             || ds.timecode.minutes   != snap.timecode.minutes
+                             || ds.timecode.seconds   != snap.timecode.seconds
+                             || ds.offsetTimecode.frames != snap.offsetTimecode.frames
+                             || ds.engineNames        != snap.engineNames);
+
+            bool frameDirty = (ds.timecode.frames != snap.timecode.frames);
+
+            if (staticDirty || frameDirty)
+            {
+                snap.discovered         = ds.discovered;
+                snap.isOnAir            = ds.isOnAir;
+                snap.isMaster           = ds.isMaster;
+                snap.isPlaying          = ds.isPlaying;
+                snap.trackMapped        = ds.trackMapped;
+                snap.beatInBar          = ds.beatInBar;
+                snap.xfAssign           = ds.xfAssign;
+                snap.trackId            = ds.trackId;
+                snap.playheadMs         = ds.playheadMs;
+                snap.bpmSessionOverride = ds.bpmSessionOverride;
+                snap.bpmTrackMapValue   = ds.bpmTrackMapValue;
+                snap.bpm                = ds.bpm;
+                snap.faderPitch         = ds.faderPitch;
+                snap.playState          = ds.playState;
+                snap.artist             = ds.artist;
+                snap.title              = ds.title;
+                snap.posSource          = ds.posSource;
+                snap.fpsStr             = ds.fpsStr;
+                snap.timecode           = ds.timecode;
+                snap.offsetTimecode     = ds.offsetTimecode;
+                snap.engineNames        = ds.engineNames;
+
+                if (staticDirty)
+                {
+                    ds.invalidateDeckImg();  // Windows: regenerate cached image; macOS: no-op
+                    if (!deckBounds[deck].isEmpty())
+                        repaint(deckBounds[deck]);  // full deck repaint
+                }
+                else if (frameDirty && !deckBounds[deck].isEmpty())
+                {
+                    // Only timecode frame changed -- repaint just the live overlay
+                    // strips (TC digits + waveform cursor + offset TC).
+                    // This avoids compositing the full HiDPI deck image (~3MB on
+                    // Retina) when only a few rows of pixels actually changed.
+                    auto origin = deckBounds[deck].getPosition();
+                    juce::Rectangle<int> liveArea;
+                    if (!ds.tcLocalBounds.isEmpty())
+                        liveArea = ds.tcLocalBounds + origin;
+                    if (!ds.wfLocalBounds.isEmpty())
+                    {
+                        auto wfAbs = ds.wfLocalBounds + origin;
+                        liveArea = liveArea.isEmpty() ? wfAbs : liveArea.getUnion(wfAbs);
+                    }
+                    if (!ds.mapLocalBounds.isEmpty())
+                        liveArea = liveArea.getUnion(ds.mapLocalBounds + origin);
+                    if (!liveArea.isEmpty())
+                        repaint(liveArea);
+                }
+            }
+        }
+
+        // Mixer panel: repaint when fader data arrives or VU changes.
+        if (showMixer && !mixerBounds.isEmpty())
+        {
+            bool hasFaderData = proDJLink.hasMixerFaderData();
+
+            // Detect fader/knob changes via DJM packet counter.
+            // Each 0x39 packet increments the counter -- if it changed,
+            // the DJ moved something (fader, EQ, crossfader, etc.).
+            bool faderDirty = false;
+            if (hasFaderData)
+            {
+                uint32_t pktCount = proDJLink.getMixerPacketCount();
+                if (pktCount != lastMixerPktCount)
+                {
+                    lastMixerPktCount = pktCount;
+                    faderDirty = true;
+                }
+            }
+
+            // First time fader data arrives or DJM disconnects
+            if (hasFaderData && !lastHadMixerFaderData)
+            {
+                lastHadMixerFaderData = true;
+                faderDirty = true;
+            }
+            else if (!hasFaderData && lastHadMixerFaderData)
+            {
+                lastHadMixerFaderData = false;
+                repaint(mixerBounds);  // clear mixer on disconnect
+            }
+
+            // VU meters: repaint on visible change
+            if (hasFaderData)
+            {
+                bool vuDirty = false;
+                for (int ch = 0; ch < ProDJLink::kVuSlots; ++ch)
+                    if (std::abs(vuSmoothed[ch] - vuSnapshotted[ch]) > 0.005f)
+                        { vuDirty = true; break; }
+                if (vuDirty)
+                {
+                    for (int ch = 0; ch < ProDJLink::kVuSlots; ++ch)
+                        vuSnapshotted[ch] = vuSmoothed[ch];
+                    faderDirty = true;
+                }
+            }
+
+            if (faderDirty)
+                repaint(mixerBounds);
+        }
     }
 
     //==========================================================================
@@ -552,9 +723,10 @@ public:
     //==========================================================================
     void paintOverChildren(juce::Graphics& g) override
     {
-        // Paint each deck
+        // Paint each deck (skip if bounds are too small)
         for (int deck = 0; deck < 4; ++deck)
-            paintDeck(g, deckBounds[deck], deck);
+            if (!deckBounds[deck].isEmpty())
+                paintDeck(g, deckBounds[deck], deck);
 
         // Paint mixer (only if visible)
         if (showMixer && !mixerBounds.isEmpty())
@@ -588,8 +760,11 @@ private:
     juce::ToggleButton btnShowMixer;
 
     // Smoothed VU meter levels (decay-based, updated per timer tick)
-    // Indices: 0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=MasterL, 5=MasterR
-    float vuSmoothed[6] { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    // Indices: 0-5=CH1-CH6, kVuMasterL=MasterL, kVuMasterR=MasterR
+    float vuSmoothed   [ProDJLink::kVuSlots] {};
+    float vuSnapshotted[ProDJLink::kVuSlots] {};  // last-painted VU values for dirty check
+    bool     lastHadMixerFaderData = false;        // tracks hasMixerFaderData() transitions
+    uint32_t lastMixerPktCount     = 0;            // tracks getMixerPacketCount() for fader dirty
 
     // Shared data references (not owned)
     ProDJLinkInput& proDJLink;
@@ -600,13 +775,91 @@ private:
     //==========================================================================
     // Paint one deck panel
     //==========================================================================
+
+#if JUCE_WINDOWS
+    /// Detect the display scale factor for HiDPI rendering (Windows deck cache).
+    float getDisplayScale() const
+    {
+        if (auto* tlc = getTopLevelComponent())
+            if (auto* peer = tlc->getPeer())
+                return (float)peer->getPlatformScaleFactor();
+        auto& displays = juce::Desktop::getInstance().getDisplays();
+        if (auto* primary = displays.getPrimaryDisplay())
+            return (float)primary->scale;
+        return 1.0f;
+    }
+#endif
+
     void paintDeck(juce::Graphics& g, juce::Rectangle<int> area, int deckIndex)
     {
         if (area.isEmpty()) return;
 
         auto& ds = deckState[deckIndex];
+        int w = area.getWidth(), h = area.getHeight();
+
+#if JUCE_WINDOWS
+        // Windows: cached HiDPI deck image (OpenGL composites texture efficiently)
+        float scale = getDisplayScale();
+        if (scale < 1.0f) scale = 1.0f;
+
+        if (!ds.deckImgValid || ds.cachedDeckW != w || ds.cachedDeckH != h
+            || ds.cachedDeckScale != scale)
+        {
+            int imgW = (int)std::ceil(w * scale);
+            int imgH = (int)std::ceil(h * scale);
+            ds.cachedDeckImg = juce::Image(juce::Image::ARGB, imgW, imgH, true);
+            juce::Graphics ig(ds.cachedDeckImg);
+            ig.addTransform(juce::AffineTransform::scale(scale));
+            paintDeckStatic(ig, juce::Rectangle<int>(0, 0, w, h), deckIndex);
+            ds.cachedDeckW     = w;
+            ds.cachedDeckH     = h;
+            ds.cachedDeckScale = scale;
+            ds.deckImgValid    = true;
+        }
+        g.drawImage(ds.cachedDeckImg, area.toFloat());
+#else
+        // macOS: paint directly into the CoreGraphics backing store.
+        // Text rendered into a juce::Image loses CoreGraphics subpixel
+        // antialiasing (only works on opaque native backing stores), so
+        // caching always produces blurry text on macOS.  The targeted
+        // dirty rects keep per-frame work minimal: frameDirty only
+        // repaints the TC + waveform + offset TC strips, not the full deck.
+        {
+            juce::Graphics::ScopedSaveState sss(g);
+            g.reduceClipRegion(area);
+            g.setOrigin(area.getPosition());
+            paintDeckStatic(g, juce::Rectangle<int>(0, 0, w, h), deckIndex);
+        }
+#endif
+
+        // Waveform -- painted LIVE from WaveformDisplay's own cached image.
+        if (!ds.wfLocalBounds.isEmpty())
+        {
+            auto wfAbsolute = ds.wfLocalBounds + area.getPosition();
+            juce::Graphics::ScopedSaveState sss(g);
+            g.reduceClipRegion(wfAbsolute);
+            g.setOrigin(wfAbsolute.getPosition());
+            ds.waveform.setBounds(0, 0, wfAbsolute.getWidth(), wfAbsolute.getHeight());
+            ds.waveform.paint(g);
+        }
+
+        // Draw timecode live on top
+        paintDeckTimecode(g, area, deckIndex);
+    }
+
+    // Paints everything except the timecode digits into g (local coords).
+    void paintDeckStatic(juce::Graphics& g, juce::Rectangle<int> area, int deckIndex)
+    {
+        auto& ds = deckState[deckIndex];
         int pn = deckIndex + 1;
         auto af = area.toFloat();
+
+        // Clear waveform/timecode bounds -- will be set below if layout succeeds.
+        // This prevents stale bounds from a previous larger layout being
+        // used when the deck is too small to lay out (early return below).
+        ds.wfLocalBounds = {};
+        ds.tcLocalBounds = {};
+        ds.mapLocalBounds = {};
 
         // Background panel
         g.setColour(bgDeck);
@@ -615,6 +868,7 @@ private:
         g.drawRoundedRectangle(af, 4.0f, 1.0f);
 
         auto inner = area.reduced(6);
+        if (inner.getWidth() < 30 || inner.getHeight() < 30) return;
         int deckH = inner.getHeight();
 
         // --- Proportional layout ---
@@ -814,51 +1068,36 @@ private:
         inner.removeFromTop(4);
 
         //----------------------------------------------------------------------
-        // Waveform (proportional height)
+        // Waveform area -- NOT painted here.  The waveform is painted LIVE
+        // in paintDeck() so the cursor updates every frame.
+        // We just store the local bounds and fill the background.
         //----------------------------------------------------------------------
         auto wfBounds = inner.removeFromTop(wfH);
-        paintWaveformArea(g, wfBounds, deckIndex);
+        ds.wfLocalBounds = wfBounds;
+        g.setColour(juce::Colour(0xFF0D1117));
+        g.fillRoundedRectangle(wfBounds.toFloat(), 3.0f);
 
         inner.removeFromTop(4);
 
         //----------------------------------------------------------------------
-        // Timecode display (scales with deck size)
+        // Timecode display -- drawn LIVE by paintDeckTimecode, not here.
+        // Reserve the space and store bounds for targeted repaints.
         //----------------------------------------------------------------------
-        auto tcRow = inner.removeFromTop(tcH);
-        {
-            // FPS badge (right-aligned, reserve space first)
-            auto fpsBadge = tcRow.removeFromRight(34);
-            g.setFont(juce::Font(juce::FontOptions(9.0f)));
-            g.setColour(textDim);
-            g.drawText(ds.fpsStr, fpsBadge, juce::Justification::centred);
-
-            // Timecode font scales with row height
-            float tcFontSize = juce::jlimit(14.0f, 48.0f, tcH * 0.8f);
-            juce::String tcStr = timecodeToString(ds.timecode);
-            g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), tcFontSize, juce::Font::bold)));
-            g.setColour(ds.isPlaying ? tcGlow : textMid);
-            g.drawText(tcStr, tcRow, juce::Justification::centred);
-        }
+        ds.tcLocalBounds = inner.removeFromTop(tcH);
 
         inner.removeFromTop(2);
 
         //----------------------------------------------------------------------
-        // TrackMap offset row -- running timecode with offset applied
+        // TrackMap offset row -- static background only (text drawn live)
         //----------------------------------------------------------------------
         auto mapRow = inner.removeFromTop(16);
+        ds.mapLocalBounds = mapRow;
         {
             if (ds.trackMapped)
             {
                 g.setColour(accentAmber.withAlpha(0.2f));
                 g.fillRoundedRectangle(mapRow.toFloat(), 2.0f);
-
-                // Running offset timecode (monospace, prominent)
-                juce::String offsetTcStr = timecodeToString(ds.offsetTimecode);
-                g.setColour(accentAmber);
-                g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
-                g.drawText(offsetTcStr, mapRow, juce::Justification::centred);
-
-                // Small "MAP" label on the left
+                // Small "MAP" label only (offset TC text drawn live)
                 g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
                 g.setColour(accentAmber.withAlpha(0.6f));
                 g.drawText("MAP", mapRow.withTrimmedLeft(4).withWidth(24),
@@ -992,35 +1231,6 @@ private:
     }
 
     //==========================================================================
-    // Waveform -- delegate to the WaveformDisplay's paint, positioned inline
-    //==========================================================================
-    void paintWaveformArea(juce::Graphics& g, juce::Rectangle<int> bounds, int deckIndex)
-    {
-        auto& ds = deckState[deckIndex];
-
-        if (ds.waveform.hasWaveformData())
-        {
-            // WaveformDisplay::paint() draws its own background, no need to pre-fill.
-            // Translate the Graphics context so WaveformDisplay::paint() works
-            // in its own local coordinate space but draws into our bounds.
-            juce::Graphics::ScopedSaveState saveState(g);
-            g.reduceClipRegion(bounds);
-            g.setOrigin(bounds.getPosition());
-            ds.waveform.setBounds(0, 0, bounds.getWidth(), bounds.getHeight());
-            ds.waveform.paint(g);
-        }
-        else
-        {
-            auto bf = bounds.toFloat();
-            g.setColour(juce::Colour(0xFF0D1117));
-            g.fillRoundedRectangle(bf, 3.0f);
-            g.setColour(textDim.withAlpha(0.3f));
-            g.setFont(juce::Font(juce::FontOptions(9.0f)));
-            g.drawText("WAVEFORM", bf, juce::Justification::centred);
-        }
-    }
-
-    //==========================================================================
     // Beat indicator: 4 boxes, active one highlighted
     //==========================================================================
     void paintBeatIndicator(juce::Graphics& g, juce::Rectangle<float> area, uint8_t beat)
@@ -1051,10 +1261,62 @@ private:
     }
 
     //==========================================================================
+    // Live timecode overlay -- painted on top of the deck static content.
+    // Runs every repaint; the static elements are also direct-painted.
+    //==========================================================================
+    void paintDeckTimecode(juce::Graphics& g, juce::Rectangle<int> area, int deckIndex)
+    {
+        if (area.isEmpty()) return;
+        auto& ds = deckState[deckIndex];
+
+        // No timecode overlay when deck is not connected
+        if (!ds.discovered) return;
+
+        // Use pre-computed bounds from paintDeckStatic (deck-local -> absolute)
+        auto offset = area.getPosition();
+
+        if (!ds.tcLocalBounds.isEmpty())
+        {
+            auto tcRow = ds.tcLocalBounds + offset;
+            int tcH = tcRow.getHeight();
+
+            // Fill TC area background
+            g.setColour(bgDeck);
+            g.fillRect(tcRow);
+
+            // Draw timecode
+            float tcFontSize = juce::jlimit(14.0f, 48.0f, tcH * 0.8f);
+            juce::String tcStr = timecodeToString(ds.timecode);
+            auto tcFont = juce::Font(juce::FontOptions(getMonoFontName(), tcFontSize, juce::Font::bold));
+            float availW = (float)tcRow.getWidth();
+            while (tcFontSize > 8.0f && measureStringWidth(tcFont, tcStr) > availW)
+            {
+                tcFontSize -= 1.0f;
+                tcFont = juce::Font(juce::FontOptions(getMonoFontName(), tcFontSize, juce::Font::bold));
+            }
+            g.setFont(tcFont);
+            g.setColour(ds.isPlaying ? tcGlow : textMid);
+            g.drawText(tcStr, tcRow, juce::Justification::centred);
+        }
+
+        // Draw offset timecode text
+        if (ds.trackMapped && !ds.mapLocalBounds.isEmpty())
+        {
+            auto mapRow = ds.mapLocalBounds + offset;
+            juce::String offsetTcStr = timecodeToString(ds.offsetTimecode);
+            g.setColour(accentAmber);
+            g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::bold)));
+            g.drawText(offsetTcStr, mapRow, juce::Justification::centred);
+        }
+    }
+
+    //==========================================================================
     // Mixer panel (DJM -- vertical side panel)
     //==========================================================================
     void paintMixer(juce::Graphics& g, juce::Rectangle<int> area)
     {
+        if (area.getWidth() < 20 || area.getHeight() < 40) return;
+
         auto af = area.toFloat();
         g.setColour(bgDeck);
         g.fillRoundedRectangle(af, 4.0f);
@@ -1082,28 +1344,33 @@ private:
         }
 
         // --- Bottom section: crossfader + master (reserve space) ---
-        auto bottomSection = inner.removeFromBottom(90);
-        inner.removeFromBottom(4);
+        auto bottomSection = inner.removeFromBottom(juce::jmin(90, inner.getHeight() / 3));
+        inner.removeFromBottom(juce::jmin(4, inner.getHeight()));
 
-        // --- Channel strips: 4 columns filling the remaining height ---
+        // --- Channel strips: columns filling the remaining height ---
+        int numCh = proDJLink.getMixerChannelCount();
         int gap = 3;
-        int totalW = inner.getWidth() - gap * 3;
+        int totalW = inner.getWidth() - gap * (numCh - 1);
 
-        for (int ch = 1; ch <= 4; ++ch)
+        for (int ch = 1; ch <= numCh; ++ch)
         {
-            int colW = totalW * ch / 4 - totalW * (ch - 1) / 4;
+            int colW = totalW * ch / numCh - totalW * (ch - 1) / numCh;
             auto col = inner.removeFromLeft(colW);
-            if (ch < 4) inner.removeFromLeft(gap);
+            if (ch < numCh) inner.removeFromLeft(gap);
 
             paintChannelStrip(g, col, ch);
         }
 
         // --- Crossfader ---
-        auto xfRow = bottomSection.removeFromTop(28);
-        paintCrossfader(g, xfRow.toFloat(), proDJLink.getCrossfader());
-        bottomSection.removeFromTop(4);
+        if (bottomSection.getHeight() > 30)
+        {
+            auto xfRow = bottomSection.removeFromTop(28);
+            paintCrossfader(g, xfRow.toFloat(), proDJLink.getCrossfader());
+            bottomSection.removeFromTop(4);
+        }
 
         // --- Master fader (horizontal) + stereo VU ---
+        if (bottomSection.getHeight() > 10)
         {
             auto mstRow = bottomSection;
             auto labelArea = mstRow.removeFromTop(10);
@@ -1124,8 +1391,8 @@ private:
 
             // Stereo VU bars (horizontal)
             auto vuRow = mstRow.removeFromTop(6).reduced(4, 0);
-            paintHorizontalVu(g, vuRow.removeFromTop(3), vuSmoothed[4]);
-            paintHorizontalVu(g, vuRow, vuSmoothed[5]);
+            paintHorizontalVu(g, vuRow.removeFromTop(3), vuSmoothed[ProDJLink::kVuMasterL]);
+            paintHorizontalVu(g, vuRow, vuSmoothed[ProDJLink::kVuMasterR]);
 
             mstRow.removeFromTop(3);
 
@@ -1140,11 +1407,18 @@ private:
 
             // Beat FX info
             auto fxRow = mstRow.removeFromTop(10);
-            static const char* fxNames[] = {
+            static const char* fxNames900[] = {
                 "DELAY","ECHO","PING PONG","SPIRAL","REVERB","TRANS",
                 "FILTER","FLANGER","PHASER","PITCH","SLIP ROLL","ROLL",
                 "V.BRAKE","HELIX"
             };
+            static const char* fxNamesV10[] = {
+                "DELAY","ECHO","PING PONG","SPIRAL","HELIX","REVERB",
+                "SHIMMER","FLANGER","PHASER","FILTER","TRANS","ROLL",
+                "PITCH","V.BRAKE"
+            };
+            bool isV10g = proDJLink.getMixerChannelCount() > 4;
+            const char** fxNames = isV10g ? fxNamesV10 : fxNames900;
             int fxSel = proDJLink.getBeatFxSelect();
             bool fxOn = proDJLink.getBeatFxOn() != 0;
             juce::String fxStr = (fxSel >= 0 && fxSel < 14)
@@ -1161,6 +1435,7 @@ private:
     void paintChannelStrip(juce::Graphics& g, juce::Rectangle<int> area, int ch)
     {
         bool onAir = proDJLink.isPlayerOnAir(ch);
+        bool isV10 = proDJLink.getMixerChannelCount() > 4;
         juce::Colour chCol = onAir ? accentGreen : accentCyan;
 
         // --- Channel label + on-air ---
@@ -1174,11 +1449,24 @@ private:
         paintParamBar(g, area.removeFromTop(6), proDJLink.getChannelTrim(ch), textMid, "T");
         area.removeFromTop(2);
 
+        // --- Compressor (V10 only) ---
+        if (isV10)
+        {
+            paintParamBar(g, area.removeFromTop(6), proDJLink.getChannelComp(ch), accentCyan, "K");
+            area.removeFromTop(1);
+        }
+
         // --- EQ HI / MID / LO (center-referenced bars) ---
+        // V10 has 4-band EQ: Hi, Hi-Mid, Lo-Mid, Lo
         paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqHi(ch), accentAmber, "H");
         area.removeFromTop(1);
-        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqMid(ch), accentAmber, "M");
+        paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqMid(ch), accentAmber, isV10 ? "h" : "M");
         area.removeFromTop(1);
+        if (isV10)
+        {
+            paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqLoMid(ch), accentAmber, "l");
+            area.removeFromTop(1);
+        }
         paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelEqLo(ch), accentAmber, "L");
         area.removeFromTop(2);
 
@@ -1186,36 +1474,74 @@ private:
         paintEqBar(g, area.removeFromTop(6), proDJLink.getChannelColor(ch), accentCyan, "C");
         area.removeFromTop(2);
 
-        // --- CUE button ---
+        // --- Send knob (V10 only) ---
+        if (isV10)
+        {
+            paintParamBar(g, area.removeFromTop(6), proDJLink.getChannelSend(ch), accentGreen, "S");
+            area.removeFromTop(2);
+        }
+
+        // --- CUE button(s) ---
         {
             bool cue = proDJLink.getChannelCue(ch) != 0;
+            bool cueB = isV10 && proDJLink.getChannelCueB(ch) != 0;
             auto cueRow = area.removeFromTop(10);
-            auto cueBox = cueRow.reduced(juce::jmax(0, (cueRow.getWidth() - 20) / 2), 0)
-                                 .withHeight(10);
-            g.setColour(cue ? juce::Colour(0xFFFF6D00) : juce::Colour(0xFF1A1D23));
-            g.fillRoundedRectangle(cueBox.toFloat(), 2.0f);
-            g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
-            g.setColour(cue ? juce::Colours::black : textDim);
-            g.drawText("CUE", cueBox, juce::Justification::centred);
+
+            if (isV10)
+            {
+                // Two CUE buttons side by side
+                int btnW = juce::jmin(20, (cueRow.getWidth() - 2) / 2);
+                int totalW = btnW * 2 + 2;
+                int xOff = (cueRow.getWidth() - totalW) / 2;
+                auto cueA = cueRow.withX(cueRow.getX() + xOff).withWidth(btnW).withHeight(10);
+                auto cueBx = cueA.translated(btnW + 2, 0);
+
+                g.setColour(cue ? juce::Colour(0xFFFF6D00) : juce::Colour(0xFF1A1D23));
+                g.fillRoundedRectangle(cueA.toFloat(), 2.0f);
+                g.setFont(juce::Font(juce::FontOptions(6.0f, juce::Font::bold)));
+                g.setColour(cue ? juce::Colours::black : textDim);
+                g.drawText("A", cueA, juce::Justification::centred);
+
+                g.setColour(cueB ? juce::Colour(0xFFFF6D00) : juce::Colour(0xFF1A1D23));
+                g.fillRoundedRectangle(cueBx.toFloat(), 2.0f);
+                g.setColour(cueB ? juce::Colours::black : textDim);
+                g.drawText("B", cueBx, juce::Justification::centred);
+            }
+            else
+            {
+                auto cueBox = cueRow.reduced(juce::jmax(0, (cueRow.getWidth() - 20) / 2), 0)
+                                     .withHeight(10);
+                g.setColour(cue ? juce::Colour(0xFFFF6D00) : juce::Colour(0xFF1A1D23));
+                g.fillRoundedRectangle(cueBox.toFloat(), 2.0f);
+                g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
+                g.setColour(cue ? juce::Colours::black : textDim);
+                g.drawText("CUE", cueBox, juce::Justification::centred);
+            }
         }
         area.removeFromTop(3);
 
-        // --- XF assign at bottom ---
-        auto xfRow = area.removeFromBottom(10);
-        uint8_t xfAssign = proDJLink.getChannelXfAssign(ch);
+        // --- XF assign at bottom (skip if no space) ---
+        if (area.getHeight() > 24)
         {
-            juce::String xfLabel = (xfAssign == 1) ? "A" : (xfAssign == 2) ? "B" : "-";
-            juce::Colour xfCol = (xfAssign == 1) ? accentCyan
-                               : (xfAssign == 2) ? accentAmber : textDim;
-            g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
-            g.setColour(xfCol);
-            g.drawText(xfLabel, xfRow, juce::Justification::centred);
+            auto xfRow = area.removeFromBottom(10);
+            uint8_t xfAssign = proDJLink.getChannelXfAssign(ch);
+            {
+                juce::String xfLabel = (xfAssign == 1) ? "A" : (xfAssign == 2) ? "B" : "-";
+                juce::Colour xfCol = (xfAssign == 1) ? accentCyan
+                                   : (xfAssign == 2) ? accentAmber : textDim;
+                g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                g.setColour(xfCol);
+                g.drawText(xfLabel, xfRow, juce::Justification::centred);
+            }
+            area.removeFromBottom(2);
         }
-        area.removeFromBottom(2);
 
-        // --- Fader + VU (fills remaining height) ---
-        paintFader(g, area.toFloat(), proDJLink.getChannelFader(ch),
-                   "", chCol, vuSmoothed[ch - 1]);
+        // --- Fader + VU (fills remaining height, skip if too small) ---
+        if (area.getHeight() > 4)
+        {
+            paintFader(g, area.toFloat(), proDJLink.getChannelFader(ch),
+                       "", chCol, vuSmoothed[ch - 1]);
+        }
     }
 
     //==========================================================================
@@ -1389,10 +1715,12 @@ private:
         g.setColour(textMid);
         g.drawText("XFADER", labelArea, juce::Justification::centred);
 
-        // Track (horizontal)
+        // Track (horizontal) -- inset to leave room for A/B labels at edges
+        float labelW = 10.0f;
         float trackH = 8.0f;
         float trackY = area.getCentreY() - trackH * 0.5f;
-        auto trackRect = juce::Rectangle<float>(area.getX(), trackY, area.getWidth(), trackH);
+        auto trackArea = area.reduced(labelW + 2.0f, 0.0f);
+        auto trackRect = juce::Rectangle<float>(trackArea.getX(), trackY, trackArea.getWidth(), trackH);
 
         g.setColour(juce::Colour(0xFF1A1D23));
         g.fillRoundedRectangle(trackRect, 2.0f);
@@ -1400,20 +1728,20 @@ private:
         // Thumb position: 0=side-A (left), 255=side-B (right) -- already corrected
         float thumbW = 12.0f;
         float thumbH = 14.0f;
-        float range = area.getWidth() - thumbW;
+        float range = trackArea.getWidth() - thumbW;
         float normPos = val / 255.0f;  // 0(A)=left, 255(B)=right -- direct mapping
-        float thumbX = area.getX() + normPos * range;
+        float thumbX = trackArea.getX() + normPos * range;
         float thumbY = area.getCentreY() - thumbH * 0.5f;
 
         g.setColour(accentCyan.withAlpha(0.7f));
         g.fillRoundedRectangle(thumbX, thumbY, thumbW, thumbH, 2.0f);
 
-        // A / B labels
+        // A / B labels -- vertically centred with the thumb, at bar edges
         g.setFont(juce::Font(juce::FontOptions(8.0f)));
         g.setColour(textDim);
-        g.drawText("A", juce::Rectangle<float>(area.getX(), area.getBottom() - 10, 12, 10),
+        g.drawText("A", juce::Rectangle<float>(area.getX(), thumbY, labelW, thumbH),
                    juce::Justification::centred);
-        g.drawText("B", juce::Rectangle<float>(area.getRight() - 12, area.getBottom() - 10, 12, 10),
+        g.drawText("B", juce::Rectangle<float>(area.getRight() - labelW, thumbY, labelW, thumbH),
                    juce::Justification::centred);
     }
 
@@ -1464,9 +1792,27 @@ public:
         setTitleBarHeight(20);
         setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
         setResizable(true, true);
+        if (auto* c = getConstrainer())
+            c->setMinimumSize(400, 300);
         centreWithSize(getWidth(), getHeight());
         setVisible(true);
         toFront(true);
+
+        // GPU-accelerated rendering (Windows only).
+        // On macOS, JUCE's OpenGL adds texture-upload overhead through Apple's
+        // deprecated OpenGL-to-Metal layer.  CoreGraphics + Metal compositing
+        // is faster without it.  The HiDPI deck image cache already minimizes
+        // per-frame paint work on both platforms.
+#if JUCE_WINDOWS
+        glContext.attachTo(*getContentComponent());
+#endif
+    }
+
+    ~ProDJLinkViewWindow() override
+    {
+#if JUCE_WINDOWS
+        glContext.detach();
+#endif
     }
 
     void closeButtonPressed() override
@@ -1475,6 +1821,9 @@ public:
         if (onBoundsCapture) onBoundsCapture();
         if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
             content->stopTimer();
+#if JUCE_WINDOWS
+        glContext.detach();  // release GPU resources while hidden
+#endif
         setVisible(false);
     }
 
@@ -1543,6 +1892,11 @@ public:
             return c->getShowMixer();
         return true;
     }
+
+private:
+#if JUCE_WINDOWS
+    juce::OpenGLContext glContext;
+#endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProDJLinkViewWindow)
 };

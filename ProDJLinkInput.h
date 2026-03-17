@@ -53,7 +53,7 @@
   #include <ifaddrs.h>
   #include <net/if_dl.h>
   #include <net/if_types.h>
-  #include <sys/socket.h>    // SO_BROADCAST setsockopt
+  #include <sys/socket.h>      // SO_BROADCAST setsockopt
 #elif defined(__linux__)
   #include <sys/ioctl.h>
   #include <net/if.h>
@@ -105,6 +105,13 @@ namespace ProDJLink
 
     // Maximum supported players (CDJ-3000 supports channels 1-6)
     static constexpr int kMaxPlayers = 6;
+
+    // Maximum mixer channels (DJM-V10 has 6, DJM-900NXS2 has 4)
+    static constexpr int kMaxMixerChannels = 6;
+    // VU meter indices: channels first, then master L/R
+    static constexpr int kVuMasterL = kMaxMixerChannels;      // index 6
+    static constexpr int kVuMasterR = kMaxMixerChannels + 1;  // index 7
+    static constexpr int kVuSlots   = kMaxMixerChannels + 2;  // 8 total
 
     // Device type bytes (byte [33] in keepalive packets) -- confirmed from captures:
     //   0x01 = bridge / lighting controller
@@ -338,6 +345,23 @@ public:
         }
 
         // --- Create sockets ---
+        // IMPORTANT: beatSock and statusSock must NOT use setEnablePortReuse().
+        // On macOS, JUCE's setEnablePortReuse(true) enables SO_REUSEPORT, which
+        // tells the kernel to distribute incoming packets among ALL sockets bound
+        // to the same port. If a previous STC instance didn't close cleanly, or
+        // another Pro DJ Link app (Bridge, rekordbox) has a socket on port 50001,
+        // the kernel splits packets between them — causing packet reordering and
+        // stale playhead values that appear as timecode fluctuation.
+        //
+        // Binding to the specific interface IP (bindIp) instead of INADDR_ANY
+        // further ensures we only receive packets from one network path, avoiding
+        // duplicate delivery on machines with multiple interfaces (Ethernet+WiFi).
+        //
+        // keepaliveSock keeps SO_REUSEPORT because port 50000 is the standard
+        // ProDJLink keepalive port and we may need to coexist with other software.
+        // Bound to INADDR_ANY to receive CDJ/DJM broadcast keepalives for
+        // device discovery.
+
         keepaliveSock = std::make_unique<juce::DatagramSocket>(true);
         keepaliveSock->setEnablePortReuse(true);
         if (!keepaliveSock->bindToPort(ProDJLink::kKeepalivePort))
@@ -349,8 +373,9 @@ public:
         ensureSoBroadcast(keepaliveSock.get(), "keepalive");
 
         beatSock = std::make_unique<juce::DatagramSocket>(true);
-        beatSock->setEnablePortReuse(true);
-        if (!beatSock->bindToPort(ProDJLink::kBeatPort))
+        // NO setEnablePortReuse -- see comment above
+        if (!beatSock->bindToPort(ProDJLink::kBeatPort, bindIp)
+            && !beatSock->bindToPort(ProDJLink::kBeatPort))  // fallback to INADDR_ANY
         {
             DBG("ProDJLink: WARNING -- Failed to bind beat socket to port " << ProDJLink::kBeatPort
                 << " (beat sync unavailable, but status/keepalive will work)");
@@ -359,8 +384,9 @@ public:
         if (beatSock) ensureSoBroadcast(beatSock.get(), "beat");
 
         statusSock = std::make_unique<juce::DatagramSocket>(false);
-        statusSock->setEnablePortReuse(true);
-        if (!statusSock->bindToPort(ProDJLink::kStatusPort))
+        // NO setEnablePortReuse -- see comment above
+        if (!statusSock->bindToPort(ProDJLink::kStatusPort, bindIp)
+            && !statusSock->bindToPort(ProDJLink::kStatusPort))  // fallback to INADDR_ANY
         {
             DBG("ProDJLink: Failed to bind status socket to port " << ProDJLink::kStatusPort);
             keepaliveSock = nullptr;
@@ -664,12 +690,16 @@ public:
         return (now - last) < 5000.0;
     }
 
+    /// Monotonic counter of received 0x39 mixer packets. Used by forwarding
+    /// logic to skip iteration when no new data has arrived since last check.
+    uint32_t getMixerPacketCount() const { return pktCountMixer.load(std::memory_order_relaxed); }
+
     /// Channel fader position (0=closed/bottom, 255=fully open/top).
     /// Only valid after hasMixerFaderData() returns true.
     uint8_t getChannelFader(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 255;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 255;
         return mixerFader[idx].load(std::memory_order_relaxed);
     }
 
@@ -677,31 +707,50 @@ public:
     uint8_t getChannelTrim(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 128;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
         return mixerTrim[idx].load(std::memory_order_relaxed);
+    }
+
+    /// Per-channel Compressor knob (0=off, 255=max).  V10 only; always 0 on 900NXS2.
+    /// Confirmed from Comp__V10.pcapng: per-channel offset +2.
+    uint8_t getChannelComp(int channel) const
+    {
+        int idx = channel - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 0;
+        return mixerComp[idx].load(std::memory_order_relaxed);
     }
 
     /// EQ High knob (0=full cut, 128=center/flat, 255=full boost).
     uint8_t getChannelEqHi(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 128;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
         return mixerEqHi[idx].load(std::memory_order_relaxed);
     }
 
     /// EQ Mid knob (0=full cut, 128=center/flat, 255=full boost).
+    /// On V10 this is "Hi Mid" (4-band EQ).
     uint8_t getChannelEqMid(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 128;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
         return mixerEqMid[idx].load(std::memory_order_relaxed);
+    }
+
+    /// EQ Low Mid knob (0=full cut, 128=center/flat, 255=full boost).
+    /// V10 only (4-band EQ); always 0 on 900NXS2.
+    uint8_t getChannelEqLoMid(int channel) const
+    {
+        int idx = channel - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
+        return mixerEqLoMid[idx].load(std::memory_order_relaxed);
     }
 
     /// EQ Low knob (0=full cut, 128=center/flat, 255=full boost).
     uint8_t getChannelEqLo(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 128;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
         return mixerEqLo[idx].load(std::memory_order_relaxed);
     }
 
@@ -709,23 +758,40 @@ public:
     uint8_t getChannelColor(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 128;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 128;
         return mixerColor[idx].load(std::memory_order_relaxed);
+    }
+
+    /// Per-channel Send knob (0=off, 255=max).  V10 only; always 0 on 900NXS2.
+    /// Confirmed from Send_V10.pcapng: per-channel offset +8.
+    uint8_t getChannelSend(int channel) const
+    {
+        int idx = channel - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 0;
+        return mixerSend[idx].load(std::memory_order_relaxed);
     }
 
     /// CUE headphone button (0=off, 1=on).
     uint8_t getChannelCue(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 0;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 0;
         return mixerCueBtn[idx].load(std::memory_order_relaxed);
+    }
+
+    /// CUE B headphone button (0=off, 1=on).  V10 dual-cue; always 0 on 900NXS2.
+    uint8_t getChannelCueB(int channel) const
+    {
+        int idx = channel - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 0;
+        return mixerCueBtnB[idx].load(std::memory_order_relaxed);
     }
 
     /// Input source selector (0=USB_A,1=USB_B,2=DIGITAL,3=LINE,4=PHONO,8=RET/AUX).
     uint8_t getChannelInputSrc(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 3;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 3;
         return mixerInputSrc[idx].load(std::memory_order_relaxed);
     }
 
@@ -733,7 +799,7 @@ public:
     uint8_t getChannelXfAssign(int channel) const
     {
         int idx = channel - 1;
-        if (idx < 0 || idx > 3) return 0;
+        if (idx < 0 || idx >= ProDJLink::kMaxMixerChannels) return 0;
         return mixerXfAssign[idx].load(std::memory_order_relaxed);
     }
 
@@ -743,12 +809,23 @@ public:
     uint8_t getMasterFader()   const { return mixerMasterFader.load(std::memory_order_relaxed); }
     /// Master CUE button (0=off, 1=on).
     uint8_t getMasterCue()     const { return mixerMasterCue.load(std::memory_order_relaxed); }
+    uint8_t getMasterCueB()    const { return mixerMasterCueB.load(std::memory_order_relaxed); }   // V10 dual-cue
+    /// Isolator On/Off (0/1).  V10 only; always 0 on 900NXS2.
+    uint8_t getIsolatorOn()    const { return mixerIsolatorOn.load(std::memory_order_relaxed); }
+    /// Isolator Hi (0-255, 128=center).  V10 only.
+    uint8_t getIsolatorHi()    const { return mixerIsolatorHi.load(std::memory_order_relaxed); }
+    /// Isolator Mid (0-255, 128=center).  V10 only.
+    uint8_t getIsolatorMid()   const { return mixerIsolatorMid.load(std::memory_order_relaxed); }
+    /// Isolator Lo (0-255, 128=center).  V10 only.
+    uint8_t getIsolatorLo()    const { return mixerIsolatorLo.load(std::memory_order_relaxed); }
     /// Fader curve (0/1/2).
     uint8_t getFaderCurve()    const { return mixerFaderCurve.load(std::memory_order_relaxed); }
     /// Crossfader curve (0/1/2).
     uint8_t getXfCurve()       const { return mixerXfCurve.load(std::memory_order_relaxed); }
     /// Booth monitor level (0-255).
     uint8_t getBoothLevel()    const { return mixerBooth.load(std::memory_order_relaxed); }
+    uint8_t getBoothEqHi()     const { return mixerBoothEqHi.load(std::memory_order_relaxed); }   // V10 only
+    uint8_t getBoothEqLo()     const { return mixerBoothEqLo.load(std::memory_order_relaxed); }   // V10 only
 
     /// Headphone Cue Link (0=off, 1=on).
     uint8_t getHpCueLink()     const { return mixerHpCueLink.load(std::memory_order_relaxed); }
@@ -756,6 +833,14 @@ public:
     uint8_t getHpMixing()      const { return mixerHpMixing.load(std::memory_order_relaxed); }
     /// Headphone level (0-255).
     uint8_t getHpLevel()       const { return mixerHpLevel.load(std::memory_order_relaxed); }
+    /// HP A Pre EQ button (0=off, 1=on).  V10 only; always 0 on 900NXS2.
+    uint8_t getHpPreEq()       const { return mixerHpPreEq.load(std::memory_order_relaxed); }
+    /// Headphone B Cue Link (0=off, 1=on).  V10 only; always 0 on 900NXS2.
+    uint8_t getHpCueLinkB()    const { return mixerHpCueLinkB.load(std::memory_order_relaxed); }
+    /// Headphone B mixing knob (0=CUE, 255=Master).  V10 only.
+    uint8_t getHpMixingB()     const { return mixerHpMixingB.load(std::memory_order_relaxed); }
+    /// Headphone B level (0-255).  V10 only.
+    uint8_t getHpLevelB()      const { return mixerHpLevelB.load(std::memory_order_relaxed); }
 
     /// Beat FX selector (0-13: Delay,Echo,PingPong,Spiral,Reverb,Trans,Filter,Flanger,Phaser,Pitch,SlipRoll,Roll,VinylBrake,Helix).
     uint8_t getBeatFxSelect()  const { return mixerBeatFxSel.load(std::memory_order_relaxed); }
@@ -771,6 +856,10 @@ public:
     uint8_t getFxFreqHi()      const { return mixerFxFreqHi.load(std::memory_order_relaxed); }
     /// Send/Return level (0-255).
     uint8_t getSendReturnLevel() const { return mixerSendReturn.load(std::memory_order_relaxed); }
+    /// Multi I/O Select (0=Mic, 1-6=CH1-CH6, 7=Master).  V10 only.
+    uint8_t getMultiIoSelect() const { return mixerMultiIoSelect.load(std::memory_order_relaxed); }
+    /// Multi I/O Level (0-255).  V10 only.
+    uint8_t getMultiIoLevel()  const { return mixerMultiIoLevel.load(std::memory_order_relaxed); }
 
     /// Color FX selector (255=OFF, 0=Space,1=DubEcho,2=Sweep,3=Noise,4=Crush,5=Filter).
     uint8_t getColorFxSelect() const { return mixerColorFxSel.load(std::memory_order_relaxed); }
@@ -778,11 +867,33 @@ public:
     uint8_t getColorFxParam()  const { return mixerColorFxParam.load(std::memory_order_relaxed); }
     /// Color FX channel assign (same enum as Beat FX assign).
     uint8_t getColorFxAssign() const { return mixerColorFxAssign.load(std::memory_order_relaxed); }
+    /// Send Ext1 On/Off (0/1).  V10 only; always 0 on 900NXS2.
+    uint8_t getSendExt1()      const { return mixerSendExt1.load(std::memory_order_relaxed); }
+    /// Send Ext2 On/Off (0/1).  V10 only; always 0 on 900NXS2.
+    uint8_t getSendExt2()      const { return mixerSendExt2.load(std::memory_order_relaxed); }
+
+    /// Master Mix On/Off (0/1).  V10 only; always 0 on 900NXS2.
+    uint8_t getMasterMixOn()    const { return mixerMasterMixOn.load(std::memory_order_relaxed); }
+    /// Master Mix Size/Feedback (0-255).  V10 only.
+    uint8_t getMasterMixSize()  const { return mixerMasterMixSize.load(std::memory_order_relaxed); }
+    /// Master Mix Time (0-255).  V10 only.
+    uint8_t getMasterMixTime()  const { return mixerMasterMixTime.load(std::memory_order_relaxed); }
+    /// Master Mix Tone (0-255).  V10 only.
+    uint8_t getMasterMixTone()  const { return mixerMasterMixTone.load(std::memory_order_relaxed); }
+    /// Master Mix Level (0-255).  V10 only.  Shares offset 0x0e2 with Color FX Param.
+    uint8_t getMasterMixLevel() const { return mixerMasterMixLevel.load(std::memory_order_relaxed); }
 
     /// Mic EQ High (0-255, 128=center).
     uint8_t getMicEqHi()       const { return mixerMicEqHi.load(std::memory_order_relaxed); }
     /// Mic EQ Low (0-255, 128=center).
     uint8_t getMicEqLo()       const { return mixerMicEqLo.load(std::memory_order_relaxed); }
+
+    /// Filter LPF button (0=off, 1=on).  V10 only; always 0 on 900NXS2.
+    uint8_t getFilterLPF()     const { return mixerFilterLPF.load(std::memory_order_relaxed); }
+    /// Filter HPF button (0=off, 1=on).  V10 only; always 0 on 900NXS2.
+    uint8_t getFilterHPF()     const { return mixerFilterHPF.load(std::memory_order_relaxed); }
+    /// Filter Resonance knob (0-255).  V10 only; always 0 on 900NXS2.
+    uint8_t getFilterResonance() const { return mixerFilterReso.load(std::memory_order_relaxed); }
 
     /// Has VU meter data been received recently?
     bool hasVuMeterData() const
@@ -794,10 +905,10 @@ public:
     }
 
     /// VU peak level for a channel (0=silence, 32767=clip).
-    /// ch: 0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=MasterL, 5=MasterR
+    /// ch: 0-5=CH1-CH6, kVuMasterL=Master L, kVuMasterR=Master R
     uint16_t getVuPeak(int ch) const
     {
-        if (ch < 0 || ch > 5) return 0;
+        if (ch < 0 || ch >= ProDJLink::kVuSlots) return 0;
         return vuPeak[ch].load(std::memory_order_relaxed);
     }
 
@@ -805,10 +916,10 @@ public:
     float getVuPeakNorm(int ch) const { return float(getVuPeak(ch)) / 32767.0f; }
 
     /// Copy all 15 VU segments for one channel into dst[15].
-    /// ch: 0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=MasterL, 5=MasterR
+    /// ch: 0-5=CH1-CH6, kVuMasterL=Master L, kVuMasterR=Master R
     void getVuSegments(int ch, uint16_t dst[15]) const
     {
-        if (ch < 0 || ch > 5) { std::memset(dst, 0, 15 * sizeof(uint16_t)); return; }
+        if (ch < 0 || ch >= ProDJLink::kVuSlots) { std::memset(dst, 0, 15 * sizeof(uint16_t)); return; }
         const juce::SpinLock::ScopedLockType sl(vuDataLock);
         std::memcpy(dst, vuSegments[ch], 15 * sizeof(uint16_t));
     }
@@ -818,6 +929,15 @@ public:
     {
         const juce::ScopedLock sl(djmIpLock);
         return djmModels.empty() ? juce::String() : juce::String(djmModels[0]);
+    }
+
+    /// Number of mixer channels based on detected DJM model.
+    /// DJM-V10 / V10-LF = 6 channels; all others = 4.
+    int getMixerChannelCount() const
+    {
+        juce::String model = getDJMModel();
+        if (model.containsIgnoreCase("V10")) return 6;
+        return 4;
     }
 
     /// Playhead position in milliseconds
@@ -1080,14 +1200,13 @@ private:
 
                 if (djmsKnown && !initialSubSent && readyForFirstSub)
                 {
-                    // First contact: burst of 3 subscribes 200ms apart
-                    // to maximize chances of DJM accepting the session.
-                    DBG("ProDJLink: Initial DJM subscribe burst (3x subscribe)");
-                    for (int burst = 0; burst < 3 && !threadShouldExit(); ++burst)
-                    {
-                        sendBridgeSubscribeToAll();
-                        if (burst < 2) juce::Thread::sleep(200);
-                    }
+                    // First contact: send subscribe (will be repeated on next
+                    // loop iterations via the normal re-subscribe timer).
+                    // Previously this used a burst of 3 with Thread::sleep(200)
+                    // between each, but that blocked the network thread for 400ms
+                    // causing packet accumulation and stale playhead values.
+                    DBG("ProDJLink: Initial DJM subscribe");
+                    sendBridgeSubscribeToAll();
                     initialSubSent    = true;
                     lastBridgeSubSend = now;
                 }
@@ -1109,49 +1228,56 @@ private:
             }
 
             // --- Poll sockets ---
+            // Strategy: block on beatSock for up to 5ms (the busiest socket,
+            // carrying abspos at ~15ms intervals and DJM mixer data).
+            // This drives the loop rate from ~1000 iter/sec down to ~200 iter/sec,
+            // reducing syscall count from ~31,000/sec to ~600/sec.
+            // The loop wakes immediately when any beat packet arrives, so there
+            // is no added latency. keepaliveSock and statusSock are polled
+            // non-blocking afterwards -- they are low-rate (~1Hz and ~5Hz).
 
-            // Keepalive (port 50000) -- ~1Hz per player, low priority
-            if (keepaliveSock && keepaliveSock->waitUntilReady(true, 2))
+            juce::String sender;
+            int port = 0;
+
+            // Block up to 5ms waiting for a beat/abspos/mixer packet.
+            // Falls through immediately if a packet is already waiting.
+            if (beatSock)
+                beatSock->waitUntilReady(true, 5);
+
+            // Keepalive (port 50000) -- ~1Hz per player
+            if (keepaliveSock && keepaliveSock->waitUntilReady(true, 0))
             {
                 uint8_t buf[256];
-                juce::String sender;
-                int port = 0;
                 int n = keepaliveSock->read(buf, sizeof(buf), false, sender, port);
                 if (n > 0)
                     handleKeepalivePacket(buf, n, sender);
             }
 
-            // Beat (port 50001) -- 30ms interval for abs position, drain multiple
-            // Buffer must accommodate: 0x0b abs pos (~60B), 0x28 beat (~96B),
-            // 0x03 on-air (45B), 0x39 fader (248B), 0x58 DJM response (524B)
+            // Beat (port 50001) -- abspos ~67Hz, DJM mixer ~33Hz, drain all ready
+            int beatDrained = 0;
             if (beatSock)
             {
-                int drained = 0;
-                while (drained < 20 && beatSock->waitUntilReady(true, 1))
+                while (beatDrained < 20 && beatSock->waitUntilReady(true, 0))
                 {
                     uint8_t buf[600];
-                    juce::String sender;
-                    int port = 0;
                     int n = beatSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
                         handleBeatPacket(buf, n);
-                    ++drained;
+                    ++beatDrained;
                 }
             }
 
             // Status (port 50002) -- ~5Hz per player
+            int statusDrained = 0;
             if (statusSock)
             {
-                int drained = 0;
-                while (drained < 10 && statusSock->waitUntilReady(true, 1))
+                while (statusDrained < 10 && statusSock->waitUntilReady(true, 0))
                 {
-                    uint8_t buf[1200];  // CDJ-3000 sends 0x200 = 512 bytes
-                    juce::String sender;
-                    int port = 0;
+                    uint8_t buf[1200];
                     int n = statusSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
                         handleStatusPacket(buf, n);
-                    ++drained;
+                    ++statusDrained;
                 }
             }
 
@@ -1214,7 +1340,7 @@ private:
         std::memcpy(pkt + 44, ownIpBytes, 4);
         pkt[53] = 0x20;
 
-        // Pioneer bridge identification (bytes 54-94) — REQUIRED for dbserver access
+        // Pioneer bridge identification (bytes 54-94) -- REQUIRED for dbserver access
         std::strncpy(reinterpret_cast<char*>(pkt + 54), "PIONEER DJ CORP", 19);
         std::strncpy(reinterpret_cast<char*>(pkt + 74), "PRODJLINK BRIDGE", 19);
         pkt[94] = 0x43;  // 'C'
@@ -1269,21 +1395,13 @@ private:
         // 1) Standard broadcast (all devices see it)
         keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, pkt, sizeof(pkt));
 
-        // 2) Unicast copy to each known DJM.
-        //    Sent from bridgeSock (ephemeral port) so sport != dport.
-        //    On macOS, keepaliveSock:50000 → DJM:50000 gets ignored
-        //    (DJM treats sport==dport as its own echo).
-        //    bridgeSock:ephemeral → DJM:50000 works on both platforms.
-        {
-            std::vector<std::string> djmCopy;
-            {
-                const juce::ScopedLock sl(djmIpLock);
-                djmCopy = djmIps;
-            }
-            auto* uniSock = bridgeSock ? bridgeSock.get() : keepaliveSock.get();
-            for (auto& ip : djmCopy)
-                uniSock->write(juce::String(ip), ProDJLink::kKeepalivePort, pkt, sizeof(pkt));
-        }
+        // NOTE: No unicast keepalive to DJM.
+        // The real Pioneer Bridge only broadcasts keepalives — it never sends
+        // unicast copies to the DJM. Confirmed from full startup capture
+        // (Captura_larga_bridge_por_wifi.pcapng): the DJM activates faders
+        // 0.2s after seeing the broadcast keepalive alone.
+        // The previous unicast copy may have confused the DJM on WiFi
+        // (two keepalives from same name but different source ports).
     }
 
     // (Old CDJ 4-phase join sequence removed — STC uses bridge join only)
@@ -1468,10 +1586,11 @@ private:
     {
         if (len < 40) return;
 
-        bool ch1 = (data[36] != 0x00);
-        bool ch2 = (data[37] != 0x00);
-        bool ch3 = (data[38] != 0x00);
-        bool ch4 = (data[39] != 0x00);
+        // On-air flags at bytes 36-41 (4-ch DJMs use 36-39, V10 may use 36-41)
+        bool chOnAir[6] = { false };
+        int numCh = juce::jmin(6, len - 36);  // how many channel flags fit
+        for (int i = 0; i < numCh; ++i)
+            chOnAir[i] = (data[36 + i] != 0x00);
 
         // Update player on-air state (only if we don't have 0x29 unicast data,
         // which is more reliable since it's DJM→bridge specific)
@@ -1481,21 +1600,13 @@ private:
             {
                 if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
                 uint8_t pn = players[i].playerNumber.load(std::memory_order_relaxed);
-                bool onAir = false;
-                switch (pn)
-                {
-                    case 1: onAir = ch1; break;
-                    case 2: onAir = ch2; break;
-                    case 3: onAir = ch3; break;
-                    case 4: onAir = ch4; break;
-                    default: continue;
-                }
-                players[i].isOnAir.store(onAir, std::memory_order_relaxed);
+                if (pn < 1 || pn > 6) continue;
+                players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
             }
         }
 
-        DBG("ProDJLink: 0x03 on-air broadcast ch1=" << (int)ch1 << " ch2=" << (int)ch2
-            << " ch3=" << (int)ch3 << " ch4=" << (int)ch4);
+        DBG("ProDJLink: 0x03 on-air broadcast ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
+            << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]);
     }
 
     /// Register a DJM IP + model for bridge subscription.
@@ -1536,7 +1647,7 @@ private:
 
     // Bridge subscribe (0x57) — 40B sent to DJM on beat port (50001).
     // Triggers DJM fader (0x39→50002) and VU meter (0x58→50001) delivery.
-    // Byte [33] is the subscription bitmask: 0xFE = all data, 0x87 = faders only.
+    // Byte [33] is the subscription bitmask.
     void sendBridgeSubscribe(const std::string& djmIp)
     {
         if (!beatSock) return;
@@ -1559,14 +1670,13 @@ private:
 
         auto djmStr = juce::String(djmIp);
 
-        // Original path: beatSock (sport=50001) → DJM:50001  — works on Windows
-        beatSock->write(djmStr, ProDJLink::kBeatPort, pkt, sizeof(pkt));
-
-        // Additional: bridgeSock (ephemeral port) → DJM:50001  — for macOS compat
-        // Pioneer Bridge uses a separate ephemeral port for subscribes.
-        // Sending from both is harmless (duplicate subscribe is idempotent).
-        if (bridgeSock)
-            bridgeSock->write(djmStr, ProDJLink::kBeatPort, pkt, sizeof(pkt));
+        // Send ONLY from bridgeSock (ephemeral port), matching the real Bridge
+        // which uses a dedicated port (~50006) for subscribe/notify traffic.
+        // NOT from beatSock (50001) — that port is for receiving beats.
+        // The DJM may reject subscribes from a port it also sends data to.
+        // Fallback to beatSock only if bridgeSock is unavailable.
+        auto* sock = bridgeSock ? bridgeSock.get() : beatSock.get();
+        sock->write(djmStr, ProDJLink::kBeatPort, pkt, sizeof(pkt));
 
         DBG("ProDJLink: Sent 0x57 subscribe to " << djmStr
             << " port " << ProDJLink::kBeatPort);
@@ -1719,6 +1829,14 @@ private:
         if (type == ProDJLink::kBeatTypeAbsPosition && len >= 60)
         {
             // Absolute Position packet (CDJ-3000)
+            //
+            // The CDJ-3000 sends PAIRS of 0x0b packets every ~30ms:
+            //   1) Real position data: byte[33] = player number (1-6)
+            //   2) Unknown variant:    byte[33] = high random value (0x80-0xFF)
+            // The second variant has garbage in the position fields and is
+            // already filtered by the pn > kMaxPlayers check above.
+            // Confirmed from Wireshark captures on both Mac and Windows.
+            //
             // Content at offset 36:
             //   [36-39] track_len   (uint32be, seconds)
             //   [40-43] playhead    (uint32be, milliseconds)
@@ -1749,6 +1867,7 @@ private:
             double absNow = juce::Time::getMillisecondCounterHiRes();
             p.absPositionTs.store(absNow, std::memory_order_relaxed);
             p.lastPacketTime.store(absNow, std::memory_order_relaxed);
+
             p.playheadMs.store(playhead, std::memory_order_relaxed);
 
             pktCountAbsPos.fetch_add(1, std::memory_order_relaxed);
@@ -1995,7 +2114,8 @@ private:
         int vlen = (int)sizeof(verify);
         ::getsockopt((SOCKET)fd, SOL_SOCKET, SO_BROADCAST, (char*)&verify, &vlen);
 #else
-        int rc = ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &flag, sizeof(flag));
+        socklen_t flen = sizeof(flag);
+        int rc = ::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &flag, flen);
         int verify = 0;
         socklen_t vlen = sizeof(verify);
         ::getsockopt(fd, SOL_SOCKET, SO_BROADCAST, &verify, &vlen);
@@ -2108,13 +2228,21 @@ private:
     // COMPLETE OFFSET MAP — confirmed from DJM-900NXS2 packet captures.
     //
     // Per-channel block: 24 bytes, base=[0x024,0x03c,0x054,0x06c]
-    //   +0   Input source  (0=USB_A,1=USB_B,2=DIGITAL,3=LINE,4=PHONO,8=RET/AUX)
+    //   +0   Input source  900NXS2: (0=USB_A,1=USB_B,2=DIGITAL,3=LINE,4=PHONO,8=RET/AUX)
+    //                     V10: 0=USB_A, 1=USB_B, 2=DIGITAL, 3=LINE,
+    //                          4=PHONO (CH1/3/4/6), 5=BUILT-IN, 6=EXT1 (CH1-5),
+    //                          7=EXT2 (CH2-6), 8=MULTI_IO (CH2/5),
+    //                          9=COMBO_BUILTIN_EXT1_EXT2 (CH1/6)
     //   +1   Trim          (0-255, 128=unity)
+    //   +2   Compressor    (0-255; V10 per-ch Comp knob, 0 on 900NXS2)
     //   +3   EQ High       (0-255, 128=center)
-    //   +4   EQ Mid        (0-255, 128=center)
+    //   +4   EQ Mid        (0-255, 128=center; "Hi Mid" on V10 4-band EQ)
+    //   +5   EQ Low Mid    (0-255, 128=center; V10 only, 0 on 900NXS2)
     //   +6   EQ Low        (0-255, 128=center)
     //   +7   Color/FX      (0-255, 128=center)
+    //   +8   Send          (0-255, V10 per-ch send knob; 0 on 900NXS2)
     //   +9   CUE button    (0=off, 1=on)
+    //   +10  CUE B button  (0=off, 1=on; V10 dual-cue, 0 on 900NXS2)
     //   +11  Channel fader (0=closed, 255=open)
     //   +12  XF Assign     (0=THRU, 1=A, 2=B)
     //
@@ -2124,87 +2252,188 @@ private:
     //   [0x0b6]  Crossfader curve (0/1/2)
     //   [0x0b7]  Master fader     (0-255)
     //   [0x0b9]  Master CUE btn   (0/1)
+    //   [0x0ba]  Master CUE B btn (0/1; V10 dual-cue, 0 on 900NXS2)
+    //   [0x0bb]  Isolator On      (0/1; V10 only)
+    //   [0x0bc]  Isolator Hi      (0-255, 128=center; V10 only)
+    //   [0x0bd]  Isolator Mid     (0-255, 128=center; V10 only)
+    //   [0x0be]  Isolator Lo      (0-255, 128=center; V10 only)
     //   [0x0bf]  Booth monitor    (0-255)
+    //   [0x0c0]  Booth EQ Hi      (0-255, 128=center; V10 only, 0 on 900NXS2)
+    //   [0x0c1]  Booth EQ Lo      (0-255, 128=center; V10 only, 0 on 900NXS2)
     //
     // Headphones:
-    //   [0x0c4]  HP Cue Link      (0/1)
-    //   [0x0e3]  HP Mixing        (0=CUE, 255=Master)
-    //   [0x0e4]  HP Level         (0-255)
+    //   [0x0c4]  HP A Cue Link    (0/1)
+    //   [0x0c5]  HP B Cue Link    (0/1; V10 only)
+    //   [0x0e3]  HP A Mixing      (0=CUE, 255=Master)
+    //   [0x0e4]  HP A Level       (0-255)
+    //   [0x0e5]  HP A Pre EQ      (0/1; V10 only)
+    //   [0x0e6]  HP B Mixing      (0=CUE, 255=Master; V10 only)
+    //   [0x0e7]  HP B Level       (0-255; V10 only)
     //
     // Beat FX:
     //   [0x0c6]  FX Freq Low      (0/1)
     //   [0x0c7]  FX Freq Mid      (0/1)
     //   [0x0c8]  FX Freq Hi       (0/1)
-    //   [0x0c9]  Beat FX Select   (0-13: Delay,Echo,PingPong,Spiral,Reverb,
-    //                               Trans,Filter,Flanger,Phaser,Pitch,
-    //                               SlipRoll,Roll,VinylBrake,Helix)
-    //   [0x0ca]  Color FX Assign  (0=Mic,1=CH1,2=CH2,3=CH3,7=CH4,
+    //   [0x0c9]  Beat FX Select   (0-13)
+    //            900NXS2: Delay,Echo,PingPong,Spiral,Reverb,
+    //                     Trans,Filter,Flanger,Phaser,Pitch,
+    //                     SlipRoll,Roll,VinylBrake,Helix
+    //            V10:     Delay,Echo,PingPong,Spiral,Helix,
+    //                     Reverb,Shimmer,Flanger,Phaser,Filter,
+    //                     Trans,Roll,Pitch,VinylBrake
+    //   [0x0ca]  FX Assign        900NXS2: (0=Mic,1=CH1,2=CH2,3=CH3,7=CH4,
     //                               6=XF-A,8=XF-B,9=Master)
+    //                            V10: (0-5=CH1-CH6, 6=Mic, 7=Master)
     //   [0x0cb]  Beat FX Level    (0-255)
     //   [0x0cc]  Beat FX ON/OFF   (0/1)
-    //   [0x0ce]  Beat FX Assign   (same enum as 0x0ca)
-    //   [0x0cf]  Send/Return Lvl  (0-255)
+    //   [0x0ce]  900NXS2: Beat FX Assign (mirrors 0x0ca)
+    //            V10: Multi I/O Select  (0=Mic,1-6=CH1-CH6,7=Master)
+    //   [0x0cf]  900NXS2: Send/Return Lvl (0-255)
+    //            V10: Multi I/O Level   (0-255)
     //
-    // Color FX:
-    //   [0x0db]  Color FX Select  (255=OFF, 0=Space,1=DubEcho,2=Sweep,
-    //                               3=Noise,4=Crush,5=Filter)
-    //   [0x0e2]  Color FX Param   (0-255)
+    // Color FX / Sends:
+    //   [0x0db]  900NXS2: Color FX Select (255=OFF, 0=Space,1=DubEcho,2=Sweep,
+    //                                      3=Noise,4=Crush,5=Filter)
+    //            V10: Send Built-IN Select (255=OFF, 0=ShortDelay,1=LongDelay,
+    //                                       3=DubEcho,4=Reverb; val 2 unknown)
+    //   [0x0dc]  Send Ext1 On/Off  (0/1; V10 only)
+    //   [0x0dd]  Send Ext2 On/Off  (0/1; V10 only)
+    //   [0x0e2]  Color FX Param   (0-255; 900NXS2 only)
+    //
+    // Master Mix (V10 only):
+    //   [0x0de]  Master Mix On    (0/1)
+    //   [0x0df]  Master Mix Size/Feedback (0-255)
+    //   [0x0e0]  Master Mix Time  (0-255)
+    //   [0x0e1]  Master Mix Tone  (0-255)
+    //   [0x0e2]  Master Mix Level (0-255; shares offset with Color FX Param)
     //
     // Mic:
     //   [0x0d6]  Mic EQ Hi        (0-255, 128=center)
     //   [0x0d7]  Mic EQ Lo        (0-255, 128=center)
+    //
+    // Filter (V10 only):
+    //   [0x0d8]  Filter LPF       (0/1)
+    //   [0x0d9]  Filter HPF       (0/1)
+    //   [0x0da]  Filter Resonance (0-255)
     //==========================================================================
     void handleMixerPacket(const uint8_t* data, int len)
     {
-        if (len < 0xe5) return;  // need up to HP level at 0x0e4
+        if (len < 0xe6) return;  // need up to HP A Pre EQ at 0x0e5
 
         // --- Per-channel block (24 bytes each) ---
-        static constexpr int chBase[4] = { 0x024, 0x03c, 0x054, 0x06c };
-        for (int ch = 0; ch < 4; ++ch)
+        // Confirmed offsets for 4-channel and 6-channel DJMs.
+        // V10 CH5/CH6 at 0x084/0x09c confirmed working (same 0x18 stride).
+        // Global offsets (crossfader, master, HP, FX) are identical on both
+        // 4-ch and 6-ch -- confirmed from V10__nuevo_crossfader.pcapng.
+        static constexpr int chBase[6] = {
+            0x024, 0x03c, 0x054, 0x06c,   // CH1-CH4 (confirmed)
+            0x084, 0x09c                   // CH5-CH6 (V10 -- confirmed working)
+        };
+        int numCh = getMixerChannelCount();
+        for (int ch = 0; ch < numCh; ++ch)
         {
             int b = chBase[ch];
+            if (b + 13 > len) break;  // not enough data for this channel
             mixerInputSrc[ch].store (data[b + 0],  std::memory_order_relaxed);
             mixerTrim[ch].store     (data[b + 1],  std::memory_order_relaxed);
+            mixerComp[ch].store     (data[b + 2],  std::memory_order_relaxed);  // V10 Compressor (0 on 900NXS2)
             mixerEqHi[ch].store     (data[b + 3],  std::memory_order_relaxed);
             mixerEqMid[ch].store    (data[b + 4],  std::memory_order_relaxed);
+            mixerEqLoMid[ch].store  (data[b + 5],  std::memory_order_relaxed);  // V10 Lo Mid (0 on 900NXS2)
             mixerEqLo[ch].store     (data[b + 6],  std::memory_order_relaxed);
             mixerColor[ch].store    (data[b + 7],  std::memory_order_relaxed);
+            mixerSend[ch].store     (data[b + 8],  std::memory_order_relaxed);  // V10 per-ch Send knob (0 on 900NXS2)
             mixerCueBtn[ch].store   (data[b + 9],  std::memory_order_relaxed);
+            mixerCueBtnB[ch].store  (data[b + 10], std::memory_order_relaxed);  // V10 CUE B (0 on 900NXS2)
             mixerFader[ch].store    (data[b + 11], std::memory_order_relaxed);
             mixerXfAssign[ch].store (data[b + 12], std::memory_order_relaxed);
         }
 
         // --- Global / Master ---
-        mixerCrossfader.store   (data[0x0b4], std::memory_order_relaxed);
-        mixerFaderCurve.store   (data[0x0b5], std::memory_order_relaxed);
-        mixerXfCurve.store      (data[0x0b6], std::memory_order_relaxed);
-        mixerMasterFader.store  (data[0x0b7], std::memory_order_relaxed);
-        mixerMasterCue.store    (data[0x0b9], std::memory_order_relaxed);
-        mixerBooth.store        (data[0x0bf], std::memory_order_relaxed);
+        // These offsets are the same for both 4-channel and 6-channel DJMs.
+        // Confirmed: V10 0x39 packets are 248 bytes (same as 900NXS2) with
+        // globals at identical absolute offsets (V10__nuevo_crossfader.pcapng).
+        if (0x0b4 + 3 <= len)
+        {
+            mixerCrossfader.store   (data[0x0b4], std::memory_order_relaxed);
+            mixerFaderCurve.store   (data[0x0b5], std::memory_order_relaxed);
+            mixerXfCurve.store      (data[0x0b6], std::memory_order_relaxed);
+            mixerMasterFader.store  (data[0x0b7], std::memory_order_relaxed);
+            mixerMasterCue.store    (data[0x0b9], std::memory_order_relaxed);
+            mixerMasterCueB.store   (data[0x0ba], std::memory_order_relaxed);  // V10 CUE B (0 on 900NXS2)
+            mixerIsolatorOn.store   (data[0x0bb], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerIsolatorHi.store   (data[0x0bc], std::memory_order_relaxed);  // V10 only
+            mixerIsolatorMid.store  (data[0x0bd], std::memory_order_relaxed);  // V10 only
+            mixerIsolatorLo.store   (data[0x0be], std::memory_order_relaxed);  // V10 only
+            mixerBooth.store        (data[0x0bf], std::memory_order_relaxed);
+            mixerBoothEqHi.store    (data[0x0c0], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerBoothEqLo.store    (data[0x0c1], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+        }
 
         // --- Headphones ---
-        mixerHpCueLink.store    (data[0x0c4], std::memory_order_relaxed);
-        mixerHpMixing.store     (data[0x0e3], std::memory_order_relaxed);
-        mixerHpLevel.store      (data[0x0e4], std::memory_order_relaxed);
+        if (0x0e5 < len)
+        {
+            mixerHpCueLink.store    (data[0x0c4], std::memory_order_relaxed);
+            mixerHpMixing.store     (data[0x0e3], std::memory_order_relaxed);
+            mixerHpLevel.store      (data[0x0e4], std::memory_order_relaxed);
+            mixerHpPreEq.store      (data[0x0e5], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+        }
+        if (0x0e7 < len)  // HP B (V10 only; 0 on 900NXS2)
+        {
+            mixerHpCueLinkB.store   (data[0x0c5], std::memory_order_relaxed);
+            mixerHpMixingB.store    (data[0x0e6], std::memory_order_relaxed);
+            mixerHpLevelB.store     (data[0x0e7], std::memory_order_relaxed);
+        }
 
         // --- Beat FX ---
-        mixerFxFreqLo.store     (data[0x0c6], std::memory_order_relaxed);
-        mixerFxFreqMid.store    (data[0x0c7], std::memory_order_relaxed);
-        mixerFxFreqHi.store     (data[0x0c8], std::memory_order_relaxed);
-        mixerBeatFxSel.store    (data[0x0c9], std::memory_order_relaxed);
-        mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);
-        mixerBeatFxLevel.store  (data[0x0cb], std::memory_order_relaxed);
-        mixerBeatFxOn.store     (data[0x0cc], std::memory_order_relaxed);
-        mixerBeatFxAssign.store (data[0x0ce], std::memory_order_relaxed);
-        mixerSendReturn.store   (data[0x0cf], std::memory_order_relaxed);
+        if (0x0cf < len)
+        {
+            mixerFxFreqLo.store     (data[0x0c6], std::memory_order_relaxed);
+            mixerFxFreqMid.store    (data[0x0c7], std::memory_order_relaxed);
+            mixerFxFreqHi.store     (data[0x0c8], std::memory_order_relaxed);
+            mixerBeatFxSel.store    (data[0x0c9], std::memory_order_relaxed);
+            mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);
+            mixerBeatFxLevel.store  (data[0x0cb], std::memory_order_relaxed);
+            mixerBeatFxOn.store     (data[0x0cc], std::memory_order_relaxed);
+            mixerBeatFxAssign.store (data[0x0ca], std::memory_order_relaxed);  // 900NXS2: same as 0x0ce; V10: 0x0ce is Multi I/O
+            mixerSendReturn.store   (data[0x0cf], std::memory_order_relaxed);
+            mixerMultiIoSelect.store(data[0x0ce], std::memory_order_relaxed);  // V10: Multi I/O (900NXS2: mirrors 0x0ca)
+            mixerMultiIoLevel.store (data[0x0cf], std::memory_order_relaxed);  // V10: Multi I/O (900NXS2: Send/Return)
+        }
 
-        // --- Color FX ---
-        mixerColorFxSel.store   (data[0x0db], std::memory_order_relaxed);
-        mixerColorFxParam.store (data[0x0e2], std::memory_order_relaxed);
+        // --- Color FX / Sends ---
+        if (0x0e2 < len)
+        {
+            mixerColorFxSel.store   (data[0x0db], std::memory_order_relaxed);  // V10: Send Built-IN select
+            mixerSendExt1.store     (data[0x0dc], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerSendExt2.store     (data[0x0dd], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerColorFxParam.store (data[0x0e2], std::memory_order_relaxed);
+        }
+
+        // --- Master Mix (V10 only; 0 on 900NXS2) ---
+        if (0x0e2 < len)
+        {
+            mixerMasterMixOn.store       (data[0x0de], std::memory_order_relaxed);
+            mixerMasterMixSize.store     (data[0x0df], std::memory_order_relaxed);
+            mixerMasterMixTime.store     (data[0x0e0], std::memory_order_relaxed);
+            mixerMasterMixTone.store     (data[0x0e1], std::memory_order_relaxed);
+            mixerMasterMixLevel.store    (data[0x0e2], std::memory_order_relaxed);  // shares offset with ColorFxParam
+        }
 
         // --- Mic ---
-        mixerMicEqHi.store      (data[0x0d6], std::memory_order_relaxed);
-        mixerMicEqLo.store      (data[0x0d7], std::memory_order_relaxed);
+        if (0x0d7 < len)
+        {
+            mixerMicEqHi.store      (data[0x0d6], std::memory_order_relaxed);
+            mixerMicEqLo.store      (data[0x0d7], std::memory_order_relaxed);
+        }
+
+        // --- Filter (V10 only; 0 on 900NXS2) ---
+        if (0x0da < len)
+        {
+            mixerFilterLPF.store    (data[0x0d8], std::memory_order_relaxed);
+            mixerFilterHPF.store    (data[0x0d9], std::memory_order_relaxed);
+            mixerFilterReso.store   (data[0x0da], std::memory_order_relaxed);
+        }
 
         hasMixerData.store(true, std::memory_order_relaxed);
         lastMixerPacketTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
@@ -2212,50 +2441,81 @@ private:
     }
 
     //==========================================================================
-    // DJM VU meter handler (type 0x58, 524 bytes, port 50001)
+    // DJM VU meter handler (type 0x58, 524+ bytes, port 50001)
     //
-    // Contains 6 blocks of 15 u16 big-endian peak-level segments.
-    // Each block represents one VU meter strip on the DJM-900NXS2.
+    // Contains blocks of 15 u16 big-endian peak-level segments.
+    // Each block represents one VU meter strip on the DJM.
     // Range: 0 = silence, 32767 = clip (+15 dB).
+    // Stride: 0x3c (60 bytes) per block.  15 u16 = 30 bytes data + 30 pad.
     //
-    //   Block A [0x02c-0x049]: CH1 (mono)
-    //   Block B [0x068-0x085]: CH2 (mono)
-    //   Block C [0x0a4-0x0c1]: CH3 (mono)
-    //   Block D [0x0e0-0x0fd]: CH4 (mono)
-    //   Block E [0x11c-0x139]: Master L (stereo)
-    //   Block F [0x158-0x175]: Master R (stereo)
+    // 4-channel DJMs (900NXS2, A9, etc) -- confirmed from capture:
+    //   Block 0 [0x02c]: CH1    Block 1 [0x068]: CH2
+    //   Block 2 [0x0a4]: CH3    Block 3 [0x0e0]: CH4
+    //   Block 4 [0x11c]: Master L    Block 5 [0x158]: Master R
     //
-    // Confirmed from DJM-900NXS2 capture: Vumetros.pcapng
+    // 6-channel DJMs (V10) -- confirmed from capture (Vumetro_5.pcapng):
+    //   Block 0 [0x02c]: CH1    Block 1 [0x068]: CH2
+    //   Block 2 [0x0a4]: CH3    Block 3 [0x0e0]: CH4
+    //   Block 4 [0x11c]: Master L    Block 5 [0x158]: Master R  (same as 4-ch)
+    //   Block 6 [0x194]: CH5    Block 7 [0x1d0]: CH6
     //==========================================================================
     void handleVuMeterPacket(const uint8_t* data, int len)
     {
-        if (len < 0x176) return;  // need up to Master R last segment
+        if (len < 0x176) return;  // need up to Master R last segment (4-ch layout)
 
-        static constexpr int kVuBlockOffsets[6] = {
+        // 4-channel layout: 4 channels + master L/R = 6 blocks
+        // Map to our slot indices: 0-3=CH1-4, kVuMasterL=MasterL, kVuMasterR=MasterR
+        static constexpr int kVu4chOffsets[6] = {
             0x02c, 0x068, 0x0a4, 0x0e0, 0x11c, 0x158
         };
+        static constexpr int kVu4chSlots[6] = {
+            0, 1, 2, 3, ProDJLink::kVuMasterL, ProDJLink::kVuMasterR
+        };
 
-        for (int ch = 0; ch < 6; ++ch)
+        // 6-channel layout (V10): Master L/R stay at 4-ch offsets,
+        // CH5/CH6 appended AFTER Master R.  Confirmed from Wireshark
+        // capture (Vumetro_5.pcapng): audio on CH5 only, 0x194 has
+        // highest peak (pre-master), 0x11c/0x158 show attenuated master.
+        static constexpr int kVu6chOffsets[8] = {
+            0x02c, 0x068, 0x0a4, 0x0e0,                         // CH1-CH4
+            0x11c, 0x158,                                        // Master L/R (same as 4-ch)
+            0x194, 0x1d0                                         // CH5, CH6
+        };
+        static constexpr int kVu6chSlots[8] = {
+            0, 1, 2, 3,
+            ProDJLink::kVuMasterL, ProDJLink::kVuMasterR,
+            4, 5
+        };
+
+        bool is6ch = (getMixerChannelCount() > 4);
+        int numBlocks       = is6ch ? 8 : 6;
+        const int* offsets  = is6ch ? kVu6chOffsets : kVu4chOffsets;
+        const int* slots    = is6ch ? kVu6chSlots   : kVu4chSlots;
+
+        for (int i = 0; i < numBlocks; ++i)
         {
-            int base = kVuBlockOffsets[ch];
+            int base = offsets[i];
+            int slot = slots[i];
+            if (base + 30 > len) break;  // 15 segments x 2 bytes
             uint16_t peak = 0;
             for (int seg = 0; seg < 15; ++seg)
             {
-                int off = base + seg * 2;
-                uint16_t val = ProDJLink::readU16BE(data + off);
+                uint16_t val = ProDJLink::readU16BE(data + base + seg * 2);
                 if (val > peak) peak = val;
             }
-            vuPeak[ch].store(peak, std::memory_order_relaxed);
+            vuPeak[slot].store(peak, std::memory_order_relaxed);
         }
 
         // Copy raw segment data under lock for UI spectrum display
         {
             const juce::SpinLock::ScopedLockType sl(vuDataLock);
-            for (int ch = 0; ch < 6; ++ch)
+            for (int i = 0; i < numBlocks; ++i)
             {
-                int base = kVuBlockOffsets[ch];
+                int base = offsets[i];
+                int slot = slots[i];
+                if (base + 30 > len) break;
                 for (int seg = 0; seg < 15; ++seg)
-                    vuSegments[ch][seg] = ProDJLink::readU16BE(data + base + seg * 2);
+                    vuSegments[slot][seg] = ProDJLink::readU16BE(data + base + seg * 2);
             }
         }
 
@@ -2288,37 +2548,31 @@ private:
     //==========================================================================
     void handleDJMStatusPacket(const uint8_t* data, int len)
     {
-        // Need at least channel 4 flag at offset 0x33 + 1 = 52 bytes
-        if (len < 0x34) return;
+        // Per-channel on-air flags at 4-byte stride starting at 0x27
+        // CH1=0x27, CH2=0x2b, CH3=0x2f, CH4=0x33, CH5=0x37, CH6=0x3b
+        static constexpr int kOnAirOffsets[6] = { 0x27, 0x2b, 0x2f, 0x33, 0x37, 0x3b };
 
-        // Extract per-channel on-air flags (0xff=on-air, 0x00=off-air)
-        bool ch1OnAir = (data[0x27] != 0x00);
-        bool ch2OnAir = (data[0x2b] != 0x00);
-        bool ch3OnAir = (data[0x2f] != 0x00);
-        bool ch4OnAir = (data[0x33] != 0x00);
+        bool chOnAir[6] = { false };
+        for (int ch = 0; ch < 6; ++ch)
+        {
+            if (kOnAirOffsets[ch] < len)
+                chOnAir[ch] = (data[kOnAirOffsets[ch]] != 0x00);
+        }
 
         // Propagate on-air state to matching player slots.
-        // Channel number == player number for standard 4-deck setups.
+        // Channel number == player number for standard setups.
         for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
         {
             if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
             uint8_t pn = players[i].playerNumber.load(std::memory_order_relaxed);
-            bool onAir = false;
-            switch (pn)
-            {
-                case 1: onAir = ch1OnAir; break;
-                case 2: onAir = ch2OnAir; break;
-                case 3: onAir = ch3OnAir; break;
-                case 4: onAir = ch4OnAir; break;
-                default: continue;  // players 5-6 have no DJM channel mapping
-            }
-            players[i].isOnAir.store(onAir, std::memory_order_relaxed);
+            if (pn < 1 || pn > 6) continue;
+            players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
         }
 
         pktCountDJMStatus.fetch_add(1, std::memory_order_relaxed);
 
-        DBG("ProDJLink: 0x29 on-air ch1=" << (int)ch1OnAir << " ch2=" << (int)ch2OnAir
-            << " ch3=" << (int)ch3OnAir << " ch4=" << (int)ch4OnAir);
+        DBG("ProDJLink: 0x29 on-air ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
+            << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]);
     }
 
     // Player state array -- indexed 0-5 for players 1-6
@@ -2366,28 +2620,47 @@ private:
     std::atomic<uint32_t> pktCountMixer      { 0 };
     std::atomic<uint32_t> pktCountDJMStatus  { 0 };  // type 0x29 packets received
 
-    // DJM mixer state (from type 0x39 packets, 248 bytes)
-    // --- Per-channel arrays (indexed 0-3 for CH1-CH4) ---
-    std::atomic<uint8_t> mixerFader[4]     {{ 255 }, { 255 }, { 255 }, { 255 }};
-    std::atomic<uint8_t> mixerTrim[4]      {{ 128 }, { 128 }, { 128 }, { 128 }};
-    std::atomic<uint8_t> mixerEqHi[4]      {{ 128 }, { 128 }, { 128 }, { 128 }};
-    std::atomic<uint8_t> mixerEqMid[4]     {{ 128 }, { 128 }, { 128 }, { 128 }};
-    std::atomic<uint8_t> mixerEqLo[4]      {{ 128 }, { 128 }, { 128 }, { 128 }};
-    std::atomic<uint8_t> mixerColor[4]     {{ 128 }, { 128 }, { 128 }, { 128 }};
-    std::atomic<uint8_t> mixerCueBtn[4]    {{ 0 }, { 0 }, { 0 }, { 0 }};
-    std::atomic<uint8_t> mixerInputSrc[4]  {{ 3 }, { 3 }, { 3 }, { 3 }};       // 0=USB_A,1=USB_B,2=DIG,3=LINE,4=PHONO,8=RET
-    std::atomic<uint8_t> mixerXfAssign[4]  {{ 0 }, { 0 }, { 0 }, { 0 }};       // 0=THRU,1=A,2=B
+    // DJM mixer state (from type 0x39 packets, 248+ bytes)
+    // --- Per-channel arrays (indexed 0-5 for CH1-CH6) ---
+    // 4-channel DJMs (900NXS2, A9, etc): only indices 0-3 are populated.
+    // 6-channel DJMs (V10, V10-LF): all 6 populated.
+    std::atomic<uint8_t> mixerFader[6]     {{ 255 }, { 255 }, { 255 }, { 255 }, { 255 }, { 255 }};
+    std::atomic<uint8_t> mixerTrim[6]      {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
+    std::atomic<uint8_t> mixerComp[6]      {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};           // V10 per-ch Compressor (0 on 900NXS2)
+    std::atomic<uint8_t> mixerEqHi[6]      {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
+    std::atomic<uint8_t> mixerEqMid[6]     {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
+    std::atomic<uint8_t> mixerEqLoMid[6]   {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};  // V10 Lo Mid (0 on 900NXS2)
+    std::atomic<uint8_t> mixerEqLo[6]      {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
+    std::atomic<uint8_t> mixerColor[6]     {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
+    std::atomic<uint8_t> mixerSend[6]      {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};         // V10 per-ch Send (0 on 900NXS2)
+    std::atomic<uint8_t> mixerCueBtn[6]    {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};
+    std::atomic<uint8_t> mixerCueBtnB[6]   {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};           // V10 CUE B (0 on 900NXS2)
+    std::atomic<uint8_t> mixerInputSrc[6]  {{ 3 }, { 3 }, { 3 }, { 3 }, { 3 }, { 3 }};       // per-channel input selector (see offset map for V10 enum)
+    std::atomic<uint8_t> mixerXfAssign[6]  {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};       // 0=THRU,1=A,2=B
     // --- Global / Master ---
     std::atomic<uint8_t> mixerCrossfader   { 128 };   // 0=A, 255=B
     std::atomic<uint8_t> mixerMasterFader  { 255 };
     std::atomic<uint8_t> mixerMasterCue    { 0 };
+    std::atomic<uint8_t> mixerMasterCueB   { 0 };     // V10 CUE B (0 on 900NXS2)
+    // --- Isolator (V10 only) ---
+    std::atomic<uint8_t> mixerIsolatorOn   { 0 };     // 0/1
+    std::atomic<uint8_t> mixerIsolatorHi   { 128 };   // 0-255, 128=center
+    std::atomic<uint8_t> mixerIsolatorMid  { 128 };   // 0-255, 128=center
+    std::atomic<uint8_t> mixerIsolatorLo   { 128 };   // 0-255, 128=center
     std::atomic<uint8_t> mixerFaderCurve   { 1 };     // 0/1/2
     std::atomic<uint8_t> mixerXfCurve      { 1 };     // 0/1/2
     std::atomic<uint8_t> mixerBooth        { 0 };     // 0-255
+    std::atomic<uint8_t> mixerBoothEqHi   { 128 };   // 0-255, 128=center (V10 only)
+    std::atomic<uint8_t> mixerBoothEqLo   { 128 };   // 0-255, 128=center (V10 only)
     // --- Headphones ---
     std::atomic<uint8_t> mixerHpCueLink    { 0 };
     std::atomic<uint8_t> mixerHpMixing     { 0 };     // 0=CUE, 255=Master
     std::atomic<uint8_t> mixerHpLevel      { 0 };
+    std::atomic<uint8_t> mixerHpPreEq      { 0 };     // V10 HP A Pre EQ (0 on 900NXS2)
+    // --- Headphones B (V10 only) ---
+    std::atomic<uint8_t> mixerHpCueLinkB   { 0 };
+    std::atomic<uint8_t> mixerHpMixingB    { 0 };     // 0=CUE, 255=Master
+    std::atomic<uint8_t> mixerHpLevelB     { 0 };
     // --- Beat FX ---
     std::atomic<uint8_t> mixerFxFreqLo     { 1 };
     std::atomic<uint8_t> mixerFxFreqMid    { 1 };
@@ -2398,21 +2671,37 @@ private:
     std::atomic<uint8_t> mixerBeatFxAssign { 9 };     // 0=Mic..9=Master
     std::atomic<uint8_t> mixerColorFxAssign{ 9 };
     std::atomic<uint8_t> mixerSendReturn   { 0 };
+    // --- Multi I/O (V10 only; on 900NXS2 these offsets are Beat FX Assign / Send Return) ---
+    std::atomic<uint8_t> mixerMultiIoSelect { 0 };    // 0=Mic,1-6=CH1-CH6,7=Master
+    std::atomic<uint8_t> mixerMultiIoLevel  { 0 };    // 0-255
     // --- Color FX ---
-    std::atomic<uint8_t> mixerColorFxSel   { 255 };   // 255=OFF, 0-5
+    std::atomic<uint8_t> mixerColorFxSel   { 255 };   // 255=OFF, 0-5 (900NXS2) / Send Built-IN (V10)
+    std::atomic<uint8_t> mixerSendExt1     { 0 };     // V10 Send Ext1 On/Off
+    std::atomic<uint8_t> mixerSendExt2     { 0 };     // V10 Send Ext2 On/Off
     std::atomic<uint8_t> mixerColorFxParam { 128 };
+    // --- Master Mix (V10 only) ---
+    std::atomic<uint8_t> mixerMasterMixOn    { 0 };    // 0/1
+    std::atomic<uint8_t> mixerMasterMixSize  { 0 };    // 0-255 (Size/Feedback)
+    std::atomic<uint8_t> mixerMasterMixTime  { 0 };    // 0-255
+    std::atomic<uint8_t> mixerMasterMixTone  { 0 };    // 0-255
+    std::atomic<uint8_t> mixerMasterMixLevel { 0 };    // 0-255 (shares 0x0e2 with ColorFxParam)
     // --- Mic ---
     std::atomic<uint8_t> mixerMicEqHi      { 128 };
     std::atomic<uint8_t> mixerMicEqLo      { 128 };
+    // --- Filter (V10 only) ---
+    std::atomic<uint8_t> mixerFilterLPF    { 0 };     // 0/1
+    std::atomic<uint8_t> mixerFilterHPF    { 0 };     // 0/1
+    std::atomic<uint8_t> mixerFilterReso   { 0 };     // 0-255
     // --- Flag ---
     std::atomic<bool>    hasMixerData      { false };
     std::atomic<double>  lastMixerPacketTime { 0.0 };  // for staleness detection
 
-    // VU meter data (from type 0x58 packets, 524 bytes)
-    // 6 channels: 0=CH1, 1=CH2, 2=CH3, 3=CH4, 4=MasterL, 5=MasterR
-    std::atomic<uint16_t> vuPeak[6]       {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};
+    // VU meter data (from type 0x58 packets, 524+ bytes)
+    // Indices 0-5 = CH1-CH6 (4-ch DJMs only populate 0-3)
+    // Index 6 = Master L, Index 7 = Master R (ProDJLink::kVuMasterL/R)
+    std::atomic<uint16_t> vuPeak[8]       {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};
     mutable juce::SpinLock vuDataLock;
-    uint16_t              vuSegments[6][15] {};  // protected by vuDataLock
+    uint16_t              vuSegments[8][15] {};  // protected by vuDataLock
     std::atomic<bool>     hasVuData        { false };
     std::atomic<double>   lastVuPacketTime { 0.0 };   // for staleness detection
     std::atomic<uint32_t> pktCountVU       { 0 };

@@ -57,56 +57,70 @@ public:
 
     bool hasWaveformData() const { return hasColorData; }
 
-    /// Set the play cursor position (0.0 = start, 1.0 = end). Triggers repaint.
+    /// Set the play cursor position (0.0 = start, 1.0 = end).
+    /// Two modes based on whether this component is a real child or an orphan:
+    ///
+    /// Real child (engine mini-player): Sub-pixel moves accumulate until
+    /// the delta crosses 0.5px, then position updates and a partial repaint
+    /// fires.  This avoids scheduling repaints for invisible movement.
+    ///
+    /// Orphan (PDL View -- painted manually by parent): Position is stored
+    /// immediately every call; the parent controls when to repaint.
     void setPlayPosition(float ratio)
     {
         float clamped = juce::jlimit(0.0f, 1.0f, ratio);
-        if (clamped != playPosition)
+        if (clamped == playPosition) return;
+
+        // Orphan component (PDL View paints us manually) -- always store.
+        // The parent's dirty check drives repaints, not ours.
+        if (getParentComponent() == nullptr)
         {
-            // Pixel-based threshold: skip repaint only if cursor moved < 0.5px.
-            // Using component width avoids the old bug where a ratio-based
-            // threshold (0.002) meant the cursor froze for seconds on long tracks.
-            float w = (float)getWidth();
-            float pxDelta = std::abs(clamped - playPosition) * w;
-            if (pxDelta >= 0.5f || (clamped == 0.0f && playPosition != 0.0f))
-            {
-                playPosition = clamped;
-                repaint();
-            }
+            playPosition = clamped;
+            return;
         }
+
+        float w = (float)getWidth();
+        if (w <= 0.0f) return;     // not yet laid out
+
+        float pxDelta = std::abs(clamped - playPosition) * w;
+        if (pxDelta < 0.5f && !(clamped == 0.0f && playPosition != 0.0f))
+            return;
+
+        float inset   = 2.0f;
+        float drawW   = w - inset * 2.0f;
+        float oldX    = inset + playPosition * drawW;
+        float newX    = inset + clamped      * drawW;
+        playPosition  = clamped;
+
+        // Repaint the union of old and new cursor strips plus margin for
+        // anti-aliased float-positioned edges (2px extra each side).
+        float dirtyX  = std::min(oldX, newX) - 5.0f;
+        float dirtyW  = std::abs(newX - oldX) + 11.0f;
+        repaint((int)dirtyX, 0, (int)std::ceil(dirtyW), getHeight());
     }
 
-    /// Set debug position info for overlay display.
-    void setDebugPositionMs(uint32_t posMs, uint32_t totalMs)
-    {
-        debugPosMs = posMs;
-        debugTotalMs = totalMs;
-    }
 
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat();
 
-        // Background
-        g.setColour(juce::Colour(0xFF0D1117));
-        g.fillRoundedRectangle(bounds, 3.0f);
-
         if (hasColorData && !colorWaveformData.empty() && colorEntryCount > 0)
         {
-            // Ensure cached waveform image is up to date (regenerates only
-            // when data changes or component size changes -- the expensive
-            // per-pixel bar rendering is skipped on every other frame).
             ensureCachedImage();
-
             if (cachedWaveformImg.isValid())
             {
-                g.drawImageAt(cachedWaveformImg, 0, 0);
+                // Draw the cached high-res image scaled to logical bounds.
+                // On HiDPI/Retina, the image is at physical resolution so
+                // JUCE composites it 1:1 with the framebuffer -- no upscaling blur.
+                g.drawImage(cachedWaveformImg, bounds);
                 paintOverlay(g, bounds, colorEntryCount);
+                return;
             }
-            return;
         }
 
-        // "No waveform" placeholder
+        // No waveform -- plain background + placeholder text
+        g.setColour(juce::Colour(0xFF0D1117));
+        g.fillRoundedRectangle(bounds, 3.0f);
         g.setColour(juce::Colour(0xFF4A5568));
         g.setFont(10.0f);
         g.drawText("No Waveform", bounds, juce::Justification::centred);
@@ -114,15 +128,32 @@ public:
 
 private:
     //----------------------------------------------------------------------
-    // Cached waveform image -- regenerated only when data or size changes.
-    // This eliminates hundreds of setColour()+drawVerticalLine() calls per
-    // frame on macOS CoreGraphics, which was the root cause of stuttering.
+    // Cached waveform image -- rendered at physical pixel resolution to
+    // avoid HiDPI upscaling blur.  Regenerated only when data, size, or
+    // display scale changes.
     //----------------------------------------------------------------------
     juce::Image cachedWaveformImg;
     int cachedW = 0, cachedH = 0;
+    float cachedScale = 0.0f;
     bool cacheValid = false;
 
     void invalidateCache() { cacheValid = false; }
+
+    /// Detect the display scale factor for this component (or its parent).
+    float getDisplayScale() const
+    {
+        // Try the component's own top-level peer first
+        if (auto* tlc = getTopLevelComponent())
+            if (auto* peer = tlc->getPeer())
+                return (float)peer->getPlatformScaleFactor();
+
+        // Fallback: main display scale (covers orphan components in PDL View)
+        auto& displays = juce::Desktop::getInstance().getDisplays();
+        if (auto* primary = displays.getPrimaryDisplay())
+            return (float)primary->scale;
+
+        return 1.0f;
+    }
 
     void ensureCachedImage()
     {
@@ -130,15 +161,25 @@ private:
         int h = getHeight();
         if (w <= 0 || h <= 0) return;
 
-        // Regenerate if size changed or cache was invalidated
-        if (cacheValid && cachedW == w && cachedH == h)
+        float scale = getDisplayScale();
+        if (scale < 1.0f) scale = 1.0f;
+
+        // Regenerate if size, scale, or data changed
+        if (cacheValid && cachedW == w && cachedH == h && cachedScale == scale)
             return;
 
-        cachedWaveformImg = juce::Image(juce::Image::ARGB, w, h, true);
+        // Create image at physical pixel resolution
+        int imgW = (int)std::ceil(w * scale);
+        int imgH = (int)std::ceil(h * scale);
+        cachedWaveformImg = juce::Image(juce::Image::ARGB, imgW, imgH, true);
         juce::Graphics ig(cachedWaveformImg);
 
+        // Scale the Graphics context so all drawing uses logical coordinates
+        // but renders at physical pixel density
+        ig.addTransform(juce::AffineTransform::scale(scale));
+
         // Background
-        auto bounds = getLocalBounds().toFloat();
+        auto bounds = juce::Rectangle<float>(0.0f, 0.0f, (float)w, (float)h);
         ig.setColour(juce::Colour(0xFF0D1117));
         ig.fillRoundedRectangle(bounds, 3.0f);
 
@@ -156,6 +197,7 @@ private:
 
         cachedW = w;
         cachedH = h;
+        cachedScale = scale;
         cacheValid = true;
     }
 
@@ -169,6 +211,7 @@ private:
         float midY = inset + drawH * 0.5f;
         float halfH = drawH * 0.5f;
         float entriesPerPx = (float)colorEntryCount / drawW;
+        float barW = std::max(1.0f, drawW / (float)colorEntryCount);
         const uint8_t* data = colorWaveformData.data();
         int totalBytes = (int)colorWaveformData.size();
 
@@ -218,8 +261,8 @@ private:
             float blueB = 1.0f;
 
             g.setColour(juce::Colour::fromFloatRGBA(blueR, blueG, blueB, 1.0f));
-            g.drawVerticalLine((int)x, midY - barH, midY);
-            g.drawVerticalLine((int)x, midY, midY + barH);
+            g.fillRect(x, midY - barH, barW, barH);
+            g.fillRect(x, midY, barW, barH);
         }
     }
 
@@ -233,6 +276,7 @@ private:
         float midY = inset + drawH * 0.5f;
         float halfH = drawH * 0.5f;
         float entriesPerPx = (float)colorEntryCount / drawW;
+        float barW = std::max(1.0f, drawW / (float)colorEntryCount);
         const uint8_t* data = colorWaveformData.data();
         int totalBytes = (int)colorWaveformData.size();
 
@@ -281,8 +325,8 @@ private:
             float blueB = 1.0f;
 
             g.setColour(juce::Colour::fromFloatRGBA(blueR, blueG, blueB, 1.0f));
-            g.drawVerticalLine((int)x, midY - barH, midY);
-            g.drawVerticalLine((int)x, midY, midY + barH);
+            g.fillRect(x, midY - barH, barW, barH);
+            g.fillRect(x, midY, barW, barH);
         }
     }
 
@@ -294,7 +338,7 @@ private:
         float drawW = w - inset * 2;
         float drawH = bounds.getHeight() - inset * 2;
 
-        // Play cursor
+        // Play cursor -- draw directly (2 fillRect calls, cheap)
         if (playPosition >= 0.0f && playPosition <= 1.0f && hasWaveformData())
         {
             float cursorX = inset + playPosition * drawW;
@@ -304,24 +348,12 @@ private:
             g.fillRect(cursorX - 0.5f, inset, 2.0f, drawH);
         }
 
-        // Resolution label
+        // Resolution label -- drawn directly (one drawText call, negligible cost)
         juce::String label = juce::String(barCount)
                            + (colorBytesPerEntry == 3 ? " (3-band)" : " (color)");
         g.setColour(juce::Colour(0x60FFFFFF));
         g.setFont(9.0f);
         g.drawText(label, bounds.reduced(4.0f, 1.0f), juce::Justification::topRight);
-
-        // Position info
-        if (debugPosMs > 0 || debugTotalMs > 0)
-        {
-            auto fmtMs = [](uint32_t ms) -> juce::String {
-                int s = (int)(ms / 1000);
-                return juce::String(s / 60) + ":" + juce::String(s % 60).paddedLeft('0', 2);
-            };
-            g.setColour(juce::Colour(0x60FFFFFF));
-            g.drawText(fmtMs(debugPosMs) + "/" + fmtMs(debugTotalMs),
-                        bounds.reduced(4.0f, 1.0f), juce::Justification::topLeft);
-        }
     }
 
     std::vector<uint8_t> colorWaveformData;
@@ -329,8 +361,6 @@ private:
     int colorBytesPerEntry = 0;  // 3=ThreeBand(CDJ-3000), 6=ColorNxs2
     bool hasColorData = false;
     float playPosition = 0.0f;   // 0.0 = start, 1.0 = end
-    uint32_t debugPosMs = 0;
-    uint32_t debugTotalMs = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveformDisplay)
 };

@@ -193,7 +193,10 @@ private:
     {
         if (midiOutput == nullptr
             || paused.load(std::memory_order_relaxed))
+        {
+            stopTimer();   // Don't spin at 1000Hz when there's nothing to send
             return;
+        }
 
         // Single atomic read -- guarantees QF interval and rate code are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);

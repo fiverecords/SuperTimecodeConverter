@@ -19,9 +19,12 @@ class MixerMapEditor : public juce::Component,
                        public juce::TableListBoxModel
 {
 public:
-    MixerMapEditor(MixerMap& map) : mixerMap(map)
+    MixerMapEditor(MixerMap& map, bool showV10 = true) : mixerMap(map), isV10(showV10)
     {
         setSize(750, 620);
+
+        // Build filtered row indices (hide V10 params when not in V10 mode)
+        rebuildFilter(isV10);
 
         // --- Table ---
         addAndMakeVisible(table);
@@ -61,6 +64,7 @@ public:
                     if (result == 1)
                     {
                         mixerMap.resetToDefaults();
+                        rebuildFilter(isV10);
                         table.updateContent();
                         table.repaint();
                         if (onChange) onChange();
@@ -77,6 +81,83 @@ public:
         btnDisableAll.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF2A2A2A));
         btnDisableAll.setColour(juce::TextButton::textColourOffId, textDim);
         btnDisableAll.onClick = [this] { setAllEnabled(false); };
+
+        addAndMakeVisible(btnToggleV10);
+        updateV10Button();
+        btnToggleV10.onClick = [this]
+        {
+            isV10 = !isV10;
+            rebuildFilter(isV10);
+            updateV10Button();
+            table.updateContent();
+            table.repaint();
+        };
+
+        addAndMakeVisible(btnExport);
+        btnExport.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1E2A1E));
+        btnExport.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF66CC66));
+        btnExport.onClick = [this]
+        {
+            fileChooser = std::make_unique<juce::FileChooser>(
+                "Export Mixer Map", juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
+                    .getChildFile("mixermap.json"), "*.json");
+            fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
+                                   | juce::FileBrowserComponent::canSelectFiles,
+                [this](const juce::FileChooser& fc)
+                {
+                    auto file = fc.getResult();
+                    if (file == juce::File()) return;
+                    // Build JSON from current entries
+                    auto* root = new juce::DynamicObject();
+                    juce::Array<juce::var> arr;
+                    for (auto& e : mixerMap.getEntries())
+                        arr.add(e.toVar());
+                    root->setProperty("params", arr);
+                    file.replaceWithText(juce::JSON::toString(juce::var(root)));
+                });
+        };
+
+        addAndMakeVisible(btnImport);
+        btnImport.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1E1E2A));
+        btnImport.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF6699FF));
+        btnImport.onClick = [this]
+        {
+            fileChooser = std::make_unique<juce::FileChooser>(
+                "Import Mixer Map", juce::File::getSpecialLocation(juce::File::userDesktopDirectory),
+                "*.json");
+            fileChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                   | juce::FileBrowserComponent::canSelectFiles,
+                [this](const juce::FileChooser& fc)
+                {
+                    auto file = fc.getResult();
+                    if (file == juce::File() || !file.existsAsFile()) return;
+                    auto parsed = juce::JSON::parse(file.loadFileAsString());
+                    auto* obj = parsed.getDynamicObject();
+                    if (!obj) return;
+                    auto* arr = obj->getProperty("params").getArray();
+                    if (!arr) return;
+                    for (auto& item : *arr)
+                    {
+                        MixerMapEntry saved;
+                        saved.fromVar(item);
+                        for (auto& e : mixerMap.getEntries())
+                        {
+                            if (e.paramId == saved.paramId)
+                            {
+                                e.oscAddress = saved.oscAddress;
+                                e.midiCC     = saved.midiCC;
+                                e.midiNote   = saved.midiNote;
+                                e.artnetCh   = saved.artnetCh;
+                                e.enabled    = saved.enabled;
+                                break;
+                            }
+                        }
+                    }
+                    table.updateContent();
+                    table.repaint();
+                    if (onChange) onChange();
+                });
+        };
     }
 
     /// Called whenever a parameter mapping is changed
@@ -93,6 +174,11 @@ public:
         btnDisableAll.setBounds(btnRow.removeFromRight(90));
         btnRow.removeFromRight(6);
         btnEnableAll.setBounds(btnRow.removeFromRight(90));
+        btnToggleV10.setBounds(btnRow.removeFromLeft(100));
+        btnRow.removeFromLeft(6);
+        btnExport.setBounds(btnRow.removeFromLeft(70));
+        btnRow.removeFromLeft(6);
+        btnImport.setBounds(btnRow.removeFromLeft(70));
 
         area.removeFromBottom(6);
         table.setBounds(area);
@@ -104,7 +190,7 @@ public:
     }
 
     // --- TableListBoxModel ---
-    int getNumRows() override { return mixerMap.size(); }
+    int getNumRows() override { return (int)filteredIndices.size(); }
 
     void paintRowBackground(juce::Graphics& g, int rowNumber,
                             int /*w*/, int /*h*/, bool selected) override
@@ -117,9 +203,9 @@ public:
             g.fillAll(bgDark);
 
         // Draw group separator: thin line when group changes
-        if (rowNumber > 0 && rowNumber < mixerMap.size())
+        if (rowNumber > 0 && rowNumber < (int)filteredIndices.size())
         {
-            if (mixerMap[rowNumber].group != mixerMap[rowNumber - 1].group)
+            if (mixerMap[mapRow(rowNumber)].group != mixerMap[mapRow(rowNumber - 1)].group)
             {
                 g.setColour(borderCol);
                 g.drawLine(0.0f, 0.5f, (float)getWidth(), 0.5f, 1.0f);
@@ -130,8 +216,8 @@ public:
     void paintCell(juce::Graphics& g, int rowNumber, int columnId,
                    int width, int height, bool /*selected*/) override
     {
-        if (rowNumber < 0 || rowNumber >= mixerMap.size()) return;
-        const auto& e = mixerMap[rowNumber];
+        if (rowNumber < 0 || rowNumber >= (int)filteredIndices.size()) return;
+        const auto& e = mixerMap[mapRow(rowNumber)];
 
         g.setFont(juce::Font(juce::FontOptions(11.0f)));
         auto textCol = e.enabled ? textNormal : textDim;
@@ -157,7 +243,7 @@ public:
                                               bool /*selected*/,
                                               juce::Component* existing) override
     {
-        if (rowNumber < 0 || rowNumber >= mixerMap.size())
+        if (rowNumber < 0 || rowNumber >= (int)filteredIndices.size())
         {
             delete existing;
             return nullptr;
@@ -168,12 +254,12 @@ public:
         {
             auto* cb = dynamic_cast<EnabledToggle*>(existing);
             if (!cb) { delete existing; cb = new EnabledToggle(); }
-            cb->setRow(rowNumber, mixerMap[rowNumber].enabled);
+            cb->setRow(rowNumber, mixerMap[mapRow(rowNumber)].enabled);
             cb->onToggle = [this](int row, bool val)
             {
-                if (row >= 0 && row < mixerMap.size())
+                if (row >= 0 && row < (int)filteredIndices.size())
                 {
-                    mixerMap[row].enabled = val;
+                    mixerMap[mapRow(row)].enabled = val;
                     table.repaintRow(row);
                     if (onChange) onChange();
                 }
@@ -186,12 +272,12 @@ public:
         {
             auto* ed = dynamic_cast<EditableCell*>(existing);
             if (!ed) { delete existing; ed = new EditableCell(); }
-            ed->setRow(rowNumber, mixerMap[rowNumber].oscAddress);
+            ed->setRow(rowNumber, mixerMap[mapRow(rowNumber)].oscAddress);
             ed->onEdit = [this](int row, const juce::String& val)
             {
-                if (row >= 0 && row < mixerMap.size())
+                if (row >= 0 && row < (int)filteredIndices.size())
                 {
-                    mixerMap[row].oscAddress = val.trim();
+                    mixerMap[mapRow(row)].oscAddress = val.trim();
                     if (onChange) onChange();
                 }
             };
@@ -203,18 +289,18 @@ public:
         {
             auto* ed = dynamic_cast<EditableCell*>(existing);
             if (!ed) { delete existing; ed = new EditableCell(); }
-            juce::String ccText = (mixerMap[rowNumber].midiCC >= 0)
-                                ? juce::String(mixerMap[rowNumber].midiCC) : "";
+            juce::String ccText = (mixerMap[mapRow(rowNumber)].midiCC >= 0)
+                                ? juce::String(mixerMap[mapRow(rowNumber)].midiCC) : "";
             ed->setRow(rowNumber, ccText);
             ed->onEdit = [this](int row, const juce::String& val)
             {
-                if (row >= 0 && row < mixerMap.size())
+                if (row >= 0 && row < (int)filteredIndices.size())
                 {
                     auto trimmed = val.trim();
                     if (trimmed.isEmpty() || trimmed == "--" || trimmed == "-1")
-                        mixerMap[row].midiCC = -1;
+                        mixerMap[mapRow(row)].midiCC = -1;
                     else
-                        mixerMap[row].midiCC = juce::jlimit(-1, 127, trimmed.getIntValue());
+                        mixerMap[mapRow(row)].midiCC = juce::jlimit(-1, 127, trimmed.getIntValue());
                     table.repaintRow(row);
                     if (onChange) onChange();
                 }
@@ -227,18 +313,18 @@ public:
         {
             auto* ed = dynamic_cast<EditableCell*>(existing);
             if (!ed) { delete existing; ed = new EditableCell(); }
-            juce::String noteText = (mixerMap[rowNumber].midiNote >= 0)
-                                  ? juce::String(mixerMap[rowNumber].midiNote) : "";
+            juce::String noteText = (mixerMap[mapRow(rowNumber)].midiNote >= 0)
+                                  ? juce::String(mixerMap[mapRow(rowNumber)].midiNote) : "";
             ed->setRow(rowNumber, noteText);
             ed->onEdit = [this](int row, const juce::String& val)
             {
-                if (row >= 0 && row < mixerMap.size())
+                if (row >= 0 && row < (int)filteredIndices.size())
                 {
                     auto trimmed = val.trim();
                     if (trimmed.isEmpty() || trimmed == "--" || trimmed == "-1")
-                        mixerMap[row].midiNote = -1;
+                        mixerMap[mapRow(row)].midiNote = -1;
                     else
-                        mixerMap[row].midiNote = juce::jlimit(-1, 127, trimmed.getIntValue());
+                        mixerMap[mapRow(row)].midiNote = juce::jlimit(-1, 127, trimmed.getIntValue());
                     table.repaintRow(row);
                     if (onChange) onChange();
                 }
@@ -251,18 +337,18 @@ public:
         {
             auto* ed = dynamic_cast<EditableCell*>(existing);
             if (!ed) { delete existing; ed = new EditableCell(); }
-            juce::String dmxText = (mixerMap[rowNumber].artnetCh > 0)
-                                 ? juce::String(mixerMap[rowNumber].artnetCh) : "";
+            juce::String dmxText = (mixerMap[mapRow(rowNumber)].artnetCh > 0)
+                                 ? juce::String(mixerMap[mapRow(rowNumber)].artnetCh) : "";
             ed->setRow(rowNumber, dmxText);
             ed->onEdit = [this](int row, const juce::String& val)
             {
-                if (row >= 0 && row < mixerMap.size())
+                if (row >= 0 && row < (int)filteredIndices.size())
                 {
                     auto trimmed = val.trim();
                     if (trimmed.isEmpty() || trimmed == "--" || trimmed == "0")
-                        mixerMap[row].artnetCh = 0;
+                        mixerMap[mapRow(row)].artnetCh = 0;
                     else
-                        mixerMap[row].artnetCh = juce::jlimit(0, 512, trimmed.getIntValue());
+                        mixerMap[mapRow(row)].artnetCh = juce::jlimit(0, 512, trimmed.getIntValue());
                     table.repaintRow(row);
                     if (onChange) onChange();
                 }
@@ -284,6 +370,28 @@ private:
     enum ColumnIds { ColEnabled = 1, ColGroup, ColParam, ColOsc, ColMidiCC, ColMidiNote, ColDmxCh };
 
     MixerMap& mixerMap;
+    bool isV10 = true;
+
+    // --- V10 filtering ---
+    std::vector<int> filteredIndices;
+
+    int mapRow(int visibleRow) const
+    {
+        if (visibleRow >= 0 && visibleRow < (int)filteredIndices.size())
+            return filteredIndices[(size_t)visibleRow];
+        return 0;
+    }
+
+    void rebuildFilter(bool showV10)
+    {
+        filteredIndices.clear();
+        for (int i = 0; i < mixerMap.size(); ++i)
+        {
+            if (!showV10 && mixerMap[i].v10Only)
+                continue;
+            filteredIndices.push_back(i);
+        }
+    }
 
     // Colours (matching MainComponent / STC theme)
     juce::Colour bgDark    { 0xFF16181E };
@@ -298,12 +406,26 @@ private:
     juce::TextButton btnResetDefaults { "Reset Defaults" };
     juce::TextButton btnEnableAll     { "Enable All" };
     juce::TextButton btnDisableAll    { "Disable All" };
+    juce::TextButton btnToggleV10     { "DJM-V10" };
+    juce::TextButton btnExport        { "Export" };
+    juce::TextButton btnImport        { "Import" };
+
+    std::unique_ptr<juce::FileChooser> fileChooser;
+
+    void updateV10Button()
+    {
+        btnToggleV10.setButtonText(isV10 ? "DJM-V10" : "DJM-900NXS2");
+        btnToggleV10.setColour(juce::TextButton::buttonColourId,
+                               isV10 ? accentCol.withAlpha(0.25f) : juce::Colour(0xFF2A2A2A));
+        btnToggleV10.setColour(juce::TextButton::textColourOffId,
+                               isV10 ? accentCol.brighter(0.3f) : textDim);
+    }
     juce::ScopedMessageBox resetConfirmBox;
 
     void setAllEnabled(bool val)
     {
-        for (int i = 0; i < mixerMap.size(); ++i)
-            mixerMap[i].enabled = val;
+        for (int idx : filteredIndices)
+            mixerMap[idx].enabled = val;
         table.updateContent();
         table.repaint();
         if (onChange) onChange();
