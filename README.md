@@ -4,7 +4,6 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
 [![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
-[![GitHub Stars](https://img.shields.io/github/stars/fiverecords/SuperTimecodeConverter?style=flat&label=Stars&color=yellow)](https://github.com/fiverecords/SuperTimecodeConverter/stargazers)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
