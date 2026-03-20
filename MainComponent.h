@@ -480,9 +480,10 @@ private:
     int  getArtNetAddressFromCombos(const juce::ComboBox& cmbNet, const juce::ComboBox& cmbSub,
                                      const juce::ComboBox& cmbUni);
 
-#if JUCE_WINDOWS
-    juce::OpenGLContext glContext;     // GPU-accelerated rendering (Windows only)
-#endif
+    // OpenGL context removed: see constructor comment for rationale.
+    // Keeping the juce_opengl module in Projucer is harmless and allows
+    // re-enabling GPU rendering in the future if the thread safety issues
+    // are addressed.
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

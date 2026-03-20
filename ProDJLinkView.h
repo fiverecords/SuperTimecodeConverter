@@ -140,7 +140,7 @@ private:
         bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
         int      metadataRequestTick = 0;   // tick counter for retry after ~3s
 
-        // Cached deck image -- Windows only (OpenGL composites efficiently).
+        // Cached deck image -- Windows only (GDI benefits from caching).
         // On macOS, painting directly preserves CoreGraphics subpixel AA.
 #if JUCE_WINDOWS
         juce::Image cachedDeckImg;
@@ -386,22 +386,23 @@ public:
             // Position ratio for waveform cursor
             ds.posRatio = proDJLink.getPlayPositionRatio(pn);
 
-            // TrackMap lookup
+            // TrackMap lookup (single find, reused for offset + BPM multiplier)
+            const TrackMapEntry* tmEntry = nullptr;
             ds.trackMapped = false;
             ds.offset = "00:00:00:00";
             ds.offsetTimecode = {};
             if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
                 && !ds.title.startsWith("Track #"))
             {
-                const auto* entry = trackMap.find(ds.artist, ds.title);
-                if (entry != nullptr)
+                tmEntry = trackMap.find(ds.artist, ds.title);
+                if (tmEntry != nullptr)
                 {
                     ds.trackMapped = true;
-                    ds.offset = entry->timecodeOffset;
+                    ds.offset = tmEntry->timecodeOffset;
 
                     // Parse offset and compute running timecode with offset applied
                     int oH, oM, oS, oF;
-                    if (TrackMapEntry::parseTimecodeString(entry->timecodeOffset, oH, oM, oS, oF))
+                    if (TrackMapEntry::parseTimecodeString(tmEntry->timecodeOffset, oH, oM, oS, oF))
                     {
                         ds.offsetTimecode = applyTimecodeOffset(
                             ds.timecode, fps, oH, oM, oS, oF, fps);
@@ -412,7 +413,7 @@ public:
             // Engine assignment: find which engines monitor this player
             ds.engineNames.clear();
             ds.bpmSessionOverride = TimecodeEngine::kBpmNoOverride;
-            ds.bpmTrackMapValue   = 0;
+            ds.bpmTrackMapValue   = tmEntry ? tmEntry->bpmMultiplier : 0;
             for (auto& eng : engines)
             {
                 if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
@@ -421,13 +422,6 @@ public:
                     ds.engineNames.add(eng->getName());
                     ds.bpmSessionOverride = eng->getBpmPlayerOverride();
                 }
-            }
-            // BPM multiplier from TrackMap (independent of engine)
-            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
-            {
-                const auto* entry = trackMap.find(ds.artist, ds.title);
-                if (entry != nullptr)
-                    ds.bpmTrackMapValue = entry->bpmMultiplier;
             }
 
             // --- Track changed? ---
@@ -798,7 +792,7 @@ private:
         int w = area.getWidth(), h = area.getHeight();
 
 #if JUCE_WINDOWS
-        // Windows: cached HiDPI deck image (OpenGL composites texture efficiently)
+        // Windows: cached HiDPI deck image (avoids full repaint every frame)
         float scale = getDisplayScale();
         if (scale < 1.0f) scale = 1.0f;
 
@@ -1412,13 +1406,20 @@ private:
                 "FILTER","FLANGER","PHASER","PITCH","SLIP ROLL","ROLL",
                 "V.BRAKE","HELIX"
             };
+            static const char* fxNamesA9[] = {
+                "DELAY","ECHO","PING PONG","SPIRAL","HELIX","REVERB",
+                "FLANGER","PHASER","FILTER","TRIP FLT","TRANS","ROLL",
+                "TRIP ROLL","MOBIUS"
+            };
             static const char* fxNamesV10[] = {
                 "DELAY","ECHO","PING PONG","SPIRAL","HELIX","REVERB",
                 "SHIMMER","FLANGER","PHASER","FILTER","TRANS","ROLL",
                 "PITCH","V.BRAKE"
             };
-            bool isV10g = proDJLink.getMixerChannelCount() > 4;
-            const char** fxNames = isV10g ? fxNamesV10 : fxNames900;
+            DjmModel djmG = djmModelFromString(proDJLink.getDJMModel());
+            const char** fxNames = (djmG == DjmModel::V10Only) ? fxNamesV10
+                                 : (djmG == DjmModel::A9Plus)  ? fxNamesA9
+                                                                : fxNames900;
             int fxSel = proDJLink.getBeatFxSelect();
             bool fxOn = proDJLink.getBeatFxOn() != 0;
             juce::String fxStr = (fxSel >= 0 && fxSel < 14)
@@ -1435,7 +1436,9 @@ private:
     void paintChannelStrip(juce::Graphics& g, juce::Rectangle<int> area, int ch)
     {
         bool onAir = proDJLink.isPlayerOnAir(ch);
-        bool isV10 = proDJLink.getMixerChannelCount() > 4;
+        DjmModel djm = djmModelFromString(proDJLink.getDJMModel());
+        bool isV10 = (djm == DjmModel::V10Only);
+        bool hasDualCue = (djm >= DjmModel::A9Plus);  // A9 and V10 have CUE A/B
         juce::Colour chCol = onAir ? accentGreen : accentCyan;
 
         // --- Channel label + on-air ---
@@ -1484,10 +1487,10 @@ private:
         // --- CUE button(s) ---
         {
             bool cue = proDJLink.getChannelCue(ch) != 0;
-            bool cueB = isV10 && proDJLink.getChannelCueB(ch) != 0;
+            bool cueB = hasDualCue && proDJLink.getChannelCueB(ch) != 0;
             auto cueRow = area.removeFromTop(10);
 
-            if (isV10)
+            if (hasDualCue)
             {
                 // Two CUE buttons side by side
                 int btnW = juce::jmin(20, (cueRow.getWidth() - 2) / 2);
@@ -1798,22 +1801,13 @@ public:
         setVisible(true);
         toFront(true);
 
-        // GPU-accelerated rendering (Windows only).
-        // On macOS, JUCE's OpenGL adds texture-upload overhead through Apple's
-        // deprecated OpenGL-to-Metal layer.  CoreGraphics + Metal compositing
-        // is faster without it.  The HiDPI deck image cache already minimizes
-        // per-frame paint work on both platforms.
-#if JUCE_WINDOWS
-        glContext.attachTo(*getContentComponent());
-#endif
+        // OpenGL context removed: see MainComponent constructor for rationale.
+        // With timerCallback() writing juce::String members (artist, title,
+        // playState, key...) on the message thread and paint() reading them on
+        // the GL thread, the concurrent access corrupts String refcounts.
     }
 
-    ~ProDJLinkViewWindow() override
-    {
-#if JUCE_WINDOWS
-        glContext.detach();
-#endif
-    }
+    ~ProDJLinkViewWindow() override = default;
 
     void closeButtonPressed() override
     {
@@ -1821,9 +1815,6 @@ public:
         if (onBoundsCapture) onBoundsCapture();
         if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
             content->stopTimer();
-#if JUCE_WINDOWS
-        glContext.detach();  // release GPU resources while hidden
-#endif
         setVisible(false);
     }
 
@@ -1894,9 +1885,5 @@ public:
     }
 
 private:
-#if JUCE_WINDOWS
-    juce::OpenGLContext glContext;
-#endif
-
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProDJLinkViewWindow)
 };

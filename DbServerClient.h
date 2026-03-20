@@ -219,6 +219,45 @@ public:
         return {};
     }
 
+    /// Lightweight metadata lookup -- returns text fields and IDs only,
+    /// skipping the waveform vector copy.  Use when you only need artist/title/
+    /// key/BPM/artworkId (e.g. from getActiveTrackInfo at 60Hz).
+    struct MetadataLight
+    {
+        uint32_t trackId = 0;
+        juce::String title, artist, album, genre, key;
+        int bpmTimes100 = 0;
+        uint32_t artworkId = 0;
+        int durationSeconds = 0;
+        bool valid = false;
+        bool isValid() const { return valid; }
+    };
+
+    MetadataLight getCachedMetadataLightById(uint32_t trackId) const
+    {
+        if (trackId == 0) return {};
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        for (auto& [key, meta] : metadataCache)
+        {
+            if (meta.trackId == trackId && meta.isValid())
+            {
+                MetadataLight m;
+                m.trackId         = meta.trackId;
+                m.title           = meta.title;
+                m.artist          = meta.artist;
+                m.album           = meta.album;
+                m.genre           = meta.genre;
+                m.key             = meta.key;
+                m.bpmTimes100     = meta.bpmTimes100;
+                m.artworkId       = meta.artworkId;
+                m.durationSeconds = meta.durationSeconds;
+                m.valid           = true;
+                return m;
+            }
+        }
+        return {};
+    }
+
     //==========================================================================
     // Retrieve cached artwork (returns null Image if not cached)
     //==========================================================================

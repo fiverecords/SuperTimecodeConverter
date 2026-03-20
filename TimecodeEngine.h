@@ -433,7 +433,7 @@ public:
                 // Phase 2: check dbClient cache or request if missing
                 if (dbClient != nullptr && dbClient->getIsRunning())
                 {
-                    auto meta = dbClient->getCachedMetadataByTrackId(id);
+                    auto meta = dbClient->getCachedMetadataLightById(id);
                     if (meta.isValid())
                     {
                         cachedTrackArtist = meta.artist;
@@ -491,10 +491,12 @@ public:
             info.offset = TrackMapEntry::formatTimecodeString(
                               cachedOffH, cachedOffM, cachedOffS, cachedOffF);
 
-        // Phase 2: enrich with dbClient cache if available
+        // Phase 2: enrich with dbClient cache if available.
+        // Uses the lightweight lookup to avoid copying waveform data (~3600B)
+        // every frame at 60Hz.
         if (dbClient != nullptr && cachedTrackId != 0)
         {
-            auto meta = dbClient->getCachedMetadataByTrackId(cachedTrackId);
+            auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
             if (meta.isValid())
             {
                 info.album      = meta.album;
@@ -663,7 +665,8 @@ public:
             case InputSource::SystemTime:
                 updateSystemTime();
                 sourceActive = true;
-                inputStatusText = "SYSTEM CLOCK";
+                if (statusTextVisible)
+                    inputStatusText = "SYSTEM CLOCK";
                 break;
 
             case InputSource::MTC:
@@ -675,13 +678,14 @@ public:
                     {
                         auto d = mtcInput.getDetectedFrameRate();
                         if (d != currentFps) setFrameRate(d);
-                        inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
+                        if (statusTextVisible)
+                            inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
                     }
-                    else
+                    else if (statusTextVisible)
                         inputStatusText = "PAUSED - " + mtcInput.getCurrentDeviceName();
                     sourceActive = rx;
                 }
-                else { sourceActive = false; inputStatusText = "WAITING FOR DEVICE..."; }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "WAITING FOR DEVICE..."; }
                 break;
 
             case InputSource::ArtNet:
@@ -693,13 +697,14 @@ public:
                     {
                         auto d = artnetInput.getDetectedFrameRate();
                         if (d != currentFps) setFrameRate(d);
-                        inputStatusText = "RX ON " + artnetInput.getBindInfo();
+                        if (statusTextVisible)
+                            inputStatusText = "RX ON " + artnetInput.getBindInfo();
                     }
-                    else
+                    else if (statusTextVisible)
                         inputStatusText = "PAUSED - " + artnetInput.getBindInfo();
                     sourceActive = rx;
                 }
-                else { sourceActive = false; inputStatusText = "NOT LISTENING"; }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
                 break;
 
             case InputSource::LTC:
@@ -719,14 +724,15 @@ public:
                                 userOverrodeLtcFps = false;
                             setFrameRate(d);
                         }
-                        inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
-                                        + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1);
+                        if (statusTextVisible)
+                            inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
+                                            + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1);
                     }
-                    else
+                    else if (statusTextVisible)
                         inputStatusText = "PAUSED - " + ltcInput.getCurrentDeviceName();
                     sourceActive = rx;
                 }
-                else { sourceActive = false; inputStatusText = "WAITING FOR DEVICE..."; }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "WAITING FOR DEVICE..."; }
                 break;
 
             case InputSource::ProDJLink:
@@ -739,8 +745,11 @@ public:
                     if (ep < 1 || ep > ProDJLink::kMaxPlayers)
                     {
                         sourceActive = false;
-                        juce::String sideLabel = (proDJLinkPlayer == kPlayerXfA) ? "XF-A" : "XF-B";
-                        inputStatusText = sideLabel + ": NO PLAYER ON SIDE";
+                        if (statusTextVisible)
+                        {
+                            juce::String sideLabel = (proDJLinkPlayer == kPlayerXfA) ? "XF-A" : "XF-B";
+                            inputStatusText = sideLabel + ": NO PLAYER ON SIDE";
+                        }
                         break;
                     }
 
@@ -859,7 +868,7 @@ public:
                     if (dbClient != nullptr && cachedTrackId != 0
                         && cachedTrackTitle.startsWith("Track #"))
                     {
-                        auto meta = dbClient->getCachedMetadataByTrackId(cachedTrackId);
+                        auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
                         if (meta.isValid())
                         {
                             cachedTrackArtist = meta.artist;
@@ -875,11 +884,14 @@ public:
                     }
 
                     // --- Persist auto-filled metadata ---
+                    // tick() runs on the message thread (timerCallback), so we can
+                    // call save() directly.  The previous callAsync captured a raw
+                    // pointer that could dangle if the app closed between post and
+                    // execution.
                     if (trackMapDirty && trackMapPtr != nullptr)
                     {
                         trackMapDirty = false;
-                        TrackMap* mapRef = trackMapPtr;
-                        juce::MessageManager::callAsync([mapRef]() { mapRef->save(); });
+                        trackMapPtr->save();
                     }
 
                     // --- Apply timecode offset ---
@@ -892,57 +904,60 @@ public:
                     }
 
                     bool pdlRx = sharedProDJLink->isReceiving();
-                    if (pdlRx)
+                    if (statusTextVisible)
                     {
-                        // Note: no fps auto-detection for ProDJLink -- CDJ sends ms,
-                        // not frames. The user's fps selection IS the frame rate.
-
-                        bool pdlHasTC = sharedProDJLink->hasTimecodeData(ep);
-                        if (pdlHasTC)
+                        if (pdlRx)
                         {
-                            juce::String pdlModel = sharedProDJLink->getPlayerModel(ep);
-                            inputStatusText = isXfMode()
-                                ? ((proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
-                                   + juce::String(" P") + juce::String(ep))
-                                : ("RX P" + juce::String(ep));
-                            if (pdlModel.isNotEmpty())
-                                inputStatusText += " " + pdlModel;
+                            // Note: no fps auto-detection for ProDJLink -- CDJ sends ms,
+                            // not frames. The user's fps selection IS the frame rate.
 
-                            if (!sharedProDJLink->isPositionMoving(ep))
-                                inputStatusText += " " + sharedProDJLink->getPlayStateString(ep);
+                            bool pdlHasTC = sharedProDJLink->hasTimecodeData(ep);
+                            if (pdlHasTC)
+                            {
+                                juce::String pdlModel = sharedProDJLink->getPlayerModel(ep);
+                                inputStatusText = isXfMode()
+                                    ? ((proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
+                                       + juce::String(" P") + juce::String(ep))
+                                    : ("RX P" + juce::String(ep));
+                                if (pdlModel.isNotEmpty())
+                                    inputStatusText += " " + pdlModel;
 
-                            double pdlBpm = sharedProDJLink->getBPM(ep);
-                            if (pdlBpm > 0.0)
-                                inputStatusText += " | " + juce::String(pdlBpm, 1) + " BPM";
-                        }
-                        else
-                        {
-                            inputStatusText = "P" + juce::String(ep)
-                                + " " + sharedProDJLink->getPlayStateString(ep)
-                                + " - NO POSITION DATA";
-                        }
+                                if (!sharedProDJLink->isPositionMoving(ep))
+                                    inputStatusText += " " + sharedProDJLink->getPlayStateString(ep);
 
-                        if (pdlHasTC && trackMapEnabled
-                            && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty()
-                            && !cachedTrackTitle.startsWith("Track #"))
-                        {
-                            if (trackMapped)
-                                inputStatusText += " | MAP: " + cachedTrackTitle;
+                                double pdlBpm = sharedProDJLink->getBPM(ep);
+                                if (pdlBpm > 0.0)
+                                    inputStatusText += " | " + juce::String(pdlBpm, 1) + " BPM";
+                            }
                             else
-                                inputStatusText += " | NO MAP";
-                        }
+                            {
+                                inputStatusText = "P" + juce::String(ep)
+                                    + " " + sharedProDJLink->getPlayStateString(ep)
+                                    + " - NO POSITION DATA";
+                            }
 
-                        inputStatusText += " | " + sharedProDJLink->getBindInfo();
-                    }
-                    else
-                    {
-                        inputStatusText = "WAITING";
-                        auto discP = sharedProDJLink->getDiscoveredPlayers();
-                        if (discP.isEmpty())
-                            inputStatusText += " | NO PLAYERS";
+                            if (pdlHasTC && trackMapEnabled
+                                && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty()
+                                && !cachedTrackTitle.startsWith("Track #"))
+                            {
+                                if (trackMapped)
+                                    inputStatusText += " | MAP: " + cachedTrackTitle;
+                                else
+                                    inputStatusText += " | NO MAP";
+                            }
+
+                            inputStatusText += " | " + sharedProDJLink->getBindInfo();
+                        }
                         else
-                            inputStatusText += " | " + juce::String(discP.size()) + " PLAYER(S)";
-                        inputStatusText += " | " + sharedProDJLink->getBindInfo();
+                        {
+                            inputStatusText = "WAITING";
+                            auto discP = sharedProDJLink->getDiscoveredPlayers();
+                            if (discP.isEmpty())
+                                inputStatusText += " | NO PLAYERS";
+                            else
+                                inputStatusText += " | " + juce::String(discP.size()) + " PLAYER(S)";
+                            inputStatusText += " | " + sharedProDJLink->getBindInfo();
+                        }
                     }
 
                     // --- MIDI Clock ---
@@ -1013,7 +1028,7 @@ public:
                     if (sourceActive && !wasActive)
                         ltcOutput.reseed();
                 }
-                else { sourceActive = false; inputStatusText = "NOT CONNECTED"; }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
         }
 
@@ -1029,6 +1044,11 @@ public:
     juce::String getArtnetOutStatusText() const { return artnetOutStatusText; }
     juce::String getLtcOutStatusText() const { return ltcOutStatusText; }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
+
+    /// Only the currently displayed engine needs to build status text strings.
+    /// Call with true for the selected engine, false for background engines.
+    /// Avoids ~25 juce::String heap allocations per tick on non-visible engines.
+    void setStatusTextVisible(bool visible) { statusTextVisible = visible; }
 
     //==========================================================================
     // VU meter smoothed levels
@@ -1124,7 +1144,7 @@ private:
     // Input state
     InputSource activeInput = InputSource::SystemTime;
     FrameRate currentFps = FrameRate::FPS_30;
-    mutable juce::SpinLock timecodeLock;  // protects currentTimecode (GL thread reads, message thread writes)
+    mutable juce::SpinLock timecodeLock;  // protects currentTimecode for getCurrentTimecode() thread safety
     Timecode currentTimecode;
     bool sourceActive = true;
     bool outputsWereActive = false;  // previous sourceActive state for transition detection
@@ -1438,6 +1458,7 @@ private:
     // Status
     juce::String inputStatusText = "SYSTEM CLOCK";
     juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText;
+    bool statusTextVisible = true;  // only build inputStatusText when engine is displayed
 
     // VU meter smoothed state
     float sLtcIn = 0.0f, sThruIn = 0.0f, sLtcOut = 0.0f, sThruOut = 0.0f;
@@ -1870,17 +1891,19 @@ private:
             case 20: return pdl.getMicEqHi();
             case 21: return pdl.getMicEqLo();
             // V10 globals (0 on 900NXS2)
+            // A9+ globals (A9 and V10: dual CUE, HP B, booth EQ)
             case 22: return pdl.getMasterCueB();
-            case 23: return pdl.getIsolatorOn();
-            case 24: return pdl.getIsolatorHi();
-            case 25: return pdl.getIsolatorMid();
-            case 26: return pdl.getIsolatorLo();
-            case 27: return pdl.getBoothEqHi();
-            case 28: return pdl.getBoothEqLo();
-            case 29: return pdl.getHpCueLinkB();
-            case 30: return pdl.getHpMixingB();
-            case 31: return pdl.getHpLevelB();
-            case 32: return pdl.getHpPreEq();
+            case 23: return pdl.getHpCueLinkB();
+            case 24: return pdl.getHpMixingB();
+            case 25: return pdl.getHpLevelB();
+            case 26: return pdl.getBoothEqHi();
+            case 27: return pdl.getBoothEqLo();
+            case 28: return pdl.getBoothEq();
+            // V10-only globals
+            case 29: return pdl.getIsolatorOn();
+            case 30: return pdl.getIsolatorHi();
+            case 31: return pdl.getIsolatorMid();
+            case 32: return pdl.getIsolatorLo();
             case 33: return pdl.getFilterLPF();
             case 34: return pdl.getFilterHPF();
             case 35: return pdl.getFilterResonance();

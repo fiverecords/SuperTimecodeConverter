@@ -110,8 +110,8 @@ public:
     /// Call when resuming from pause to avoid continuing a stale half-encoded frame.
     void reseed()
     {
-        needNewFrame = true;
-        encoderSeeded = false;
+        needNewFrame.store(true, std::memory_order_relaxed);
+        encoderSeeded.store(false, std::memory_order_relaxed);
     }
 
     void setPaused(bool p)
@@ -148,7 +148,11 @@ private:
     std::atomic<float> peakLevel { 0.0f };
     std::atomic<double> pitchMultiplier { 1.0 };
 
-    // LTC encoder state -- audio-callback-thread-only (no synchronisation needed)
+    // LTC encoder state -- mostly audio-callback-thread-only.
+    // EXCEPTION: needNewFrame and encoderSeeded are also written by reseed()
+    // from the message thread, so they must be atomic to avoid data races
+    // (especially on ARM / Apple Silicon where non-atomic cross-thread writes
+    // can produce torn reads).
     static constexpr int LTC_FRAME_BITS = 80;
     uint8_t frameBits[LTC_FRAME_BITS] = {};
     int currentBitIndex = 0;
@@ -156,13 +160,13 @@ private:
     double samplePositionInHalfBit = 0.0;
     double samplesPerHalfBit = 0.0;
     float currentLevel = 1.0f;
-    bool needNewFrame = true;
+    std::atomic<bool> needNewFrame { true };
     static constexpr float baseAmplitude = 0.8f;
 
     // Auto-increment state: the encoder maintains its own running timecode
     // to avoid repeating frames when the UI thread lags behind the audio clock
     Timecode encoderTc;
-    bool encoderSeeded = false;
+    std::atomic<bool> encoderSeeded { false };
 
     void resetEncoder()
     {
@@ -170,8 +174,8 @@ private:
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
         currentLevel = 1.0f;
-        needNewFrame = true;
-        encoderSeeded = false;
+        needNewFrame.store(true, std::memory_order_relaxed);
+        encoderSeeded.store(false, std::memory_order_relaxed);
         encoderTc = Timecode();
         updateSamplesPerBit();
     }
@@ -190,10 +194,10 @@ private:
         FrameRate fps = pendingFps.load(std::memory_order_relaxed);
         Timecode pendingTc = unpackTimecode(packedPendingTc.load(std::memory_order_relaxed));
 
-        if (!encoderSeeded)
+        if (!encoderSeeded.load(std::memory_order_relaxed))
         {
             encoderTc = pendingTc;
-            encoderSeeded = true;
+            encoderSeeded.store(true, std::memory_order_relaxed);
         }
         else
         {
@@ -320,14 +324,14 @@ private:
         float peak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
         {
-            if (needNewFrame)
+            if (needNewFrame.load(std::memory_order_relaxed))
             {
                 updateSamplesPerBit();
                 packFrame();
                 currentBitIndex = 0;
                 halfCellIndex = 0;
                 samplePositionInHalfBit = 0.0;
-                needNewFrame = false;
+                needNewFrame.store(false, std::memory_order_relaxed);
                 // Do NOT invert currentLevel here -- the mandatory start-of-bit
                 // transition for bit 0 was already applied when the previous
                 // frame's last bit completed (halfCellIndex 1 -> 0 branch).
@@ -362,7 +366,7 @@ private:
                     currentLevel = -currentLevel;
 
                     if (currentBitIndex >= LTC_FRAME_BITS)
-                        needNewFrame = true;
+                        needNewFrame.store(true, std::memory_order_relaxed);
                 }
             }
         }

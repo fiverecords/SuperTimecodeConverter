@@ -161,6 +161,50 @@ public:
         return send(address, "f:" + juce::String(value));
     }
 
+    /// Zero-allocation fast path for sending a single float.
+    /// Builds the OSC packet in a stack buffer -- no juce::String creation,
+    /// no MemoryBlock, no tokenization.  Used by mixer forwarding hot path.
+    bool sendFloatDirect(const juce::String& address, float value)
+    {
+        if (address.isEmpty()) return false;
+
+        auto utf8 = address.toRawUTF8();
+        size_t addrLen = std::strlen(utf8) + 1;              // include null
+        size_t addrPadded = (addrLen + 3) & ~(size_t)3;      // pad to 4
+
+        // Max packet: 128-byte address + 4-byte type tag + 4-byte float
+        // Stack buffer is generous to avoid any edge case.
+        constexpr size_t kMaxPacket = 256;
+        if (addrPadded + 8 > kMaxPacket) return false;        // address too long
+
+        uint8_t packet[kMaxPacket];
+        std::memset(packet, 0, addrPadded + 8);
+
+        // 1. Address string (null-padded to 4-byte boundary)
+        std::memcpy(packet, utf8, addrLen);
+
+        // 2. Type tag ",f" (null-padded to 4 bytes)
+        size_t off = addrPadded;
+        packet[off]     = ',';
+        packet[off + 1] = 'f';
+        // packet[off + 2] and [off + 3] already 0
+
+        // 3. Float32 big-endian
+        off += 4;
+        int32_t asInt;
+        std::memcpy(&asInt, &value, 4);
+        packet[off]     = (uint8_t)((asInt >> 24) & 0xFF);
+        packet[off + 1] = (uint8_t)((asInt >> 16) & 0xFF);
+        packet[off + 2] = (uint8_t)((asInt >> 8)  & 0xFF);
+        packet[off + 3] = (uint8_t)(asInt & 0xFF);
+
+        int totalSize = (int)(addrPadded + 8);
+
+        juce::SpinLock::ScopedLockType lock(socketLock);
+        if (!connected || !socket) return false;
+        return socket->write(destIp, destPort, packet, totalSize) > 0;
+    }
+
     /// Convenience: send with a single string argument
     bool sendString(const juce::String& address, const juce::String& value)
     {

@@ -939,26 +939,33 @@ MainComponent::MainComponent()
     startTimerHz(60);
     startAudioDeviceScan();
 
-    // GPU-accelerated rendering (Windows only).
-    // On Windows, JUCE's OpenGL context offloads image compositing from GDI
-    // to the GPU, reducing message-thread load from repaint().
-    // On macOS, this is DISABLED: JUCE still renders into software images
-    // and then uploads them as textures through Apple's deprecated
-    // OpenGL-to-Metal translation layer, which adds overhead rather than
-    // reducing it.  CoreGraphics already uses Metal internally for
-    // compositing, so native rendering is faster without OpenGL.
-#if JUCE_WINDOWS
-    glContext.attachTo(*this);
-#endif
+    // GPU-accelerated rendering: DISABLED for thread safety.
+    //
+    // When glContext.attachTo(*this) is active, JUCE calls paint() for ALL
+    // child components on the OpenGL thread -- not the message thread.
+    // Meanwhile, timerCallback() writes juce::String members (artist, title,
+    // playState, sourceName, etc.) on the message thread.  juce::String is
+    // reference-counted: a concurrent read during write can corrupt the
+    // refcount and crash.  This affects TimecodeDisplay, ProDJLinkView,
+    // all juce::Label instances, and any component that reads String data
+    // in paint().
+    //
+    // JUCE's OpenGL renderer paints into software images on the CPU and
+    // only uses the GPU for the final texture upload + composite.  With
+    // the waveform image cache, HiDPI deck image cache, and targeted
+    // dirty-rect repainting already in place, the performance difference
+    // is negligible.  Windows DWM already hardware-accelerates the native
+    // GDI composite path.
+    //
+    // For a live performance application, eliminating the entire class of
+    // GL-thread data races is worth more than the marginal compositing
+    // speedup.  If GPU acceleration is ever re-enabled, all juce::String
+    // members read in paint() must be replaced with atomic-safe types
+    // (fixed char arrays, packed atomics, or a SpinLock-protected snapshot).
 }
 
 MainComponent::~MainComponent()
 {
-    // 0. Detach OpenGL before destroying any components (Windows only)
-#if JUCE_WINDOWS
-    glContext.detach();
-#endif
-
     // 1. Stop our UI timer first -- no more timerCallback() after this
     stopTimer();
 
@@ -1021,9 +1028,15 @@ MainComponent::~MainComponent()
     // 9. Explicitly shut down each engine (timers, threads, sockets)
     //    BEFORE engines.clear() destroys the objects, so all HighResolutionTimer
     //    threads are stopped while the message manager is still alive.
+    //    Also disconnect shared pointers (TrackMap, MixerMap, ProDJLink, DbServer)
+    //    so no stale references survive into AppSettings destruction.
     for (auto& eng : engines)
     {
         eng->setMidiClockEnabled(false);
+        eng->setTrackMap(nullptr);
+        eng->setMixerMap(nullptr);
+        eng->setSharedProDJLinkInput(nullptr);
+        eng->setDbServerClient(nullptr);
         eng->stopMtcOutput();
         eng->stopArtnetOutput();
         eng->stopLtcOutput();
@@ -1033,7 +1046,7 @@ MainComponent::~MainComponent()
         eng->stopLtcInput();
     }
 
-    // 9. Now safe to destroy engine objects
+    // 10. Now safe to destroy engine objects
     engines.clear();
 }
 
@@ -1083,6 +1096,12 @@ void MainComponent::removeEngine(int index)
 
     // Explicitly stop all protocols on the engine being deleted BEFORE
     // erasing it, so destructors don't race with any pending callbacks.
+    // Disconnect shared pointers first to prevent stale access during stop.
+    engines[(size_t)index]->setTrackMap(nullptr);
+    engines[(size_t)index]->setMixerMap(nullptr);
+    engines[(size_t)index]->setSharedProDJLinkInput(nullptr);
+    engines[(size_t)index]->setDbServerClient(nullptr);
+    engines[(size_t)index]->setMidiClockEnabled(false);
     engines[(size_t)index]->getTriggerOutput().setSharedMidiOutput(nullptr);
     engines[(size_t)index]->stopMtcOutput();
     engines[(size_t)index]->stopArtnetOutput();
@@ -1732,7 +1751,7 @@ void MainComponent::openMixerMapEditor()
     }
 
     auto* editor = new MixerMapEditor(sharedMixerMap,
-                                      sharedProDJLinkInput.getMixerChannelCount() > 4);
+                                      djmModelFromString(sharedProDJLinkInput.getDJMModel()));
     editor->onChange = [this]
     {
         sharedMixerMap.save();
@@ -3944,8 +3963,11 @@ void MainComponent::timerCallback()
     // uses its own audio-callback-driven auto-increment, so it's similarly
     // decoupled.  If UI stalls (resize, modal dialog), outputs continue
     // transmitting the last-known timecode until the next tick() updates it.
-    for (auto& eng : engines)
-        eng->tick();
+    for (int i = 0; i < (int)engines.size(); ++i)
+    {
+        engines[(size_t)i]->setStatusTextVisible(i == selectedEngine);
+        engines[(size_t)i]->tick();
+    }
 
     // Update UI for selected engine
     auto& eng = currentEngine();
@@ -4087,7 +4109,10 @@ void MainComponent::timerCallback()
         {
             // Track changed -- clear old waveform immediately (avoids stale cursor)
             waveformDisplay.clearWaveform();
-            displayedWaveformTrackId = 0;
+            // Mark this track as "attempted" so we don't re-enter this block
+            // every frame.  The retry path below uses hasWaveformData() to
+            // detect when the async waveform query completes.
+            displayedWaveformTrackId = wfTrackId;
 
             // Try to populate from cache (may not have waveform yet)
             juce::String pdlIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
@@ -4096,10 +4121,9 @@ void MainComponent::timerCallback()
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
                     meta.waveformEntryCount, meta.waveformBytesPerEntry);
-                displayedWaveformTrackId = wfTrackId;
             }
         }
-        else if (wfTrackId != 0 && displayedWaveformTrackId == 0)
+        else if (wfTrackId != 0 && !waveformDisplay.hasWaveformData())
         {
             // Waveform not yet loaded -- retry from cache (async: arrives after metadata)
             juce::String pdlIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
@@ -4108,7 +4132,6 @@ void MainComponent::timerCallback()
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
                     meta.waveformEntryCount, meta.waveformBytesPerEntry);
-                displayedWaveformTrackId = wfTrackId;
             }
         }
         else if (wfTrackId == 0 && displayedWaveformTrackId != 0)

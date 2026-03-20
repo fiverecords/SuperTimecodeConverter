@@ -19,12 +19,13 @@ class MixerMapEditor : public juce::Component,
                        public juce::TableListBoxModel
 {
 public:
-    MixerMapEditor(MixerMap& map, bool showV10 = true) : mixerMap(map), isV10(showV10)
+    MixerMapEditor(MixerMap& map, DjmModel model = DjmModel::V10Only)
+        : mixerMap(map), selectedModel(model)
     {
         setSize(750, 620);
 
-        // Build filtered row indices (hide V10 params when not in V10 mode)
-        rebuildFilter(isV10);
+        // Build filtered row indices (hide params above selected model level)
+        rebuildFilter(selectedModel);
 
         // --- Table ---
         addAndMakeVisible(table);
@@ -64,7 +65,7 @@ public:
                     if (result == 1)
                     {
                         mixerMap.resetToDefaults();
-                        rebuildFilter(isV10);
+                        rebuildFilter(selectedModel);
                         table.updateContent();
                         table.repaint();
                         if (onChange) onChange();
@@ -82,13 +83,16 @@ public:
         btnDisableAll.setColour(juce::TextButton::textColourOffId, textDim);
         btnDisableAll.onClick = [this] { setAllEnabled(false); };
 
-        addAndMakeVisible(btnToggleV10);
-        updateV10Button();
-        btnToggleV10.onClick = [this]
+        addAndMakeVisible(btnToggleModel);
+        updateModelButton();
+        btnToggleModel.onClick = [this]
         {
-            isV10 = !isV10;
-            rebuildFilter(isV10);
-            updateV10Button();
+            // Cycle: 900NXS2 -> A9 -> V10 -> 900NXS2
+            if (selectedModel == DjmModel::All)         selectedModel = DjmModel::A9Plus;
+            else if (selectedModel == DjmModel::A9Plus) selectedModel = DjmModel::V10Only;
+            else                                        selectedModel = DjmModel::All;
+            rebuildFilter(selectedModel);
+            updateModelButton();
             table.updateContent();
             table.repaint();
         };
@@ -174,7 +178,7 @@ public:
         btnDisableAll.setBounds(btnRow.removeFromRight(90));
         btnRow.removeFromRight(6);
         btnEnableAll.setBounds(btnRow.removeFromRight(90));
-        btnToggleV10.setBounds(btnRow.removeFromLeft(100));
+        btnToggleModel.setBounds(btnRow.removeFromLeft(110));
         btnRow.removeFromLeft(6);
         btnExport.setBounds(btnRow.removeFromLeft(70));
         btnRow.removeFromLeft(6);
@@ -370,9 +374,9 @@ private:
     enum ColumnIds { ColEnabled = 1, ColGroup, ColParam, ColOsc, ColMidiCC, ColMidiNote, ColDmxCh };
 
     MixerMap& mixerMap;
-    bool isV10 = true;
+    DjmModel selectedModel = DjmModel::V10Only;
 
-    // --- V10 filtering ---
+    // --- Model filtering ---
     std::vector<int> filteredIndices;
 
     int mapRow(int visibleRow) const
@@ -382,12 +386,13 @@ private:
         return 0;
     }
 
-    void rebuildFilter(bool showV10)
+    void rebuildFilter(DjmModel model)
     {
         filteredIndices.clear();
         for (int i = 0; i < mixerMap.size(); ++i)
         {
-            if (!showV10 && mixerMap[i].v10Only)
+            // Show entry if its minimum model requirement is met by selected model
+            if ((int)mixerMap[i].minModel > (int)model)
                 continue;
             filteredIndices.push_back(i);
         }
@@ -406,19 +411,37 @@ private:
     juce::TextButton btnResetDefaults { "Reset Defaults" };
     juce::TextButton btnEnableAll     { "Enable All" };
     juce::TextButton btnDisableAll    { "Disable All" };
-    juce::TextButton btnToggleV10     { "DJM-V10" };
+    juce::TextButton btnToggleModel   { "DJM-V10" };
     juce::TextButton btnExport        { "Export" };
     juce::TextButton btnImport        { "Import" };
 
     std::unique_ptr<juce::FileChooser> fileChooser;
 
-    void updateV10Button()
+    void updateModelButton()
     {
-        btnToggleV10.setButtonText(isV10 ? "DJM-V10" : "DJM-900NXS2");
-        btnToggleV10.setColour(juce::TextButton::buttonColourId,
-                               isV10 ? accentCol.withAlpha(0.25f) : juce::Colour(0xFF2A2A2A));
-        btnToggleV10.setColour(juce::TextButton::textColourOffId,
-                               isV10 ? accentCol.brighter(0.3f) : textDim);
+        juce::String label;
+        juce::Colour bgCol, txtCol;
+        switch (selectedModel)
+        {
+            case DjmModel::All:
+                label = "DJM-900NXS2";
+                bgCol = juce::Colour(0xFF2A2A2A);
+                txtCol = textDim;
+                break;
+            case DjmModel::A9Plus:
+                label = "DJM-A9";
+                bgCol = juce::Colour(0xFF2A3A1E);
+                txtCol = juce::Colour(0xFF88CC44);
+                break;
+            case DjmModel::V10Only:
+                label = "DJM-V10";
+                bgCol = accentCol.withAlpha(0.25f);
+                txtCol = accentCol.brighter(0.3f);
+                break;
+        }
+        btnToggleModel.setButtonText(label);
+        btnToggleModel.setColour(juce::TextButton::buttonColourId, bgCol);
+        btnToggleModel.setColour(juce::TextButton::textColourOffId, txtCol);
     }
     juce::ScopedMessageBox resetConfirmBox;
 

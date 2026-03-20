@@ -1,7 +1,5 @@
 # Super Timecode Converter
 
-![Super Timecode Converter](docs/screenshotV1.5.png)
-
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ and DJM hardware** via native Pro DJ Link integration — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
@@ -51,7 +49,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtual CDJ, converting the DJ's playhead position into frame-accurate SMPTE timecode in real time.
 
-**Tested hardware:** CDJ-3000, CDJ-3000X, DJM-900NXS2, DJM-V10. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, DJM-A9, etc.) should work but has not been verified yet -- please report any issues on GitHub.
+**Tested hardware:** CDJ-3000, CDJ-3000X, DJM-900NXS2, DJM-V10, DJM-A9. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, etc.) should work but has not been verified yet -- please report any issues on GitHub.
 
 **Player tracking:**
 - Automatic player discovery on the Pro DJ Link network
@@ -70,10 +68,11 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
 
 **DJM mixer integration:**
-- Real-time mixer data from DJM-900NXS2 and DJM-V10
-- **DJM-900NXS2:** per-channel faders, trim, EQ (3-band), color/FX, CUE buttons, crossfader, master fader, booth, headphones, beat FX, color FX, mic EQ (76 parameters)
-- **DJM-V10:** all of the above plus compressor, EQ (4-band), send, CUE A/B dual-cue, isolator, booth EQ, headphones A/B, filter, master mix (sends), multi I/O (123 parameters). Auto-detected from DJM model name.
-- VU meters: per-channel peak metering + Master L/R stereo, 15 segments per channel. 4-channel (900NXS2) or 6-channel (V10) layouts.
+- Real-time mixer data from DJM-900NXS2, DJM-A9, and DJM-V10
+- **DJM-900NXS2:** per-channel faders, trim, EQ (3-band), color/FX, CUE buttons, crossfader, master fader, booth, headphones, beat FX, color FX, mic EQ (58 parameters)
+- **DJM-A9:** all of the above plus CUE A/B dual-cue, master CUE B, headphone B, booth EQ, multi I/O, Bluetooth and USB input sources. Beat FX names match the A9 panel (including Triplet Filter, Triplet Roll, Mobius). Mic FX section is internal to the mixer and not available via protocol (71 parameters).
+- **DJM-V10:** all of the above plus compressor, EQ (4-band), send, isolator, filter, master mix (sends), channels 5-6 (123 parameters). Auto-detected from DJM model name.
+- VU meters: per-channel peak metering + Master L/R stereo, 15 segments per channel. 4-channel (900NXS2, A9) or 6-channel (V10) layouts.
 - Per-channel on-air status
 
 **Track metadata (via dbserver):**
@@ -98,14 +97,14 @@ Map tracks by **artist + title** to timecode offsets and show control triggers. 
 
 ### Mixer Map
 
-Configurable mapping from every DJM mixer parameter to show control protocols. Up to 123 parameters (DJM-V10) can be independently routed to any combination of:
+Configurable mapping from every DJM mixer parameter to show control protocols. From 58 parameters (DJM-900NXS2) to 123 (DJM-V10), each independently routed to any combination of:
 
 - **OSC** -- normalized float 0.0-1.0, configurable address per parameter
 - **MIDI CC** -- 0-127, configurable CC number and channel
 - **MIDI Note** -- 0-127 velocity (for grandMA2/MA3 executor faders)
 - **Art-Net DMX** -- 0-255, configurable DMX channel and universe
 
-Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed. DJM model toggle (DJM-900NXS2 / DJM-V10) shows or hides V10-specific parameters. Export and import mixer maps as JSON files for backup or sharing between machines.
+Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed. Three-way DJM model toggle (DJM-900NXS2 / DJM-A9 / DJM-V10) shows or hides model-specific parameters. Export and import mixer maps as JSON files for backup or sharing between machines.
 
 ### PDL View
 
@@ -115,6 +114,7 @@ External window showing the full Pro DJ Link network state at 30Hz:
 - Per-deck BPM multiplier buttons (single click for session override, double click to save to Track Map)
 - Mixer strip: channel faders with segmented VU meters, crossfader, master fader with stereo VU
 - DJM-V10 enhanced view: compressor, 4-band EQ, send knobs, dual CUE A/B buttons per channel
+- DJM-A9 / DJM-V10: dual CUE A/B buttons rendered automatically when detected
 - On-air, master, and beat indicators per player
 
 ### BPM Multiplier
@@ -178,6 +178,12 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 
 ---
 
+## Screenshot
+
+![Super Timecode Converter](docs/screenshotV1.4.png)
+
+---
+
 ## Getting Started
 
 ### Prerequisites
@@ -219,7 +225,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.5.2)
+   project(SuperTimecodeConverter VERSION 1.5.3)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -229,7 +235,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.5.2"
+       VERSION "1.5.3"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -371,7 +377,7 @@ This is a one-time step -- macOS remembers the exception after the first launch.
 
 ### macOS: DJM Subscribe Race Condition
 
-On macOS, the DJM-900NXS2 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
+On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
 
 ---
 
@@ -394,11 +400,11 @@ The application is built around a modular, header-only architecture:
 | `AudioThru.h` | Audio passthrough with independent device routing (Engine 1 only) |
 | `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
 | `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
-| `MixerMap.h` | DJM parameter → OSC / MIDI CC / MIDI Note / Art-Net DMX mapping |
+| `MixerMap.h` | DJM parameter mapping with three-tier model support (900NXS2 / A9 / V10) |
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
-| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters (V10 enhanced) |
+| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters (A9/V10 enhanced) |
 | `MediaDisplay.h` | Color waveform renderer (ThreeBand and ColorNxs2 formats) |
 | `TrackMapEditor.h` | Table editor for artist+title → timecode offset + trigger mapping |
 | `MixerMapEditor.h` | Table editor for DJM parameter → protocol output mapping |
@@ -415,9 +421,9 @@ The application is built around a modular, header-only architecture:
 - **Thread safety:** atomics with explicit memory ordering for cross-thread data, SpinLocks for composite structures, SPSC queues for producer-consumer patterns
 - **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
-- **GPU-accelerated rendering (Windows):** OpenGL context offloads image compositing to GPU, reducing message-thread load. Disabled on macOS where JUCE's OpenGL adds texture-upload overhead through Apple's deprecated OpenGL-to-Metal layer -- CoreGraphics with native Metal compositing is faster
+- **Native rendering:** OpenGL context intentionally disabled to prevent GL-thread data races on juce::String refcounts (paint() vs timerCallback()). Windows DWM already hardware-accelerates the native GDI composite path, and the waveform/deck image caches minimize per-frame paint work
 - **PLL-based timecode:** Pro DJ Link input uses a phase-locked loop driven by CDJ actual motor speed for jitter-free LTC bit-rate scaling
-- **Interface-bound sockets:** Pro DJ Link UDP sockets are bound to the specific network interface IP, not INADDR_ANY, preventing duplicate packet delivery on multi-interface systems. Beat and status sockets avoid SO_REUSEPORT to prevent kernel packet distribution across stale/duplicate sockets on macOS
+- **Interface-bound sockets:** Pro DJ Link UDP sockets (beat, status, bridge) are bound to the specific network interface IP, not INADDR_ANY, preventing duplicate packet delivery on multi-interface systems. The keepalive socket binds to the interface IP on Windows (to force the correct outgoing NIC on multi-adapter systems) but to INADDR_ANY on macOS (where broadcast reception requires it). Beat and status sockets avoid SO_REUSEPORT to prevent kernel packet distribution across stale/duplicate sockets on macOS
 - **Background device scanning:** audio devices are scanned on a background thread to avoid blocking the UI on startup
 - **Two-phase initialization:** non-audio settings are applied immediately; audio device settings are applied after the background scan completes
 - **Cross-engine device conflict detection:** custom popup menu rendering highlights devices in use with colour-coded markers (cyan for current engine, amber with engine name for others)

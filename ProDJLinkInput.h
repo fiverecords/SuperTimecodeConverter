@@ -336,7 +336,7 @@ public:
         parseIpString(iface.ip, ownIpBytes);
 
         // Get MAC address for this interface
-        if (!getMacAddress(iface.name, ownMacBytes))
+        if (!getMacAddress(iface.name, ownMacBytes, iface.ip))
         {
             // Fallback: use a plausible MAC
             std::memset(ownMacBytes, 0, 6);
@@ -350,21 +350,35 @@ public:
         // tells the kernel to distribute incoming packets among ALL sockets bound
         // to the same port. If a previous STC instance didn't close cleanly, or
         // another Pro DJ Link app (Bridge, rekordbox) has a socket on port 50001,
-        // the kernel splits packets between them — causing packet reordering and
+        // the kernel splits packets between them -- causing packet reordering and
         // stale playhead values that appear as timecode fluctuation.
         //
-        // Binding to the specific interface IP (bindIp) instead of INADDR_ANY
-        // further ensures we only receive packets from one network path, avoiding
-        // duplicate delivery on machines with multiple interfaces (Ethernet+WiFi).
+        // beatSock, statusSock, and bridgeSock bind to bindIp to ensure packets
+        // go out the correct NIC and to receive only from the selected interface.
         //
-        // keepaliveSock keeps SO_REUSEPORT because port 50000 is the standard
-        // ProDJLink keepalive port and we may need to coexist with other software.
-        // Bound to INADDR_ANY to receive CDJ/DJM broadcast keepalives for
-        // device discovery.
+        // keepaliveSock binding is PLATFORM-SPECIFIC:
+        //   Windows: bind to bindIp.  On multi-adapter systems (two NICs on the
+        //     same subnet), INADDR_ANY lets the OS routing table pick the outgoing
+        //     interface for broadcasts -- which may be the wrong one.  The DJM sees
+        //     the keepalive arriving from a different MAC than the payload and
+        //     rejects the bridge identity.
+        //   macOS: bind to INADDR_ANY.  macOS does NOT deliver broadcast packets
+        //     to sockets bound to a specific IP -- only to INADDR_ANY.  Without
+        //     broadcast reception on port 50000, no CDJ or DJM keepalives arrive
+        //     and device discovery fails completely.
+        // keepaliveSock keeps SO_REUSEPORT for coexistence with other Pro DJ Link
+        // software on port 50000.
 
         keepaliveSock = std::make_unique<juce::DatagramSocket>(true);
         keepaliveSock->setEnablePortReuse(true);
+#ifdef _WIN32
+        // Windows: bind to specific interface to force correct outgoing NIC
+        if (!keepaliveSock->bindToPort(ProDJLink::kKeepalivePort, bindIp)
+            && !keepaliveSock->bindToPort(ProDJLink::kKeepalivePort))
+#else
+        // macOS/Linux: INADDR_ANY required for broadcast reception
         if (!keepaliveSock->bindToPort(ProDJLink::kKeepalivePort))
+#endif
         {
             DBG("ProDJLink: Failed to bind keepalive socket to port " << ProDJLink::kKeepalivePort);
             keepaliveSock = nullptr;
@@ -779,7 +793,7 @@ public:
         return mixerCueBtn[idx].load(std::memory_order_relaxed);
     }
 
-    /// CUE B headphone button (0=off, 1=on).  V10 dual-cue; always 0 on 900NXS2.
+    /// CUE B headphone button (0=off, 1=on).  A9/V10 dual-cue; always 0 on 900NXS2.
     uint8_t getChannelCueB(int channel) const
     {
         int idx = channel - 1;
@@ -787,7 +801,11 @@ public:
         return mixerCueBtnB[idx].load(std::memory_order_relaxed);
     }
 
-    /// Input source selector (0=USB_A,1=USB_B,2=DIGITAL,3=LINE,4=PHONO,8=RET/AUX).
+    /// Input source selector per channel.
+    /// 900NXS2: 0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE, 4=PHONO, 8=RET/AUX
+    /// A9: 0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE, 4=PHONO, 7=USB, 8=RETURN, 10=BLUETOOTH
+    /// V10: 0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE, 4=PHONO, 5=BUILT-IN,
+    ///      6=EXT1, 7=EXT2, 8=MULTI I/O, 9=COMBO
     uint8_t getChannelInputSrc(int channel) const
     {
         int idx = channel - 1;
@@ -809,7 +827,7 @@ public:
     uint8_t getMasterFader()   const { return mixerMasterFader.load(std::memory_order_relaxed); }
     /// Master CUE button (0=off, 1=on).
     uint8_t getMasterCue()     const { return mixerMasterCue.load(std::memory_order_relaxed); }
-    uint8_t getMasterCueB()    const { return mixerMasterCueB.load(std::memory_order_relaxed); }   // V10 dual-cue
+    uint8_t getMasterCueB()    const { return mixerMasterCueB.load(std::memory_order_relaxed); }   // A9/V10 dual-cue
     /// Isolator On/Off (0/1).  V10 only; always 0 on 900NXS2.
     uint8_t getIsolatorOn()    const { return mixerIsolatorOn.load(std::memory_order_relaxed); }
     /// Isolator Hi (0-255, 128=center).  V10 only.
@@ -824,8 +842,8 @@ public:
     uint8_t getXfCurve()       const { return mixerXfCurve.load(std::memory_order_relaxed); }
     /// Booth monitor level (0-255).
     uint8_t getBoothLevel()    const { return mixerBooth.load(std::memory_order_relaxed); }
-    uint8_t getBoothEqHi()     const { return mixerBoothEqHi.load(std::memory_order_relaxed); }   // V10 only
-    uint8_t getBoothEqLo()     const { return mixerBoothEqLo.load(std::memory_order_relaxed); }   // V10 only
+    uint8_t getBoothEqHi()     const { return mixerBoothEqHi.load(std::memory_order_relaxed); }   // A9/V10
+    uint8_t getBoothEqLo()     const { return mixerBoothEqLo.load(std::memory_order_relaxed); }   // A9/V10
 
     /// Headphone Cue Link (0=off, 1=on).
     uint8_t getHpCueLink()     const { return mixerHpCueLink.load(std::memory_order_relaxed); }
@@ -834,12 +852,13 @@ public:
     /// Headphone level (0-255).
     uint8_t getHpLevel()       const { return mixerHpLevel.load(std::memory_order_relaxed); }
     /// HP A Pre EQ button (0=off, 1=on).  V10 only; always 0 on 900NXS2.
-    uint8_t getHpPreEq()       const { return mixerHpPreEq.load(std::memory_order_relaxed); }
-    /// Headphone B Cue Link (0=off, 1=on).  V10 only; always 0 on 900NXS2.
+    /// Booth EQ button (0=off, 1=on).  A9 and V10; always 0 on 900NXS2.
+    uint8_t getBoothEq()    const { return mixerBoothEq.load(std::memory_order_relaxed); }
+    /// Headphone B Cue Link (0=off, 1=on).  A9 and V10; always 0 on 900NXS2.
     uint8_t getHpCueLinkB()    const { return mixerHpCueLinkB.load(std::memory_order_relaxed); }
-    /// Headphone B mixing knob (0=CUE, 255=Master).  V10 only.
+    /// Headphone B mixing knob (0=CUE, 255=Master).  A9 and V10.
     uint8_t getHpMixingB()     const { return mixerHpMixingB.load(std::memory_order_relaxed); }
-    /// Headphone B level (0-255).  V10 only.
+    /// Headphone B level (0-255).  A9 and V10.
     uint8_t getHpLevelB()      const { return mixerHpLevelB.load(std::memory_order_relaxed); }
 
     /// Beat FX selector (0-13: Delay,Echo,PingPong,Spiral,Reverb,Trans,Filter,Flanger,Phaser,Pitch,SlipRoll,Roll,VinylBrake,Helix).
@@ -856,9 +875,11 @@ public:
     uint8_t getFxFreqHi()      const { return mixerFxFreqHi.load(std::memory_order_relaxed); }
     /// Send/Return level (0-255).
     uint8_t getSendReturnLevel() const { return mixerSendReturn.load(std::memory_order_relaxed); }
-    /// Multi I/O Select (0=Mic, 1-6=CH1-CH6, 7=Master).  V10 only.
+    /// Multi I/O Select.  A9 and V10; 0 on 900NXS2.
+    /// A9: 0-3=CH1-CH4, 6=MIC, 7=Master, 8=XF-A, 9=XF-B
+    /// V10: 0=Mic, 1-6=CH1-CH6, 7=Master
     uint8_t getMultiIoSelect() const { return mixerMultiIoSelect.load(std::memory_order_relaxed); }
-    /// Multi I/O Level (0-255).  V10 only.
+    /// Multi I/O Level (0-255).  A9 and V10; 0 on 900NXS2.
     uint8_t getMultiIoLevel()  const { return mixerMultiIoLevel.load(std::memory_order_relaxed); }
 
     /// Color FX selector (255=OFF, 0=Space,1=DubEcho,2=Sweep,3=Noise,4=Crush,5=Filter).
@@ -932,7 +953,7 @@ public:
     }
 
     /// Number of mixer channels based on detected DJM model.
-    /// DJM-V10 / V10-LF = 6 channels; all others = 4.
+    /// DJM-V10 / V10-LF = 6 channels; all others (900NXS2, A9) = 4.
     int getMixerChannelCount() const
     {
         juce::String model = getDJMModel();
@@ -2137,7 +2158,13 @@ private:
             out[i] = uint8_t(tokens[i].getIntValue());
     }
 
-    static bool getMacAddress(const juce::String& ifaceName, uint8_t out[6])
+    /// Get MAC address for a network interface.
+    /// On Windows, matches by IP address (reliable — adapter FriendlyName can
+    /// change with driver/OS updates, breaking name-based matching).
+    /// On macOS/Linux, matches by interface name (stable, e.g. "en0").
+    /// The interfaceIp parameter is used on Windows for IP-based matching.
+    static bool getMacAddress(const juce::String& ifaceName, uint8_t out[6],
+                              const juce::String& interfaceIp = {})
     {
         std::memset(out, 0, 6);
 
@@ -2145,11 +2172,42 @@ private:
         ULONG bufSize = 15000;
         std::vector<uint8_t> buffer(bufSize);
         auto* addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-        if (GetAdaptersAddresses(AF_INET, 0, nullptr, addresses, &bufSize) != NO_ERROR)
-            return false;
+        ULONG result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, addresses, &bufSize);
+        if (result == ERROR_BUFFER_OVERFLOW)
+        {
+            buffer.resize(bufSize);
+            addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+            result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, addresses, &bufSize);
+        }
+        if (result != NO_ERROR) return false;
+
+        // Primary: match by IP address (most reliable on Windows).
+        // Adapter FriendlyName can change with driver/OS updates, regional
+        // settings, or user renaming. The IP is what we actually bound to.
+        if (interfaceIp.isNotEmpty())
+        {
+            for (auto* adapter = addresses; adapter; adapter = adapter->Next)
+            {
+                for (auto* unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next)
+                {
+                    if (unicast->Address.lpSockaddr->sa_family == AF_INET)
+                    {
+                        auto* addr = reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr);
+                        char ipStr[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
+                        if (interfaceIp == ipStr && adapter->PhysicalAddressLength >= 6)
+                        {
+                            std::memcpy(out, adapter->PhysicalAddress, 6);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: match by adapter friendly name or description
         for (auto* adapter = addresses; adapter; adapter = adapter->Next)
         {
-            // Match by adapter friendly name or description
             juce::String friendlyName(adapter->FriendlyName);
             juce::String description(adapter->Description);
             if (friendlyName.containsIgnoreCase(ifaceName)
@@ -2225,24 +2283,28 @@ private:
     //==========================================================================
     // DJM Mixer status handler (type 0x39, 248 bytes)
     //
-    // COMPLETE OFFSET MAP — confirmed from DJM-900NXS2 packet captures.
+    // COMPLETE OFFSET MAP -- confirmed from DJM-900NXS2, DJM-A9, and DJM-V10
+    // packet captures.
     //
     // Per-channel block: 24 bytes, base=[0x024,0x03c,0x054,0x06c]
-    //   +0   Input source  900NXS2: (0=USB_A,1=USB_B,2=DIGITAL,3=LINE,4=PHONO,8=RET/AUX)
-    //                     V10: 0=USB_A, 1=USB_B, 2=DIGITAL, 3=LINE,
-    //                          4=PHONO (CH1/3/4/6), 5=BUILT-IN, 6=EXT1 (CH1-5),
-    //                          7=EXT2 (CH2-6), 8=MULTI_IO (CH2/5),
-    //                          9=COMBO_BUILTIN_EXT1_EXT2 (CH1/6)
+    //   +0   Input source:
+    //          900NXS2: 0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE,
+    //                   4=PHONO, 8=RET/AUX
+    //          A9:      0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE,
+    //                   4=PHONO, 7=USB, 8=RETURN, 10=BLUETOOTH
+    //          V10:     0=PC USB A, 1=PC USB B, 2=DIGITAL, 3=LINE,
+    //                   4=PHONO, 5=BUILT-IN, 6=EXT1, 7=EXT2,
+    //                   8=MULTI I/O, 9=COMBO
     //   +1   Trim          (0-255, 128=unity)
-    //   +2   Compressor    (0-255; V10 per-ch Comp knob, 0 on 900NXS2)
+    //   +2   Compressor    (0-255; V10 per-ch Comp knob, 0 on 900NXS2/A9)
     //   +3   EQ High       (0-255, 128=center)
     //   +4   EQ Mid        (0-255, 128=center; "Hi Mid" on V10 4-band EQ)
-    //   +5   EQ Low Mid    (0-255, 128=center; V10 only, 0 on 900NXS2)
+    //   +5   EQ Low Mid    (0-255, 128=center; V10 only, 0 on 900NXS2/A9)
     //   +6   EQ Low        (0-255, 128=center)
     //   +7   Color/FX      (0-255, 128=center)
-    //   +8   Send          (0-255, V10 per-ch send knob; 0 on 900NXS2)
+    //   +8   Send          (0-255, V10 per-ch send knob; 0 on 900NXS2/A9)
     //   +9   CUE button    (0=off, 1=on)
-    //   +10  CUE B button  (0=off, 1=on; V10 dual-cue, 0 on 900NXS2)
+    //   +10  CUE B button  (0=off, 1=on; A9/V10 dual-cue, 0 on 900NXS2)
     //   +11  Channel fader (0=closed, 255=open)
     //   +12  XF Assign     (0=THRU, 1=A, 2=B)
     //
@@ -2252,23 +2314,23 @@ private:
     //   [0x0b6]  Crossfader curve (0/1/2)
     //   [0x0b7]  Master fader     (0-255)
     //   [0x0b9]  Master CUE btn   (0/1)
-    //   [0x0ba]  Master CUE B btn (0/1; V10 dual-cue, 0 on 900NXS2)
+    //   [0x0ba]  Master CUE B btn (0/1; A9/V10 dual-cue, 0 on 900NXS2)
     //   [0x0bb]  Isolator On      (0/1; V10 only)
     //   [0x0bc]  Isolator Hi      (0-255, 128=center; V10 only)
     //   [0x0bd]  Isolator Mid     (0-255, 128=center; V10 only)
     //   [0x0be]  Isolator Lo      (0-255, 128=center; V10 only)
     //   [0x0bf]  Booth monitor    (0-255)
-    //   [0x0c0]  Booth EQ Hi      (0-255, 128=center; V10 only, 0 on 900NXS2)
-    //   [0x0c1]  Booth EQ Lo      (0-255, 128=center; V10 only, 0 on 900NXS2)
+    //   [0x0c0]  Booth EQ Hi      (0-255, 128=center; A9/V10, 0 on 900NXS2)
+    //   [0x0c1]  Booth EQ Lo      (0-255, 128=center; A9/V10, 0 on 900NXS2)
     //
     // Headphones:
     //   [0x0c4]  HP A Cue Link    (0/1)
-    //   [0x0c5]  HP B Cue Link    (0/1; V10 only)
+    //   [0x0c5]  HP B Cue Link    (0/1; A9/V10, 0 on 900NXS2)
     //   [0x0e3]  HP A Mixing      (0=CUE, 255=Master)
     //   [0x0e4]  HP A Level       (0-255)
-    //   [0x0e5]  HP A Pre EQ      (0/1; V10 only)
-    //   [0x0e6]  HP B Mixing      (0=CUE, 255=Master; V10 only)
-    //   [0x0e7]  HP B Level       (0-255; V10 only)
+    //   [0x0e5]  Booth EQ         (0/1; A9/V10, 0 on 900NXS2)
+    //   [0x0e6]  HP B Mixing      (0=CUE, 255=Master; A9/V10)
+    //   [0x0e7]  HP B Level       (0-255; A9/V10)
     //
     // Beat FX:
     //   [0x0c6]  FX Freq Low      (0/1)
@@ -2278,6 +2340,9 @@ private:
     //            900NXS2: Delay,Echo,PingPong,Spiral,Reverb,
     //                     Trans,Filter,Flanger,Phaser,Pitch,
     //                     SlipRoll,Roll,VinylBrake,Helix
+    //            A9:      Delay,Echo,PingPong,Spiral,Helix,Reverb,
+    //                     Flanger,Phaser,Filter,TripletFilter,
+    //                     Trans,Roll,TripletRoll,Mobius
     //            V10:     Delay,Echo,PingPong,Spiral,Helix,
     //                     Reverb,Shimmer,Flanger,Phaser,Filter,
     //                     Trans,Roll,Pitch,VinylBrake
@@ -2287,9 +2352,11 @@ private:
     //   [0x0cb]  Beat FX Level    (0-255)
     //   [0x0cc]  Beat FX ON/OFF   (0/1)
     //   [0x0ce]  900NXS2: Beat FX Assign (mirrors 0x0ca)
-    //            V10: Multi I/O Select  (0=Mic,1-6=CH1-CH6,7=Master)
+    //            A9: Multi I/O Select (0-3=CH1-CH4, 6=MIC, 7=Master,
+    //                                  8=XF-A, 9=XF-B)
+    //            V10: Multi I/O Select (0=Mic, 1-6=CH1-CH6, 7=Master)
     //   [0x0cf]  900NXS2: Send/Return Lvl (0-255)
-    //            V10: Multi I/O Level   (0-255)
+    //            A9/V10: Multi I/O Level (0-255)
     //
     // Color FX / Sends:
     //   [0x0db]  900NXS2: Color FX Select (255=OFF, 0=Space,1=DubEcho,2=Sweep,
@@ -2344,7 +2411,7 @@ private:
             mixerColor[ch].store    (data[b + 7],  std::memory_order_relaxed);
             mixerSend[ch].store     (data[b + 8],  std::memory_order_relaxed);  // V10 per-ch Send knob (0 on 900NXS2)
             mixerCueBtn[ch].store   (data[b + 9],  std::memory_order_relaxed);
-            mixerCueBtnB[ch].store  (data[b + 10], std::memory_order_relaxed);  // V10 CUE B (0 on 900NXS2)
+            mixerCueBtnB[ch].store  (data[b + 10], std::memory_order_relaxed);  // A9/V10 CUE B (0 on 900NXS2)
             mixerFader[ch].store    (data[b + 11], std::memory_order_relaxed);
             mixerXfAssign[ch].store (data[b + 12], std::memory_order_relaxed);
         }
@@ -2360,14 +2427,14 @@ private:
             mixerXfCurve.store      (data[0x0b6], std::memory_order_relaxed);
             mixerMasterFader.store  (data[0x0b7], std::memory_order_relaxed);
             mixerMasterCue.store    (data[0x0b9], std::memory_order_relaxed);
-            mixerMasterCueB.store   (data[0x0ba], std::memory_order_relaxed);  // V10 CUE B (0 on 900NXS2)
-            mixerIsolatorOn.store   (data[0x0bb], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerMasterCueB.store   (data[0x0ba], std::memory_order_relaxed);  // A9/V10 CUE B (0 on 900NXS2)
+            mixerIsolatorOn.store   (data[0x0bb], std::memory_order_relaxed);  // A9/V10 (0 on 900NXS2)
             mixerIsolatorHi.store   (data[0x0bc], std::memory_order_relaxed);  // V10 only
             mixerIsolatorMid.store  (data[0x0bd], std::memory_order_relaxed);  // V10 only
             mixerIsolatorLo.store   (data[0x0be], std::memory_order_relaxed);  // V10 only
             mixerBooth.store        (data[0x0bf], std::memory_order_relaxed);
-            mixerBoothEqHi.store    (data[0x0c0], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
-            mixerBoothEqLo.store    (data[0x0c1], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerBoothEqHi.store    (data[0x0c0], std::memory_order_relaxed);  // A9/V10 (0 on 900NXS2)
+            mixerBoothEqLo.store    (data[0x0c1], std::memory_order_relaxed);  // A9/V10 (0 on 900NXS2)
         }
 
         // --- Headphones ---
@@ -2376,9 +2443,9 @@ private:
             mixerHpCueLink.store    (data[0x0c4], std::memory_order_relaxed);
             mixerHpMixing.store     (data[0x0e3], std::memory_order_relaxed);
             mixerHpLevel.store      (data[0x0e4], std::memory_order_relaxed);
-            mixerHpPreEq.store      (data[0x0e5], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerBoothEq.store   (data[0x0e5], std::memory_order_relaxed);  // Booth EQ (A9 and V10; 0 on 900NXS2)
         }
-        if (0x0e7 < len)  // HP B (V10 only; 0 on 900NXS2)
+        if (0x0e7 < len)  // HP B (A9/V10; 0 on 900NXS2)
         {
             mixerHpCueLinkB.store   (data[0x0c5], std::memory_order_relaxed);
             mixerHpMixingB.store    (data[0x0e6], std::memory_order_relaxed);
@@ -2395,18 +2462,18 @@ private:
             mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);
             mixerBeatFxLevel.store  (data[0x0cb], std::memory_order_relaxed);
             mixerBeatFxOn.store     (data[0x0cc], std::memory_order_relaxed);
-            mixerBeatFxAssign.store (data[0x0ca], std::memory_order_relaxed);  // 900NXS2: same as 0x0ce; V10: 0x0ce is Multi I/O
+            mixerBeatFxAssign.store (data[0x0ca], std::memory_order_relaxed);  // 900NXS2: same as 0x0ce; A9/V10: 0x0ce is Multi I/O
             mixerSendReturn.store   (data[0x0cf], std::memory_order_relaxed);
-            mixerMultiIoSelect.store(data[0x0ce], std::memory_order_relaxed);  // V10: Multi I/O (900NXS2: mirrors 0x0ca)
-            mixerMultiIoLevel.store (data[0x0cf], std::memory_order_relaxed);  // V10: Multi I/O (900NXS2: Send/Return)
+            mixerMultiIoSelect.store(data[0x0ce], std::memory_order_relaxed);  // A9/V10: Multi I/O (900NXS2: mirrors 0x0ca)
+            mixerMultiIoLevel.store (data[0x0cf], std::memory_order_relaxed);  // A9/V10: Multi I/O (900NXS2: Send/Return)
         }
 
         // --- Color FX / Sends ---
         if (0x0e2 < len)
         {
             mixerColorFxSel.store   (data[0x0db], std::memory_order_relaxed);  // V10: Send Built-IN select
-            mixerSendExt1.store     (data[0x0dc], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
-            mixerSendExt2.store     (data[0x0dd], std::memory_order_relaxed);  // V10 only (0 on 900NXS2)
+            mixerSendExt1.store     (data[0x0dc], std::memory_order_relaxed);  // A9/V10 (0 on 900NXS2)
+            mixerSendExt2.store     (data[0x0dd], std::memory_order_relaxed);  // A9/V10 (0 on 900NXS2)
             mixerColorFxParam.store (data[0x0e2], std::memory_order_relaxed);
         }
 
@@ -2634,14 +2701,14 @@ private:
     std::atomic<uint8_t> mixerColor[6]     {{ 128 }, { 128 }, { 128 }, { 128 }, { 128 }, { 128 }};
     std::atomic<uint8_t> mixerSend[6]      {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};         // V10 per-ch Send (0 on 900NXS2)
     std::atomic<uint8_t> mixerCueBtn[6]    {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};
-    std::atomic<uint8_t> mixerCueBtnB[6]   {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};           // V10 CUE B (0 on 900NXS2)
-    std::atomic<uint8_t> mixerInputSrc[6]  {{ 3 }, { 3 }, { 3 }, { 3 }, { 3 }, { 3 }};       // per-channel input selector (see offset map for V10 enum)
+    std::atomic<uint8_t> mixerCueBtnB[6]   {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};           // A9/V10 CUE B (0 on 900NXS2)
+    std::atomic<uint8_t> mixerInputSrc[6]  {{ 3 }, { 3 }, { 3 }, { 3 }, { 3 }, { 3 }};       // per-channel input selector (see offset map for per-model enum)
     std::atomic<uint8_t> mixerXfAssign[6]  {{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }};       // 0=THRU,1=A,2=B
     // --- Global / Master ---
     std::atomic<uint8_t> mixerCrossfader   { 128 };   // 0=A, 255=B
     std::atomic<uint8_t> mixerMasterFader  { 255 };
     std::atomic<uint8_t> mixerMasterCue    { 0 };
-    std::atomic<uint8_t> mixerMasterCueB   { 0 };     // V10 CUE B (0 on 900NXS2)
+    std::atomic<uint8_t> mixerMasterCueB   { 0 };     // A9/V10 CUE B (0 on 900NXS2)
     // --- Isolator (V10 only) ---
     std::atomic<uint8_t> mixerIsolatorOn   { 0 };     // 0/1
     std::atomic<uint8_t> mixerIsolatorHi   { 128 };   // 0-255, 128=center
@@ -2650,13 +2717,13 @@ private:
     std::atomic<uint8_t> mixerFaderCurve   { 1 };     // 0/1/2
     std::atomic<uint8_t> mixerXfCurve      { 1 };     // 0/1/2
     std::atomic<uint8_t> mixerBooth        { 0 };     // 0-255
-    std::atomic<uint8_t> mixerBoothEqHi   { 128 };   // 0-255, 128=center (V10 only)
-    std::atomic<uint8_t> mixerBoothEqLo   { 128 };   // 0-255, 128=center (V10 only)
+    std::atomic<uint8_t> mixerBoothEqHi   { 128 };   // 0-255, 128=center (A9/V10)
+    std::atomic<uint8_t> mixerBoothEqLo   { 128 };   // 0-255, 128=center (A9/V10)
     // --- Headphones ---
     std::atomic<uint8_t> mixerHpCueLink    { 0 };
     std::atomic<uint8_t> mixerHpMixing     { 0 };     // 0=CUE, 255=Master
     std::atomic<uint8_t> mixerHpLevel      { 0 };
-    std::atomic<uint8_t> mixerHpPreEq      { 0 };     // V10 HP A Pre EQ (0 on 900NXS2)
+    std::atomic<uint8_t> mixerBoothEq  { 0 };     // Booth EQ (A9 and V10; 0 on 900NXS2)
     // --- Headphones B (V10 only) ---
     std::atomic<uint8_t> mixerHpCueLinkB   { 0 };
     std::atomic<uint8_t> mixerHpMixingB    { 0 };     // 0=CUE, 255=Master
@@ -2671,7 +2738,7 @@ private:
     std::atomic<uint8_t> mixerBeatFxAssign { 9 };     // 0=Mic..9=Master
     std::atomic<uint8_t> mixerColorFxAssign{ 9 };
     std::atomic<uint8_t> mixerSendReturn   { 0 };
-    // --- Multi I/O (V10 only; on 900NXS2 these offsets are Beat FX Assign / Send Return) ---
+    // --- Multi I/O (A9/V10; on 900NXS2 these offsets are Beat FX Assign / Send Return) ---
     std::atomic<uint8_t> mixerMultiIoSelect { 0 };    // 0=Mic,1-6=CH1-CH6,7=Master
     std::atomic<uint8_t> mixerMultiIoLevel  { 0 };    // 0-255
     // --- Color FX ---

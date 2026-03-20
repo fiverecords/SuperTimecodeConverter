@@ -215,11 +215,11 @@ public:
     }
 
     /// Send a raw OSC message with a single float value.
-    /// Only sends if OSC is connected.
+    /// Uses the zero-allocation fast path -- no String creation, no tokenization.
+    /// The connected check is inside sendFloatDirect (single lock acquisition).
     void sendOscFloat(const juce::String& address, float value)
     {
-        if (!oscSender.isConnected()) return;
-        oscSender.sendFloat(address, value);
+        oscSender.sendFloatDirect(address, value);
     }
 
     //--------------------------------------------------------------------------
@@ -259,11 +259,11 @@ private:
 
         void start(double bpm, juce::MidiOutput* output)
         {
-            midiOut = output;
+            midiOut.store(output, std::memory_order_relaxed);
             setBpm(bpm);
             accumulator = 0.0;
             // Send MIDI Start (0xFA)
-            if (midiOut) midiOut->sendMessageNow(juce::MidiMessage(0xFA));
+            if (output) output->sendMessageNow(juce::MidiMessage(0xFA));
             startTimer(1);
         }
 
@@ -271,8 +271,9 @@ private:
         {
             stopTimer();
             // Send MIDI Stop (0xFC)
-            if (midiOut) midiOut->sendMessageNow(juce::MidiMessage(0xFC));
-            midiOut = nullptr;
+            auto* out = midiOut.load(std::memory_order_relaxed);
+            if (out) out->sendMessageNow(juce::MidiMessage(0xFC));
+            midiOut.store(nullptr, std::memory_order_relaxed);
         }
 
         void setBpm(double bpm)
@@ -282,25 +283,26 @@ private:
         }
 
         /// Redirect clock output to a different MidiOutput (e.g. when switching
-        /// from own device to shared MtcOutput device).  Thread-safe because
-        /// hiResTimerCallback only reads midiOut after null-check.
-        void updateOutput(juce::MidiOutput* newOut) { midiOut = newOut; }
+        /// from own device to shared MtcOutput device).  Now truly thread-safe
+        /// via atomic store -- timer thread reads via atomic load.
+        void updateOutput(juce::MidiOutput* newOut) { midiOut.store(newOut, std::memory_order_relaxed); }
 
         void hiResTimerCallback() override
         {
             double ppms = pulsesPerMs.load(std::memory_order_relaxed);
-            if (ppms <= 0.0 || !midiOut) return;
+            auto* out = midiOut.load(std::memory_order_relaxed);
+            if (ppms <= 0.0 || !out) return;
 
             accumulator += ppms;
             while (accumulator >= 1.0)
             {
-                midiOut->sendMessageNow(juce::MidiMessage((uint8_t)0xF8));
+                out->sendMessageNow(juce::MidiMessage((uint8_t)0xF8));
                 accumulator -= 1.0;
             }
         }
 
     private:
-        juce::MidiOutput* midiOut = nullptr;
+        std::atomic<juce::MidiOutput*> midiOut { nullptr };
         std::atomic<double> pulsesPerMs { 0.048 };  // default 120 BPM
         double accumulator = 0.0;
     };

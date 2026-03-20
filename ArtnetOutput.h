@@ -338,7 +338,7 @@ private:
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
-    uint8_t dmxSequence = 0;  // incrementing 1-255 for OpDmx sequencing
+    uint8_t dmxSequence = 0;  // incrementing 1-255 for OpDmx sequencing (message-thread-only currently, but atomic-safe for future use)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetOutput)
 };
