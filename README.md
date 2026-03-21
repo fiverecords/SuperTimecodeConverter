@@ -14,6 +14,9 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 ![Pro DJ Link](https://img.shields.io/badge/Pro_DJ_Link-Native-00BCD4)
 ![StageLinQ](https://img.shields.io/badge/StageLinQ-Native-00CC66)
 
+
+![Super Timecode Converter](docs/screenshotV1.5.png)
+
 ---
 
 ## Features
