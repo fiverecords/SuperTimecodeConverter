@@ -88,6 +88,10 @@ public:
     // Wire this to save settings and refresh engine lookups.
     std::function<void()> onTrackMapChanged;
 
+    /// Callback to check if Show Lock is active. If set and returns true,
+    /// TrackMap writes (BPM mult double-click) are blocked.
+    std::function<bool()> isShowLockedFn;
+
     // Called when layout or mixer visibility changes (for settings persistence)
     std::function<void()> onLayoutChanged;
 
@@ -208,7 +212,9 @@ public:
                 if (isDouble)
                 {
                     // Double click: persist to TrackMap (toggle)
-                    saveBpmToTrackMap(pn, ds, clickedMult);
+                    // Blocked during Show Lock -- TrackMap is configuration.
+                    if (!isShowLockedFn || !isShowLockedFn())
+                        saveBpmToTrackMap(pn, ds, clickedMult);
                 }
                 else
                 {
@@ -1830,6 +1836,12 @@ public:
     {
         if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
             content->onLayoutChanged = std::move(cb);
+    }
+
+    void setIsShowLockedFn(std::function<bool()> cb)
+    {
+        if (auto* content = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
+            content->isShowLockedFn = std::move(cb);
     }
 
     // --- Bounds persistence ---

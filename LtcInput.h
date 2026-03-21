@@ -394,7 +394,7 @@ private:
             // Reserve 1 sentinel slot to distinguish full from empty.
             // Need freeSlots >= 2 because 1 is the sentinel -- only (freeSlots-1)
             // are actually writable.  Effective ring capacity is RING_SIZE-1
-            // (32767 samples ≈ 682ms @48kHz), which is plenty for bridging
+            // (32767 samples ~ 682ms @48kHz), which is plenty for bridging
             // the latency between input and AudioThru output callbacks.
             int toWrite = (freeSlots >= 2)
                         ? (int)juce::jmin((uint32_t)numSamples, freeSlots - 1)

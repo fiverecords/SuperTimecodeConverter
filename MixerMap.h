@@ -28,6 +28,9 @@
 ///   V10Only = V10 only (6ch, 4-band EQ, compressor, send, isolator, filter, master mix, multi I/O)
 enum class DjmModel : int { All = 0, A9Plus = 1, V10Only = 2 };
 
+/// Mixer map mode: Pioneer DJM or Denon StageLinQ
+enum class MixerMapMode { Pioneer, Denon };
+
 /// Convert a DJM model name string (from ProDJLinkInput::getDJMModel()) to a DjmModel tier.
 /// Used by MixerMapEditor, ProDJLinkView, and MainComponent for model-aware filtering.
 inline DjmModel djmModelFromString(const juce::String& modelName)
@@ -85,21 +88,27 @@ public:
     //------------------------------------------------------------------
     // Build default parameter list with hardcoded defaults
     //------------------------------------------------------------------
-    MixerMap()
+    MixerMap(MixerMapMode mode = MixerMapMode::Pioneer)
+        : mapMode(mode)
     {
-        buildDefaults();
+        if (mapMode == MixerMapMode::Denon)
+            buildDenonDefaults();
+        else
+            buildDefaults();
     }
 
     //------------------------------------------------------------------
-    // File location
+    // File location (separate files for Pioneer and Denon)
     //------------------------------------------------------------------
-    static juce::File getMixerMapFile()
+    juce::File getMixerMapFile() const
     {
         auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
                        .getChildFile("SuperTimecodeConverter");
         dir.createDirectory();
-        return dir.getChildFile("mixermap.json");
+        return dir.getChildFile(mapMode == MixerMapMode::Denon ? "slq_mixermap.json" : "mixermap.json");
     }
+
+    MixerMapMode getMode() const { return mapMode; }
 
     //------------------------------------------------------------------
     // Persistence
@@ -180,7 +189,10 @@ public:
     void resetToDefaults()
     {
         entries.clear();
-        buildDefaults();
+        if (mapMode == MixerMapMode::Denon)
+            buildDenonDefaults();
+        else
+            buildDefaults();
     }
 
     std::vector<MixerMapEntry>& getEntries() { return entries; }
@@ -188,7 +200,11 @@ public:
 
 private:
     std::vector<MixerMapEntry> entries;
+    MixerMapMode mapMode = MixerMapMode::Pioneer;
 
+    //------------------------------------------------------------------
+    // Pioneer DJM defaults (faders, EQ, effects -- 45+ params)
+    //------------------------------------------------------------------
     void buildDefaults()
     {
         entries.clear();
@@ -319,5 +335,29 @@ private:
         e.enabled     = enabled;
         e.minModel    = model;
         entries.push_back(std::move(e));
+    }
+
+    //------------------------------------------------------------------
+    // Denon StageLinQ defaults (faders + crossfader from StateMap)
+    //
+    // Currently 5 params. More will be added as hardware testing reveals
+    // additional mixer paths (EQ, effects, etc.).
+    //------------------------------------------------------------------
+    void buildDenonDefaults()
+    {
+        entries.clear();
+        entries.reserve(16);
+
+        // Per-channel faders (from /Mixer/CH{N}faderPosition)
+        for (int ch = 1; ch <= 4; ++ch)
+        {
+            juce::String pfx = "ch" + juce::String(ch);
+            juce::String grp = "Channel " + juce::String(ch);
+            juce::String osc = "/mixer/ch" + juce::String(ch);
+            addEntry(pfx + "_fader", "Fader", grp, osc, ch, ch, true);
+        }
+
+        // Crossfader (from /Mixer/CrossfaderPosition)
+        addEntry("crossfader", "Crossfader", "Master", "/mixer/crossfader", 5, 5, true);
     }
 };

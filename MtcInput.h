@@ -236,10 +236,10 @@ private:
             int maxFrames = frameRateToInt(detectedFps);
 
             // MTC quarter-frame messages describe the timecode from 2 frames
-            // prior (8 QFs × ¼ frame = 2 frames of latency).  Adding 2 compensates
+            // prior (8 QFs x 1/4 frame = 2 frames of latency).  Adding 2 compensates
             // so the displayed timecode matches the current position.
             // NOTE: this compensation assumes forward playback.  Reverse or locate
-            // operations may briefly show a ±4 frame discrepancy until the next
+            // operations may briefly show a +/-4 frame discrepancy until the next
             // full 8-QF cycle completes.
             int64_t totalFrames = (int64_t)hours * 3600 * maxFrames
                                 + (int64_t)minutes * 60 * maxFrames

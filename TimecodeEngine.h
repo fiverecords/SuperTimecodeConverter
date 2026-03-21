@@ -12,6 +12,7 @@
 #include "LtcInput.h"
 #include "LtcOutput.h"
 #include "ProDJLinkInput.h"
+#include "StageLinQInput.h"
 #include "DbServerClient.h"
 #include "TriggerOutput.h"
 #include "LinkBridge.h"
@@ -35,7 +36,7 @@ inline constexpr int kMaxEngines = 8;
 class TimecodeEngine
 {
 public:
-    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink };
+    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ };
 
     //--------------------------------------------------------------------------
     explicit TimecodeEngine(int index, const juce::String& name = {})
@@ -65,6 +66,7 @@ public:
         stopArtnetInput();
         stopLtcInput();
         // ProDJLink is shared -- not stopped per-engine
+        // StageLinQ is shared -- not stopped per-engine
     }
 
     //==========================================================================
@@ -120,6 +122,7 @@ public:
             case InputSource::ArtNet: stopArtnetInput(); break;
             case InputSource::LTC:    stopLtcInput();    break;
             case InputSource::ProDJLink: stopProDJLinkInput(); break;
+            case InputSource::StageLinQ: stopStageLinQInput(); break;
             default: break;
         }
 
@@ -127,8 +130,8 @@ public:
         activeInput = source;
         sourceActive = false;
 
-        // Reset TrackMap cache when leaving ProDJLink
-        if (source != InputSource::ProDJLink)
+        // Reset TrackMap cache when leaving ProDJLink / StageLinQ
+        if (source != InputSource::ProDJLink && source != InputSource::StageLinQ)
         {
             trackMapped = false;
             cachedTrackId = 0;
@@ -165,20 +168,29 @@ public:
     FrameRate getOutputFps() const { return outputFps; }
     Timecode getOutputTimecode() const { return outputTimecode; }
 
-    /// Playhead in ms from CDJ (for UI cursor / position display).
-    /// Reads directly from ProDJLinkInput — the CDJ-3000 sends clean
-    /// monotonic positions at ~30Hz, no smoothing needed.
+    /// Playhead in ms from CDJ/Denon (for UI cursor / position display).
+    /// Reads directly from ProDJLinkInput or StageLinQInput.
     uint32_t getSmoothedPlayheadMs() const
     {
+        if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
+        {
+            int ep = getEffectivePlayer();
+            return (ep >= 1) ? sharedStageLinQ->getPlayheadMs(ep) : 0;
+        }
         if (sharedProDJLink == nullptr) return 0;
         int ep = getEffectivePlayer();
         if (ep < 1) return 0;
         return sharedProDJLink->getPlayheadMs(ep);
     }
 
-    /// Play position as 0.0-1.0 ratio from CDJ (for waveform cursor).
+    /// Play position as 0.0-1.0 ratio (for waveform cursor).
     float getSmoothedPlayPositionRatio() const
     {
+        if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
+        {
+            int ep = getEffectivePlayer();
+            return (ep >= 1) ? sharedStageLinQ->getPlayPositionRatio(ep) : 0.0f;
+        }
         if (sharedProDJLink == nullptr) return 0.0f;
         int ep = getEffectivePlayer();
         if (ep < 1) return 0.0f;
@@ -245,6 +257,8 @@ public:
     LtcOutput&    getLtcOutput()    { return ltcOutput; }
     ProDJLinkInput& getProDJLinkInput()   { jassert(sharedProDJLink != nullptr); return *sharedProDJLink; }
     void setSharedProDJLinkInput(ProDJLinkInput* shared) { sharedProDJLink = shared; }
+    StageLinQInput& getStageLinQInput()   { jassert(sharedStageLinQ != nullptr); return *sharedStageLinQ; }
+    void setSharedStageLinQInput(StageLinQInput* shared) { sharedStageLinQ = shared; }
     void setDbServerClient(DbServerClient* client) { dbClient = client; }
     int  getProDJLinkPlayer() const     { return proDJLinkPlayer; }
     /// Returns the physical player (1-6) actually being followed.
@@ -381,6 +395,47 @@ public:
     }
 
     //==========================================================================
+    // StageLinQ input (shared across engines)
+    //==========================================================================
+    bool startStageLinQInput(int player = 1)
+    {
+        resetProDJLinkCache();
+
+        // Reset forward dedup
+        lastSentClockBpm = -1.0f;
+        lastSentOscBpm = -1.0f;
+        std::fill(std::begin(lastSentSlqMixer), std::end(lastSentSlqMixer), -1);
+
+        // Reset DMX buffer to avoid broadcasting stale Pioneer data
+        std::memset(dmxBuffer, 0, sizeof(dmxBuffer));
+        dmxHighWaterMark = 0;
+        lastDmxSendTime = 0.0;
+
+        // StageLinQ has no fps auto-detection -- use configured output fps
+        currentFps = outputFps;
+
+        proDJLinkPlayer = juce::jlimit(1, StageLinQ::kMaxDecks, player);
+        resolvedXfPlayer = 0;
+
+        if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
+        {
+            lastSeenTrackVersion = sharedStageLinQ->getTrackVersion(proDJLinkPlayer);
+            inputStatusText = "LISTENING | " + sharedStageLinQ->getBindInfo();
+            return true;
+        }
+        inputStatusText = "WAITING FOR STAGELINQ...";
+        return sharedStageLinQ != nullptr;
+    }
+
+    void stopStageLinQInput()
+    {
+        // Reset PLL and LTC encoder state so other sources start clean.
+        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
+        ltcOutput.setPitchMultiplier(1.0);
+    }
+
+    //==========================================================================
     // TrackMap -- track-to-timecode-offset mapping
     //==========================================================================
 
@@ -401,6 +456,12 @@ public:
     {
         mixerMapPtr = map;
         std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
+    }
+
+    void setSlqMixerMap(MixerMap* map)
+    {
+        slqMixerMapPtr = map;
+        std::fill(std::begin(lastSentSlqMixer), std::end(lastSentSlqMixer), -1);
     }
 
     /// Enable or disable TrackMap offset application.
@@ -754,7 +815,7 @@ public:
                     }
 
                     // PLL runs only for pitch calculation (LTC bit-rate scaling).
-                    // It does NOT drive the displayed timecode — that comes directly
+                    // It does NOT drive the displayed timecode -- that comes directly
                     // from the CDJ's playhead, which is clean and monotonic (~30Hz).
                     double cdjSpeed = sharedProDJLink->getActualSpeed(ep);
                     pll.tick(
@@ -773,7 +834,7 @@ public:
 
                     if (isNewPacket)
                     {
-                        // New CDJ data arrived — snap to real position
+                        // New CDJ data arrived -- snap to real position
                         pdlLastPlayheadMs = rawPlayheadMs;
                         pdlSnapMs = (double)rawPlayheadMs;
                         pdlSnapTime = now;
@@ -1030,6 +1091,203 @@ public:
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
+
+            case InputSource::StageLinQ:
+                if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
+                {
+                    // StageLinQ does not support XF-A/XF-B (no DJM mixer protocol)
+                    const int ep = proDJLinkPlayer;
+                    if (ep < 1 || ep > StageLinQ::kMaxDecks)
+                    {
+                        sourceActive = false;
+                        if (statusTextVisible) inputStatusText = "INVALID DECK";
+                        break;
+                    }
+
+                    // Drive PLL from StageLinQ deck data
+                    double slqSpeed = sharedStageLinQ->getActualSpeed(ep);
+                    pll.tick(
+                        sharedStageLinQ->getPlayheadMs(ep),
+                        sharedStageLinQ->getAbsPositionTs(ep),
+                        slqSpeed,
+                        sharedStageLinQ->isPositionMoving(ep)
+                    );
+
+                    // Smooth timecode display using interpolation between StateMap/BeatInfo updates
+                    uint32_t rawPlayheadMs = sharedStageLinQ->getPlayheadMs(ep);
+                    double now = juce::Time::getMillisecondCounterHiRes();
+
+                    bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
+                    if (isNewPacket)
+                    {
+                        pdlLastPlayheadMs = rawPlayheadMs;
+                        pdlSnapMs = (double)rawPlayheadMs;
+                        pdlSnapTime = now;
+                        pdlSnapSpeed = slqSpeed;
+                        currentTimecode = StageLinQ::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
+                    }
+                    else if (pdlSnapSpeed > 0.01 && sharedStageLinQ->isPlayerPlaying(ep))
+                    {
+                        double elapsed = now - pdlSnapTime;
+                        double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
+                        double maxAdvance = 50.0 * pdlSnapSpeed;
+                        if (elapsed <= maxAdvance)
+                            currentTimecode = StageLinQ::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
+                    }
+
+                    // Feed pitch to LTC output.
+                    // Use pll.pitch directly -- same as ProDJLink.  When the deck
+                    // pauses, Speed ramps toward 0, the PLL follows, and LTC
+                    // decelerates smoothly.  The previous code gated on isPlaying
+                    // which cut LTC to zero the instant Play=false arrived -- before
+                    // Speed had a chance to ramp down -- causing an audible click
+                    // in the LTC audio stream.
+                    // No end-of-track freeze needed: Denon does not have the CDJ
+                    // frozen-actualSpeed quirk.  sourceActive below gates on
+                    // speed >= kMinEncodingPitch, which handles the stopped state.
+                    ltcOutput.setPitchMultiplier(pll.pitch);
+
+                    // --- Track change detection ---
+                    uint32_t slqTrackVer = sharedStageLinQ->getTrackVersion(ep);
+                    if (slqTrackVer != lastSeenTrackVersion)
+                    {
+                        lastSeenTrackVersion = slqTrackVer;
+                        auto tinfo = sharedStageLinQ->getTrackInfo(ep);
+                        if (tinfo.artist.isNotEmpty() || tinfo.title.isNotEmpty())
+                        {
+                            cachedTrackArtist = tinfo.artist;
+                            cachedTrackTitle  = tinfo.title;
+                            cachedTrackId = slqTrackVer;  // StageLinQ has no numeric ID; use version
+
+                            DBG("TimecodeEngine: StageLinQ track changed -- "
+                                + cachedTrackArtist + " - " + cachedTrackTitle
+                                + " deck=" + juce::String(ep));
+
+                            const auto* entry = lookupTrackInMap();
+                            bpmPlayerOverride = kBpmNoOverride;
+                            lastSentClockBpm = -1.0f;
+                            lastSentOscBpm   = -1.0f;
+                            fireTrackTrigger(entry);
+                        }
+                    }
+
+                    // Persist auto-filled metadata
+                    if (trackMapDirty && trackMapPtr != nullptr)
+                    {
+                        trackMapDirty = false;
+                        trackMapPtr->save();
+                    }
+
+                    // Apply timecode offset from TrackMap
+                    if (trackMapEnabled && trackMapped)
+                    {
+                        currentTimecode = applyTimecodeOffset(
+                            currentTimecode, currentFps,
+                            cachedOffH, cachedOffM, cachedOffS, cachedOffF,
+                            currentFps);
+                    }
+
+                    bool slqRx = sharedStageLinQ->isReceiving();
+                    if (statusTextVisible)
+                    {
+                        if (slqRx)
+                        {
+                            bool slqHasTC = sharedStageLinQ->hasTimecodeData(ep);
+                            if (slqHasTC)
+                            {
+                                juce::String slqModel = sharedStageLinQ->getPlayerModel(ep);
+                                inputStatusText = "RX D" + juce::String(ep);
+                                if (slqModel.isNotEmpty())
+                                    inputStatusText += " " + slqModel;
+
+                                if (!sharedStageLinQ->isPositionMoving(ep))
+                                    inputStatusText += " " + sharedStageLinQ->getPlayStateString(ep);
+
+                                double slqBpm = sharedStageLinQ->getBPM(ep);
+                                if (slqBpm > 0.0)
+                                    inputStatusText += " | " + juce::String(slqBpm, 1) + " BPM";
+                            }
+                            else
+                            {
+                                inputStatusText = "D" + juce::String(ep)
+                                    + " " + sharedStageLinQ->getPlayStateString(ep)
+                                    + " - NO POSITION DATA";
+                            }
+
+                            if (slqHasTC && trackMapEnabled
+                                && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty())
+                            {
+                                if (trackMapped)
+                                    inputStatusText += " | MAP: " + cachedTrackTitle;
+                                else
+                                    inputStatusText += " | NO MAP";
+                            }
+
+                            inputStatusText += " | " + sharedStageLinQ->getBindInfo();
+                        }
+                        else
+                        {
+                            inputStatusText = "WAITING | " + sharedStageLinQ->getBindInfo();
+                        }
+                    }
+
+                    // --- MIDI Clock ---
+                    if (slqRx && midiClockEnabled && triggerOutput.isMidiClockRunning())
+                    {
+                        double slqClkBpm = sharedStageLinQ->getMasterBPM();
+                        if (slqClkBpm <= 0.0) slqClkBpm = sharedStageLinQ->getBPM(ep);
+                        slqClkBpm = applyBpmMultiplier(slqClkBpm, getEffectiveBpmMultiplier());
+                        if (slqClkBpm > 0.0 && std::abs((float)slqClkBpm - lastSentClockBpm) > 0.05f)
+                        {
+                            triggerOutput.updateMidiClockBpm(slqClkBpm);
+                            lastSentClockBpm = (float)slqClkBpm;
+                        }
+                    }
+
+                    // --- Ableton Link ---
+                    if (slqRx && linkBridge.isEnabled())
+                    {
+                        double slqLnkBpm = sharedStageLinQ->getMasterBPM();
+                        if (slqLnkBpm <= 0.0) slqLnkBpm = sharedStageLinQ->getBPM(ep);
+                        slqLnkBpm = applyBpmMultiplier(slqLnkBpm, getEffectiveBpmMultiplier());
+                        if (slqLnkBpm > 0.0)
+                            linkBridge.setTempo(slqLnkBpm);
+                    }
+
+                    // --- OSC BPM Forward ---
+                    if (slqRx && oscForwardEnabled && triggerOutput.isOscConnected())
+                    {
+                        double slqOscBpm = sharedStageLinQ->getMasterBPM();
+                        if (slqOscBpm <= 0.0) slqOscBpm = sharedStageLinQ->getBPM(ep);
+                        slqOscBpm = applyBpmMultiplier(slqOscBpm, getEffectiveBpmMultiplier());
+                        if (slqOscBpm > 0.0 && std::abs((float)slqOscBpm - lastSentOscBpm) > kOscBpmThreshold)
+                        {
+                            triggerOutput.sendOscFloat(oscFwdBpmAddr, (float)slqOscBpm);
+                            lastSentOscBpm = (float)slqOscBpm;
+                        }
+                    }
+
+                    // --- Mixer fader forward (OSC/MIDI/ArtNet) ---
+                    if (slqRx && (oscMixerForwardEnabled || midiMixerForwardEnabled || artnetMixerForwardEnabled))
+                    {
+                        forwardStageLinQMixer();
+                    }
+
+                    // sourceActive from direct play state
+                    bool slqHasData = sharedStageLinQ->hasTimecodeData(ep);
+                    double speed = (pll.actualSpeed > pll.kDeadZone)
+                                 ? pll.actualSpeed
+                                 : std::abs(pll.smoothVelocity);
+
+                    bool wasActive = sourceActive;
+                    sourceActive = slqRx && slqHasData
+                                && (speed >= PlayheadPLL::kMinEncodingPitch);
+
+                    if (sourceActive && !wasActive)
+                        ltcOutput.reseed();
+                }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
+                break;
         }
 
         routeTimecodeToOutputs();
@@ -1070,6 +1328,7 @@ public:
             case InputSource::ArtNet:     return artnetInput.getIsRunning();
             case InputSource::LTC:        return ltcInput.getIsRunning();
             case InputSource::ProDJLink:  return sharedProDJLink != nullptr && sharedProDJLink->getIsRunning();
+            case InputSource::StageLinQ:  return sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning();
             default:                      return false;
         }
     }
@@ -1083,6 +1342,7 @@ public:
             case InputSource::SystemTime: return "SystemTime";
             case InputSource::LTC:        return "LTC";
             case InputSource::ProDJLink:  return "ProDJLink";
+            case InputSource::StageLinQ:  return "StageLinQ";
         }
         return "SystemTime";
     }
@@ -1093,6 +1353,7 @@ public:
         if (s == "ArtNet") return InputSource::ArtNet;
         if (s == "LTC") return InputSource::LTC;
         if (s == "ProDJLink") return InputSource::ProDJLink;
+        if (s == "StageLinQ") return InputSource::StageLinQ;
         if (s == "TCNet") return InputSource::ProDJLink;  // legacy migration
         return InputSource::SystemTime;
     }
@@ -1106,6 +1367,7 @@ public:
             case InputSource::SystemTime: return "SYSTEM";
             case InputSource::LTC:        return "LTC";
             case InputSource::ProDJLink:  return "PRO DJ LINK";
+            case InputSource::StageLinQ:  return "STAGELINQ";
             default:                      return "---";
         }
     }
@@ -1173,6 +1435,7 @@ private:
     LtcInput     ltcInput;
     LtcOutput    ltcOutput;
     ProDJLinkInput* sharedProDJLink = nullptr;  // shared across engines
+    StageLinQInput* sharedStageLinQ = nullptr;  // shared across engines
     DbServerClient* dbClient       = nullptr;  // shared across engines (Phase 2)
     int             proDJLinkPlayer = 1;        // per-engine player selection (1..6, 7=XF-A, 8=XF-B)
 
@@ -1466,6 +1729,7 @@ private:
     // TrackMap state (track-to-offset mapping)
     TrackMap* trackMapPtr       = nullptr;
     MixerMap* mixerMapPtr       = nullptr;
+    MixerMap* slqMixerMapPtr    = nullptr;  // Denon StageLinQ mixer map
     bool      trackMapEnabled   = false;
     bool      trackMapped       = false;    // current track has a mapping
     bool      trackMapDirty     = false;    // auto-fill modified map, needs save
@@ -1515,13 +1779,21 @@ private:
     int lastSentMixer[kMaxMixerEntries];  // initialised to -1 in constructor/reset
     uint32_t lastMixerPktCount = 0;      // for dirty-flag skip in forwardMixerParams
 
+    // StageLinQ mixer dedup: 4 faders + 1 crossfader (0-255 scaled)
+    static constexpr int kSlqMixerSlots = 5;  // CH1..CH4 fader + crossfader
+    int lastSentSlqMixer[kSlqMixerSlots] = { -1, -1, -1, -1, -1 };
+
 public:
     void setMidiClockEnabled(bool enabled)
     {
         midiClockEnabled = enabled;
         if (enabled && triggerOutput.isMidiOpen())
         {
-            float bpm = (sharedProDJLink != nullptr) ? (float)sharedProDJLink->getMasterBPM() : 0.0f;
+            float bpm = 0.0f;
+            if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
+                bpm = (float)sharedStageLinQ->getBPM(proDJLinkPlayer);
+            else if (sharedProDJLink != nullptr)
+                bpm = (float)sharedProDJLink->getMasterBPM();
             triggerOutput.startMidiClock(bpm > 0.0f ? (double)bpm : 120.0);
         }
         else
@@ -1822,6 +2094,87 @@ private:
                 lastDmxSendTime = now;
             }
         }
+    }
+
+    //==========================================================================
+    // Forward StageLinQ mixer data (faders + crossfader) via OSC/MIDI/ArtNet.
+    //
+    // StageLinQ provides channel faders (0.0-1.0) and crossfader (0.0-1.0)
+    // directly from StateMap. No MixerMap needed -- we use built-in addresses.
+    //
+    // OSC:    /mixer/ch1/fader .. /mixer/ch4/fader, /mixer/crossfader  (0.0-1.0)
+    // MIDI:   CC 1-4 = faders, CC 5 = crossfader  (0-127)
+    // ArtNet: DMX ch 1-4 = faders, ch 5 = crossfader  (0-255)
+    //
+    // When more mixer paths are discovered from hardware (EQ, effects, etc.),
+    // they can be added here without requiring a MixerMap editor.
+    //==========================================================================
+    void forwardStageLinQMixer()
+    {
+        if (!sharedStageLinQ || !slqMixerMapPtr) return;
+
+        const bool doOsc    = oscMixerForwardEnabled && triggerOutput.isOscConnected();
+        const bool doMidi   = midiMixerForwardEnabled && triggerOutput.isMidiOpen();
+        const bool doArtnet = artnetMixerForwardEnabled && artnetOutput.getIsRunning();
+        if (!doOsc && !doMidi && !doArtnet) return;
+
+        bool dmxDirty = false;
+        const int ccCh   = midiMixerCCChannel;
+        const int noteCh = midiMixerNoteChannel;
+        const int n = juce::jmin(slqMixerMapPtr->size(), kSlqMixerSlots);
+        const auto& entries = slqMixerMapPtr->getEntries();
+
+        for (int i = 0; i < n; ++i)
+        {
+            const auto& e = entries[(size_t)i];
+            if (!e.enabled) continue;
+
+            int val = readSlqMixerValue(i);
+            if (val < 0 || val == lastSentSlqMixer[i]) continue;
+
+            if (doOsc && e.oscAddress.isNotEmpty())
+                triggerOutput.sendOscFloat(e.oscAddress, val / 255.0f);
+
+            if (doMidi && e.midiCC >= 0)
+                triggerOutput.sendCC(ccCh, e.midiCC, val >> 1);
+
+            if (doMidi && e.midiNote >= 0)
+                triggerOutput.sendNote(noteCh, e.midiNote, val >> 1);
+
+            if (doArtnet && e.artnetCh > 0 && e.artnetCh <= 512)
+            {
+                dmxBuffer[e.artnetCh - 1] = (uint8_t)val;
+                dmxDirty = true;
+                if (e.artnetCh > dmxHighWaterMark)
+                    dmxHighWaterMark = e.artnetCh;
+            }
+
+            lastSentSlqMixer[i] = val;
+        }
+
+        // Art-Net DMX re-send (prevent node timeout)
+        if (doArtnet && dmxHighWaterMark > 0)
+        {
+            double now = juce::Time::getMillisecondCounterHiRes();
+            if (dmxDirty || (now - lastDmxSendTime) >= 100.0)
+            {
+                artnetOutput.sendDmxFrame(dmxBuffer, dmxHighWaterMark, artnetMixerUniverse);
+                lastDmxSendTime = now;
+            }
+        }
+    }
+
+    /// Read a StageLinQ mixer value (0-255) by MixerMap entry index.
+    /// Entry order matches buildDenonDefaults():
+    ///   [0] CH1 fader, [1] CH2 fader, [2] CH3 fader, [3] CH4 fader, [4] crossfader
+    int readSlqMixerValue(int entryIndex) const
+    {
+        if (!sharedStageLinQ) return -1;
+        if (entryIndex >= 0 && entryIndex < 4)
+            return juce::jlimit(0, 255, (int)(sharedStageLinQ->getFaderPosition(entryIndex + 1) * 255.0));
+        if (entryIndex == 4)
+            return juce::jlimit(0, 255, (int)(sharedStageLinQ->getCrossfaderPosition() * 255.0));
+        return -1;
     }
 
     /// Read a DJM mixer parameter value (0-255) by MixerMap entry index.

@@ -300,8 +300,8 @@ private:
 
         packet[10] = 0x00;  // ProtVer Hi (big-endian)
         packet[11] = 0x0E;  // ProtVer Lo = 14 (Art-Net 4 standard)
-        packet[12] = 0;     // Filler1 -- reserved, must be 0 (Art-Net 4 spec §12)
-        packet[13] = 0;     // Filler2 -- reserved, must be 0 (Art-Net 4 spec §12)
+        packet[12] = 0;     // Filler1 -- reserved, must be 0 (Art-Net 4 spec Sec.12)
+        packet[13] = 0;     // Filler2 -- reserved, must be 0 (Art-Net 4 spec Sec.12)
 
         packet[14] = (uint8_t)tc.frames;
         packet[15] = (uint8_t)tc.seconds;

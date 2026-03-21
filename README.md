@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ and DJM hardware** via native Pro DJ Link integration — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
 [![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
@@ -12,6 +12,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 ![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
 ![Ableton Link](https://img.shields.io/badge/Ableton_Link-Supported-brightgreen)
 ![Pro DJ Link](https://img.shields.io/badge/Pro_DJ_Link-Native-00BCD4)
+![StageLinQ](https://img.shields.io/badge/StageLinQ-Native-00CC66)
 
 ---
 
@@ -24,7 +25,7 @@ Run **up to 8 independent timecode engines** simultaneously. Each engine has its
 - Route system clock to MTC on one engine while converting LTC input to Art-Net on another
 - Feed the same source to multiple outputs with different frame offsets
 - Run independent MTC, Art-Net, and LTC pipelines side by side — each with its own device assignments
-- Monitor different CDJ players on separate engines — each generating independent timecode streams
+- Monitor different CDJ or Denon players on separate engines — each generating independent timecode streams
 
 Engines are managed through the tab bar at the top of the window. Click **+** to add a new engine, right-click a tab to rename or remove it. The dashboard in the centre shows all engines at a glance with their current timecodes and status.
 
@@ -33,6 +34,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 ### Inputs (select one per engine)
 
 - **Pro DJ Link** — connect directly to Pioneer CDJ/XDJ/DJM hardware on the network (see below)
+- **StageLinQ** — connect directly to Denon Engine OS hardware on the network (see below)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
@@ -80,9 +82,40 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - Album artwork
 - Color preview waveform (ThreeBand and ColorNxs2 formats)
 
+### StageLinQ Integration (Denon) -- Preliminary
+
+STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving deck state, track metadata, mixer fader positions, and beat information in real time.
+
+**Note:** This implementation is based entirely on open-source protocol references and has not yet been tested with real Denon hardware. If you have access to Denon Prime equipment, please try it and report results on [GitHub](https://github.com/fiverecords/SuperTimecodeConverter/issues).
+
+**Supported hardware:** SC5000, SC6000, SC6000M, LC6000, Prime 4, Prime 2, Prime Go, X1800, X1850. Other StageLinQ-compatible hardware should work but has not been verified yet -- please report any issues on GitHub.
+
+**Deck state (via StateMap service):**
+- Play/pause/cue state per deck (up to 4 decks per device)
+- Current BPM, pitch/speed, speed state
+- Track metadata: artist, title, duration, loaded state
+- Channel fader positions and crossfader position
+
+**Beat information (via BeatInfo service):**
+- Real-time beat position, total beats, and BPM per deck
+- Timeline position for playhead tracking
+- Beat-in-bar derived from beat position
+
+**Protocol notes:**
+- Discovery via UDP broadcast on port 51337
+- StateMap and BeatInfo data received over persistent TCP connections
+- All strings encoded as UTF-16BE with JSON values
+- No additional software or hardware bridge required
+- StageLinQ implementation based on open-source reverse-engineering work by chrisle/StageLinq, icedream/go-stagelinq, and Jaxc/PyStageLinQ (all MIT licensed)
+
+**Known limitations:**
+- No artwork or waveform display (requires FileTransfer service -- planned for future release)
+- No DJM-style mixer parameter mapping (Denon mixers expose basic fader data only via StateMap)
+- XF-A/XF-B crossfader auto-follow not available (requires Pioneer DJM protocol)
+
 ### Track Map
 
-Map tracks by **artist + title** to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ, STC automatically applies the timecode offset and fires the configured triggers. Tracks are identified universally regardless of which USB/SD they are loaded from.
+Map tracks by **artist + title** to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ or Denon deck, STC automatically applies the timecode offset and fires the configured triggers. Tracks are identified universally regardless of which USB/SD they are loaded from.
 
 - Per-track timecode offset (HH:MM:SS:FF)
 - Per-track BPM multiplier (/4, /2, 1x, x2, x4) — applied to MIDI Clock, Ableton Link, and OSC BPM forward
@@ -131,11 +164,11 @@ Scale the BPM sent to MIDI Clock, Ableton Link, and OSC before forwarding — us
 
 ### Ableton Link
 
-BPM from the selected CDJ player is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically.
+BPM from the selected CDJ player or Denon deck is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically.
 
 ### MIDI Clock & OSC BPM Forward
 
-- **MIDI Clock:** 24ppqn clock driven by CDJ BPM
+- **MIDI Clock:** 24ppqn clock driven by CDJ or Denon deck BPM
 - **OSC BPM:** sends current BPM as float to configurable OSC address (default: Resolume tempo controller)
 
 ### Shared MIDI Output
@@ -162,6 +195,12 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 ### Synchronization
 
 - **Output frame offsets** — independent offset per output (MTC, Art-Net, LTC) from −30 to +30 frames, to compensate for device latency or synchronization differences
+
+### Show Lock
+
+Prevents accidental changes during live shows. A single click on the **SHOW LOCK** button in the tab bar locks all configuration: input sources, frame rates, device assignments, engine add/remove, TrackMap editor, output frame offsets, integration toggles (OSC, MIDI clock, MIDI/ArtNet mixer forward, Ableton Link, triggers), and backup/restore. Attempting a blocked action flashes the lock button as visual feedback; ComboBox and slider selections revert automatically.
+
+Operational controls remain active while locked: output enable/disable (for emergency silencing), gain sliders, BPM multiplier, freewheel controls, and view windows. Unlock requires a confirmation dialog to prevent accidental unlock. Lock state persists across restarts.
 
 ### Additional Capabilities
 
@@ -225,7 +264,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.5.3)
+   project(SuperTimecodeConverter VERSION 1.6.0)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -235,7 +274,7 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.5.3"
+       VERSION "1.6.0"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -243,12 +282,14 @@ When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port,
    target_sources(SuperTimecodeConverter PRIVATE
        Main.cpp
        MainComponent.cpp
+       sqlite3.c
    )
 
    target_compile_definitions(SuperTimecodeConverter PRIVATE
        JUCE_WEB_BROWSER=0
        JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_PRODUCT_NAME>"
        JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
+       SQLITE_THREADSAFE=1
    )
 
    target_link_libraries(SuperTimecodeConverter PRIVATE
@@ -431,6 +472,18 @@ The application is built around a modular, header-only architecture:
 
 ---
 
+## Roadmap
+
+Planned features for upcoming releases:
+
+- **Denon DJ / Engine DJ support (StageLinQ)** -- Connect to Denon Prime hardware (SC5000, SC6000, Prime 4, Prime Go, Prime 2) via the StageLinQ protocol. Track metadata, playhead position, mixer faders, and beat data from Denon devices would feed into STC's existing timecode engines, enabling the same show control workflow currently available for Pioneer DJ setups. Community interest has been strong and the protocol is well-documented by open-source projects.
+
+- **DJM-A9 full protocol validation** -- Continue mapping any remaining A9-specific parameter differences as community captures become available.
+
+If you have hardware to test or Wireshark captures to share, please open an issue on GitHub.
+
+---
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
@@ -445,30 +498,39 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ## Disclaimer
 
-This project is **not affiliated with, endorsed by, or associated with AlphaTheta Corporation or Pioneer DJ** in any way. PRO DJ LINK™ is a trademark of AlphaTheta Corporation. Pioneer DJ is a trademark of Pioneer Corporation, used under license by AlphaTheta Corporation. All other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
+This project is **not affiliated with, endorsed by, or associated with AlphaTheta Corporation or Pioneer DJ** in any way. PRO DJ LINK is a trademark of AlphaTheta Corporation. Pioneer DJ is a trademark of Pioneer Corporation, used under license by AlphaTheta Corporation.
 
-The Pro DJ Link protocol implementation in this project is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. This project has not been developed using any proprietary documentation, SDK, or confidential information from AlphaTheta Corporation.
+This project is **not affiliated with, endorsed by, or associated with inMusic Brands, Inc., Denon DJ, or Engine DJ** in any way. Denon is a trademark of D&M Holdings Inc. Denon DJ and Engine DJ are trademarks of inMusic Brands, Inc. StageLinQ is a protocol developed by inMusic/Denon DJ for their Engine OS hardware.
 
-**Use at your own risk.** This software communicates with DJ hardware using an undocumented protocol. While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+All other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
 
-Ableton Link™ is a trademark of Ableton AG. This project is not affiliated with, endorsed by, or associated with Ableton AG. The Link SDK is used under the terms of the Ableton Link License.
+The Pro DJ Link protocol implementation in this project is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. The StageLinQ protocol implementation is based on independent open-source reverse-engineering work by [chrisle/StageLinq](https://github.com/chrisle/StageLinq) (TypeScript, MIT), [icedream/go-stagelinq](https://github.com/icedream/go-stagelinq) (Go, MIT), and [Jaxc/PyStageLinQ](https://github.com/Jaxc/PyStageLinQ) (Python, MIT). This project has not been developed using any proprietary documentation, SDK, or confidential information from AlphaTheta Corporation or inMusic Brands, Inc.
+
+**Use at your own risk.** This software communicates with DJ hardware using undocumented protocols. While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+
+Ableton Link is a trademark of Ableton AG. This project is not affiliated with, endorsed by, or associated with Ableton AG. The Link SDK is used under the terms of the Ableton Link License.
 
 ---
 
 ## Credits
 
-Developed by **Joaquin Villodre** — [github.com/fiverecords](https://github.com/fiverecords)
+Developed by **Joaquin Villodre** -- [github.com/fiverecords](https://github.com/fiverecords)
 
-Built with [JUCE](https://juce.com/) — the cross-platform C++ framework for audio applications.
+Built with [JUCE](https://juce.com/) -- the cross-platform C++ framework for audio applications.
 
-The Pro DJ Link implementation would not have been possible without the incredible protocol documentation by **Deep Symmetry** — their [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) provided the foundation for understanding the Pioneer protocol and paved the way for this integration.
+The Pro DJ Link implementation would not have been possible without the incredible protocol documentation by **Deep Symmetry** -- their [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) provided the foundation for understanding the Pioneer protocol and paved the way for this integration.
+
+The StageLinQ implementation is built on the open-source reverse-engineering work of three projects: **chrisle/StageLinq** by Chris Le and Martijn Reuvers (TypeScript, the most complete implementation including FileTransfer and database access), **icedream/go-stagelinq** by Carl Kittelberger (Go, clean protocol reference and BeatInfo), and **Jaxc/PyStageLinQ** by Jaxc (Python, byte-level protocol documentation and Wireshark dissector). Their collective work made third-party StageLinQ integration possible.
 
 ---
 
 ## Links
 
 - [GitHub Repository](https://github.com/fiverecords/SuperTimecodeConverter)
-- [Deep Symmetry — DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/)
+- [Deep Symmetry -- DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/)
+- [chrisle/StageLinq -- TypeScript StageLinQ library](https://github.com/chrisle/StageLinq)
+- [icedream/go-stagelinq -- Go StageLinQ library](https://github.com/icedream/go-stagelinq)
+- [Jaxc/PyStageLinQ -- Python StageLinQ library](https://github.com/Jaxc/PyStageLinQ)
 - [JUCE Framework](https://juce.com/)
 - [Art-Net Protocol](https://art-net.org.uk/)
 - [MIDI Time Code Specification](https://en.wikipedia.org/wiki/MIDI_timecode)

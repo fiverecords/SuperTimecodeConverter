@@ -85,6 +85,9 @@ public:
 
         addAndMakeVisible(btnToggleModel);
         updateModelButton();
+        // Hide DJM model filter for Denon mode (no model tiers)
+        if (mixerMap.getMode() == MixerMapMode::Denon)
+            btnToggleModel.setVisible(false);
         btnToggleModel.onClick = [this]
         {
             // Cycle: 900NXS2 -> A9 -> V10 -> 900NXS2
@@ -104,7 +107,7 @@ public:
         {
             fileChooser = std::make_unique<juce::FileChooser>(
                 "Export Mixer Map", juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                    .getChildFile("mixermap.json"), "*.json");
+                    .getChildFile(mixerMap.getMode() == MixerMapMode::Denon ? "slq_mixermap.json" : "mixermap.json"), "*.json");
             fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
                                    | juce::FileBrowserComponent::canSelectFiles,
                 [this](const juce::FileChooser& fc)

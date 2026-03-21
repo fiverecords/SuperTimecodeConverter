@@ -11,7 +11,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.5.3"; }
+    const juce::String getApplicationVersion() override { return "1.6.0"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
@@ -26,7 +26,12 @@ public:
 
     void systemRequestedQuit() override
     {
-        quit();
+        // Route through closeButtonPressed so the Show Lock guard applies
+        // (covers macOS Cmd+Q, dock Quit, etc.)
+        if (mainWindow != nullptr)
+            mainWindow->closeButtonPressed();
+        else
+            quit();
     }
 
     class MainWindow : public juce::DocumentWindow
@@ -71,18 +76,48 @@ public:
 
         void closeButtonPressed() override
         {
+            auto* mc = dynamic_cast<MainComponent*>(getContentComponent());
+
+            // If Show Lock is active, confirm before quitting
+            if (mc != nullptr && mc->isShowModeLocked())
+            {
+                auto options = juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle("Show Lock Active")
+                    .withMessage("Show Lock is active. Closing the application "
+                                 "will stop all timecode outputs.\n\n"
+                                 "Are you sure you want to quit?")
+                    .withButton("Quit")
+                    .withButton("Cancel");
+                juce::Component::SafePointer<MainWindow> safeThis(this);
+                juce::AlertWindow::showAsync(options, [safeThis](int result)
+                {
+                    if (safeThis == nullptr) return;
+                    if (result == 1)
+                    {
+                        auto* mc2 = dynamic_cast<MainComponent*>(safeThis->getContentComponent());
+                        safeThis->saveWindowBoundsAndQuit(mc2);
+                    }
+                });
+                return;
+            }
+
+            saveWindowBoundsAndQuit(mc);
+        }
+
+    private:
+        void saveWindowBoundsAndQuit(MainComponent* mc)
+        {
             // Save window bounds before quitting
-            if (auto* mc = dynamic_cast<MainComponent*>(getContentComponent()))
+            if (mc != nullptr)
             {
                 auto b = getBounds();
                 mc->saveMainWindowBounds(
                     juce::String(b.getX()) + " " + juce::String(b.getY()) + " "
                     + juce::String(b.getWidth()) + " " + juce::String(b.getHeight()));
             }
-            JUCEApplication::getInstance()->systemRequestedQuit();
+            JUCEApplication::getInstance()->quit();
         }
-
-    private:
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainWindow)
     };
 

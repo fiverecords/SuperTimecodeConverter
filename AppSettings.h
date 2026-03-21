@@ -673,6 +673,7 @@ struct AppSettings
     // Window positions/sizes (persisted as "x y w h" strings, empty = default)
     juce::String mainWindowBounds;
     juce::String pdlViewBounds;
+    juce::String slqViewBounds;
     juce::String trackMapBounds;
     juce::String mixerMapBounds;
 
@@ -680,11 +681,17 @@ struct AppSettings
     bool pdlViewHorizontal  = false;
     bool pdlViewShowMixer   = true;
 
+    // SLQ View layout state
+    bool slqViewHorizontal  = false;
+
     // Per-engine settings
     std::vector<EngineSettings> engines;
 
     // Which engine tab was selected
     int selectedEngine = 0;
+
+    // Show Mode lock -- prevents accidental changes during live shows
+    bool showModeLocked = false;
 
     // Track map (Track ID -> timecode offset mapping)
     TrackMap trackMap;
@@ -709,14 +716,17 @@ struct AppSettings
         obj->setProperty("preferredSampleRate", preferredSampleRate);
         obj->setProperty("preferredBufferSize", preferredBufferSize);
         obj->setProperty("selectedEngine", selectedEngine);
+        obj->setProperty("showModeLocked", showModeLocked);
         obj->setProperty("proDJLinkInterface", proDJLinkInterface);
 
         if (mainWindowBounds.isNotEmpty()) obj->setProperty("mainWindowBounds", mainWindowBounds);
         if (pdlViewBounds.isNotEmpty())   obj->setProperty("pdlViewBounds",   pdlViewBounds);
+        if (slqViewBounds.isNotEmpty())   obj->setProperty("slqViewBounds",   slqViewBounds);
         if (trackMapBounds.isNotEmpty())   obj->setProperty("trackMapBounds",  trackMapBounds);
         if (mixerMapBounds.isNotEmpty())   obj->setProperty("mixerMapBounds",  mixerMapBounds);
         obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
         obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
+        obj->setProperty("slqViewHorizontal", slqViewHorizontal);
 
         juce::Array<juce::var> engineArray;
         for (auto& eng : engines)
@@ -761,14 +771,20 @@ struct AppSettings
             preferredSampleRate   = getDouble("preferredSampleRate", 0.0);
             preferredBufferSize   = getInt("preferredBufferSize", 0);
             selectedEngine        = getInt("selectedEngine", 0);
+            {
+                auto v = obj->getProperty("showModeLocked");
+                showModeLocked = v.isVoid() ? false : (bool)v;
+            }
             proDJLinkInterface    = getInt("proDJLinkInterface", 0);
 
             mainWindowBounds = getString("mainWindowBounds");
             pdlViewBounds   = getString("pdlViewBounds");
+            slqViewBounds   = getString("slqViewBounds");
             trackMapBounds  = getString("trackMapBounds");
             mixerMapBounds  = getString("mixerMapBounds");
             pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
             pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
+            slqViewHorizontal  = getInt("slqViewHorizontal", 0) != 0;
 
             engines.clear();
             auto* engArray = obj->getProperty("engines").getArray();

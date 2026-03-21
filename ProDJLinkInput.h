@@ -14,14 +14,14 @@
 //   NXS2/older: Beat-derived from status (beatCount x 60000/BPM, ~5Hz)
 //
 // Phase 1: UDP monitoring + Dual-keepalive bridge
-//   - Bridge join sequence: hello 0x0A (player=5) → IP claim 0x02 (player=0xC0)
+//   - Bridge join sequence: hello 0x0A (player=5) -> IP claim 0x02 (player=0xC0)
 //   - Two keepalives sent in parallel:
-//     1) 54B BROADCAST (player=0xC1) — DJM discovers bridge, activates fader delivery
-//     2) 95B UNICAST to each CDJ (player=5, PIONEER DJ CORP strings) — CDJ registers
+//     1) 54B BROADCAST (player=0xC1) -- DJM discovers bridge, activates fader delivery
+//     2) 95B UNICAST to each CDJ (player=5, PIONEER DJ CORP strings) -- CDJ registers
 //        us as a valid peer and sends AbsPos/Status unicast data
 //   - The DJM NEVER receives the 95B (it's unicast to CDJ IPs only)
-//     → DJM sees single identity (0xC1) → faders work
-//   - The CDJ sees both, but both are from the same bridge → no conflict
+//     -> DJM sees single identity (0xC1) -> faders work
+//   - The CDJ sees both, but both are from the same bridge -> no conflict
 //   - Sends type-0x57 subscribe to each DJM (port 50001)
 //     -> triggers DJM to send type-0x39 mixer fader packets
 //   - Sends type-0x55 bridge notify to each CDJ (port 50002)
@@ -122,7 +122,7 @@ namespace ProDJLink
     static constexpr uint8_t kMixerPlayerNumMin = 0x21;  // DJM player numbers start at 33
 
     // Virtual CDJ defaults
-    // Player 5 is used as bridge slot — does NOT occupy CDJ slots 1-4.
+    // Player 5 is used as bridge slot -- does NOT occupy CDJ slots 1-4.
     // The CDJ-3000 grants dbserver access to player 5 when the 95-byte
     // keepalive includes the Pioneer bridge identification strings.
     static constexpr int     kDefaultVCDJNumber = 5;
@@ -228,7 +228,7 @@ struct ProDJLinkPlayerState
     void reset()
     {
         // Store discovered=false FIRST with release ordering.
-        // UI-thread getters check discovered with acquire ordering —
+        // UI-thread getters check discovered with acquire ordering --
         // release guarantees they see discovered=false before we zero
         // the non-atomic fields (model, ipStr, macAddr).
         discovered.store(false, std::memory_order_release);
@@ -616,7 +616,7 @@ public:
 
     /// True if player has reached end of track (CDJ reports playState 0x11).
     /// In this state, actualSpeed freezes at the last playing value and
-    /// never ramps to zero — unlike pause where actualSpeed decelerates.
+    /// never ramps to zero -- unlike pause where actualSpeed decelerates.
     bool isEndOfTrack(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1155,8 +1155,8 @@ private:
         DBG("ProDJLink: Thread started, bound to " << bindIp);
 
         // --- Bridge announce sequence (must happen before keepalives) ---
-        // Bridge announce: hello 0x0A (player=5) → claim 0x02 (player=0xC0)
-        // → then starts 54B keepalive 0x06 (player=0xC1).
+        // Bridge announce: hello 0x0A (player=5) -> claim 0x02 (player=0xC0)
+        // -> then starts 54B keepalive 0x06 (player=0xC1).
         // The DJM needs to see this announce before it activates fader delivery.
         performBridgeJoinSequence();
 
@@ -1174,21 +1174,21 @@ private:
             // Two keepalives serve different purposes:
             //
             // 1) 54B bridge keepalive BROADCAST (player=0xC1)
-            //    → DJM discovers us as bridge → activates fader (0x39) delivery
-            //    → This is the standard bridge broadcast keepalive
+            //    -> DJM discovers us as bridge -> activates fader (0x39) delivery
+            //    -> This is the standard bridge broadcast keepalive
             //
             // 2) 95B dbserver keepalive UNICAST to each CDJ (player=5)
-            //    → CDJ-3000 registers us as a valid peer with PIONEER identification
-            //    → CDJ sends unicast Status + AbsPos data to our IP
+            //    -> CDJ-3000 registers us as a valid peer with PIONEER identification
+            //    -> CDJ sends unicast Status + AbsPos data to our IP
             //
-            // CRITICAL: The 95B MUST be unicast to CDJ IPs only — NEVER broadcast.
+            // CRITICAL: The 95B MUST be unicast to CDJ IPs only -- NEVER broadcast.
             // If the DJM receives both player=5 (95B) and player=0xC1 (54B) from
             // the same IP/MAC, it detects conflicting identities and refuses faders.
             // By unicasting the 95B, the DJM only ever sees the 54B broadcast.
             if ((now - lastKeepaliveSend) >= ProDJLink::kKeepaliveInterval * 1000.0)
             {
-                sendBridgeKeepalive();           // 54B BROADCAST → DJM faders
-                sendDbServerKeepaliveToAll();     // 95B UNICAST to CDJs → CDJ status data
+                sendBridgeKeepalive();           // 54B BROADCAST -> DJM faders
+                sendDbServerKeepaliveToAll();     // 95B UNICAST to CDJs -> CDJ status data
                 lastKeepaliveSend = now;
                 if (firstKeepaliveSent == 0.0)
                     firstKeepaliveSent = now;
@@ -1205,8 +1205,8 @@ private:
             // DJM has fully processed the keepalive registration, it silently
             // ignores it and never activates fader delivery.
             //
-            // Sequence: keepalive broadcasts begin → DJM registers bridge
-            // (counter increments) → wait ~3s → send subscribe burst.
+            // Sequence: keepalive broadcasts begin -> DJM registers bridge
+            // (counter increments) -> wait ~3s -> send subscribe burst.
             {
                 bool djmsKnown = false;
                 {
@@ -1310,33 +1310,33 @@ private:
     }
 
     //==========================================================================
-    // Dual keepalive system — CDJ + DJM compatible
+    // Dual keepalive system -- CDJ + DJM compatible
     //
     // Two keepalives are sent in parallel, each serving a different device:
     //
-    //   1) sendBridgeKeepalive()       — 54B BROADCAST (player=0xC1)
-    //      → DJM discovers us as bridge → activates fader (0x39) delivery
-    //      → Standard bridge broadcast keepalive
+    //   1) sendBridgeKeepalive()       -- 54B BROADCAST (player=0xC1)
+    //      -> DJM discovers us as bridge -> activates fader (0x39) delivery
+    //      -> Standard bridge broadcast keepalive
     //
-    //   2) sendDbServerKeepaliveToAll() — 95B UNICAST to each CDJ (player=5)
-    //      → CDJ-3000 validates PIONEER DJ CORP / PRODJLINK BRIDGE strings
-    //      → CDJ registers us as a valid peer → sends Status + AbsPos unicast
+    //   2) sendDbServerKeepaliveToAll() -- 95B UNICAST to each CDJ (player=5)
+    //      -> CDJ-3000 validates PIONEER DJ CORP / PRODJLINK BRIDGE strings
+    //      -> CDJ registers us as a valid peer -> sends Status + AbsPos unicast
     //
     // The DJM NEVER sees the 95B packet (it's sent unicast to CDJ IPs only).
     // From the DJM's perspective, we have a single identity: player=0xC1.
     //
     // History:
-    //   - v1.5a: 95B BROADCAST + 54B UNICAST → CDJ✅ DJM❌ (DJM saw 2 identities)
-    //   - v1.5b: 54B BROADCAST only          → CDJ❌ DJM✅ (CDJ ignored player=0xC1)
-    //   - v1.5c: 54B BROADCAST + 95B UNICAST → CDJ✅ DJM✅ (DJM only sees broadcast)
+    //   - v1.5a: 95B BROADCAST + 54B UNICAST -> CDJ[OK] DJM[FAIL] (DJM saw 2 identities)
+    //   - v1.5b: 54B BROADCAST only          -> CDJ[FAIL] DJM[OK] (CDJ ignored player=0xC1)
+    //   - v1.5c: 54B BROADCAST + 95B UNICAST -> CDJ[OK] DJM[OK] (DJM only sees broadcast)
     //==========================================================================
 
-    // dbserver keepalive (0x06) — 95B UNICAST to each discovered CDJ.
+    // dbserver keepalive (0x06) -- 95B UNICAST to each discovered CDJ.
     // Contains "PIONEER DJ CORP" / "PRODJLINK BRIDGE" identification strings
     // that CDJ-3000 validates for granting dbserver metadata access and
     // for sending unicast Status + AbsPos data to our IP.
     //
-    // CRITICAL: This must be UNICAST to CDJ IPs only — NEVER broadcast.
+    // CRITICAL: This must be UNICAST to CDJ IPs only -- NEVER broadcast.
     // The DJM must only see the 54B bridge keepalive (player=0xC1).
     // If the DJM sees this 95B packet (player=5), it registers a conflicting
     // identity from the same IP and refuses to activate fader delivery.
@@ -1380,7 +1380,7 @@ private:
         }
     }
 
-    // Bridge keepalive (0x06) — 54B BROADCAST
+    // Bridge keepalive (0x06) -- 54B BROADCAST
     // Standard bridge format: variant=0x01, player=0xC1,
     // class=0x00, flags=0x05, last=0x20. DJM activates faders on seeing this.
     //
@@ -1394,7 +1394,7 @@ private:
     // UDP delivery (checksum offloading, interface routing, firewall interaction)
     // that can cause the DJM to never see the broadcast keepalive even though it
     // reaches the wire. Unicasting a copy ensures the DJM sees our bridge identity.
-    // The DJM receives the same player=0xC1 identity both ways — no conflict.
+    // The DJM receives the same player=0xC1 identity both ways -- no conflict.
     void sendBridgeKeepalive()
     {
         if (!keepaliveSock) return;
@@ -1417,7 +1417,7 @@ private:
         keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, pkt, sizeof(pkt));
 
         // NOTE: No unicast keepalive to DJM.
-        // The real Pioneer Bridge only broadcasts keepalives — it never sends
+        // The real Pioneer Bridge only broadcasts keepalives -- it never sends
         // unicast copies to the DJM. Confirmed from full startup capture
         // (Captura_larga_bridge_por_wifi.pcapng): the DJM activates faders
         // 0.2s after seeing the broadcast keepalive alone.
@@ -1425,17 +1425,17 @@ private:
         // (two keepalives from same name but different source ports).
     }
 
-    // (Old CDJ 4-phase join sequence removed — STC uses bridge join only)
+    // (Old CDJ 4-phase join sequence removed -- STC uses bridge join only)
 
     //==========================================================================
-    // Bridge join sequence — announces our presence on the network.
+    // Bridge join sequence -- announces our presence on the network.
     //
     // From capture analysis: the DJM responds in <0.2s after the FIRST
     // 54B keepalive broadcast. The 21 claims the reference implementation sends are its
-    // own slot-reservation process — not a DJM requirement.
+    // own slot-reservation process -- not a DJM requirement.
     //
     // Pioneer Bridge sends 2 hellos + 11 claims (~6s). More claims gives the
-    // DJM more time to register the bridge identity. Additive — won't break
+    // DJM more time to register the bridge identity. Additive -- won't break
     // platforms where fewer claims already worked.
     //==========================================================================
     void performBridgeJoinSequence()
@@ -1443,7 +1443,7 @@ private:
         if (!keepaliveSock) return;
         DBG("ProDJLink: Starting bridge join sequence (2 hello + 11 claims)");
 
-        // Hello announce × 2 (Pioneer Bridge does this)
+        // Hello announce x 2 (Pioneer Bridge does this)
         for (int h = 0; h < 2; ++h)
         {
             if (threadShouldExit()) return;
@@ -1464,7 +1464,7 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    // Bridge hello (0x0A) — 37 bytes broadcast
+    // Bridge hello (0x0A) -- 37 bytes broadcast
     //
     // Packet format:
     //   [0x00-0x09] Magic "Qspt1WmJOL"
@@ -1493,7 +1493,7 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    // Bridge IP claim (0x02) — 50 bytes broadcast
+    // Bridge IP claim (0x02) -- 50 bytes broadcast
     //
     // Packet format:
     //   [0x00-0x09] Magic
@@ -1522,7 +1522,7 @@ private:
         p[0x23] = 0x32;  // length = 50
         std::memcpy(p + 0x24, ownIpBytes, 4);   // IP
         std::memcpy(p + 0x28, ownMacBytes, 6);   // MAC
-        // [0x2e] = auto-increment token (XOR-based hash — the exact value
+        // [0x2e] = auto-increment token (XOR-based hash -- the exact value
         // doesn't appear to affect DJM fader activation, only the overall
         // claim structure matters)
         p[0x2e] = uint8_t(ownMacBytes[5] ^ uint8_t(counter * 3 + 0xFB));
@@ -1536,7 +1536,7 @@ private:
     }
 
     //==========================================================================
-    // Bridge notify (0x55) — sent to each CDJ on port 50002.
+    // Bridge notify (0x55) -- sent to each CDJ on port 50002.
     //
     // The bridge sends this periodically to maintain the session.
     // Packet format (44 bytes) from capture:
@@ -1569,10 +1569,10 @@ private:
         pkt[42] = 0x03;
         pkt[43] = 0x01;
 
-        // Original path: statusSock (sport=50002) → CDJ:50002  — works on Windows
+        // Original path: statusSock (sport=50002) -> CDJ:50002  -- works on Windows
         statusSock->write(cdjIp, ProDJLink::kStatusPort, pkt, sizeof(pkt));
 
-        // Additional: bridgeSock (ephemeral port) → CDJ:50002  — for macOS compat
+        // Additional: bridgeSock (ephemeral port) -> CDJ:50002  -- for macOS compat
         if (bridgeSock)
             bridgeSock->write(cdjIp, ProDJLink::kStatusPort, pkt, sizeof(pkt));
     }
@@ -1614,7 +1614,7 @@ private:
             chOnAir[i] = (data[36 + i] != 0x00);
 
         // Update player on-air state (only if we don't have 0x29 unicast data,
-        // which is more reliable since it's DJM→bridge specific)
+        // which is more reliable since it's DJM->bridge specific)
         if (pktCountDJMStatus.load(std::memory_order_relaxed) == 0)
         {
             for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
@@ -1648,13 +1648,13 @@ private:
                 }
             }
 
-            // New DJM — add to list (subscribe outside the lock)
+            // New DJM -- add to list (subscribe outside the lock)
             djmIps.push_back(ip);
             djmModels.push_back(model);
             djmLastSeen.push_back(juce::Time::getMillisecondCounterHiRes());
             isNew = true;
         }
-        // Socket write OUTSIDE the lock — avoids blocking UI thread on getDJMModel()
+        // Socket write OUTSIDE the lock -- avoids blocking UI thread on getDJMModel()
         if (isNew)
         {
             DBG("ProDJLink: Registered DJM [" << juce::String(model) << "] at " << juce::String(ip));
@@ -1666,8 +1666,8 @@ private:
         }
     }
 
-    // Bridge subscribe (0x57) — 40B sent to DJM on beat port (50001).
-    // Triggers DJM fader (0x39→50002) and VU meter (0x58→50001) delivery.
+    // Bridge subscribe (0x57) -- 40B sent to DJM on beat port (50001).
+    // Triggers DJM fader (0x39->50002) and VU meter (0x58->50001) delivery.
     // Byte [33] is the subscription bitmask.
     void sendBridgeSubscribe(const std::string& djmIp)
     {
@@ -1693,7 +1693,7 @@ private:
 
         // Send ONLY from bridgeSock (ephemeral port), matching the real Bridge
         // which uses a dedicated port (~50006) for subscribe/notify traffic.
-        // NOT from beatSock (50001) — that port is for receiving beats.
+        // NOT from beatSock (50001) -- that port is for receiving beats.
         // The DJM may reject subscribes from a port it also sends data to.
         // Fallback to beatSock only if bridgeSock is unavailable.
         auto* sock = bridgeSock ? bridgeSock.get() : beatSock.get();
@@ -1705,7 +1705,7 @@ private:
 
     void sendBridgeSubscribeToAll()
     {
-        // Copy IPs under lock, then write outside — same pattern as registerDJM.
+        // Copy IPs under lock, then write outside -- same pattern as registerDJM.
         // Avoids blocking UI thread (getDJMModel) during socket writes.
         std::vector<std::string> ipsCopy;
         {
@@ -2036,8 +2036,8 @@ private:
             p.beatCount.store(bc, std::memory_order_relaxed);
             // NOTE: beatInBar is NOT updated here.  Status packets arrive at ~5Hz
             // and may carry a stale beat-in-bar value from before the latest beat
-            // transition, causing the UI to briefly flicker backwards (e.g. 3→2→3).
-            // Beat packets (type 0x28, port 50001) are the authoritative source —
+            // transition, causing the UI to briefly flicker backwards (e.g. 3->2->3).
+            // Beat packets (type 0x28, port 50001) are the authoritative source --
             // they arrive at the exact moment of each beat and are handled in
             // handleBeatPacket().
 
@@ -2091,8 +2091,8 @@ private:
         //   - hasMixerFaderData() goes stale (5s timeout on lastMixerPacketTime)
         //   - DJM IP is removed from subscribe list (this GC, 10s)
         // When the DJM comes back:
-        //   - Its keepalive triggers registerDJM() → re-adds IP + immediate subscribe
-        //   - Our 54B broadcast keepalive is still going → DJM rediscovers us
+        //   - Its keepalive triggers registerDJM() -> re-adds IP + immediate subscribe
+        //   - Our 54B broadcast keepalive is still going -> DJM rediscovers us
         //   - Fader delivery reactivates automatically
         {
             const juce::ScopedLock sl(djmIpLock);
@@ -2115,7 +2115,7 @@ private:
     //==========================================================================
 
     /// Explicitly re-assert SO_BROADCAST on a JUCE DatagramSocket after bind.
-    /// Applied on ALL platforms — harmless re-confirmation on Windows,
+    /// Applied on ALL platforms -- harmless re-confirmation on Windows,
     /// critical on macOS where the flag can be lost after bindToPort().
     static void ensureSoBroadcast(juce::DatagramSocket* sock, const char* label)
     {
@@ -2159,7 +2159,7 @@ private:
     }
 
     /// Get MAC address for a network interface.
-    /// On Windows, matches by IP address (reliable — adapter FriendlyName can
+    /// On Windows, matches by IP address (reliable -- adapter FriendlyName can
     /// change with driver/OS updates, breaking name-based matching).
     /// On macOS/Linux, matches by interface name (stable, e.g. "en0").
     /// The interfaceIp parameter is used on Windows for IP-based matching.

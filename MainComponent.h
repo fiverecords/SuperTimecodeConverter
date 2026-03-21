@@ -16,6 +16,8 @@
 #include "UpdateChecker.h"
 #include "MediaDisplay.h"
 #include "ProDJLinkView.h"
+#include "StageLinQView.h"
+#include "StageLinQDbClient.h"
 #include <vector>
 #include <memory>
 
@@ -99,6 +101,7 @@ public:
 
     /// Main window bounds persistence (called by MainWindow in Main.cpp)
     juce::String getSavedMainWindowBounds() const { return settings.mainWindowBounds; }
+    bool isShowModeLocked() const { return settings.showModeLocked; }
     void saveMainWindowBounds(const juce::String& bounds)
     {
         settings.mainWindowBounds = bounds;
@@ -154,6 +157,9 @@ private:
     std::vector<std::unique_ptr<TimecodeEngine>> engines;
     int selectedEngine = 0;
     ProDJLinkInput sharedProDJLinkInput;  // shared across all engines
+    StageLinQInput sharedStageLinQInput;  // shared across all engines
+    StageLinQDbClient sharedStageLinQDb;  // database client for Denon metadata + artwork
+    MixerMap sharedSlqMixerMap { MixerMapMode::Denon };  // Denon mixer map
     MixerMap       sharedMixerMap;        // shared DJM parameter mapping
     DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
 
@@ -229,6 +235,7 @@ private:
     juce::TextButton btnSysTime  { "SYSTEM" };
     juce::TextButton btnLtcIn    { "LTC" };
     juce::TextButton btnProDJLinkIn { "PRO DJ LINK" };
+    juce::TextButton btnStageLinQIn { "STAGELINQ" };
 
     // --- Output toggles ---
     juce::ToggleButton btnMtcOut    { "MTC OUT" };
@@ -312,11 +319,49 @@ private:
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
     juce::Component::SafePointer<juce::DocumentWindow> mixerMapWindow;
     juce::TextButton btnProDJLinkView { "PDL View" };
+    juce::TextButton btnStageLinQView { "SLQ View" };
     juce::TextButton btnBackup  { "Backup" };
     juce::TextButton btnRestore { "Restore" };
+    juce::TextButton btnShowLock { "SHOW LOCK" };
+    int showLockFlashCountdown = 0;  // ticks remaining for flash feedback
+
+    /// Returns true if Show Lock is active and the action should be blocked.
+    /// Flashes the lock button red briefly to give visual feedback.
+    bool isShowLocked()
+    {
+        if (!settings.showModeLocked) return false;
+        // Flash feedback: briefly brighten the lock button (reset in timerCallback)
+        btnShowLock.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFFF3333));
+        showLockFlashCountdown = 18;  // ~300ms at 60Hz
+        return true;
+    }
+
+    /// Same as isShowLocked(), but also reverts a ToggleButton's auto-flipped state.
+    /// JUCE ToggleButtons flip their state BEFORE onClick fires, so we must undo it.
+    bool isShowLockedToggle(juce::ToggleButton& btn)
+    {
+        if (!settings.showModeLocked) return false;
+        btn.setToggleState(!btn.getToggleState(), juce::dontSendNotification);
+        btnShowLock.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFFF3333));
+        showLockFlashCountdown = 18;
+        return true;
+    }
+
+    /// Same as isShowLocked(), but also reverts the UI to match engine state.
+    /// JUCE ComboBoxes and Sliders update their visual value BEFORE onChange
+    /// fires, so we re-sync the entire UI from engine state to undo the change.
+    bool isShowLockedRevert()
+    {
+        if (!settings.showModeLocked) return false;
+        syncUIFromEngine();  // restores all combos/sliders/toggles to engine state
+        btnShowLock.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFFF3333));
+        showLockFlashCountdown = 18;
+        return true;
+    }
     std::unique_ptr<juce::FileChooser> configFileChooser;
     juce::ScopedMessageBox importConfirmBox;
     std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
+    std::unique_ptr<StageLinQViewWindow> stageLinQViewWindow;
 
     // Track change triggers
     juce::ToggleButton btnTriggerMidi { "MIDI Trigger" };
@@ -418,9 +463,11 @@ private:
     void startCurrentArtnetInput();
     void startCurrentLtcInput();
     void startCurrentProDJLinkInput();
+    void startCurrentStageLinQInput();
     void openTrackMapEditor();
     void openMixerMapEditor();
     void openProDJLinkView();
+    void openStageLinQView();
     void exportConfig();
     void importConfig();
     void applyTriggerSettings();

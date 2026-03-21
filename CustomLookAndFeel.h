@@ -252,7 +252,7 @@ public:
         }
 
         // Detect marker patterns:
-        //   " ●"          -> current engine active device (cyan dot)
+        //   " (dot)"          -> current engine active device (cyan dot)
         //   " [ENGINE N]" -> other engine using this device (amber tag)
         static const juce::String dotChar = juce::String::charToString(0x25CF);
 
@@ -304,7 +304,7 @@ public:
         if (hasActiveDot && isActive)
         {
             // Current engine active: draw device name + cyan dot
-            auto basePart = text.substring(0, text.length() - (dotChar.length() + 1)); // strip " ●"
+            auto basePart = text.substring(0, text.length() - (dotChar.length() + 1)); // strip " (dot)"
             g.setColour(textBright);
             g.drawText(basePart, textArea, juce::Justification::centredLeft, false);
 
