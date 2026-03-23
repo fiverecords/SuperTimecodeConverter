@@ -247,7 +247,8 @@ public:
     {
         if (ds.artist.isEmpty() || ds.title.isEmpty()) return;
 
-        auto* entry = trackMap.find(ds.artist, ds.title);
+        int dur = (int)ds.trackLenSec;
+        auto* entry = trackMap.find(ds.artist, ds.title, dur);
         int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
 
         // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
@@ -268,6 +269,7 @@ public:
             TrackMapEntry newEntry;
             newEntry.artist  = ds.artist;
             newEntry.title   = ds.title;
+            newEntry.durationSec = dur;
             newEntry.bpmMultiplier = newValue;
             trackMap.addOrUpdate(newEntry);
         }
@@ -400,7 +402,7 @@ public:
             if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
                 && !ds.title.startsWith("Track #"))
             {
-                tmEntry = trackMap.find(ds.artist, ds.title);
+                tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
                 if (tmEntry != nullptr)
                 {
                     ds.trackMapped = true;
@@ -1865,7 +1867,7 @@ public:
                 auto centre = b.getCentre();
                 bool onScreen = false;
                 for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
-                    if (disp.userArea.contains(centre)) { onScreen = true; break; }
+                    if (disp.totalArea.contains(centre)) { onScreen = true; break; }
                 if (onScreen)
                     setBounds(b);
             }

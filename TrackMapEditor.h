@@ -7,6 +7,7 @@
 #include "AppSettings.h"
 #include "ProDJLinkInput.h"
 #include "DbServerClient.h"
+#include "CuePointEditor.h"
 #include "CustomLookAndFeel.h"
 
 //==============================================================================
@@ -46,6 +47,7 @@ public:
         hdr.addColumn("Offset",    ColOffset,  100, 80, 130, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("BPM",       ColBpm,      46, 40,  70, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Trig",      ColTrig,     40, 30,  60, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Cues",      ColCues,     40, 30,  60, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Notes",     ColNotes,   100, 60, 400, juce::TableHeaderComponent::notSortable);
 
         // --- Buttons ---
@@ -66,7 +68,7 @@ public:
 
         btnLearn.setColour(juce::TextButton::buttonColourId, accentCyan.withAlpha(0.25f));
         btnLearn.setColour(juce::TextButton::textColourOffId, accentCyan.brighter(0.4f));
-        btnLearn.setEnabled(proDJLinkInput != nullptr);
+        btnLearn.setEnabled(true);  // onLearn handles missing sources gracefully
 
         // Player selector for Learn -- lets the user capture tracks from any CDJ player
         addAndMakeVisible(lblLearnLayer);
@@ -184,9 +186,21 @@ public:
 
         addFormBtn(btnFormSave,   "Save");
         addFormBtn(btnFormCancel, "Cancel");
+        addFormBtn(btnFormCues,   "Cue Editor");
         btnFormSave.setColour(juce::TextButton::buttonColourId, accentGreen.withAlpha(0.3f));
+        btnFormCues.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF00CC88).withAlpha(0.25f));
+        btnFormCues.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF00CC88));
         btnFormSave.onClick   = [this] { onFormSave(); };
         btnFormCancel.onClick = [this] { onFormCancel(); };
+        btnFormCues.onClick   = [this]
+        {
+            if (editingRow < 0 || editingRow >= (int)rows.size()) return;
+            if (!onOpenCueEditor) return;
+            auto* entry = trackMap.find(rows[(size_t)editingRow]->artist,
+                                         rows[(size_t)editingRow]->title,
+                                         rows[(size_t)editingRow]->durationSec);
+            if (entry) onOpenCueEditor(entry);
+        };
 
         // --- Status bar ---
         addAndMakeVisible(lblStatus);
@@ -205,6 +219,16 @@ public:
     // Callback when TrackMap is modified (wire to save + refresh)
     //--------------------------------------------------------------------------
     std::function<void()> onChange;
+
+    /// Called when user clicks the Cues column to open the cue editor for a track.
+    /// Receives a mutable pointer to the TrackMapEntry (valid as long as TrackMap is unchanged).
+    std::function<void(TrackMapEntry*)> onOpenCueEditor;
+
+    /// Callback to get active track info from the current engine.
+    /// Used as fallback for Learn when ProDJLink is not the active input
+    /// (e.g. StageLinQ mode).  Returns artist, title, durationSec.
+    struct LearnTrackInfo { juce::String artist, title; int durationSec = 0; };
+    std::function<LearnTrackInfo()> onLearnTrackInfo;
 
     //--------------------------------------------------------------------------
     // Set the active track ID (for visual highlighting in the table)
@@ -272,7 +296,7 @@ public:
         area.removeFromTop(6);
 
         // Status bar
-        auto statusRow = area.removeFromBottom(20);
+        auto statusRow = area.removeFromBottom(18);
         lblStatus.setBounds(statusRow);
 
         // Edit form (fixed height at bottom, above status)
@@ -353,6 +377,23 @@ public:
                 }
                 return;
             }
+            case ColCues:
+            {
+                int n = (int)entry.cuePoints.size();
+                if (n > 0)
+                {
+                    g.setColour(juce::Colour(0xFF00CC88));  // green-teal accent
+                    g.drawText(juce::String(n), 4, 0, width - 8, height,
+                               juce::Justification::centredLeft, true);
+                }
+                else
+                {
+                    g.setColour(juce::Colour(0xFF555555));
+                    g.drawText("+", 4, 0, width - 8, height,
+                               juce::Justification::centredLeft, true);
+                }
+                return;
+            }
             case ColNotes:   text = entry.notes; break;
         }
 
@@ -364,6 +405,22 @@ public:
     {
         if (rowNumber >= 0 && rowNumber < (int)rows.size())
             openFormForRow(rowNumber);
+    }
+
+    void cellClicked(int rowNumber, int columnId, const juce::MouseEvent&) override
+    {
+        if (columnId == ColCues && rowNumber >= 0 && rowNumber < (int)rows.size())
+        {
+            if (onOpenCueEditor)
+            {
+                // Get mutable pointer from the trackMap (rows[] are const pointers)
+                auto* entry = trackMap.find(rows[(size_t)rowNumber]->artist,
+                                             rows[(size_t)rowNumber]->title,
+                                             rows[(size_t)rowNumber]->durationSec);
+                if (entry)
+                    onOpenCueEditor(entry);
+            }
+        }
     }
 
     void selectedRowsChanged(int lastRowSelected) override
@@ -384,6 +441,7 @@ private:
     uint64_t rowsGeneration = 0;               // generation at which rows were built
     std::string activeTrackKey;  // artist|title key of currently playing track
     int editingRow = -1;               // -1 = adding new, >= 0 = editing existing
+    int learnedDurationSec = 0;        // captured from CDJ during Learn (used for new entries)
 
     //--------------------------------------------------------------------------
     // Colours (matching MainComponent)
@@ -401,7 +459,7 @@ private:
     //--------------------------------------------------------------------------
     // Column IDs
     //--------------------------------------------------------------------------
-    enum { ColArtist = 1, ColTitle, ColOffset, ColBpm, ColTrig, ColNotes };
+    enum { ColArtist = 1, ColTitle, ColOffset, ColBpm, ColTrig, ColCues, ColNotes };
 
     //--------------------------------------------------------------------------
     // UI components
@@ -414,7 +472,7 @@ private:
 
     // Edit form
     juce::Component formPanel;
-    static constexpr int kFormHeight = 300;   // track info + trigger section + buttons
+    static constexpr int kFormHeight = 256;   // track info + trigger section + buttons
 
     juce::Label      lblFormArtist, lblFormTitle, lblFormOffset, lblFormNotes;
     juce::TextEditor edFormArtist, edFormTitle, edFormOffset, edFormNotes;
@@ -440,7 +498,7 @@ private:
     juce::Label    lblFormBpmMult;
     juce::ComboBox cmbFormBpmMult;
 
-    juce::TextButton btnFormSave, btnFormCancel;
+    juce::TextButton btnFormSave, btnFormCancel, btnFormCues;
 
     juce::Label lblStatus;
 
@@ -592,9 +650,10 @@ private:
 
         area.removeFromTop(6);
 
-        // Row 7: Save / Cancel buttons (right-aligned)
-        auto row7 = area.removeFromTop(24);
+        // Row 7: Cue Editor (left), Save / Cancel (right) -- anchored to bottom
+        auto row7 = area.removeFromBottom(24);
         {
+            btnFormCues.setBounds(row7.removeFromLeft(90));
             btnFormCancel.setBounds(row7.removeFromRight(64));
             row7.removeFromRight(4);
             btnFormSave.setBounds(row7.removeFromRight(64));
@@ -643,6 +702,7 @@ private:
             cmbFormBpmMult.setSelectedId(comboId, juce::dontSendNotification);
         }
 
+        btnFormCues.setEnabled(true);  // existing track -- can edit cues
         formPanel.setVisible(true);
         resized();
         edFormOffset.grabKeyboardFocus();
@@ -678,6 +738,7 @@ private:
         // BPM multiplier default (off)
         cmbFormBpmMult.setSelectedId(1, juce::dontSendNotification);
 
+        btnFormCues.setEnabled(false);  // new track -- no cues yet
         formPanel.setVisible(true);
         resized();
 
@@ -720,12 +781,21 @@ private:
         }
         offset = TrackMapEntry::formatTimecodeString(h, m, s, f);
 
+        // Preserve cuePoints and durationSec from existing entry BEFORE any removal
+        std::vector<CuePoint> preservedCuePoints;
+        int preservedDurationSec = 0;
+        if (editingRow >= 0 && editingRow < (int)rows.size())
+        {
+            preservedCuePoints = rows[(size_t)editingRow]->cuePoints;
+            preservedDurationSec = rows[(size_t)editingRow]->durationSec;
+        }
+
         // If editing an existing row whose artist/title changed, remove the old entry
         if (editingRow >= 0 && editingRow < (int)rows.size())
         {
             auto& oldEntry = *rows[(size_t)editingRow];
-            if (TrackMapEntry::makeKey(formArtist, formTitle) != oldEntry.key())
-                trackMap.remove(oldEntry.artist, oldEntry.title);
+            if (TrackMapEntry::makeKey(formArtist, formTitle, oldEntry.durationSec) != oldEntry.key())
+                trackMap.remove(oldEntry.artist, oldEntry.title, oldEntry.durationSec);
         }
 
         TrackMapEntry entry;
@@ -771,6 +841,18 @@ private:
             else                   entry.bpmMultiplier =  0;
         }
 
+        // Apply preserved cuePoints and durationSec
+        if (editingRow >= 0)
+        {
+            entry.cuePoints   = std::move(preservedCuePoints);
+            entry.durationSec = preservedDurationSec;
+        }
+        else
+        {
+            // New entry: use duration from Learn (if available)
+            entry.durationSec = learnedDurationSec;
+        }
+
         auto savedKey = entry.key();
         trackMap.addOrUpdate(entry);
         closeForm();
@@ -797,35 +879,62 @@ private:
     //--------------------------------------------------------------------------
     void onLearn()
     {
-        if (!proDJLinkInput || !proDJLinkInput->getIsRunning()) return;
+        juce::String learnArtist, learnTitle;
+        learnedDurationSec = 0;
 
-        int player = cmbLearnLayer.getSelectedId();
-        uint32_t cdjId = proDJLinkInput->getTrackID(player);
-        if (cdjId == 0) return;
-
-        auto tinfo = proDJLinkInput->getTrackInfo(player);
-
-        // Enrich with dbClient cache if available
-        if (dbClient != nullptr)
+        // Try ProDJLink first (direct player selection via combo)
+        if (proDJLinkInput && proDJLinkInput->getIsRunning())
         {
-            auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
-            if (meta.isValid())
+            int player = cmbLearnLayer.getSelectedId();
+            uint32_t cdjId = proDJLinkInput->getTrackID(player);
+            if (cdjId == 0) return;
+
+            auto tinfo = proDJLinkInput->getTrackInfo(player);
+            learnArtist = tinfo.artist;
+            learnTitle  = tinfo.title;
+
+            // Enrich with dbClient cache if available
+            if (dbClient != nullptr)
             {
-                tinfo.artist = meta.artist;
-                tinfo.title  = meta.title;
+                auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
+                if (meta.isValid())
+                {
+                    learnArtist = meta.artist;
+                    learnTitle  = meta.title;
+                }
+            }
+
+            learnedDurationSec = (int)proDJLinkInput->getTrackLengthSec(player);
+            if (learnedDurationSec == 0 && dbClient != nullptr)
+            {
+                auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
+                if (meta.isValid() && meta.durationSeconds > 0)
+                    learnedDurationSec = meta.durationSeconds;
             }
         }
+        // Fallback: get track info from the active engine (StageLinQ, etc.)
+        else if (onLearnTrackInfo)
+        {
+            auto info = onLearnTrackInfo();
+            learnArtist = info.artist;
+            learnTitle  = info.title;
+            learnedDurationSec = info.durationSec;
+        }
+        else
+        {
+            return;  // no source available
+        }
 
-        if (tinfo.artist.isEmpty() || tinfo.title.isEmpty()
-            || tinfo.title.startsWith("Track #"))
+        if (learnArtist.isEmpty() || learnTitle.isEmpty()
+            || learnTitle.startsWith("Track #"))
             return;  // can't learn without real metadata
 
         // If entry already exists, open it for editing
-        if (trackMap.contains(tinfo.artist, tinfo.title))
+        if (trackMap.contains(learnArtist, learnTitle, learnedDurationSec))
         {
             rebuildRows();
             table.updateContent();
-            auto targetKey = TrackMapEntry::makeKey(tinfo.artist, tinfo.title);
+            auto targetKey = TrackMapEntry::makeKey(learnArtist, learnTitle, learnedDurationSec);
             for (int i = 0; i < (int)rows.size(); ++i)
             {
                 if (rows[(size_t)i]->key() == targetKey)
@@ -838,12 +947,13 @@ private:
         }
         else
         {
-            openFormForNew(tinfo.artist, tinfo.title);
+            openFormForNew(learnArtist, learnTitle);
         }
     }
 
     void onAdd()
     {
+        learnedDurationSec = 0;
         openFormForNew();
     }
 
@@ -856,6 +966,7 @@ private:
         const auto& entry = *rows[(size_t)selected];
         juce::String deleteArtist = entry.artist;
         juce::String deleteTitle  = entry.title;
+        int deleteDur = entry.durationSec;
         juce::String msg = "Delete \"" + deleteArtist + " - " + deleteTitle + "\"?";
 
         auto options = juce::MessageBoxOptions()
@@ -866,11 +977,11 @@ private:
             .withButton("Cancel");
 
         deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
-            [this, deleteArtist, deleteTitle](int result)
+            [this, deleteArtist, deleteTitle, deleteDur](int result)
             {
                 if (result == 1)
                 {
-                    trackMap.remove(deleteArtist, deleteTitle);
+                    trackMap.remove(deleteArtist, deleteTitle, deleteDur);
                     closeForm();
                     notifyChanged();
                 }
@@ -933,7 +1044,8 @@ private:
 
             // Mark duplicates
             for (size_t i = 0; i < items.size(); ++i)
-                isDuplicate.push_back(existingMap.contains(items[i].artist, items[i].title));
+                isDuplicate.push_back(existingMap.contains(items[i].artist, items[i].title,
+                                                          items[i].durationSec));
 
             setSize(600, 400);
 

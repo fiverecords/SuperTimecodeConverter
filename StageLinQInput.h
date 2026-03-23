@@ -76,7 +76,7 @@ namespace StageLinQ
     // Our identity
     static constexpr const char* kOurDeviceName  = "SuperTimecodeConverter";
     static constexpr const char* kOurSwName       = "STC";
-    static constexpr const char* kOurSwVersion    = "1.6.0";
+    static constexpr const char* kOurSwVersion    = "1.7.0";
 
     // Timing
     static constexpr double kDiscoveryInterval     = 1.0;   // seconds between our announcements
@@ -790,6 +790,7 @@ public:
     int getInterfaceCount() const { return availableInterfaces.size(); }
 
     juce::String getBindInfo() const { return bindIp; }
+    int getSelectedInterface() const { return selectedInterface; }
 
     //==========================================================================
     // Start / Stop
@@ -809,6 +810,7 @@ public:
         int idx = juce::jlimit(0, availableInterfaces.size() - 1, interfaceIndex);
         const auto& iface = availableInterfaces[idx];
         bindIp = iface.ip;
+        selectedInterface = idx;
 
         // Reset all decks
         for (auto& d : decks) d.reset();
@@ -1128,6 +1130,45 @@ public:
         int idx = channel - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0.0;
         return decks[idx].faderPosition.load(std::memory_order_relaxed);
+    }
+
+    /// Crossfader assignment for a channel.
+    /// Values assumed to be: 0=THRU, 1=A, 2=B (same as Pioneer DJM).
+    /// Not yet confirmed with real hardware -- awaiting community testing.
+    int getChannelAssignment(int channel) const
+    {
+        int idx = channel - 1;
+        if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0;
+        return decks[idx].channelAssignment.load(std::memory_order_relaxed);
+    }
+
+    /// Derive on-air status from fader + crossfader + channel assignment.
+    /// A deck is "on-air" when its fader is up AND it's not cut by crossfader.
+    bool isDeckOnAir(int deckNum) const
+    {
+        static constexpr double kFaderThreshold = 0.02;  // ~2% above zero
+        static constexpr double kXfCutThreshold = 0.02;  // crossfader fully to opposite side
+
+        int idx = deckNum - 1;
+        if (idx < 0 || idx >= StageLinQ::kMaxDecks) return false;
+
+        double fader = decks[idx].faderPosition.load(std::memory_order_relaxed);
+        if (fader < kFaderThreshold) return false;  // fader down = not on-air
+
+        int assign = decks[idx].channelAssignment.load(std::memory_order_relaxed);
+        double xf = mixerState.crossfaderPosition.load(std::memory_order_relaxed);
+
+        // Assumed: 0=THRU, 1=A (left), 2=B (right)
+        if (assign == 1 && xf > (1.0 - kXfCutThreshold)) return false;  // A-side, xf fully right
+        if (assign == 2 && xf < kXfCutThreshold)          return false;  // B-side, xf fully left
+
+        return true;
+    }
+
+    /// Returns true if we have mixer fader data (any fader ever received)
+    bool hasMixerData() const
+    {
+        return mixerState.numChannels.load(std::memory_order_relaxed) > 0;
     }
 
     bool isReceiving() const
@@ -2621,6 +2662,7 @@ private:
 
     // Network
     juce::String bindIp;
+    int selectedInterface = 0;
     juce::Array<NetworkInterface> availableInterfaces;
 
     // Discovery socket

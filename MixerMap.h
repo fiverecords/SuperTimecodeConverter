@@ -40,6 +40,13 @@ inline DjmModel djmModelFromString(const juce::String& modelName)
     return DjmModel::All;  // 900NXS2 and unknown models
 }
 
+/// Value type for mixer parameters, used for correct OSC/MIDI/DMX mapping.
+/// Not serialized -- set by buildDefaults (same lifetime as minModel).
+///   Continuous: 0-255 analog (faders, knobs, levels) -> OSC 0.0-1.0, CC 0-127, DMX 0-255
+///   Toggle:     0/1 on-off (CUE buttons, FX on/off)  -> OSC 0.0/1.0, CC 0/127, DMX 0/255
+///   Discrete:   small integer (select, assign, curve) -> OSC integer-as-float, CC clamped, DMX raw
+enum class ParamType : int { Continuous = 0, Toggle = 1, Discrete = 2 };
+
 struct MixerMapEntry
 {
     juce::String paramId;       // unique key, e.g. "ch1_fader", "crossfader"
@@ -53,6 +60,7 @@ struct MixerMapEntry
     int          artnetCh = 0;  // Art-Net DMX channel, 0 = disabled, 1-512
     bool         enabled = true;
     DjmModel     minModel = DjmModel::All;  // minimum DJM model required (not serialized; set by buildDefaults)
+    ParamType    paramType = ParamType::Continuous;  // value mapping type (not serialized; set by buildDefaults)
 
     juce::var toVar() const
     {
@@ -214,6 +222,9 @@ private:
         constexpr auto A  = DjmModel::All;
         constexpr auto A9 = DjmModel::A9Plus;
         constexpr auto V  = DjmModel::V10Only;
+        constexpr auto C  = ParamType::Continuous;
+        constexpr auto T  = ParamType::Toggle;
+        constexpr auto D  = ParamType::Discrete;
 
         // --- Per-channel parameters (up to 6 for V10 support) ---
         // Default DMX layout: 6 params per channel, packed sequentially.
@@ -243,87 +254,87 @@ private:
             int ccColor = (ch <= 4) ? (27 + (ch - 1)) : ccBase + 5;
 
             DjmModel chBase = isV10Ch ? V : A;   // base params: All for CH1-4, V10 for CH5-6
-            addEntry(pfx + "_fader",     "Fader",       grp, osc,             ccFader,  dmxBase + 1, !isV10Ch, chBase);
-            addEntry(pfx + "_trim",      "Trim",        grp, osc + "/trim",   ccTrim,   dmxBase + 2, !isV10Ch, chBase);
-            addEntry(pfx + "_eq_hi",     "EQ High",     grp, osc + "/eq_hi",  ccEqHi,   dmxBase + 3, !isV10Ch, chBase);
-            addEntry(pfx + "_eq_mid",    "EQ Mid",      grp, osc + "/eq_mid", ccEqMid,  dmxBase + 4, !isV10Ch, chBase);
-            addEntry(pfx + "_eq_lo",     "EQ Low",      grp, osc + "/eq_lo",  ccEqLo,   dmxBase + 5, !isV10Ch, chBase);
-            addEntry(pfx + "_color",     "Color",       grp, osc + "/color",  ccColor,  dmxBase + 6, !isV10Ch, chBase);
-            addEntry(pfx + "_cue",       "CUE Button",  grp, osc + "/cue",    -1, 0, false, chBase);
-            addEntry(pfx + "_input_src", "Input Source", grp, osc + "/input",  -1, 0, false, chBase);
-            addEntry(pfx + "_xf_assign", "XF Assign",   grp, osc + "/xf_assign", -1, 0, false, chBase);
+            addEntry(pfx + "_fader",     "Fader",       grp, osc,             ccFader,  dmxBase + 1, !isV10Ch, chBase, C);
+            addEntry(pfx + "_trim",      "Trim",        grp, osc + "/trim",   ccTrim,   dmxBase + 2, !isV10Ch, chBase, C);
+            addEntry(pfx + "_eq_hi",     "EQ High",     grp, osc + "/eq_hi",  ccEqHi,   dmxBase + 3, !isV10Ch, chBase, C);
+            addEntry(pfx + "_eq_mid",    "EQ Mid",      grp, osc + "/eq_mid", ccEqMid,  dmxBase + 4, !isV10Ch, chBase, C);
+            addEntry(pfx + "_eq_lo",     "EQ Low",      grp, osc + "/eq_lo",  ccEqLo,   dmxBase + 5, !isV10Ch, chBase, C);
+            addEntry(pfx + "_color",     "Color",       grp, osc + "/color",  ccColor,  dmxBase + 6, !isV10Ch, chBase, C);
+            addEntry(pfx + "_cue",       "CUE Button",  grp, osc + "/cue",    -1, 0, false, chBase, T);
+            addEntry(pfx + "_input_src", "Input Source", grp, osc + "/input",  -1, 0, false, chBase, D);
+            addEntry(pfx + "_xf_assign", "XF Assign",   grp, osc + "/xf_assign", -1, 0, false, chBase, D);
             // V10 per-channel: compressor, 4-band EQ lo-mid, per-channel send (0 on 900NXS2 and A9)
-            addEntry(pfx + "_comp",      "Compressor",  grp, osc + "/comp",       -1, 0, false, V);
-            addEntry(pfx + "_eq_lo_mid", "EQ Lo Mid",   grp, osc + "/eq_lo_mid",  -1, 0, false, V);
-            addEntry(pfx + "_send",      "Send",        grp, osc + "/send",       -1, 0, false, V);
+            addEntry(pfx + "_comp",      "Compressor",  grp, osc + "/comp",       -1, 0, false, V, C);
+            addEntry(pfx + "_eq_lo_mid", "EQ Lo Mid",   grp, osc + "/eq_lo_mid",  -1, 0, false, V, C);
+            addEntry(pfx + "_send",      "Send",        grp, osc + "/send",       -1, 0, false, V, C);
             // Dual CUE: A9 and V10 (0 on 900NXS2)
-            addEntry(pfx + "_cue_b",     "CUE B (A9/V10)", grp, osc + "/cue_b",      -1, 0, false, isV10Ch ? V : A9);
+            addEntry(pfx + "_cue_b",     "CUE B (A9/V10)", grp, osc + "/cue_b",      -1, 0, false, isV10Ch ? V : A9, T);
         }
 
         // --- Master / Global faders --- (DMX after all channels)
         int masterDmxBase = kChCount * 6 + 1;  // 37
-        addEntry("crossfader",    "Crossfader",    "Master", "/mixer/crossfader",  5,  masterDmxBase,     true);
-        addEntry("master_fader",  "Master Fader",  "Master", "/mixer/master",      7,  masterDmxBase + 1, true);
-        addEntry("master_cue",    "Master CUE",    "Master", "/mixer/master_cue",  43, 0,  false);
-        addEntry("fader_curve",   "Fader Curve",   "Master", "/mixer/fader_curve", -1, 0,  false);
-        addEntry("xf_curve",      "XF Curve",      "Master", "/mixer/xf_curve",   -1, 0,  false);
+        addEntry("crossfader",    "Crossfader",    "Master", "/mixer/crossfader",  5,  masterDmxBase,     true,  A, C);
+        addEntry("master_fader",  "Master Fader",  "Master", "/mixer/master",      7,  masterDmxBase + 1, true,  A, C);
+        addEntry("master_cue",    "Master CUE",    "Master", "/mixer/master_cue",  43, 0,  false, A, T);
+        addEntry("fader_curve",   "Fader Curve",   "Master", "/mixer/fader_curve", -1, 0,  false, A, D);
+        addEntry("xf_curve",      "XF Curve",      "Master", "/mixer/xf_curve",   -1, 0,  false, A, D);
 
         // --- Monitoring ---
-        addEntry("booth",         "Booth Level",   "Monitor", "/mixer/booth",       31, masterDmxBase + 5, false);
-        addEntry("hp_cue_link",   "HP Cue Link",   "Monitor", "/mixer/hp_cue_link", -1, 0,  false);
-        addEntry("hp_mixing",     "HP Mixing",     "Monitor", "/mixer/hp_mixing",   33, masterDmxBase + 6, false);
-        addEntry("hp_level",      "HP Level",      "Monitor", "/mixer/hp_level",    34, masterDmxBase + 7, false);
+        addEntry("booth",         "Booth Level",   "Monitor", "/mixer/booth",       31, masterDmxBase + 5, false, A, C);
+        addEntry("hp_cue_link",   "HP Cue Link",   "Monitor", "/mixer/hp_cue_link", -1, 0,  false, A, T);
+        addEntry("hp_mixing",     "HP Mixing",     "Monitor", "/mixer/hp_mixing",   33, masterDmxBase + 6, false, A, C);
+        addEntry("hp_level",      "HP Level",      "Monitor", "/mixer/hp_level",    34, masterDmxBase + 7, false, A, C);
 
         // --- Beat FX ---
-        addEntry("beatfx_select", "Beat FX Select", "Beat FX", "/mixer/beatfx_select", 40, 0, false);
-        addEntry("beatfx_level",  "Beat FX Level",  "Beat FX", "/mixer/beatfx_level",  35, 0, false);
-        addEntry("beatfx_on",     "Beat FX On/Off", "Beat FX", "/mixer/beatfx_on",     41, 0, false);
-        addEntry("beatfx_assign", "Beat FX Assign", "Beat FX", "/mixer/beatfx_assign", -1, 0, false);
-        addEntry("fx_freq_lo",    "FX Freq Lo",     "Beat FX", "/mixer/fx_freq_lo",    -1, 0, false);
-        addEntry("fx_freq_mid",   "FX Freq Mid",    "Beat FX", "/mixer/fx_freq_mid",   -1, 0, false);
-        addEntry("fx_freq_hi",    "FX Freq Hi",     "Beat FX", "/mixer/fx_freq_hi",    -1, 0, false);
-        addEntry("send_return",   "Send/Return",    "Beat FX", "/mixer/send_return",   37, 0, false);
+        addEntry("beatfx_select", "Beat FX Select", "Beat FX", "/mixer/beatfx_select", 40, 0, false, A, D);
+        addEntry("beatfx_level",  "Beat FX Level",  "Beat FX", "/mixer/beatfx_level",  35, 0, false, A, C);
+        addEntry("beatfx_on",     "Beat FX On/Off", "Beat FX", "/mixer/beatfx_on",     41, 0, false, A, T);
+        addEntry("beatfx_assign", "Beat FX Assign", "Beat FX", "/mixer/beatfx_assign", -1, 0, false, A, D);
+        addEntry("fx_freq_lo",    "FX Freq Lo",     "Beat FX", "/mixer/fx_freq_lo",    -1, 0, false, A, T);
+        addEntry("fx_freq_mid",   "FX Freq Mid",    "Beat FX", "/mixer/fx_freq_mid",   -1, 0, false, A, T);
+        addEntry("fx_freq_hi",    "FX Freq Hi",     "Beat FX", "/mixer/fx_freq_hi",    -1, 0, false, A, T);
+        addEntry("send_return",   "Send/Return",    "Beat FX", "/mixer/send_return",   37, 0, false, A, C);
 
         // --- Color FX ---
-        addEntry("colorfx_select", "Color FX Select", "Color FX", "/mixer/colorfx_select", 42, 0, false);
-        addEntry("colorfx_param",  "Color FX Param",  "Color FX", "/mixer/colorfx_param",  36, 0, false);
-        addEntry("colorfx_assign", "Color FX Assign", "Color FX", "/mixer/colorfx_assign", -1, 0, false);
+        addEntry("colorfx_select", "Color FX Select", "Color FX", "/mixer/colorfx_select", 42, 0, false, A, D);
+        addEntry("colorfx_param",  "Color FX Param",  "Color FX", "/mixer/colorfx_param",  36, 0, false, A, C);
+        addEntry("colorfx_assign", "Color FX Assign", "Color FX", "/mixer/colorfx_assign", -1, 0, false, A, D);
 
         // --- Mic ---
-        addEntry("mic_eq_hi",  "Mic EQ High", "Mic", "/mixer/mic_eq_hi", 38, 0, false);
-        addEntry("mic_eq_lo",  "Mic EQ Low",  "Mic", "/mixer/mic_eq_lo", 39, 0, false);
+        addEntry("mic_eq_hi",  "Mic EQ High", "Mic", "/mixer/mic_eq_hi", 38, 0, false, A, C);
+        addEntry("mic_eq_lo",  "Mic EQ Low",  "Mic", "/mixer/mic_eq_lo", 39, 0, false, A, C);
 
         // --- A9+ globals (A9 and V10: dual CUE, headphone B, booth EQ) ---
-        addEntry("master_cue_b",     "Master CUE B",       "Master (A9/V10)",  "/mixer/master_cue_b",      -1, 0, false, A9);
-        addEntry("hp_b_cue_link",    "HP B Cue Link",      "Monitor (A9/V10)", "/mixer/hp_b_cue_link",     -1, 0, false, A9);
-        addEntry("hp_b_mixing",      "HP B Mixing",        "Monitor (A9/V10)", "/mixer/hp_b_mixing",       -1, 0, false, A9);
-        addEntry("hp_b_level",       "HP B Level",         "Monitor (A9/V10)", "/mixer/hp_b_level",        -1, 0, false, A9);
-        addEntry("booth_eq_hi",      "Booth EQ Hi",        "Monitor (A9/V10)", "/mixer/booth_eq_hi",       -1, 0, false, A9);
-        addEntry("booth_eq_lo",      "Booth EQ Lo",        "Monitor (A9/V10)", "/mixer/booth_eq_lo",       -1, 0, false, A9);
-        addEntry("booth_eq",     "Booth EQ",       "Monitor (A9/V10)", "/mixer/booth_eq",      -1, 0, false, A9);
+        addEntry("master_cue_b",     "Master CUE B",       "Master (A9/V10)",  "/mixer/master_cue_b",      -1, 0, false, A9, T);
+        addEntry("hp_b_cue_link",    "HP B Cue Link",      "Monitor (A9/V10)", "/mixer/hp_b_cue_link",     -1, 0, false, A9, T);
+        addEntry("hp_b_mixing",      "HP B Mixing",        "Monitor (A9/V10)", "/mixer/hp_b_mixing",       -1, 0, false, A9, C);
+        addEntry("hp_b_level",       "HP B Level",         "Monitor (A9/V10)", "/mixer/hp_b_level",        -1, 0, false, A9, C);
+        addEntry("booth_eq_hi",      "Booth EQ Hi",        "Monitor (A9/V10)", "/mixer/booth_eq_hi",       -1, 0, false, A9, C);
+        addEntry("booth_eq_lo",      "Booth EQ Lo",        "Monitor (A9/V10)", "/mixer/booth_eq_lo",       -1, 0, false, A9, C);
+        addEntry("booth_eq",     "Booth EQ",       "Monitor (A9/V10)", "/mixer/booth_eq",      -1, 0, false, A9, T);
 
         // --- V10-only globals (0 on 900NXS2 and A9) ---
-        addEntry("isolator_on",      "Isolator On",        "Isolator (V10)", "/mixer/isolator_on",       -1, 0, false, V);
-        addEntry("isolator_hi",      "Isolator Hi",        "Isolator (V10)", "/mixer/isolator_hi",       -1, 0, false, V);
-        addEntry("isolator_mid",     "Isolator Mid",       "Isolator (V10)", "/mixer/isolator_mid",      -1, 0, false, V);
-        addEntry("isolator_lo",      "Isolator Lo",        "Isolator (V10)", "/mixer/isolator_lo",       -1, 0, false, V);
-        addEntry("filter_lpf",       "Filter LPF",         "Filter (V10)",   "/mixer/filter_lpf",        -1, 0, false, V);
-        addEntry("filter_hpf",       "Filter HPF",         "Filter (V10)",   "/mixer/filter_hpf",        -1, 0, false, V);
-        addEntry("filter_resonance", "Filter Resonance",   "Filter (V10)",   "/mixer/filter_resonance",  -1, 0, false, V);
-        addEntry("send_ext1",        "Send Ext1",          "Sends (V10)",    "/mixer/send_ext1",         -1, 0, false, V);
-        addEntry("send_ext2",        "Send Ext2",          "Sends (V10)",    "/mixer/send_ext2",         -1, 0, false, V);
-        addEntry("master_mix_on",    "Master Mix On",      "Sends (V10)",    "/mixer/master_mix_on",     -1, 0, false, V);
-        addEntry("master_mix_size",  "Master Mix Size",    "Sends (V10)",    "/mixer/master_mix_size",   -1, 0, false, V);
-        addEntry("master_mix_time",  "Master Mix Time",    "Sends (V10)",    "/mixer/master_mix_time",   -1, 0, false, V);
-        addEntry("master_mix_tone",  "Master Mix Tone",    "Sends (V10)",    "/mixer/master_mix_tone",   -1, 0, false, V);
-        addEntry("master_mix_level", "Master Mix Level",   "Sends (V10)",    "/mixer/master_mix_level",  -1, 0, false, V);
-        addEntry("multi_io_select",  "Multi I/O Select",   "Multi I/O (A9/V10)","/mixer/multi_io_select",   -1, 0, false, A9);
-        addEntry("multi_io_level",   "Multi I/O Level",    "Multi I/O (A9/V10)","/mixer/multi_io_level",    -1, 0, false, A9);
+        addEntry("isolator_on",      "Isolator On",        "Isolator (V10)", "/mixer/isolator_on",       -1, 0, false, V, T);
+        addEntry("isolator_hi",      "Isolator Hi",        "Isolator (V10)", "/mixer/isolator_hi",       -1, 0, false, V, C);
+        addEntry("isolator_mid",     "Isolator Mid",       "Isolator (V10)", "/mixer/isolator_mid",      -1, 0, false, V, C);
+        addEntry("isolator_lo",      "Isolator Lo",        "Isolator (V10)", "/mixer/isolator_lo",       -1, 0, false, V, C);
+        addEntry("filter_lpf",       "Filter LPF",         "Filter (V10)",   "/mixer/filter_lpf",        -1, 0, false, V, T);
+        addEntry("filter_hpf",       "Filter HPF",         "Filter (V10)",   "/mixer/filter_hpf",        -1, 0, false, V, T);
+        addEntry("filter_resonance", "Filter Resonance",   "Filter (V10)",   "/mixer/filter_resonance",  -1, 0, false, V, C);
+        addEntry("send_ext1",        "Send Ext1",          "Sends (V10)",    "/mixer/send_ext1",         -1, 0, false, V, T);
+        addEntry("send_ext2",        "Send Ext2",          "Sends (V10)",    "/mixer/send_ext2",         -1, 0, false, V, T);
+        addEntry("master_mix_on",    "Master Mix On",      "Sends (V10)",    "/mixer/master_mix_on",     -1, 0, false, V, T);
+        addEntry("master_mix_size",  "Master Mix Size",    "Sends (V10)",    "/mixer/master_mix_size",   -1, 0, false, V, C);
+        addEntry("master_mix_time",  "Master Mix Time",    "Sends (V10)",    "/mixer/master_mix_time",   -1, 0, false, V, C);
+        addEntry("master_mix_tone",  "Master Mix Tone",    "Sends (V10)",    "/mixer/master_mix_tone",   -1, 0, false, V, C);
+        addEntry("master_mix_level", "Master Mix Level",   "Sends (V10)",    "/mixer/master_mix_level",  -1, 0, false, V, C);
+        addEntry("multi_io_select",  "Multi I/O Select",   "Multi I/O (A9/V10)","/mixer/multi_io_select",   -1, 0, false, A9, D);
+        addEntry("multi_io_level",   "Multi I/O Level",    "Multi I/O (A9/V10)","/mixer/multi_io_level",    -1, 0, false, A9, C);
     }
 
     void addEntry(const juce::String& id, const juce::String& name, const juce::String& group,
                   const juce::String& osc, int cc, int dmxCh, bool enabled,
-                  DjmModel model = DjmModel::All)
+                  DjmModel model = DjmModel::All, ParamType type = ParamType::Continuous)
     {
         MixerMapEntry e;
         e.paramId     = id;
@@ -334,6 +345,7 @@ private:
         e.artnetCh    = dmxCh;
         e.enabled     = enabled;
         e.minModel    = model;
+        e.paramType   = type;
         entries.push_back(std::move(e));
     }
 

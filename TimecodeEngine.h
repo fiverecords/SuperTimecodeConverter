@@ -140,6 +140,7 @@ public:
             bpmPlayerOverride = kBpmNoOverride;
             cachedTrackArtist.clear();
             cachedTrackTitle.clear();
+            cachedTrackDurationSec = 0;
             // Disable Link to avoid publishing stale tempo on the network
             linkBridge.setEnabled(false);
         }
@@ -237,6 +238,10 @@ public:
     void setOutputArtnetEnabled(bool e) { outputArtnetEnabled = e; }
     void setOutputLtcEnabled(bool e)    { outputLtcEnabled = e; }
     void setOutputThruEnabled(bool e)   { outputThruEnabled = e; }
+    void setOutputTcnetEnabled(bool e)  { outputTcnetEnabled = e; }
+    bool isOutputTcnetEnabled() const   { return outputTcnetEnabled; }
+    void setTcnetLayer(int l)           { tcnetLayer = juce::jlimit(0, 3, l); }
+    int  getTcnetLayer() const          { return tcnetLayer; }
 
     int getMtcOutputOffset() const      { return mtcOutputOffset; }
     int getArtnetOutputOffset() const   { return artnetOutputOffset; }
@@ -350,6 +355,9 @@ public:
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
+        cachedTrackDurationSec = 0;
+        armedCues.clear();
+        lastCueCheckMs = 0;
         pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
@@ -414,7 +422,7 @@ public:
         // StageLinQ has no fps auto-detection -- use configured output fps
         currentFps = outputFps;
 
-        proDJLinkPlayer = juce::jlimit(1, StageLinQ::kMaxDecks, player);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
         resolvedXfPlayer = 0;
 
         if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
@@ -490,6 +498,7 @@ public:
                 auto tinfo = sharedProDJLink->getTrackInfo(getEffectivePlayer());
                 cachedTrackArtist = tinfo.artist;
                 cachedTrackTitle  = tinfo.title;
+                cachedTrackDurationSec = (int)sharedProDJLink->getTrackLengthSec(getEffectivePlayer());
 
                 // Phase 2: check dbClient cache or request if missing
                 if (dbClient != nullptr && dbClient->getIsRunning())
@@ -499,11 +508,13 @@ public:
                     {
                         cachedTrackArtist = meta.artist;
                         cachedTrackTitle  = meta.title;
-                        // Propagate track duration to player state (NXS2 needs this
-                        // since it doesn't report duration in protocol packets)
-                        if (meta.durationSeconds > 0 && sharedProDJLink != nullptr)
-                            sharedProDJLink->setTrackLengthSec(getEffectivePlayer(),
-                                (uint32_t)meta.durationSeconds);
+                        if (meta.durationSeconds > 0)
+                        {
+                            cachedTrackDurationSec = meta.durationSeconds;
+                            if (sharedProDJLink != nullptr)
+                                sharedProDJLink->setTrackLengthSec(getEffectivePlayer(),
+                                    (uint32_t)meta.durationSeconds);
+                        }
                     }
                     else
                     {
@@ -539,6 +550,7 @@ public:
         juce::String key;
         int bpmTimes100 = 0;
         uint32_t artworkId = 0;
+        int durationSec = 0;
     };
 
     ActiveTrackInfo getActiveTrackInfo() const
@@ -547,6 +559,7 @@ public:
         info.trackId = cachedTrackId;
         info.artist  = cachedTrackArtist;
         info.title   = cachedTrackTitle;
+        info.durationSec = cachedTrackDurationSec;
         info.mapped  = trackMapped;
         if (trackMapped)
             info.offset = TrackMapEntry::formatTimecodeString(
@@ -580,7 +593,18 @@ public:
     void refreshTrackMapLookup()
     {
         if (!trackMapPtr || cachedTrackArtist.isEmpty()) return;
-        lookupTrackInMap();
+        const auto* entry = lookupTrackInMap();
+        // Reload cue points (user may have added/edited/deleted cues).
+        // Preserve playhead position so cues behind the current playhead
+        // are marked as already fired (don't re-trigger on edit).
+        uint32_t savedPlayhead = lastCueCheckMs;
+        loadCuePointsForTrack(entry);
+        if (savedPlayhead > 0)
+        {
+            for (auto& ac : armedCues)
+                ac.fired = (ac.cue.positionMs < savedPlayhead);
+            lastCueCheckMs = savedPlayhead;
+        }
     }
 
     /// Re-request metadata for the current track (used when waveform data
@@ -900,6 +924,7 @@ public:
                             auto tinfo = sharedProDJLink->getTrackInfo(ep);
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
+                            cachedTrackDurationSec = (int)sharedProDJLink->getTrackLengthSec(ep);
 
                             DBG("TimecodeEngine: track changed -- "
                                 + cachedTrackArtist + " - " + cachedTrackTitle
@@ -919,6 +944,7 @@ public:
                             lastSentClockBpm = -1.0f;
                             lastSentOscBpm   = -1.0f;
                             fireTrackTrigger(entry);
+                            loadCuePointsForTrack(entry);
                         }
                     }
 
@@ -934,13 +960,18 @@ public:
                         {
                             cachedTrackArtist = meta.artist;
                             cachedTrackTitle  = meta.title;
-                            if (meta.durationSeconds > 0 && sharedProDJLink != nullptr)
-                                sharedProDJLink->setTrackLengthSec(ep,
-                                    (uint32_t)meta.durationSeconds);
+                            if (meta.durationSeconds > 0)
+                            {
+                                cachedTrackDurationSec = meta.durationSeconds;
+                                if (sharedProDJLink != nullptr)
+                                    sharedProDJLink->setTrackLengthSec(ep,
+                                        (uint32_t)meta.durationSeconds);
+                            }
 
                             // NOW we have real artist+title -- do the TrackMap lookup
                             const auto* entry = lookupTrackInMap();
                             fireTrackTrigger(entry);
+                            loadCuePointsForTrack(entry);
                         }
                     }
 
@@ -955,6 +986,33 @@ public:
                         trackMapPtr->save();
                     }
 
+                    // Deferred duration pickup: NXS2 doesn't report duration in
+                    // protocol packets.  If we missed it at track-change time,
+                    // check ProDJLinkInput (CDJ-3000 abspos) or dbClient cache.
+                    if (cachedTrackDurationSec == 0 && trackMapPtr != nullptr)
+                    {
+                        int nowDur = (int)sharedProDJLink->getTrackLengthSec(ep);
+                        if (nowDur == 0 && dbClient != nullptr && cachedTrackId != 0)
+                        {
+                            auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
+                            if (meta.isValid() && meta.durationSeconds > 0)
+                                nowDur = meta.durationSeconds;
+                        }
+                        if (nowDur > 0)
+                        {
+                            cachedTrackDurationSec = nowDur;
+                            const auto* entry = lookupTrackInMap();
+                            uint32_t savedPlayhead = lastCueCheckMs;
+                            loadCuePointsForTrack(entry);
+                            if (savedPlayhead > 0)
+                            {
+                                for (auto& ac : armedCues)
+                                    ac.fired = (ac.cue.positionMs < savedPlayhead);
+                                lastCueCheckMs = savedPlayhead;
+                            }
+                        }
+                    }
+
                     // --- Apply timecode offset ---
                     if (trackMapEnabled && trackMapped)
                     {
@@ -963,6 +1021,16 @@ public:
                             cachedOffH, cachedOffM, cachedOffS, cachedOffF,
                             currentFps);
                     }
+
+                    // --- Fire cue point triggers ---
+                    // Only fire during actual playback.  Scrub/jog/cue-preview
+                    // moves the playhead but should NOT trigger cue points --
+                    // DJs preview constantly and spurious MIDI/OSC/ArtNet
+                    // triggers during preparation would be disruptive.
+                    if (sharedProDJLink->isPlayerPlaying(ep))
+                        tickCuePoints(rawPlayheadMs);
+                    else
+                        lastCueCheckMs = rawPlayheadMs;  // track position so seek detection stays correct
 
                     bool pdlRx = sharedProDJLink->isReceiving();
                     if (statusTextVisible)
@@ -1095,12 +1163,21 @@ public:
             case InputSource::StageLinQ:
                 if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
                 {
-                    // StageLinQ does not support XF-A/XF-B (no DJM mixer protocol)
-                    const int ep = proDJLinkPlayer;
+                    // XF-A/XF-B auto-follow (same logic as ProDJLink)
+                    if (isXfMode())
+                        resolveXfPlayerStageLinQ();
+                    const int ep = getEffectivePlayer();
                     if (ep < 1 || ep > StageLinQ::kMaxDecks)
                     {
                         sourceActive = false;
-                        if (statusTextVisible) inputStatusText = "INVALID DECK";
+                        if (statusTextVisible)
+                        {
+                            if (isXfMode())
+                                inputStatusText = juce::String(proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
+                                                + ": NO DECK ON SIDE";
+                            else
+                                inputStatusText = "INVALID DECK";
+                        }
                         break;
                     }
 
@@ -1158,6 +1235,7 @@ public:
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
                             cachedTrackId = slqTrackVer;  // StageLinQ has no numeric ID; use version
+                            cachedTrackDurationSec = (int)sharedStageLinQ->getTrackLengthSec(ep);
 
                             DBG("TimecodeEngine: StageLinQ track changed -- "
                                 + cachedTrackArtist + " - " + cachedTrackTitle
@@ -1168,6 +1246,7 @@ public:
                             lastSentClockBpm = -1.0f;
                             lastSentOscBpm   = -1.0f;
                             fireTrackTrigger(entry);
+                            loadCuePointsForTrack(entry);
                         }
                     }
 
@@ -1176,6 +1255,27 @@ public:
                     {
                         trackMapDirty = false;
                         trackMapPtr->save();
+                    }
+
+                    // Deferred duration pickup: TrackLength may arrive after
+                    // SongName/SongLoaded in the StateMap stream.  If we missed
+                    // it at track-change time, pick it up now and re-lookup.
+                    if (cachedTrackDurationSec == 0 && trackMapPtr != nullptr)
+                    {
+                        int nowDur = (int)sharedStageLinQ->getTrackLengthSec(ep);
+                        if (nowDur > 0)
+                        {
+                            cachedTrackDurationSec = nowDur;
+                            const auto* entry = lookupTrackInMap();
+                            uint32_t savedPlayhead = lastCueCheckMs;
+                            loadCuePointsForTrack(entry);
+                            if (savedPlayhead > 0)
+                            {
+                                for (auto& ac : armedCues)
+                                    ac.fired = (ac.cue.positionMs < savedPlayhead);
+                                lastCueCheckMs = savedPlayhead;
+                            }
+                        }
                     }
 
                     // Apply timecode offset from TrackMap
@@ -1187,6 +1287,13 @@ public:
                             currentFps);
                     }
 
+                    // --- Fire cue point triggers ---
+                    // Same guard as ProDJLink: only during playback.
+                    if (sharedStageLinQ->isPlayerPlaying(ep))
+                        tickCuePoints(rawPlayheadMs);
+                    else
+                        lastCueCheckMs = rawPlayheadMs;
+
                     bool slqRx = sharedStageLinQ->isReceiving();
                     if (statusTextVisible)
                     {
@@ -1196,7 +1303,10 @@ public:
                             if (slqHasTC)
                             {
                                 juce::String slqModel = sharedStageLinQ->getPlayerModel(ep);
-                                inputStatusText = "RX D" + juce::String(ep);
+                                inputStatusText = isXfMode()
+                                    ? (juce::String(proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
+                                       + " D" + juce::String(ep))
+                                    : ("RX D" + juce::String(ep));
                                 if (slqModel.isNotEmpty())
                                     inputStatusText += " " + slqModel;
 
@@ -1422,6 +1532,8 @@ private:
     bool outputArtnetEnabled = false;
     bool outputLtcEnabled    = false;
     bool outputThruEnabled   = false;
+    bool outputTcnetEnabled  = false;
+    int  tcnetLayer          = 0;      // TCNet layer index 0-3
 
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
@@ -1505,6 +1617,72 @@ private:
         }
     }
 
+    /// Resolve XF-A/XF-B for StageLinQ.  Same sticky logic as ProDJLink.
+    /// Uses derived on-air status (fader + crossfader + channel assignment).
+    /// Channel assignment values assumed 0=THRU, 1=A, 2=B -- awaiting
+    /// hardware confirmation.
+    void resolveXfPlayerStageLinQ()
+    {
+        if (!sharedStageLinQ || !sharedStageLinQ->hasMixerData())
+            return;
+
+        int targetSide = (proDJLinkPlayer == kPlayerXfA) ? 1 : 2;
+
+        // Helper: get crossfader assignment for a channel.
+        // Values assumed: 0=THRU, 1=A, 2=B -- awaiting hardware confirmation.
+        auto getAssign = [this](int ch) -> int
+        {
+            return sharedStageLinQ->getChannelAssignment(ch);
+        };
+
+        // Sticky: keep current if still assigned to our side AND on-air
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= StageLinQ::kMaxDecks)
+        {
+            int assign = getAssign(resolvedXfPlayer);
+            bool onAir = sharedStageLinQ->isDeckOnAir(resolvedXfPlayer);
+            if (assign == targetSide && onAir)
+                return;  // still valid
+        }
+
+        // Find on-air replacement on our side
+        for (int ch = 1; ch <= StageLinQ::kMaxDecks; ++ch)
+        {
+            int assign = getAssign(ch);
+            if (assign == targetSide && sharedStageLinQ->isDeckOnAir(ch))
+            {
+                switchResolvedPlayer(ch);
+                return;
+            }
+        }
+
+        // No on-air player -- keep current if still on right side
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= StageLinQ::kMaxDecks)
+        {
+            int assign = getAssign(resolvedXfPlayer);
+            if (assign == targetSide)
+                return;
+        }
+
+        // Find any player on this side
+        for (int ch = 1; ch <= StageLinQ::kMaxDecks; ++ch)
+        {
+            int assign = getAssign(ch);
+            if (assign == targetSide)
+            {
+                switchResolvedPlayer(ch);
+                return;
+            }
+        }
+
+        // No player assigned to this side
+        if (resolvedXfPlayer != 0)
+        {
+            resolvedXfPlayer = 0;
+            pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
+        }
+    }
+
     /// Switch the resolved player with a mini-reset (PLL + track cache)
     void switchResolvedPlayer(int newPlayer)
     {
@@ -1518,10 +1696,13 @@ private:
         cachedTrackId = 0;
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
+        cachedTrackDurationSec = 0;
         trackMapped = false;
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
         cachedBpmMultiplier = 0;
         lastSeenTrackVersion = 0;
+        armedCues.clear();
+        lastCueCheckMs = 0;
         lastSentClockBpm = -1.0f;
         lastSentOscBpm   = -1.0f;
         bpmPlayerOverride = kBpmNoOverride;
@@ -1738,6 +1919,7 @@ private:
     uint32_t  lastSeenTrackVersion = 0;     // per-engine version counter for track change detection
     int       cachedOffH = 0, cachedOffM = 0, cachedOffS = 0, cachedOffF = 0;
     juce::String cachedTrackArtist, cachedTrackTitle;
+    int cachedTrackDurationSec = 0;
 
     // Track change triggers
     TriggerOutput triggerOutput;
@@ -1768,6 +1950,18 @@ private:
     int  trigDmxHighWater = 0;
     int  artnetTriggerUniverse = 1;     // default universe 1 (separate from mixer universe 0)
     bool artnetTriggerEnabled = false;  // must be enabled for Art-Net DMX track triggers to fire
+
+    // --- Cue point firing state ---
+    // Armed cue points for the currently loaded track.  Loaded from TrackMap
+    // on track change, sorted by positionMs.  Each has a `fired` flag that is
+    // set when the playhead crosses the cue and reset on track change or seek.
+    struct ArmedCue
+    {
+        CuePoint cue;           // copy of the cue point data (trigger config)
+        bool     fired = false;
+    };
+    std::vector<ArmedCue> armedCues;
+    uint32_t lastCueCheckMs = 0;   // last playhead position used for cue check (seek detection)
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
     float lastSentOscBpm = -1.0f;      // dedup: last sent OSC value
 
@@ -1959,7 +2153,16 @@ private:
             return nullptr;
         }
 
-        auto* entry = trackMapPtr->find(cachedTrackArtist, cachedTrackTitle);
+        auto* entry = trackMapPtr->find(cachedTrackArtist, cachedTrackTitle,
+                                        cachedTrackDurationSec);
+
+        // Duration fallback: when duration resolves late (deferred pickup),
+        // the key changes from "artist|title" to "artist|title|300".  If the
+        // user's entry was saved without duration (legacy or manual add),
+        // the duration-aware lookup misses.  Fall back to duration=0 so we
+        // don't lose the TrackMap match (and its armed cue points).
+        if (!entry && cachedTrackDurationSec > 0)
+            entry = trackMapPtr->find(cachedTrackArtist, cachedTrackTitle, 0);
         if (entry)
         {
             int h, m, s, f;
@@ -2016,6 +2219,87 @@ private:
     }
 
     //--------------------------------------------------------------------------
+    // Cue point management
+    //--------------------------------------------------------------------------
+
+    /// Load cue points from the TrackMap entry for the current track.
+    /// Called on track change after fireTrackTrigger.  Resets all fired flags.
+    void loadCuePointsForTrack(const TrackMapEntry* entry)
+    {
+        armedCues.clear();
+        lastCueCheckMs = 0;
+
+        if (!entry || entry->cuePoints.empty()) return;
+
+        armedCues.reserve(entry->cuePoints.size());
+        for (auto& cp : entry->cuePoints)
+        {
+            ArmedCue ac;
+            ac.cue = cp;       // copy trigger data
+            ac.fired = false;
+            armedCues.push_back(std::move(ac));
+        }
+        // Guarantee sorted by position
+        std::sort(armedCues.begin(), armedCues.end(),
+                  [](const ArmedCue& a, const ArmedCue& b) {
+                      return a.cue.positionMs < b.cue.positionMs;
+                  });
+    }
+
+    /// Check playhead against armed cue points and fire triggers.
+    /// Called from tick() with the current playhead in ms.
+    /// Handles forward playback, seek forward, and seek backward.
+    void tickCuePoints(uint32_t playheadMs)
+    {
+        if (armedCues.empty()) return;
+
+        // Detect seek: playhead jumped backward or jumped forward more than 500ms
+        // beyond what normal playback would produce (60Hz tick = ~17ms advance)
+        bool seekDetected = (playheadMs < lastCueCheckMs)
+                         || (playheadMs > lastCueCheckMs + 500);
+
+        if (seekDetected)
+        {
+            // Reset fired flags: un-fire cues that are ahead of new playhead,
+            // mark cues behind new playhead as already fired (don't re-trigger
+            // cues we've passed)
+            for (auto& ac : armedCues)
+                ac.fired = (ac.cue.positionMs < playheadMs);
+        }
+
+        // Fire cues whose position the playhead has crossed
+        for (auto& ac : armedCues)
+        {
+            if (ac.fired) continue;
+            if (ac.cue.positionMs > playheadMs) break;  // sorted: no more to check
+
+            // Playhead has crossed this cue -- fire it
+            ac.fired = true;
+
+            triggerOutput.fireCuePoint(ac.cue);
+
+            // Art-Net DMX trigger (same pattern as track change triggers)
+            if (artnetTriggerEnabled && ac.cue.hasArtnetTrigger() && artnetOutput.getIsRunning())
+            {
+                int ch = ac.cue.artnetCh;
+                if (ch > 0 && ch <= 512)
+                {
+                    trigDmxBuffer[ch - 1] = uint8_t(ac.cue.artnetVal);
+                    if (ch > trigDmxHighWater) trigDmxHighWater = ch;
+                    artnetOutput.sendDmxFrame(trigDmxBuffer, trigDmxHighWater,
+                                              artnetTriggerUniverse);
+                }
+            }
+
+            DBG("TimecodeEngine: Cue fired '" + ac.cue.name + "' at "
+                + CuePoint::formatPositionMs(ac.cue.positionMs)
+                + " (playhead=" + CuePoint::formatPositionMs(playheadMs) + ")");
+        }
+
+        lastCueCheckMs = playheadMs;
+    }
+
+    //--------------------------------------------------------------------------
     void updateSystemTime()
     {
         auto now = juce::Time::getCurrentTime();
@@ -2062,18 +2346,44 @@ private:
                 int val = readMixerValue(i);
                 if (val < 0 || val == lastSentMixer[i]) continue;
 
+                // Map raw value according to parameter type:
+                //   Continuous (faders, knobs):  OSC 0.0-1.0, CC 0-127, DMX 0-255
+                //   Toggle     (on/off buttons): OSC 0.0/1.0, CC 0/127, DMX 0/255
+                //   Discrete   (select, assign): OSC integer,  CC clamp, DMX raw
+                float oscVal;
+                int   midiVal;
+                int   dmxVal;
+                switch (e.paramType)
+                {
+                    case ParamType::Toggle:
+                        oscVal  = val > 0 ? 1.0f : 0.0f;
+                        midiVal = val > 0 ? 127 : 0;
+                        dmxVal  = val > 0 ? 255 : 0;
+                        break;
+                    case ParamType::Discrete:
+                        oscVal  = (float)val;          // integer as float (e.g. 3.0 for BeatFX #3)
+                        midiVal = juce::jlimit(0, 127, val);
+                        dmxVal  = val;
+                        break;
+                    default: // Continuous
+                        oscVal  = val / 255.0f;
+                        midiVal = val >> 1;            // 0-255 -> 0-127
+                        dmxVal  = val;
+                        break;
+                }
+
                 if (doOsc && e.oscAddress.isNotEmpty())
-                    triggerOutput.sendOscFloat(e.oscAddress, val / 255.0f);
+                    triggerOutput.sendOscFloat(e.oscAddress, oscVal);
 
                 if (doMidi && e.midiCC >= 0)
-                    triggerOutput.sendCC(ccCh, e.midiCC, val >> 1);
+                    triggerOutput.sendCC(ccCh, e.midiCC, midiVal);
 
                 if (doMidi && e.midiNote >= 0)
-                    triggerOutput.sendNote(noteCh, e.midiNote, val >> 1);
+                    triggerOutput.sendNote(noteCh, e.midiNote, midiVal);
 
                 if (doArtnet && e.artnetCh > 0 && e.artnetCh <= 512)
                 {
-                    dmxBuffer[e.artnetCh - 1] = uint8_t(val);
+                    dmxBuffer[e.artnetCh - 1] = uint8_t(dmxVal);
                     dmxDirty = true;
                     if (e.artnetCh > dmxHighWaterMark)
                         dmxHighWaterMark = e.artnetCh;

@@ -3,8 +3,9 @@
 // https://github.com/fiverecords/SuperTimecodeConverter
 
 #include "MainComponent.h"
+#include "WaveformCache.h"
 
-using InputSource = TimecodeEngine::InputSource;
+using SrcType = TimecodeEngine::InputSource;
 
 //==============================================================================
 // Remove " *" or " [Engine N]" markers from combo item text to get the
@@ -12,10 +13,13 @@ using InputSource = TimecodeEngine::InputSource;
 //==============================================================================
 static juce::String stripComboMarker(const juce::String& text)
 {
-    static const juce::String dotSuffix = juce::String(" ") + juce::String::charToString(0x25CF);
+    static const juce::String dotChar = juce::String::charToString(0x25CF);
+    static const juce::String dotWithSpace = juce::String(" ") + dotChar;
     auto s = text;
-    if (s.endsWith(dotSuffix))
-        s = s.dropLastCharacters(dotSuffix.length());
+    if (s.endsWith(dotWithSpace))
+        s = s.dropLastCharacters(dotWithSpace.length());
+    else if (s.endsWith(dotChar))
+        s = s.dropLastCharacters(dotChar.length());
     int bracket = s.lastIndexOf(" [");
     if (bracket >= 0 && s.endsWith("]"))
         s = s.substring(0, bracket);
@@ -130,50 +134,51 @@ MainComponent::MainComponent()
     btnMtcIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::MTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::MTC); startCurrentMtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::MTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::MTC); startCurrentMtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnArtnetIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnSysTime.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::SystemTime) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::SystemTime); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::SystemTime) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::SystemTime); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
     btnLtcIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::LTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::LTC); if (!scannedAudioInputs.isEmpty()) startCurrentLtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::LTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::LTC); if (!scannedAudioInputs.isEmpty()) startCurrentLtcInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
 
     btnProDJLinkIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::ProDJLink) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::ProDJLink); startCurrentProDJLinkInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::ProDJLink) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::ProDJLink); startCurrentProDJLinkInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
 
     btnStageLinQIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::StageLinQ) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
-        else { inputConfigExpanded = true; eng.setInputSource(InputSource::StageLinQ); startCurrentStageLinQInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
+        if (eng.getActiveInput() == SrcType::StageLinQ) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::StageLinQ); startCurrentStageLinQInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); saveSettings(); }
     };
 
     // --- Output toggles ---
-    for (auto* btn : { &btnMtcOut, &btnArtnetOut, &btnLtcOut, &btnThruOut })
+    for (auto* btn : { &btnMtcOut, &btnArtnetOut, &btnLtcOut, &btnThruOut, &btnTcnetOut })
         rightContent.addAndMakeVisible(btn);
 
     styleOutputToggle(btnMtcOut, accentRed);
     styleOutputToggle(btnArtnetOut, accentOrange);
     styleOutputToggle(btnLtcOut, accentPurple);
     styleOutputToggle(btnThruOut, accentCyan);
+    styleOutputToggle(btnTcnetOut, juce::Colour(0xFF00CC66));
 
     auto outputToggleHandler = [this]
     {
@@ -183,11 +188,27 @@ MainComponent::MainComponent()
         eng.setOutputArtnetEnabled(btnArtnetOut.getToggleState());
         eng.setOutputLtcEnabled(btnLtcOut.getToggleState());
         eng.setOutputThruEnabled(btnThruOut.getToggleState());
+        eng.setOutputTcnetEnabled(btnTcnetOut.getToggleState());
+
+        // Auto-start/stop shared TCNet output based on any engine needing it
+        bool anyTcnet = false;
+        for (auto& e : engines)
+            if (e->isOutputTcnetEnabled()) { anyTcnet = true; break; }
+        if (anyTcnet && !sharedTcnetOutput.getIsRunning())
+        {
+            sharedTcnetOutput.refreshNetworkInterfaces();
+            sharedTcnetOutput.start(settings.tcnetInterface);
+        }
+        else if (!anyTcnet && sharedTcnetOutput.getIsRunning())
+        {
+            sharedTcnetOutput.stop();
+        }
+
         updateCurrentOutputStates();
         updateDeviceSelectorVisibility();
         saveSettings();
     };
-    btnMtcOut.onClick = btnArtnetOut.onClick = btnLtcOut.onClick = btnThruOut.onClick = outputToggleHandler;
+    btnMtcOut.onClick = btnArtnetOut.onClick = btnLtcOut.onClick = btnThruOut.onClick = btnTcnetOut.onClick = outputToggleHandler;
 
     // --- Collapse toggle buttons for outputs ---
     for (auto* btn : { &btnCollapseMtcOut, &btnCollapseArtnetOut, &btnCollapseLtcOut, &btnCollapseThruOut })
@@ -228,7 +249,7 @@ MainComponent::MainComponent()
     btnFps2398.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::LTC) eng.setUserOverrodeLtcFps(true);
+        if (eng.getActiveInput() == SrcType::LTC) eng.setUserOverrodeLtcFps(true);
         eng.setFrameRate(FrameRate::FPS_2398); updateFpsButtonStates(); saveSettings();
     };
     btnFps24.onClick = [this] {
@@ -244,7 +265,7 @@ MainComponent::MainComponent()
     btnFps2997.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == InputSource::LTC) eng.setUserOverrodeLtcFps(true);
+        if (eng.getActiveInput() == SrcType::LTC) eng.setUserOverrodeLtcFps(true);
         eng.setFrameRate(FrameRate::FPS_2997); updateFpsButtonStates(); saveSettings();
     };
     btnFps30.onClick = [this] {
@@ -301,7 +322,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedRevert()) return;
         populateFilteredInputDeviceCombo();
-        if (currentEngine().getActiveInput() == InputSource::LTC)
+        if (currentEngine().getActiveInput() == SrcType::LTC)
             startCurrentLtcInput();
         saveSettings();
     };
@@ -320,7 +341,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedRevert()) return;
         int sel = cmbMidiInputDevice.getSelectedId() - 1;
-        if (sel >= 0 && currentEngine().getActiveInput() == InputSource::MTC)
+        if (sel >= 0 && currentEngine().getActiveInput() == SrcType::MTC)
         {
             currentEngine().stopMtcInput();
             currentEngine().getMtcInput().refreshDeviceList();
@@ -335,7 +356,7 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        if (currentEngine().getActiveInput() == InputSource::ArtNet)
+        if (currentEngine().getActiveInput() == SrcType::ArtNet)
         {
             int sel = cmbArtnetInputInterface.getSelectedId() - 1;
             currentEngine().stopArtnetInput();
@@ -354,14 +375,23 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        if (currentEngine().getActiveInput() == InputSource::ProDJLink)
+        if (currentEngine().getActiveInput() == SrcType::ProDJLink)
         {
             startCurrentProDJLinkInput();
+            populateMidiAndNetworkCombos();
             saveSettings();
         }
-        else if (currentEngine().getActiveInput() == InputSource::StageLinQ)
+    };
+
+    addLabelAndCombo(lblStageLinQInterface, cmbStageLinQInterface, "STAGELINQ INTERFACE:");
+    cmbStageLinQInterface.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        if (currentEngine().getActiveInput() == SrcType::StageLinQ)
         {
             startCurrentStageLinQInput();
+            populateMidiAndNetworkCombos();
             saveSettings();
         }
     };
@@ -377,7 +407,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedRevert()) return;
         auto activeIn = currentEngine().getActiveInput();
-        if (activeIn == InputSource::ProDJLink || activeIn == InputSource::StageLinQ)
+        if (activeIn == SrcType::ProDJLink || activeIn == SrcType::StageLinQ)
         {
             int player = cmbProDJLinkPlayer.getSelectedId();
             if (player >= 1)
@@ -512,12 +542,15 @@ MainComponent::MainComponent()
         else
         {
             settings.showModeLocked = true;
+            // Close cue editor (config window -- shouldn't be open during show)
+            if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); }
             updateShowLockVisuals();
             saveSettings();
         }
     };
 
     leftContent.addAndMakeVisible(btnMidiClock);
+
     btnMidiClock.setVisible(false);
     btnMidiClock.setColour(juce::ToggleButton::textColourId, textMid);
     btnMidiClock.setColour(juce::ToggleButton::tickColourId, pdlAccent);
@@ -840,7 +873,7 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        if (currentEngine().getActiveInput() == InputSource::LTC
+        if (currentEngine().getActiveInput() == SrcType::LTC
             && cmbAudioInputDevice.getSelectedId() > 0
             && cmbAudioInputDevice.getSelectedId() != kPlaceholderItemId)
         {
@@ -852,7 +885,7 @@ MainComponent::MainComponent()
     };
 
     addLabelAndCombo(lblAudioInputChannel, cmbAudioInputChannel, "LTC CHANNEL:");
-    cmbAudioInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == InputSource::LTC) { startCurrentLtcInput(); saveSettings(); } };
+    cmbAudioInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == SrcType::LTC) { startCurrentLtcInput(); saveSettings(); } };
 
     leftContent.addAndMakeVisible(sldLtcInputGain); styleGainSlider(sldLtcInputGain);
     leftContent.addAndMakeVisible(lblLtcInputGain); lblLtcInputGain.setText("LTC INPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcInputGain);
@@ -860,7 +893,7 @@ MainComponent::MainComponent()
     sldLtcInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setInputGain((float)sldLtcInputGain.getValue() / 100.0f); saveSettings(); } };
 
     addLabelAndCombo(lblThruInputChannel, cmbThruInputChannel, "AUDIO THRU CHANNEL:");
-    cmbThruInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == InputSource::LTC) { startCurrentLtcInput(); saveSettings(); } };
+    cmbThruInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == SrcType::LTC) { startCurrentLtcInput(); saveSettings(); } };
 
     leftContent.addAndMakeVisible(sldThruInputGain); styleGainSlider(sldThruInputGain);
     leftContent.addAndMakeVisible(lblThruInputGain); lblThruInputGain.setText("AUDIO THRU INPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruInputGain);
@@ -937,6 +970,34 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(sldArtnetOffset); styleOffsetSlider(sldArtnetOffset);
     rightContent.addAndMakeVisible(lblArtnetOffset); lblArtnetOffset.setText("ART-NET OFFSET:", juce::dontSendNotification); styleLabel(lblArtnetOffset);
     sldArtnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setArtnetOutputOffset((int)sldArtnetOffset.getValue()); saveSettings(); } };
+
+    // TCNet interface combo (shown when TCNET OUT is enabled)
+    addRightLabelAndCombo(lblTcnetInterface, cmbTcnetInterface, "TCNET INTERFACE:");
+    cmbTcnetInterface.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        settings.tcnetInterface = cmbTcnetInterface.getSelectedId() - 2;  // 1=All(-1), 2+=NIC index
+        if (sharedTcnetOutput.getIsRunning())
+        {
+            sharedTcnetOutput.stop();
+            sharedTcnetOutput.refreshNetworkInterfaces();
+            sharedTcnetOutput.start(settings.tcnetInterface);
+        }
+        saveSettings();
+    };
+
+    // TCNet layer selector (per-engine, selects which TCNet layer 1-4 this engine announces)
+    addRightLabelAndCombo(lblTcnetLayer, cmbTcnetLayer, "TCNET LAYER:");
+    cmbTcnetLayer.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        int sel = cmbTcnetLayer.getSelectedId() - 1;  // 1-4 -> 0-3
+        currentEngine().setTcnetLayer(sel);
+        repopulateTcnetLayerCombo();
+        saveSettings();
+    };
 
     addRightLabelAndCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, "AUDIO DRIVER:");
     cmbAudioOutputTypeFilter.onChange = [this]
@@ -1278,7 +1339,7 @@ void MainComponent::removeEngine(int index)
     if (deletedHadThru && !engines.empty())
     {
         auto& newPrimary = *engines[0];
-        if (newPrimary.getActiveInput() == InputSource::LTC
+        if (newPrimary.getActiveInput() == SrcType::LTC
             && newPrimary.getLtcInput().getIsRunning()
             && !settings.engines.empty()
             && settings.engines[0].thruOutEnabled)
@@ -1439,6 +1500,8 @@ void MainComponent::syncUIFromEngine()
     // AudioThru toggle: only show for primary engine
     btnThruOut.setToggleState(eng.isOutputThruEnabled(), juce::dontSendNotification);
     btnThruOut.setVisible(eng.isPrimary());
+    btnTcnetOut.setToggleState(eng.isOutputTcnetEnabled(), juce::dontSendNotification);
+    repopulateTcnetLayerCombo();
 
     // Offsets
     sldMtcOffset.setValue(eng.getMtcOutputOffset(), juce::dontSendNotification);
@@ -1485,6 +1548,12 @@ void MainComponent::syncUIFromEngine()
         if (artOutId <= cmbArtnetOutputInterface.getNumItems())
             cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
 
+        // TCNet interface combo (global setting, not per-engine)
+        int tcnetIfId = settings.tcnetInterface + 2;  // -1->1(All), 0->2, 1->3...
+        if (tcnetIfId < 1) tcnetIfId = 1;
+        if (tcnetIfId <= cmbTcnetInterface.getNumItems())
+            cmbTcnetInterface.setSelectedId(tcnetIfId, juce::dontSendNotification);
+
         // TrackMap toggle
         btnTrackMap.setToggleState(eng.isTrackMapEnabled(), juce::dontSendNotification);
 
@@ -1519,6 +1588,11 @@ void MainComponent::syncUIFromEngine()
         int pdlIfId = settings.proDJLinkInterface + 1;
         if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
             cmbProDJLinkInterface.setSelectedId(pdlIfId, juce::dontSendNotification);
+
+        // StageLinQ interface (global, independent from ProDJLink)
+        int slqIfId = settings.stageLinQInterface + 1;
+        if (slqIfId >= 1 && slqIfId <= cmbStageLinQInterface.getNumItems())
+            cmbStageLinQInterface.setSelectedId(slqIfId, juce::dontSendNotification);
 
         // Trigger toggles + destination
         auto& trig = eng.getTriggerOutput();
@@ -1717,13 +1791,21 @@ void MainComponent::startCurrentProDJLinkInput()
 void MainComponent::startCurrentStageLinQInput()
 {
     auto& eng = currentEngine();
-    int iface = cmbProDJLinkInterface.getSelectedId() - 1;
+    int iface = cmbStageLinQInterface.getSelectedId() - 1;
     int player = cmbProDJLinkPlayer.getSelectedId();
     if (player < 1) player = 1;
     if (iface < 0) iface = 0;
 
-    // Limit deck to 1-4 for StageLinQ (no XF mode)
-    if (player > StageLinQ::kMaxDecks) player = 1;
+    // If already running on a DIFFERENT interface, stop and restart.
+    if (sharedStageLinQInput.getIsRunning()
+        && sharedStageLinQInput.getSelectedInterface() != iface)
+    {
+        DBG("MainComponent: StageLinQ interface changed from "
+            << sharedStageLinQInput.getSelectedInterface() << " to " << iface
+            << " -- restarting");
+        sharedStageLinQInput.stop();
+        sharedStageLinQDb.stop();
+    }
 
     // Start shared StageLinQ connection if not already running
     if (!sharedStageLinQInput.getIsRunning())
@@ -1732,7 +1814,7 @@ void MainComponent::startCurrentStageLinQInput()
         sharedStageLinQInput.start(iface);
     }
 
-    // Set this engine's deck
+    // Set this engine's deck (supports XF-A/XF-B)
     eng.startStageLinQInput(player);
 }
 
@@ -1858,17 +1940,40 @@ void MainComponent::openTrackMapEditor()
 
     editor->onChange = [this]
     {
+        // Close CuePointEditor FIRST, before save/refresh.
+        // TrackMapEditor::onFormSave calls addOrUpdate/remove which can
+        // rehash the unordered_map, invalidating the TrackMapEntry&
+        // reference held by CuePointEditor.  The mutation has already
+        // happened by the time this callback fires (synchronous message
+        // thread), so close the editor before any code that might
+        // indirectly touch the dangling reference.
+        if (cuePointWindow != nullptr)
+        {
+            cuePointWindow.reset();
+            cuePointTrackKey.clear();
+        }
+
         settings.trackMap.save();
-        // Refresh all engines' TrackMap lookups
         for (auto& e : engines)
             e->refreshTrackMapLookup();
+    };
+
+    editor->onOpenCueEditor = [this](TrackMapEntry* entry)
+    {
+        if (entry && !settings.showModeLocked) openCuePointEditor(entry);
+    };
+
+    editor->onLearnTrackInfo = [this]() -> TrackMapEditor::LearnTrackInfo
+    {
+        auto info = currentEngine().getActiveTrackInfo();
+        return { info.artist, info.title, info.durationSec };
     };
 
     // Non-modal window (self-deleting on close so SafePointer auto-nulls)
     struct FloatingWindow : juce::DocumentWindow
     {
         FloatingWindow(const juce::String& t, juce::Colour bg)
-            : DocumentWindow(t, bg, DocumentWindow::closeButton) {}
+            : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
         void closeButtonPressed() override { if (onClose) onClose(); delete this; }
         std::function<void()> onClose;
     };
@@ -1891,7 +1996,7 @@ void MainComponent::openTrackMapEditor()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.userArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
             }
         }
     }
@@ -1906,6 +2011,193 @@ void MainComponent::openTrackMapEditor()
     trackMapWindow = win;
 }
 
+void MainComponent::openCuePointEditor(TrackMapEntry* entry)
+{
+    if (!entry) return;
+
+    // If already open for a different track, close it first
+    if (cuePointWindow != nullptr)
+    {
+        cuePointWindow.reset();
+    }
+
+    cuePointWindow = std::make_unique<CuePointEditorWindow>(*entry);
+    cuePointTrackKey = entry->key();
+
+    // Try to find artwork, waveform, and duration for this track
+    bool foundMeta = false;
+    bool foundWaveform = false;
+    bool foundArtwork = false;
+    for (auto& eng : engines)
+    {
+        auto info = eng->getActiveTrackInfo();
+        if (info.artist.isNotEmpty() && info.title.isNotEmpty()
+            && TrackMapEntry::makeKey(info.artist, info.title, info.durationSec)
+                == entry->key())
+        {
+            if (info.trackId != 0)
+            {
+                auto meta = sharedDbClient.getCachedMetadataByTrackId(info.trackId);
+
+                // Artwork
+                if (meta.artworkId != 0)
+                {
+                    auto art = sharedDbClient.getCachedArtwork(meta.artworkId);
+                    if (art.isValid())
+                    {
+                        cuePointWindow->setArtwork(art);
+                        foundArtwork = true;
+                        if (!WaveformCache::artworkExists(entry->key()))
+                            WaveformCache::saveArtwork(entry->key(), art);
+                    }
+                }
+
+                // Waveform
+                if (meta.hasWaveform())
+                {
+                    cuePointWindow->setWaveformData(meta.waveformData,
+                        meta.waveformEntryCount, meta.waveformBytesPerEntry);
+                    foundWaveform = true;
+
+                    // Cache waveform to disk for offline use
+                    if (!WaveformCache::exists(entry->key()))
+                    {
+                        uint32_t durMs = (meta.durationSeconds > 0)
+                            ? (uint32_t)meta.durationSeconds * 1000
+                            : (info.durationSec > 0 ? (uint32_t)info.durationSec * 1000 : 0);
+                        WaveformCache::save(entry->key(), meta.waveformData,
+                            meta.waveformEntryCount, meta.waveformBytesPerEntry, durMs);
+                    }
+                }
+
+                // Duration
+                if (meta.durationSeconds > 0)
+                {
+                    cuePointWindow->setDurationMs((uint32_t)meta.durationSeconds * 1000);
+                    foundMeta = true;
+                }
+            }
+
+            // Fallback duration: from engine (StageLinQ tracks have no dbClient metadata)
+            if (!foundMeta && info.durationSec > 0)
+                cuePointWindow->setDurationMs((uint32_t)info.durationSec * 1000);
+
+            // StageLinQ: try waveform + artwork from StageLinQDbClient
+            if (!foundWaveform
+                && eng->getActiveInput() == SrcType::StageLinQ)
+            {
+                int deck = eng->getEffectivePlayer();
+                auto netPath = sharedStageLinQInput.getTrackNetworkPath(deck);
+                if (netPath.isNotEmpty())
+                {
+                    auto wf = sharedStageLinQDb.getWaveformForTrack(netPath);
+                    if (wf.valid && !wf.data.empty())
+                    {
+                        cuePointWindow->setWaveformData(wf.data, wf.entryCount, 3);
+                        foundWaveform = true;
+
+                        if (!WaveformCache::exists(entry->key()))
+                        {
+                            uint32_t durMs = (info.durationSec > 0)
+                                ? (uint32_t)info.durationSec * 1000 : 0;
+                            WaveformCache::save(entry->key(), wf.data,
+                                wf.entryCount, 3, durMs);
+                        }
+                    }
+
+                    if (!foundArtwork)
+                    {
+                        auto art = sharedStageLinQDb.getArtworkForTrack(netPath);
+                        if (art.isValid())
+                        {
+                            cuePointWindow->setArtwork(art);
+                            foundArtwork = true;
+                            if (!WaveformCache::artworkExists(entry->key()))
+                                WaveformCache::saveArtwork(entry->key(), art);
+                        }
+                    }
+                }
+            }
+
+            break;
+        }
+    }
+
+    // If no live waveform was found, try loading from cache
+    if (!foundWaveform)
+    {
+        auto cached = WaveformCache::load(entry->key());
+        if (cached.valid)
+        {
+            cuePointWindow->setWaveformData(cached.data,
+                cached.entryCount, cached.bytesPerEntry);
+            // Use cached duration if we didn't get one from live sources
+            if (!foundMeta && cached.durationMs > 0)
+                cuePointWindow->setDurationMs(cached.durationMs);
+        }
+    }
+
+    // If no live artwork was found, try loading from cache
+    if (!foundArtwork)
+    {
+        auto cachedArt = WaveformCache::loadArtwork(entry->key());
+        if (cachedArt.isValid())
+            cuePointWindow->setArtwork(cachedArt);
+    }
+
+    // Last resort: use duration from the TrackMap entry itself
+    if (!foundMeta && entry->durationSec > 0)
+        cuePointWindow->setDurationMs((uint32_t)entry->durationSec * 1000);
+
+    cuePointWindow->setOnChange([this]
+    {
+        settings.trackMap.save();
+        for (auto& eng : engines)
+            eng->refreshTrackMapLookup();
+
+        // Refresh TrackMap editor table if open (cue count column)
+        if (trackMapWindow != nullptr)
+        {
+            if (auto* editor = dynamic_cast<TrackMapEditor*>(trackMapWindow->getContentComponent()))
+                editor->refresh();
+        }
+    });
+
+    cuePointWindow->setOnCapturePlayhead([this]() -> uint32_t
+    {
+        return currentEngine().getSmoothedPlayheadMs();
+    });
+
+    // Restore saved window position
+    if (settings.cuePointBounds.isNotEmpty())
+    {
+        auto parts = juce::StringArray::fromTokens(settings.cuePointBounds, " ", "");
+        if (parts.size() == 4)
+        {
+            auto b = juce::Rectangle<int>(parts[0].getIntValue(), parts[1].getIntValue(),
+                                           parts[2].getIntValue(), parts[3].getIntValue());
+            if (b.getWidth() >= 400 && b.getHeight() >= 300)
+            {
+                auto c = b.getCentre();
+                for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
+                    if (d.totalArea.contains(c)) { cuePointWindow->setBounds(b); break; }
+            }
+        }
+    }
+
+    // Save window position on close
+    cuePointWindow->onBoundsCapture = [this]
+    {
+        if (cuePointWindow != nullptr)
+        {
+            auto b = cuePointWindow->getBounds();
+            settings.cuePointBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                    + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+            saveSettings();
+        }
+    };
+}
+
 void MainComponent::openMixerMapEditor()
 {
     if (mixerMapWindow != nullptr)
@@ -1915,7 +2207,7 @@ void MainComponent::openMixerMapEditor()
     }
 
     // Choose mixer map based on active input
-    bool isSlq = currentEngine().getActiveInput() == TimecodeEngine::InputSource::StageLinQ;
+    bool isSlq = currentEngine().getActiveInput() == SrcType::StageLinQ;
     MixerMap& activeMap = isSlq ? sharedSlqMixerMap : sharedMixerMap;
 
     auto* editor = new MixerMapEditor(activeMap,
@@ -1934,7 +2226,7 @@ void MainComponent::openMixerMapEditor()
     struct FloatingWindow : juce::DocumentWindow
     {
         FloatingWindow(const juce::String& t, juce::Colour bg)
-            : DocumentWindow(t, bg, DocumentWindow::closeButton) {}
+            : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
         void closeButtonPressed() override { if (onClose) onClose(); delete this; }
         std::function<void()> onClose;
     };
@@ -1957,7 +2249,7 @@ void MainComponent::openMixerMapEditor()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.userArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
             }
         }
     }
@@ -2272,7 +2564,7 @@ void MainComponent::updateCurrentOutputStates()
     {
         if (eng.isOutputThruEnabled() && eng.getAudioThru() && !eng.getAudioThru()->getIsRunning())
         {
-            if (eng.getActiveInput() == InputSource::LTC)
+            if (eng.getActiveInput() == SrcType::LTC)
                 startCurrentLtcInput();
             else
                 startCurrentThruOutput();
@@ -2569,7 +2861,7 @@ void MainComponent::restartAllAudioDevices()
         if (i == selectedEngine)
         {
             // Selected engine: restart via UI combos
-            if (eng.getActiveInput() == InputSource::LTC && eng.getLtcInput().getIsRunning())
+            if (eng.getActiveInput() == SrcType::LTC && eng.getLtcInput().getIsRunning())
                 startCurrentLtcInput();
             if (eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning())
                 startCurrentLtcOutput();
@@ -2577,7 +2869,7 @@ void MainComponent::restartAllAudioDevices()
         else
         {
             // Non-selected engines: restart using their current device settings
-            if (eng.getActiveInput() == InputSource::LTC && eng.getLtcInput().getIsRunning())
+            if (eng.getActiveInput() == SrcType::LTC && eng.getLtcInput().getIsRunning())
             {
                 auto devName = eng.getLtcInput().getCurrentDeviceName();
                 auto typeName = eng.getLtcInput().getCurrentTypeName();
@@ -2612,6 +2904,7 @@ void MainComponent::populateMidiAndNetworkCombos()
     int savedArtIn    = cmbArtnetInputInterface.getSelectedId();
     int savedArtOut   = cmbArtnetOutputInterface.getSelectedId();
     int savedArtDmx   = cmbArtnetDmxInterface.getSelectedId();
+    int savedTcnetIf  = cmbTcnetInterface.getSelectedId();
 
     // MIDI Input
     auto midiIns = juce::MidiInput::getAvailableDevices();
@@ -2672,23 +2965,61 @@ void MainComponent::populateMidiAndNetworkCombos()
     cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
     cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
     cmbArtnetDmxInterface.addItem("All Interfaces (Broadcast)", 1);
+    cmbTcnetInterface.clear(juce::dontSendNotification);
+    cmbTcnetInterface.addItem("All Interfaces (Broadcast)", 1);
     for (int i = 0; i < nets.size(); i++)
     {
         auto label = nets[i].name + " (" + nets[i].ip + ")";
         cmbArtnetInputInterface.addItem(label + getArtnetMarker(i + 2, true), i + 2);
         cmbArtnetOutputInterface.addItem(label + getArtnetMarker(i + 2, false), i + 2);
         cmbArtnetDmxInterface.addItem(label, i + 2);
+        cmbTcnetInterface.addItem(label, i + 2);
     }
 
     // Pro DJ Link interfaces
     int savedProDJLinkIf = cmbProDJLinkInterface.getSelectedId();
     cmbProDJLinkInterface.clear(juce::dontSendNotification);
-    for (int i = 0; i < nets.size(); i++)
-        cmbProDJLinkInterface.addItem(nets[i].name + " (" + nets[i].ip + ")", i + 1);
+    {
+        // Determine which IP is currently active for ProDJLink
+        juce::String activeIp;
+        if (sharedProDJLinkInput.getIsRunning())
+            activeIp = sharedProDJLinkInput.getBindInfo();
+
+        static const juce::String dot = juce::String(" ") + juce::String::charToString(0x25CF);
+        for (int i = 0; i < nets.size(); i++)
+        {
+            juce::String label = nets[i].name + " (" + nets[i].ip + ")";
+            if (activeIp.isNotEmpty() && nets[i].ip == activeIp)
+                label += dot;
+            cmbProDJLinkInterface.addItem(label, i + 1);
+        }
+    }
     if (savedProDJLinkIf > 0 && savedProDJLinkIf <= cmbProDJLinkInterface.getNumItems())
         cmbProDJLinkInterface.setSelectedId(savedProDJLinkIf, juce::dontSendNotification);
     else if (cmbProDJLinkInterface.getNumItems() > 0)
         cmbProDJLinkInterface.setSelectedId(1, juce::dontSendNotification);
+
+    // StageLinQ interfaces (independent combo)
+    int savedStageLinQIf = cmbStageLinQInterface.getSelectedId();
+    cmbStageLinQInterface.clear(juce::dontSendNotification);
+    {
+        juce::String slqActiveIp;
+        if (sharedStageLinQInput.getIsRunning())
+            slqActiveIp = sharedStageLinQInput.getBindInfo();
+
+        static const juce::String dot = juce::String(" ") + juce::String::charToString(0x25CF);
+        for (int i = 0; i < nets.size(); i++)
+        {
+            juce::String label = nets[i].name + " (" + nets[i].ip + ")";
+            if (slqActiveIp.isNotEmpty() && nets[i].ip == slqActiveIp)
+                label += dot;
+            cmbStageLinQInterface.addItem(label, i + 1);
+        }
+    }
+    if (savedStageLinQIf > 0 && savedStageLinQIf <= cmbStageLinQInterface.getNumItems())
+        cmbStageLinQInterface.setSelectedId(savedStageLinQIf, juce::dontSendNotification);
+    else if (cmbStageLinQInterface.getNumItems() > 0)
+        cmbStageLinQInterface.setSelectedId(1, juce::dontSendNotification);
 
     // Restore all selections (IDs are stable across repopulate)
     if (savedMidiIn > 0 && savedMidiIn <= cmbMidiInputDevice.getNumItems())
@@ -2703,6 +3034,10 @@ void MainComponent::populateMidiAndNetworkCombos()
         cmbArtnetDmxInterface.setSelectedId(savedArtDmx, juce::dontSendNotification);
     else if (cmbArtnetDmxInterface.getNumItems() > 0)
         cmbArtnetDmxInterface.setSelectedId(1, juce::dontSendNotification);
+    if (savedTcnetIf > 0 && savedTcnetIf <= cmbTcnetInterface.getNumItems())
+        cmbTcnetInterface.setSelectedId(savedTcnetIf, juce::dontSendNotification);
+    else if (cmbTcnetInterface.getNumItems() > 0)
+        cmbTcnetInterface.setSelectedId(1, juce::dontSendNotification);  // default: All Interfaces
 }
 
 void MainComponent::populateAudioCombos()
@@ -2710,6 +3045,34 @@ void MainComponent::populateAudioCombos()
     populateTypeFilterCombos();
     populateFilteredInputDeviceCombo();
     populateFilteredOutputDeviceCombos();
+}
+
+void MainComponent::repopulateTcnetLayerCombo()
+{
+    cmbTcnetLayer.clear(juce::dontSendNotification);
+
+    static const char* names[] = { "Layer 1", "Layer 2", "Layer 3", "Layer 4" };
+
+    for (int layer = 0; layer < TCNetOutput::kMaxLayers; ++layer)
+    {
+        juce::String label(names[layer]);
+
+        // Check if another engine is using this layer
+        for (int e = 0; e < (int)engines.size(); ++e)
+        {
+            if (e == selectedEngine) continue;
+            auto& eng = *engines[(size_t)e];
+            if (eng.isOutputTcnetEnabled() && eng.getTcnetLayer() == layer)
+            {
+                label += " [" + eng.getName() + "]";
+                break;
+            }
+        }
+
+        cmbTcnetLayer.addItem(label, layer + 1);
+    }
+
+    cmbTcnetLayer.setSelectedId(currentEngine().getTcnetLayer() + 1, juce::dontSendNotification);
 }
 
 //==============================================================================
@@ -2757,6 +3120,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setOutputArtnetEnabled(es.artnetOutEnabled);
         eng.setOutputLtcEnabled(es.ltcOutEnabled);
         eng.setOutputThruEnabled(es.thruOutEnabled);
+        eng.setOutputTcnetEnabled(es.tcnetOutEnabled);
+        eng.setTcnetLayer(es.tcnetLayer);
 
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
@@ -2773,16 +3138,16 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setInputSource(src);
 
         // Start non-audio protocols
-        if (src == InputSource::MTC)
+        if (src == SrcType::MTC)
         {
             int idx = findDeviceByName(cmbMidiInputDevice, es.midiInputDevice);
             eng.startMtcInput(idx);
         }
-        else if (src == InputSource::ArtNet)
+        else if (src == SrcType::ArtNet)
         {
             eng.startArtnetInput(es.artnetInputInterface);
         }
-        else if (src == InputSource::ProDJLink)
+        else if (src == SrcType::ProDJLink)
         {
             if (!sharedProDJLinkInput.getIsRunning())
             {
@@ -2797,15 +3162,14 @@ void MainComponent::loadAndApplyNonAudioSettings()
             }
             eng.startProDJLinkInput(es.proDJLinkPlayer);
         }
-        else if (src == InputSource::StageLinQ)
+        else if (src == SrcType::StageLinQ)
         {
             if (!sharedStageLinQInput.getIsRunning())
             {
                 sharedStageLinQInput.refreshNetworkInterfaces();
-                sharedStageLinQInput.start(settings.proDJLinkInterface);
+                sharedStageLinQInput.start(settings.stageLinQInterface);
             }
-            int slqDeck = juce::jlimit(1, StageLinQ::kMaxDecks, es.proDJLinkPlayer);
-            eng.startStageLinQInput(slqDeck);
+            eng.startStageLinQInput(es.proDJLinkPlayer);
         }
 
         // TrackMap -- wire pointer and restore enabled state
@@ -2880,6 +3244,18 @@ void MainComponent::loadAndApplyNonAudioSettings()
             eng.startArtnetOutput(es.artnetDmxInterface);  // DMX triggers need the socket even without timecode output
     }
 
+    // Start TCNet output if any engine has it enabled
+    {
+        bool anyTcnet = false;
+        for (auto& e : engines)
+            if (e->isOutputTcnetEnabled()) { anyTcnet = true; break; }
+        if (anyTcnet)
+        {
+            sharedTcnetOutput.refreshNetworkInterfaces();
+            sharedTcnetOutput.start(settings.tcnetInterface);
+        }
+    }
+
     // Global settings
     cmbSampleRate.setSelectedId(sampleRateToComboId(settings.preferredSampleRate), juce::dontSendNotification);
     cmbBufferSize.setSelectedId(bufferSizeToComboId(settings.preferredBufferSize), juce::dontSendNotification);
@@ -2914,7 +3290,7 @@ void MainComponent::applyAudioSettings()
         auto& eng = *engines[(size_t)i];
 
         // Audio inputs (LTC)
-        if (eng.getActiveInput() == InputSource::LTC)
+        if (eng.getActiveInput() == SrcType::LTC)
         {
             // Find the device in our scanned list
             int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs,
@@ -3017,6 +3393,8 @@ void MainComponent::flushSettings()
         es.artnetOutEnabled = eng.isOutputArtnetEnabled();
         es.ltcOutEnabled = eng.isOutputLtcEnabled();
         es.thruOutEnabled = eng.isOutputThruEnabled();
+        es.tcnetOutEnabled = eng.isOutputTcnetEnabled();
+        es.tcnetLayer = eng.getTcnetLayer();
 
         es.mtcOutputOffset = eng.getMtcOutputOffset();
         es.artnetOutputOffset = eng.getArtnetOutputOffset();
@@ -3147,6 +3525,10 @@ void MainComponent::flushSettings()
     settings.proDJLinkInterface = cmbProDJLinkInterface.getSelectedId() - 1;
     if (settings.proDJLinkInterface < 0) settings.proDJLinkInterface = 0;
 
+    // StageLinQ global settings
+    settings.stageLinQInterface = cmbStageLinQInterface.getSelectedId() - 1;
+    if (settings.stageLinQInterface < 0) settings.stageLinQInterface = 0;
+
     // Capture window bounds (if windows are open and visible)
     if (proDJLinkViewWindow != nullptr && proDJLinkViewWindow->isVisible())
     {
@@ -3166,6 +3548,12 @@ void MainComponent::flushSettings()
     {
         auto b = mixerMapWindow->getBounds();
         settings.mixerMapBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
+                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
+    }
+    if (cuePointWindow != nullptr && cuePointWindow->isVisible())
+    {
+        auto b = cuePointWindow->getBounds();
+        settings.cuePointBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
                                 + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
     }
 
@@ -3295,12 +3683,12 @@ void MainComponent::updateDeviceSelectorVisibility()
 {
     auto& eng = currentEngine();
     auto input = eng.getActiveInput();
-    bool showMidiIn   = (input == InputSource::MTC)    && inputConfigExpanded;
-    bool showArtnetIn = (input == InputSource::ArtNet)  && inputConfigExpanded;
-    bool showLtcIn    = (input == InputSource::LTC)     && inputConfigExpanded;
-    bool showProDJLinkIn = (input == InputSource::ProDJLink || input == InputSource::StageLinQ) && inputConfigExpanded;
+    bool showMidiIn   = (input == SrcType::MTC)    && inputConfigExpanded;
+    bool showArtnetIn = (input == SrcType::ArtNet)  && inputConfigExpanded;
+    bool showLtcIn    = (input == SrcType::LTC)     && inputConfigExpanded;
+    bool showProDJLinkIn = (input == SrcType::ProDJLink || input == SrcType::StageLinQ) && inputConfigExpanded;
     bool showAudioOut = (eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled()));
-    bool hasInputConfig = (input != InputSource::SystemTime);
+    bool hasInputConfig = (input != SrcType::SystemTime);
 
     btnCollapseInput.setVisible(hasInputConfig);
     updateCollapseButtonText(btnCollapseInput, inputConfigExpanded);
@@ -3309,10 +3697,10 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbArtnetInputInterface.setVisible(showArtnetIn); lblArtnetInputInterface.setVisible(showArtnetIn);
     btnTrackMap.setVisible(showProDJLinkIn);
     btnTrackMapEdit.setVisible(showProDJLinkIn);
-    btnProDJLinkView.setVisible(showProDJLinkIn && input == InputSource::ProDJLink);
-    btnStageLinQView.setVisible(showProDJLinkIn && input == InputSource::StageLinQ);
+    btnProDJLinkView.setVisible(showProDJLinkIn && input == SrcType::ProDJLink);
+    btnStageLinQView.setVisible(showProDJLinkIn && input == SrcType::StageLinQ);
     btnMixerMapEdit.setVisible(showProDJLinkIn);
-    if (input == InputSource::StageLinQ)
+    if (input == SrcType::StageLinQ)
     {
         juce::Colour slqAccent(0xFF00CC66);
         btnMixerMapEdit.setColour(juce::TextButton::buttonColourId, slqAccent.withAlpha(0.15f));
@@ -3379,21 +3767,26 @@ void MainComponent::updateDeviceSelectorVisibility()
         && (btnTriggerOsc.getToggleState() || btnOscFwdBpm.getToggleState()
             || btnOscMixerFwd.getToggleState()));
 
-    // Pro DJ Link / StageLinQ
-    cmbProDJLinkInterface.setVisible(showProDJLinkIn);  lblProDJLinkInterface.setVisible(showProDJLinkIn);
+    // Pro DJ Link / StageLinQ -- separate interface combos
+    bool showPdlIface = showProDJLinkIn && input == SrcType::ProDJLink;
+    bool showSlqIface = showProDJLinkIn && input == SrcType::StageLinQ;
+    cmbProDJLinkInterface.setVisible(showPdlIface);  lblProDJLinkInterface.setVisible(showPdlIface);
+    cmbStageLinQInterface.setVisible(showSlqIface);   lblStageLinQInterface.setVisible(showSlqIface);
     cmbProDJLinkPlayer.setVisible(showProDJLinkIn);     lblProDJLinkPlayer.setVisible(showProDJLinkIn);
 
     // Repopulate player combo based on input source:
     // ProDJLink: players 1-6 + XF-A + XF-B
-    // StageLinQ: decks 1-4 only (no sampler, no crossfader auto-follow)
+    // StageLinQ: decks 1-4 + XF-A + XF-B
     {
         int prevId = cmbProDJLinkPlayer.getSelectedId();
         cmbProDJLinkPlayer.clear(juce::dontSendNotification);
-        if (input == InputSource::StageLinQ)
+        if (input == SrcType::StageLinQ)
         {
             for (int i = 1; i <= StageLinQ::kMaxDecks; ++i)
                 cmbProDJLinkPlayer.addItem("DECK " + juce::String(i), i);
-            if (prevId < 1 || prevId > StageLinQ::kMaxDecks) prevId = 1;
+            cmbProDJLinkPlayer.addItem("XF-A", 7);
+            cmbProDJLinkPlayer.addItem("XF-B", 8);
+            if (prevId < 1 || prevId > 8) prevId = 1;
         }
         else
         {
@@ -3426,7 +3819,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     lblInputStatus.setVisible(true);
 
     // FPS Convert: not applicable for ProDJLink/StageLinQ (user selects fps directly)
-    bool showFpsConvert = (input != InputSource::ProDJLink && input != InputSource::StageLinQ);
+    bool showFpsConvert = (input != SrcType::ProDJLink && input != SrcType::StageLinQ);
     btnFpsConvert.setVisible(showFpsConvert);
     if (!showFpsConvert && eng.isFpsConvertEnabled())
     {
@@ -3439,7 +3832,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     {
         bool anyPdl = false;
         for (auto& e : engines)
-            if (e->getActiveInput() == InputSource::ProDJLink || e->getActiveInput() == InputSource::StageLinQ) { anyPdl = true; break; }
+            if (e->getActiveInput() == SrcType::ProDJLink || e->getActiveInput() == SrcType::StageLinQ) { anyPdl = true; break; }
         if (!anyPdl)
         {
             if (trackMapWindow != nullptr)
@@ -3491,7 +3884,13 @@ void MainComponent::updateDeviceSelectorVisibility()
     mtrThruOutput.setVisible(showThruConfig);
     lblOutputThruStatus.setVisible(eng.isPrimary() && eng.isOutputThruEnabled());
 
-    bool anyDevice = (input != InputSource::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
+    // TCNet interface combo: visible when TCNET OUT is enabled
+    bool showTcnetConfig = eng.isOutputTcnetEnabled();
+    cmbTcnetInterface.setVisible(showTcnetConfig);  lblTcnetInterface.setVisible(showTcnetConfig);
+    cmbTcnetLayer.setVisible(showTcnetConfig);      lblTcnetLayer.setVisible(showTcnetConfig);
+    if (showTcnetConfig) repopulateTcnetLayerCombo();
+
+    bool anyDevice = (input != SrcType::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
     btnRefreshDevices.setVisible(anyDevice);
 
     resized();
@@ -3823,8 +4222,8 @@ void MainComponent::resized()
 
     // Input buttons
     auto& eng = currentEngine();
-    struct IBI { juce::TextButton* btn; InputSource src; };
-    IBI iBtns[] = { {&btnMtcIn,InputSource::MTC}, {&btnArtnetIn,InputSource::ArtNet}, {&btnSysTime,InputSource::SystemTime}, {&btnLtcIn,InputSource::LTC}, {&btnProDJLinkIn,InputSource::ProDJLink}, {&btnStageLinQIn,InputSource::StageLinQ} };
+    struct IBI { juce::TextButton* btn; SrcType src; };
+    IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
     for (auto& ib : iBtns) { ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
 
     // Section separator after input source buttons
@@ -3839,6 +4238,13 @@ void MainComponent::resized()
     if (cmbProDJLinkInterface.isVisible())
     {
         layCombo(lblProDJLinkInterface, cmbProDJLinkInterface, leftPanel);
+    }
+    if (cmbStageLinQInterface.isVisible())
+    {
+        layCombo(lblStageLinQInterface, cmbStageLinQInterface, leftPanel);
+    }
+    if (cmbProDJLinkPlayer.isVisible())
+    {
         layCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, leftPanel);
 
         // BPM Multiplier row (5 equal buttons: 1x x2 x4 /2 /4)
@@ -4162,6 +4568,17 @@ void MainComponent::resized()
         rp.removeFromTop(2);
     }
 
+    // TCNET OUT
+    {
+        rightContent.addSectionSeparator(rp.getY());
+        rp.removeFromTop(4);
+        auto row = rp.removeFromTop(btnH);
+        btnTcnetOut.setBounds(row); rp.removeFromTop(2);
+        if (cmbTcnetInterface.isVisible()) layCombo(lblTcnetInterface, cmbTcnetInterface, rp);
+        if (cmbTcnetLayer.isVisible()) layCombo(lblTcnetLayer, cmbTcnetLayer, rp);
+        rp.removeFromTop(2);
+    }
+
     // AUDIO THRU (primary engine only)
     if (btnThruOut.isVisible())
     {
@@ -4271,12 +4688,153 @@ void MainComponent::timerCallback()
         engines[(size_t)i]->tick();
     }
 
+    // Feed TCNet output layers from engines.
+    // Each engine selects its target layer (1-4) via tcnetLayer.
+    // Clear all layers first, then fill from enabled engines (last-write-wins if
+    // two engines target the same layer).
+    if (sharedTcnetOutput.getIsRunning())
+    {
+        // Track which layers are assigned by enabled engines
+        bool layerUsed[TCNetOutput::kMaxLayers] = {};
+
+        for (int i = 0; i < (int)engines.size(); ++i)
+        {
+            auto& eng = *engines[(size_t)i];
+            if (!eng.isOutputTcnetEnabled()) continue;
+
+            int layer = eng.getTcnetLayer();  // 0-3
+            layerUsed[layer] = true;
+
+            auto src = eng.getActiveInput();
+            int ep = eng.getEffectivePlayer();
+            // Fader for Resolume opacity: real DJM/Denon fader value, 255 for non-DJ sources
+            uint8_t onAirFader = 255;
+            uint8_t beatInBar = 0;
+            uint32_t durationMs = 0;
+            uint32_t bpm100 = 0;
+
+            if (src == SrcType::ProDJLink && sharedProDJLinkInput.getIsRunning())
+            {
+                if (sharedProDJLinkInput.hasMixerFaderData())
+                    onAirFader = sharedProDJLinkInput.getChannelFader(ep);
+                beatInBar = sharedProDJLinkInput.getBeatInBar(ep);
+                bpm100 = (uint32_t)(sharedProDJLinkInput.getBPM(ep) * 100.0);
+            }
+            else if (src == SrcType::StageLinQ && sharedStageLinQInput.getIsRunning())
+            {
+                if (sharedStageLinQInput.hasMixerData())
+                {
+                    double faderPos = sharedStageLinQInput.getFaderPosition(ep);
+                    onAirFader = (uint8_t)juce::jlimit(0, 255, (int)(faderPos * 255.0));
+                }
+                beatInBar = sharedStageLinQInput.getBeatInBar(ep);
+                bpm100 = (uint32_t)(sharedStageLinQInput.getBPM(ep) * 100.0);
+            }
+
+            auto info = eng.getActiveTrackInfo();
+            durationMs = (info.durationSec > 0) ? (uint32_t)info.durationSec * 1000 : 0;
+
+            sharedTcnetOutput.setLayerFromEngine(
+                layer,
+                eng.getOutputTimecode(),
+                eng.getEffectiveOutputFps(),
+                eng.getSmoothedPlayheadMs(),
+                durationMs,
+                eng.isSourceActive(),
+                onAirFader,
+                beatInBar,
+                bpm100);
+
+            // Feed track metadata for Resolume unicast.
+            // DJ sources: real artist + title from CDJ/Denon.
+            // Non-DJ sources: input name as artist, "STC" as title.
+            juce::String artist, title;
+            if (info.artist.isNotEmpty() || info.title.isNotEmpty())
+            {
+                artist = info.artist;
+                title  = info.title;
+            }
+            else
+            {
+                switch (src)
+                {
+                    case SrcType::MTC:        artist = "MTC Input";        break;
+                    case SrcType::ArtNet:      artist = "Art-Net Input";    break;
+                    case SrcType::LTC:         artist = "LTC Input";        break;
+                    case SrcType::SystemTime:  artist = "System Time";      break;
+                    case SrcType::ProDJLink:   artist = "Pro DJ Link";      break;
+                    case SrcType::StageLinQ:   artist = "StageLinQ";        break;
+                    default:                   artist = "STC";              break;
+                }
+                title = eng.getName();
+            }
+            sharedTcnetOutput.setLayerMetadata(layer, artist, title);
+
+            // Feed artwork: live source -> disk cache -> STC logo
+            if ((src == SrcType::ProDJLink || src == SrcType::StageLinQ) && info.title.isNotEmpty())
+            {
+                // Build cache key matching TrackMap format
+                juce::String artKey = info.artist + "|" + info.title;
+                if (info.durationSec > 0)
+                    artKey += "|" + juce::String(info.durationSec);
+                if (tcnetArtworkKey[layer] != artKey)
+                {
+                    tcnetArtworkKey[layer] = artKey;
+                    juce::Image artImg;
+
+                    // 1. Try live source (already in memory from metadata fetch)
+                    if (src == SrcType::ProDJLink && info.artworkId != 0)
+                        artImg = sharedDbClient.getCachedArtwork(info.artworkId);
+                    else if (src == SrcType::StageLinQ)
+                    {
+                        auto netPath = sharedStageLinQInput.getTrackNetworkPath(ep);
+                        if (netPath.isNotEmpty() && sharedStageLinQDb.isDatabaseReady())
+                            artImg = sharedStageLinQDb.getArtworkForTrack(netPath);
+                    }
+
+                    // 2. Try disk cache (saved by CuePointEditor)
+                    if (!artImg.isValid())
+                        artImg = WaveformCache::loadArtwork(artKey.toStdString());
+                    if (!artImg.isValid() && info.durationSec > 0)
+                        artImg = WaveformCache::loadArtwork((info.artist + "|" + info.title).toStdString());
+
+                    // 3. Convert to JPEG and send, or fall back to STC logo
+                    if (artImg.isValid())
+                    {
+                        juce::MemoryOutputStream mos;
+                        juce::JPEGImageFormat fmt;
+                        fmt.setQuality(0.7f);
+                        if (fmt.writeImageToStream(artImg, mos))
+                            sharedTcnetOutput.setLayerArtwork(layer, mos.getData(), mos.getDataSize());
+                        else
+                            sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);
+                    }
+                    else
+                        sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);
+                }
+            }
+            else
+            {
+                if (tcnetArtworkKey[layer].isNotEmpty())
+                {
+                    tcnetArtworkKey[layer] = {};
+                    sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);  // STC logo
+                }
+            }
+        }
+
+        // Clear layers not assigned to any engine
+        for (int i = 0; i < TCNetOutput::kMaxLayers; ++i)
+            if (!layerUsed[i])
+                sharedTcnetOutput.clearLayer(i);
+    }
+
     // Update UI for selected engine
     auto& eng = currentEngine();
 
     updateStatusLabels();
 
-    if (eng.getActiveInput() == InputSource::ProDJLink && sharedProDJLinkInput.isReceiving())
+    if (eng.getActiveInput() == SrcType::ProDJLink && sharedProDJLinkInput.isReceiving())
     {
         int pdlPlayer = eng.getEffectivePlayer();
 
@@ -4456,7 +5014,7 @@ void MainComponent::timerCallback()
         updateBpmMultButtonStates();
         } // end pdlPlayer >= 1
     }
-    else if (eng.getActiveInput() == InputSource::StageLinQ && sharedStageLinQInput.isReceiving())
+    else if (eng.getActiveInput() == SrcType::StageLinQ && sharedStageLinQInput.isReceiving())
     {
         int slqDeck = eng.getEffectivePlayer();
         if (slqDeck >= 1 && slqDeck <= StageLinQ::kMaxDecks)
@@ -4583,7 +5141,7 @@ void MainComponent::timerCallback()
             lblMixerStatus.setText("", juce::dontSendNotification);
         }
     }
-    else if (eng.getActiveInput() != InputSource::ProDJLink && eng.getActiveInput() != InputSource::StageLinQ)
+    else if (eng.getActiveInput() != SrcType::ProDJLink && eng.getActiveInput() != SrcType::StageLinQ)
     {
         lblProDJLinkTrackInfo.setText("", juce::dontSendNotification);
         lblProDJLinkMetadata.setText("", juce::dontSendNotification);
@@ -4784,7 +5342,8 @@ void MainComponent::updateBpmMultButtonStates()
     int map = 0;
     if (trackInfo.artist.isNotEmpty() && trackInfo.title.isNotEmpty())
     {
-        auto* entry = settings.trackMap.find(trackInfo.artist, trackInfo.title);
+        auto* entry = settings.trackMap.find(trackInfo.artist, trackInfo.title,
+                                              trackInfo.durationSec);
         if (entry != nullptr) map = entry->bpmMultiplier;
     }
 
@@ -4830,7 +5389,7 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
     auto info = eng.getActiveTrackInfo();
     if (info.artist.isEmpty() || info.title.isEmpty()) return;
 
-    auto* entry = settings.trackMap.find(info.artist, info.title);
+    auto* entry = settings.trackMap.find(info.artist, info.title, info.durationSec);
     int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
 
     // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
@@ -4852,6 +5411,7 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
         TrackMapEntry newEntry;
         newEntry.artist  = info.artist;
         newEntry.title   = info.title;
+        newEntry.durationSec = info.durationSec;
         newEntry.bpmMultiplier = newValue;
         settings.trackMap.addOrUpdate(newEntry);
     }
@@ -4882,8 +5442,8 @@ void MainComponent::updateInputButtonStates()
 {
     auto& eng = currentEngine();
     auto active = eng.getActiveInput();
-    struct I { juce::TextButton* b; InputSource s; };
-    I bs[] = { {&btnMtcIn,InputSource::MTC}, {&btnArtnetIn,InputSource::ArtNet}, {&btnSysTime,InputSource::SystemTime}, {&btnLtcIn,InputSource::LTC}, {&btnProDJLinkIn,InputSource::ProDJLink}, {&btnStageLinQIn,InputSource::StageLinQ} };
+    struct I { juce::TextButton* b; SrcType s; };
+    I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
     for (auto& i : bs) styleInputButton(*i.b, active == i.s, getInputColour(i.s));
 }
 
@@ -4909,16 +5469,16 @@ void MainComponent::updateOutputFpsButtonStates()
     }
 }
 
-juce::Colour MainComponent::getInputColour(InputSource s) const
+juce::Colour MainComponent::getInputColour(SrcType s) const
 {
     switch (s)
     {
-        case InputSource::MTC:        return accentRed;
-        case InputSource::ArtNet:     return accentOrange;
-        case InputSource::SystemTime: return accentGreen;
-        case InputSource::LTC:        return accentPurple;
-        case InputSource::ProDJLink:  return juce::Colour(0xFF00AAFF);  // bright blue
-        case InputSource::StageLinQ:  return juce::Colour(0xFF00CC66);  // Denon green
+        case SrcType::MTC:        return accentRed;
+        case SrcType::ArtNet:     return accentOrange;
+        case SrcType::SystemTime: return accentGreen;
+        case SrcType::LTC:        return accentPurple;
+        case SrcType::ProDJLink:  return juce::Colour(0xFF00AAFF);  // bright blue
+        case SrcType::StageLinQ:  return juce::Colour(0xFF00CC66);  // Denon green
         default:                      return textMid;
     }
 }

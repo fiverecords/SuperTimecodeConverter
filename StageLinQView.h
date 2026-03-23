@@ -239,7 +239,7 @@ private:
             ds.offsetTimecode = {};
             if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
             {
-                tmEntry = trackMap.find(ds.artist, ds.title);
+                tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
                 if (tmEntry != nullptr)
                 {
                     ds.trackMapped = true;
@@ -941,7 +941,7 @@ public:
                 auto centre = b.getCentre();
                 bool onScreen = false;
                 for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
-                    if (disp.userArea.contains(centre)) { onScreen = true; break; }
+                    if (disp.totalArea.contains(centre)) { onScreen = true; break; }
                 if (onScreen)
                     setBounds(b);
             }

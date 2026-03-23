@@ -18,6 +18,7 @@
 #include "ProDJLinkView.h"
 #include "StageLinQView.h"
 #include "StageLinQDbClient.h"
+#include "TCNetOutput.h"
 #include <vector>
 #include <memory>
 
@@ -162,6 +163,8 @@ private:
     MixerMap sharedSlqMixerMap { MixerMapMode::Denon };  // Denon mixer map
     MixerMap       sharedMixerMap;        // shared DJM parameter mapping
     DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
+    TCNetOutput    sharedTcnetOutput;     // shared TCNet timecode broadcast
+    juce::String   tcnetArtworkKey[TCNetOutput::kMaxLayers];  // track key per layer for artwork change detection
 
     TimecodeEngine& currentEngine() { return *engines[(size_t)selectedEngine]; }
     const TimecodeEngine& currentEngine() const { return *engines[(size_t)selectedEngine]; }
@@ -274,6 +277,7 @@ private:
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
+    juce::ComboBox cmbStageLinQInterface;    juce::Label lblStageLinQInterface;
 
     // BPM Multiplier buttons (per-player, ProDJLink only)
     // Single click: session override (temporary, cleared on track change).
@@ -316,6 +320,8 @@ private:
     juce::Label        lblLinkStatus;
 
     juce::Component::SafePointer<juce::DocumentWindow> trackMapWindow;
+    std::unique_ptr<CuePointEditorWindow> cuePointWindow;
+    std::string cuePointTrackKey;  // key of the entry being edited (for dangling ref safety)
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
     juce::Component::SafePointer<juce::DocumentWindow> mixerMapWindow;
     juce::TextButton btnProDJLinkView { "PDL View" };
@@ -323,6 +329,9 @@ private:
     juce::TextButton btnBackup  { "Backup" };
     juce::TextButton btnRestore { "Restore" };
     juce::TextButton btnShowLock { "SHOW LOCK" };
+    juce::ToggleButton btnTcnetOut  { "TCNET OUT" };
+    juce::ComboBox cmbTcnetInterface; juce::Label lblTcnetInterface;
+    juce::ComboBox cmbTcnetLayer; juce::Label lblTcnetLayer;
     int showLockFlashCountdown = 0;  // ticks remaining for flash feedback
 
     /// Returns true if Show Lock is active and the action should be blocked.
@@ -434,6 +443,7 @@ private:
     void startAudioDeviceScan();
     void populateMidiAndNetworkCombos();
     void populateAudioCombos();
+    void repopulateTcnetLayerCombo();
     void populateTypeFilterCombos();
     void populateFilteredInputDeviceCombo();
     void populateFilteredOutputDeviceCombos();
@@ -465,6 +475,7 @@ private:
     void startCurrentProDJLinkInput();
     void startCurrentStageLinQInput();
     void openTrackMapEditor();
+    void openCuePointEditor(TrackMapEntry* entry);
     void openMixerMapEditor();
     void openProDJLinkView();
     void openStageLinQView();

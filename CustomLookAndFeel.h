@@ -201,6 +201,39 @@ public:
         g.setColour(box.findColour(juce::ComboBox::outlineColourId));
         g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, 1.0f);
 
+        // Get the RAW item text to detect dot marker
+        static const juce::String dotChar = juce::String::charToString(0x25CF);
+        static const juce::String dotWithSpace = juce::String(" ") + dotChar;
+        auto itemText = box.getItemText(box.indexOfItemId(box.getSelectedId()));
+        bool hasDot = itemText.endsWith(dotChar);
+
+        // Strip dot from display text
+        juce::String displayText = itemText;
+        if (hasDot)
+        {
+            if (displayText.endsWith(dotWithSpace))
+                displayText = displayText.dropLastCharacters(dotWithSpace.length());
+            else
+                displayText = displayText.dropLastCharacters(dotChar.length());
+        }
+
+        // Draw the display text ourselves (the JUCE label is hidden via positionComboBoxText)
+        auto font = juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain));
+        g.setFont(font);
+        g.setColour(box.findColour(juce::ComboBox::textColourId));
+        auto textArea = juce::Rectangle<int>(6, 0, width - 28, height);
+        g.drawText(displayText, textArea, juce::Justification::centredLeft, true);
+
+        // Draw cyan dot indicator next to the arrow
+        if (hasDot)
+        {
+            float dotSize = 5.0f;
+            float dotX = (float)width - 26.0f;
+            float dotY = (float)height / 2.0f - dotSize / 2.0f;
+            g.setColour(juce::Colour(0xFF00BCD4));
+            g.fillEllipse(dotX, dotY, dotSize, dotSize);
+        }
+
         // Arrow
         float arrowSize = 6.0f;
         float arrowX = (float)width - 16.0f;
@@ -221,8 +254,10 @@ public:
 
     void positionComboBoxText(juce::ComboBox& box, juce::Label& label) override
     {
-        label.setBounds(6, 0, box.getWidth() - 28, box.getHeight());
-        label.setFont(getComboBoxFont(box));
+        // Hide the built-in label -- we draw the text ourselves in drawComboBox
+        // to avoid JUCE re-setting the label text from the item text after we strip it.
+        label.setBounds(0, 0, 0, 0);
+        (void)box;
     }
 
     //==============================================================================
@@ -304,7 +339,10 @@ public:
         if (hasActiveDot && isActive)
         {
             // Current engine active: draw device name + cyan dot
-            auto basePart = text.substring(0, text.length() - (dotChar.length() + 1)); // strip " (dot)"
+            // Handle both " dot" (Art-Net/PDL/SLQ) and "dot" (MIDI/Audio) formats
+            static const juce::String dotWithSpace = juce::String(" ") + dotChar;
+            int stripLen = text.endsWith(dotWithSpace) ? (dotChar.length() + 1) : dotChar.length();
+            auto basePart = text.substring(0, text.length() - stripLen);
             g.setColour(textBright);
             g.drawText(basePart, textArea, juce::Justification::centredLeft, false);
 

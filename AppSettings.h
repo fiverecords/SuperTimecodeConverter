@@ -13,10 +13,109 @@
 
 /// A single entry mapping a track (identified by artist + title) to a
 /// timecode offset that will be applied when that track is detected as playing.
+//==============================================================================
+// CuePoint -- trigger at a specific playhead position within a track
+//==============================================================================
+struct CuePoint
+{
+    uint32_t positionMs = 0;        // playhead position in ms from track start
+    juce::String name;              // user label ("BREAK", "DROP", "LIGHTS ON", etc.)
+
+    // Trigger config (same structure as TrackMapEntry track-change triggers)
+    int  midiChannel  = 0;          // 0-15 (displayed as 1-16)
+    int  midiNoteNum  = -1;         // -1 = disabled
+    int  midiNoteVel  = 127;
+    int  midiCCNum    = -1;         // -1 = disabled
+    int  midiCCVal    = 127;
+
+    juce::String oscAddress;        // empty = no OSC
+    juce::String oscArgs;
+
+    int  artnetCh     = 0;          // 0 = disabled, 1-512
+    int  artnetVal    = 255;
+
+    // --- Query helpers ---
+    bool hasMidiTrigger()   const { return midiNoteNum >= 0 || midiCCNum >= 0; }
+    bool hasOscTrigger()    const { return oscAddress.isNotEmpty(); }
+    bool hasArtnetTrigger() const { return artnetCh > 0; }
+    bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
+
+    // --- Serialization ---
+    juce::var toVar() const
+    {
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty("positionMs", (int)positionMs);
+        if (name.isNotEmpty())
+            obj->setProperty("name", name);
+
+        if (midiNoteNum >= 0 || midiCCNum >= 0)
+        {
+            obj->setProperty("midiChannel", midiChannel);
+            obj->setProperty("midiNoteNum", midiNoteNum);
+            obj->setProperty("midiNoteVel", midiNoteVel);
+            obj->setProperty("midiCCNum",   midiCCNum);
+            obj->setProperty("midiCCVal",   midiCCVal);
+        }
+        if (oscAddress.isNotEmpty())
+        {
+            obj->setProperty("oscAddress", oscAddress);
+            if (oscArgs.isNotEmpty())
+                obj->setProperty("oscArgs", oscArgs);
+        }
+        if (artnetCh > 0)
+        {
+            obj->setProperty("artnetCh",  artnetCh);
+            obj->setProperty("artnetVal", artnetVal);
+        }
+        return juce::var(obj);
+    }
+
+    void fromVar(const juce::var& v)
+    {
+        auto* obj = v.getDynamicObject();
+        if (!obj) return;
+
+        auto getInt = [&](const char* key, int def) {
+            auto val = obj->getProperty(key);
+            return val.isVoid() ? def : (int)val;
+        };
+        auto getString = [&](const char* key, const juce::String& def = {}) {
+            auto val = obj->getProperty(key);
+            return val.isVoid() ? def : val.toString();
+        };
+
+        positionMs  = (uint32_t)juce::jmax(0, getInt("positionMs", 0));
+        name        = getString("name");
+        midiChannel = juce::jlimit(0, 15, getInt("midiChannel", 0));
+        midiNoteNum = juce::jlimit(-1, 127, getInt("midiNoteNum", -1));
+        midiNoteVel = juce::jlimit(0, 127, getInt("midiNoteVel", 127));
+        midiCCNum   = juce::jlimit(-1, 127, getInt("midiCCNum", -1));
+        midiCCVal   = juce::jlimit(0, 127, getInt("midiCCVal", 127));
+        oscAddress  = getString("oscAddress");
+        oscArgs     = getString("oscArgs");
+        artnetCh    = juce::jlimit(0, 512, getInt("artnetCh", 0));
+        artnetVal   = juce::jlimit(0, 255, getInt("artnetVal", 255));
+    }
+
+    /// Format positionMs as "MM:SS.mmm" for display
+    static juce::String formatPositionMs(uint32_t ms)
+    {
+        int totalSec = (int)(ms / 1000);
+        int mins = totalSec / 60;
+        int secs = totalSec % 60;
+        int millis = (int)(ms % 1000);
+        return juce::String::formatted("%02d:%02d.%03d", mins, secs, millis);
+    }
+};
+
+//==============================================================================
+// TrackMapEntry -- per-track config: offset, triggers, cue points
+//==============================================================================
 struct TrackMapEntry
 {
     juce::String artist;
     juce::String title;
+    int          durationSec     = 0;       // track duration in seconds (0 = unknown/legacy)
     juce::String timecodeOffset  = "00:00:00:00";   // HH:MM:SS:FF
     juce::String notes;
 
@@ -39,14 +138,21 @@ struct TrackMapEntry
     // 0 = off (pass-through), 1 = x2, 2 = x4, -1 = /2, -2 = /4
     int          bpmMultiplier   = 0;
 
+    // Cue points -- triggers at specific playhead positions within the track.
+    // Sorted by positionMs ascending for efficient linear scan during playback.
+    std::vector<CuePoint> cuePoints;
+
     //------------------------------------------------------------------
-    // Key generation -- case-insensitive artist|title
+    // Key generation -- case-insensitive artist|title[|duration]
     //------------------------------------------------------------------
-    static std::string makeKey(const juce::String& a, const juce::String& t)
+    static std::string makeKey(const juce::String& a, const juce::String& t, int dur = 0)
     {
-        return (a.toLowerCase().trim() + "|" + t.toLowerCase().trim()).toStdString();
+        auto base = (a.toLowerCase().trim() + "|" + t.toLowerCase().trim()).toStdString();
+        if (dur > 0)
+            return base + "|" + std::to_string(dur);
+        return base;
     }
-    std::string key() const { return makeKey(artist, title); }
+    std::string key() const { return makeKey(artist, title, durationSec); }
     bool hasValidKey() const { return artist.isNotEmpty() && title.isNotEmpty(); }
 
     //------------------------------------------------------------------
@@ -56,6 +162,14 @@ struct TrackMapEntry
     bool hasOscTrigger()    const { return oscAddress.isNotEmpty(); }
     bool hasArtnetTrigger() const { return artnetCh > 0; }
     bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
+    bool hasCuePoints()     const { return !cuePoints.empty(); }
+
+    /// Sort cue points by position (call after adding/editing cues)
+    void sortCuePoints()
+    {
+        std::sort(cuePoints.begin(), cuePoints.end(),
+                  [](const CuePoint& a, const CuePoint& b) { return a.positionMs < b.positionMs; });
+    }
 
     //------------------------------------------------------------------
     juce::var toVar() const
@@ -63,6 +177,8 @@ struct TrackMapEntry
         auto* obj = new juce::DynamicObject();
         obj->setProperty("artist",         artist);
         obj->setProperty("title",          title);
+        if (durationSec > 0)
+            obj->setProperty("durationSec", durationSec);
         obj->setProperty("timecodeOffset", timecodeOffset);
         obj->setProperty("notes",          notes);
 
@@ -92,6 +208,15 @@ struct TrackMapEntry
         if (bpmMultiplier != 0)
             obj->setProperty("bpmMultiplier", bpmMultiplier);
 
+        // Cue points (only write if present)
+        if (!cuePoints.empty())
+        {
+            juce::Array<juce::var> cueArr;
+            for (auto& cue : cuePoints)
+                cueArr.add(cue.toVar());
+            obj->setProperty("cuePoints", cueArr);
+        }
+
         return juce::var(obj);
     }
 
@@ -111,6 +236,7 @@ struct TrackMapEntry
 
         artist         = getString("artist");
         title          = getString("title");
+        durationSec    = juce::jmax(0, getInt("durationSec", 0));
         notes          = getString("notes");
 
         // Legacy migration: if entry has trackId but no title, generate a placeholder
@@ -171,6 +297,22 @@ struct TrackMapEntry
         {
             int raw = getInt("bpmMultiplier", 0);
             bpmMultiplier = (raw == 1 || raw == 2 || raw == -1 || raw == -2) ? raw : 0;
+        }
+
+        // Cue points
+        cuePoints.clear();
+        auto* cueArr = obj->getProperty("cuePoints").getArray();
+        if (cueArr)
+        {
+            for (auto& item : *cueArr)
+            {
+                CuePoint cp;
+                cp.fromVar(item);
+                cuePoints.push_back(std::move(cp));
+            }
+            // Ensure sorted by position
+            std::sort(cuePoints.begin(), cuePoints.end(),
+                      [](const CuePoint& a, const CuePoint& b) { return a.positionMs < b.positionMs; });
         }
     }
 
@@ -272,34 +414,37 @@ public:
     }
 
     //------------------------------------------------------------------
-    // Lookup
+    // Lookup -- single hash lookup by artist|title[|duration]
     //------------------------------------------------------------------
 
-    /// Find entry by artist + title -- returns nullptr if not found
-    const TrackMapEntry* find(const juce::String& artist, const juce::String& title) const
+    /// Find entry by artist + title + optional duration.
+    const TrackMapEntry* find(const juce::String& artist, const juce::String& title,
+                              int dur = 0) const
     {
-        auto it = entries.find(TrackMapEntry::makeKey(artist, title));
+        auto it = entries.find(TrackMapEntry::makeKey(artist, title, dur));
         return (it != entries.end()) ? &it->second : nullptr;
     }
 
     /// Mutable find (for editing in-place)
-    TrackMapEntry* find(const juce::String& artist, const juce::String& title)
+    TrackMapEntry* find(const juce::String& artist, const juce::String& title,
+                        int dur = 0)
     {
-        auto it = entries.find(TrackMapEntry::makeKey(artist, title));
+        auto it = entries.find(TrackMapEntry::makeKey(artist, title, dur));
         return (it != entries.end()) ? &it->second : nullptr;
     }
 
-    /// Check if an artist+title exists in the map
-    bool contains(const juce::String& artist, const juce::String& title) const
+    /// Check if an artist+title[+duration] exists in the map
+    bool contains(const juce::String& artist, const juce::String& title,
+                  int dur = 0) const
     {
-        return entries.count(TrackMapEntry::makeKey(artist, title)) > 0;
+        return entries.count(TrackMapEntry::makeKey(artist, title, dur)) > 0;
     }
 
     //------------------------------------------------------------------
     // Mutation
     //------------------------------------------------------------------
 
-    /// Add or update an entry (key = artist|title)
+    /// Add or update an entry (key = artist|title[|duration])
     void addOrUpdate(const TrackMapEntry& entry)
     {
         if (entry.hasValidKey())
@@ -309,10 +454,11 @@ public:
         }
     }
 
-    /// Remove by artist+title -- returns true if found and removed
-    bool remove(const juce::String& artist, const juce::String& title)
+    /// Remove by artist+title+optional duration
+    bool remove(const juce::String& artist, const juce::String& title,
+                int dur = 0)
     {
-        bool erased = entries.erase(TrackMapEntry::makeKey(artist, title)) > 0;
+        bool erased = entries.erase(TrackMapEntry::makeKey(artist, title, dur)) > 0;
         if (erased) ++generation;
         return erased;
     }
@@ -452,6 +598,8 @@ struct EngineSettings
     bool artnetOutEnabled = false;
     bool ltcOutEnabled = false;
     bool thruOutEnabled = false;       // only meaningful for engine 0
+    bool tcnetOutEnabled = false;      // TCNet timecode layer output
+    int  tcnetLayer = 0;               // TCNet layer index 0-3 (Layer 1-4)
     juce::String midiOutputDevice = "";
     int artnetOutputInterface = 0;
     juce::String audioOutputDevice = "";
@@ -524,6 +672,8 @@ struct EngineSettings
         obj->setProperty("artnetOutEnabled", artnetOutEnabled);
         obj->setProperty("ltcOutEnabled", ltcOutEnabled);
         obj->setProperty("thruOutEnabled", thruOutEnabled);
+        obj->setProperty("tcnetOutEnabled", tcnetOutEnabled);
+        obj->setProperty("tcnetLayer", tcnetLayer);
         obj->setProperty("midiOutputDevice", midiOutputDevice);
         obj->setProperty("artnetOutputInterface", artnetOutputInterface);
         obj->setProperty("audioOutputDevice", audioOutputDevice);
@@ -618,6 +768,8 @@ struct EngineSettings
         artnetOutEnabled     = getBool("artnetOutEnabled", false);
         ltcOutEnabled        = getBool("ltcOutEnabled", false);
         thruOutEnabled       = getBool("thruOutEnabled", false);
+        tcnetOutEnabled      = getBool("tcnetOutEnabled", false);
+        tcnetLayer           = juce::jlimit(0, 3, getInt("tcnetLayer", 0));
         midiOutputDevice     = getString("midiOutputDevice");
         artnetOutputInterface = getInt("artnetOutputInterface", 0);
         audioOutputDevice    = getString("audioOutputDevice");
@@ -670,12 +822,19 @@ struct AppSettings
     // Global Pro DJ Link settings (shared connection, not per-engine)
     int  proDJLinkInterface = 0;
 
+    // Global StageLinQ settings (independent interface from ProDJLink)
+    int  stageLinQInterface = 0;
+
+    // TCNet output (global network interface, enable is per-engine in EngineSettings)
+    int  tcnetInterface = -1;    // -1 = all interfaces (broadcast 255.255.255.255)
+
     // Window positions/sizes (persisted as "x y w h" strings, empty = default)
     juce::String mainWindowBounds;
     juce::String pdlViewBounds;
     juce::String slqViewBounds;
     juce::String trackMapBounds;
     juce::String mixerMapBounds;
+    juce::String cuePointBounds;
 
     // PDL View layout state
     bool pdlViewHorizontal  = false;
@@ -718,12 +877,15 @@ struct AppSettings
         obj->setProperty("selectedEngine", selectedEngine);
         obj->setProperty("showModeLocked", showModeLocked);
         obj->setProperty("proDJLinkInterface", proDJLinkInterface);
+        obj->setProperty("stageLinQInterface", stageLinQInterface);
+        obj->setProperty("tcnetInterface", tcnetInterface);
 
         if (mainWindowBounds.isNotEmpty()) obj->setProperty("mainWindowBounds", mainWindowBounds);
         if (pdlViewBounds.isNotEmpty())   obj->setProperty("pdlViewBounds",   pdlViewBounds);
         if (slqViewBounds.isNotEmpty())   obj->setProperty("slqViewBounds",   slqViewBounds);
         if (trackMapBounds.isNotEmpty())   obj->setProperty("trackMapBounds",  trackMapBounds);
         if (mixerMapBounds.isNotEmpty())   obj->setProperty("mixerMapBounds",  mixerMapBounds);
+        if (cuePointBounds.isNotEmpty())  obj->setProperty("cuePointBounds", cuePointBounds);
         obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
         obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
         obj->setProperty("slqViewHorizontal", slqViewHorizontal);
@@ -776,12 +938,15 @@ struct AppSettings
                 showModeLocked = v.isVoid() ? false : (bool)v;
             }
             proDJLinkInterface    = getInt("proDJLinkInterface", 0);
+            stageLinQInterface    = getInt("stageLinQInterface", 0);
+            tcnetInterface        = getInt("tcnetInterface", -1);
 
             mainWindowBounds = getString("mainWindowBounds");
             pdlViewBounds   = getString("pdlViewBounds");
             slqViewBounds   = getString("slqViewBounds");
             trackMapBounds  = getString("trackMapBounds");
             mixerMapBounds  = getString("mixerMapBounds");
+            cuePointBounds  = getString("cuePointBounds");
             pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
             pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
             slqViewHorizontal  = getInt("slqViewHorizontal", 0) != 0;

@@ -177,6 +177,37 @@ public:
         lastFiredTrackKey = entry.key();
     }
 
+    /// Fire a cue point trigger (MIDI + OSC).
+    /// Same dispatch as fire() but reads from CuePoint fields.
+    void fireCuePoint(const CuePoint& cue)
+    {
+        if (midiEnabled && cue.hasMidiTrigger())
+        {
+            auto* midi = getActiveMidi();
+            if (midi)
+            {
+                int ch = juce::jlimit(0, 15, cue.midiChannel) + 1;
+                if (cue.midiNoteNum >= 0)
+                {
+                    int note = juce::jlimit(0, 127, cue.midiNoteNum);
+                    int vel  = juce::jlimit(0, 127, cue.midiNoteVel);
+                    midi->sendMessageNow(juce::MidiMessage::noteOn(ch, note, (uint8_t)vel));
+                    midi->sendMessageNow(juce::MidiMessage::noteOff(ch, note));
+                }
+                if (cue.midiCCNum >= 0)
+                {
+                    int cc  = juce::jlimit(0, 127, cue.midiCCNum);
+                    int val = juce::jlimit(0, 127, cue.midiCCVal);
+                    midi->sendMessageNow(juce::MidiMessage::controllerEvent(ch, cc, val));
+                }
+            }
+        }
+        if (oscEnabled && cue.hasOscTrigger() && oscSender.isConnected())
+        {
+            oscSender.send(cue.oscAddress, cue.oscArgs);
+        }
+    }
+
     std::string getLastFiredTrackKey() const { return lastFiredTrackKey; }
 
     //--------------------------------------------------------------------------
