@@ -563,18 +563,6 @@ The application is built around a modular, header-only architecture:
 
 -----
 
-## Roadmap
-
-Planned features for upcoming releases:
-
-- **Track History** – Automatic log of played tracks (artist, title, source, timestamp, on-air duration) exportable as CSV for post-show reports and royalty tracking.
-- **OSC Input** – Remote control of STC via OSC messages (change engine, player, toggle outputs) for integration with Companion/Stream Deck, TouchOSC, and lighting consoles. Also enables bridge integration with DJ software that exports playhead data via OSC (Serato, Traktor, VirtualDJ via external bridges like Clockworks).
-- **DJM-A9 full protocol validation** – Continue mapping any remaining A9-specific parameter differences as community captures become available.
-
-If you have hardware to test or Wireshark captures to share, please open an issue on GitHub.
-
------
-
 ## Contributing
 
 Contributions are welcome! Please see <CONTRIBUTING.md> for guidelines.
@@ -593,15 +581,19 @@ This project is **not affiliated with, endorsed by, or associated with AlphaThet
 
 This project is **not affiliated with, endorsed by, or associated with inMusic Brands, Inc., Denon DJ, or Engine DJ** in any way. Denon is a trademark of D&M Holdings Inc. Denon DJ and Engine DJ are trademarks of inMusic Brands, Inc. StageLinQ is a protocol developed by inMusic/Denon DJ for their Engine OS hardware.
 
-This project is **not affiliated with, endorsed by, or associated with TC-Supply, Event Imagineering Group, or Resolume** in any way. TCNet is an open protocol created by TC-Supply / Event Imagineering Group. Resolume Arena is a trademark of Resolume B.V. ChamSys, Avolites, and madMapper are trademarks of their respective owners.
+This project is **not affiliated with, endorsed by, or associated with TC-Supply or Event Imagineering Group** in any way. TCNet is an open protocol created by TC-Supply / Event Imagineering Group.
 
-All other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
-
-The Pro DJ Link protocol implementation in this project is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. The StageLinQ protocol implementation is based on independent open-source reverse-engineering work by [chrisle/StageLinq](https://github.com/chrisle/StageLinq) (TypeScript, MIT), [icedream/go-stagelinq](https://github.com/icedream/go-stagelinq) (Go, MIT), and [Jaxc/PyStageLinQ](https://github.com/Jaxc/PyStageLinQ) (Python, MIT). The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use). This project has not been developed using any proprietary documentation, SDK, or confidential information from AlphaTheta Corporation, inMusic Brands, Inc., or Resolume B.V.
-
-**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+This project is **not affiliated with, endorsed by, or associated with Resolume B.V.** in any way. Resolume Arena is a trademark of Resolume B.V.
 
 Ableton Link is a trademark of Ableton AG. This project is not affiliated with, endorsed by, or associated with Ableton AG. The Link SDK is used under the terms of the Ableton Link License.
+
+ChamSys, Avolites, madMapper, and all other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
+
+The Pro DJ Link protocol implementation is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. The StageLinQ protocol implementation is based on independent open-source reverse-engineering work by [chrisle/StageLinq](https://github.com/chrisle/StageLinq) (TypeScript, MIT), [icedream/go-stagelinq](https://github.com/icedream/go-stagelinq) (Go, MIT), and [Jaxc/PyStageLinQ](https://github.com/Jaxc/PyStageLinQ) (Python, MIT). The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
+
+This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies.
+
+**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
 
 -----
 
@@ -626,4 +618,5 @@ The StageLinQ implementation is built on the open-source reverse-engineering wor
 - [Jaxc/PyStageLinQ – Python StageLinQ library](https://github.com/Jaxc/PyStageLinQ)
 - [JUCE Framework](https://juce.com/)
 - [Art-Net Protocol](https://art-net.org.uk/)
+- [TCNet Protocol Specification](https://www.tc-supply.com/tcnet)
 - [MIDI Time Code Specification](https://en.wikipedia.org/wiki/MIDI_timecode)
