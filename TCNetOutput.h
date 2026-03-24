@@ -87,6 +87,15 @@ public:
         // Artwork (JPEG bytes for TCNet type 204 packet)
         std::vector<uint8_t> artworkJpeg;
         bool artworkDirty      = false;
+
+        // Jog anti-jitter: committed position for deadband filter.
+        // During jog/scratch the CDJ's abspos oscillates +/-several ms due to
+        // mechanical jog wheel resolution.  Without filtering, Resolume sees
+        // sub-frame position reversals and renders a visible frame vibration.
+        // The deadband suppresses direction changes smaller than one video frame
+        // (~33ms at 30fps) while passing through sustained movement and playback.
+        uint32_t committedMs   = 0;
+        bool     wasPlaying    = false;
     };
 
     struct SlaveNode
@@ -182,11 +191,45 @@ public:
     void setLayerFromEngine(int idx, const Timecode& tc, FrameRate fps,
                             uint32_t playheadMs, uint32_t durationMs,
                             bool isPlaying, uint8_t onAirFader,
-                            uint8_t beatInBar, uint32_t bpm100 = 0)
+                            uint8_t beatInBar, uint32_t bpm100 = 0,
+                            int offsetMs = 0)
     {
         if (idx < 0 || idx >= kMaxLayers) return;
         auto& L       = layers[idx];
-        L.currentTimeMs = (playheadMs > 0) ? playheadMs : tcToMs(tc, fps);
+        int64_t baseMs = (int64_t)((playheadMs > 0) ? playheadMs : tcToMs(tc, fps));
+        int64_t adjusted = baseMs + offsetMs;
+        uint32_t newMs = (uint32_t)juce::jlimit((int64_t)0, (int64_t)0xFFFFFFFF, adjusted);
+
+        // Jog anti-jitter deadband.
+        // During playback: pass through directly (position advances monotonically).
+        // On play->pause transition: commit current position as anchor.
+        // While paused/jogging: only update if movement exceeds one video frame
+        // (~33ms).  This suppresses the +/-few-ms oscillation from the CDJ's jog
+        // wheel that causes visible frame vibration in Resolume.
+        static constexpr uint32_t kJogDeadband = 33;  // ~1 frame at 30fps
+
+        if (isPlaying)
+        {
+            L.currentTimeMs = newMs;
+            L.committedMs   = newMs;
+        }
+        else
+        {
+            // Transition from play to pause: anchor at current position
+            if (L.wasPlaying)
+                L.committedMs = newMs;
+
+            int64_t delta = (int64_t)newMs - (int64_t)L.committedMs;
+            if (delta < 0) delta = -delta;
+            if ((uint64_t)delta >= kJogDeadband)
+            {
+                L.committedMs   = newMs;
+                L.currentTimeMs = newMs;
+            }
+            // else: hold L.currentTimeMs at the last committed value
+        }
+        L.wasPlaying    = isPlaying;
+
         L.beatMarker    = beatInBar;
         L.layerState    = isPlaying ? kStatePlaying : kStatePaused;
         L.onAir         = onAirFader;
@@ -693,8 +736,6 @@ private:
 
     static void writeUtf32LE(uint8_t* dst, const juce::String& str, int maxChars)
     {
-        auto utf16 = str.toUTF16();
-        const juce::CharPointer_UTF16 ptr = utf16;
         int written = 0;
         for (auto it = str.begin(); it != str.end() && written < maxChars; ++it, ++written)
         {

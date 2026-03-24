@@ -53,9 +53,11 @@ struct TrackMetadata
     std::vector<uint8_t> waveformData;
     int waveformEntryCount = 0;
     int waveformBytesPerEntry = 0;  // 3 = ThreeBand, 6 = ColorNxs2
+    bool waveformQueried = false;   // true once waveform fetch has been attempted
 
     bool isValid() const { return trackId != 0 && title.isNotEmpty(); }
     bool hasWaveform() const { return waveformEntryCount > 0 && !waveformData.empty(); }
+    bool isFullyCached() const { return isValid() && waveformQueried; }
     bool isThreeBandWaveform() const { return waveformBytesPerEntry == 3; }
 };
 
@@ -129,13 +131,16 @@ public:
             + " ourPlayer=" + juce::String(ourPlayer)
             + " model=" + playerModel);
 
-        // Check cache first -- avoid unnecessary requests
+        // Check cache first -- avoid unnecessary requests.
+        // Use isFullyCached() so that entries with metadata but no waveform
+        // (partial cache from an early query before CDJ was fully ready)
+        // are re-requested to fetch the missing waveform data.
         uint64_t cacheKey = makeCacheKey(playerIP, trackId);
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             auto it = metadataCache.find(cacheKey);
-            if (it != metadataCache.end() && it->second.isValid())
-                return;  // already cached
+            if (it != metadataCache.end() && it->second.isFullyCached())
+                return;  // fully cached (metadata + waveform attempted)
         }
 
         // Enqueue request (producer lock: any thread may call this)
@@ -1337,54 +1342,90 @@ private:
 
         if (req.trackId != 0)
         {
-            // Metadata request
-            auto meta = queryTrackMetadata(*conn, req.slot, req.trackType,
-                                            req.trackId, req.ourPlayer);
-            if (meta.isValid())
+            // Check if metadata text is already cached (partial cache --
+            // metadata succeeded on a previous request but waveform or
+            // artwork may still be missing).
+            uint64_t cacheKey = makeCacheKey(req.playerIP, req.trackId);
+            bool metaAlreadyCached = false;
+            TrackMetadata meta;
             {
-                cacheMetadata(req.playerIP, meta);
-                DBG("DbServerClient: cached metadata for track "
-                    + juce::String(req.trackId) + " -- \""
-                    + meta.artist + " - " + meta.title + "\"");
+                const juce::SpinLock::ScopedLockType lock(cacheLock);
+                auto it = metadataCache.find(cacheKey);
+                if (it != metadataCache.end() && it->second.isValid())
+                {
+                    metaAlreadyCached = true;
+                    meta = it->second;
+                }
+            }
 
-                // Request artwork if available
-                if (req.wantArt && meta.artworkId != 0)
+            if (!metaAlreadyCached)
+            {
+                // First time: query metadata from CDJ dbserver
+                meta = queryTrackMetadata(*conn, req.slot, req.trackType,
+                                          req.trackId, req.ourPlayer);
+                if (meta.isValid())
+                {
+                    cacheMetadata(req.playerIP, meta);
+                    DBG("DbServerClient: cached metadata for track "
+                        + juce::String(req.trackId) + " -- \""
+                        + meta.artist + " - " + meta.title + "\"");
+                }
+                else
+                {
+                    errorCount.fetch_add(1, std::memory_order_relaxed);
+                    DBG("DbServerClient: metadata query failed for trackId="
+                        + juce::String(req.trackId));
+                    if (!conn->isConnected())
+                        conn->close();
+                    return;
+                }
+            }
+
+            // Artwork: fetch if not yet cached
+            if (req.wantArt && meta.artworkId != 0)
+            {
+                bool artCached;
+                {
+                    const juce::SpinLock::ScopedLockType lock(artCacheLock);
+                    artCached = artworkCache.count(meta.artworkId) > 0;
+                }
+                if (!artCached)
                 {
                     auto img = queryArtwork(*conn, req.slot, req.trackType,
                                              meta.artworkId, req.ourPlayer);
                     if (img.isValid())
                         cacheArtwork(meta.artworkId, img);
                 }
+            }
 
-                // Request preview waveform (PWV6 for CDJ-3000, PWV4 for NXS2)
-                if (req.wantWaveform)
+            // Waveform: fetch if not yet cached
+            if (req.wantWaveform && !meta.hasWaveform())
+            {
+                auto wfResult = queryPreviewWaveform(
+                    *conn, req.slot, req.trackType, req.trackId,
+                    req.ourPlayer, req.playerModel);
+                if (wfResult.entryCount > 0)
                 {
-                    auto wfResult = queryPreviewWaveform(
-                        *conn, req.slot, req.trackType, req.trackId,
-                        req.ourPlayer, req.playerModel);
-                    if (wfResult.entryCount > 0)
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
                     {
-                        uint64_t key = makeCacheKey(req.playerIP, req.trackId);
-                        const juce::SpinLock::ScopedLockType lock(cacheLock);
-                        auto it = metadataCache.find(key);
-                        if (it != metadataCache.end())
-                        {
-                            it->second.waveformData = std::move(wfResult.data);
-                            it->second.waveformEntryCount = wfResult.entryCount;
-                            it->second.waveformBytesPerEntry =
-                                (wfResult.format == WaveformFormat::ThreeBand) ? 3 : 6;
-                        }
+                        it->second.waveformData = std::move(wfResult.data);
+                        it->second.waveformEntryCount = wfResult.entryCount;
+                        it->second.waveformBytesPerEntry =
+                            (wfResult.format == WaveformFormat::ThreeBand) ? 3 : 6;
                     }
                 }
             }
-            else
+
+            // Mark waveform as attempted so isFullyCached() returns true
+            // and we don't re-request indefinitely for tracks without
+            // waveform data (e.g. non-rekordbox media).
             {
-                errorCount.fetch_add(1, std::memory_order_relaxed);
-                DBG("DbServerClient: metadata query failed for trackId="
-                    + juce::String(req.trackId));
-                // Connection may be stale -- close so next request reconnects
-                if (!conn->isConnected())
-                    conn->close();
+                const juce::SpinLock::ScopedLockType lock(cacheLock);
+                auto it = metadataCache.find(cacheKey);
+                if (it != metadataCache.end())
+                    it->second.waveformQueried = true;
             }
         }
         else if (req.artworkId != 0)

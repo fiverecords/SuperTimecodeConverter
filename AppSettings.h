@@ -632,6 +632,7 @@ struct EngineSettings
     int mtcOutputOffset = 0;
     int artnetOutputOffset = 0;
     int ltcOutputOffset = 0;
+    int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds, -1000 to +1000
 
     // Track change triggers -- destinations
     bool triggerMidiEnabled = false;
@@ -699,6 +700,7 @@ struct EngineSettings
         obj->setProperty("mtcOutputOffset", mtcOutputOffset);
         obj->setProperty("artnetOutputOffset", artnetOutputOffset);
         obj->setProperty("ltcOutputOffset", ltcOutputOffset);
+        obj->setProperty("tcnetOutputOffsetMs", tcnetOutputOffsetMs);
 
         // Track change triggers
         obj->setProperty("triggerMidiEnabled", triggerMidiEnabled);
@@ -797,6 +799,7 @@ struct EngineSettings
         mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
+        tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         // Track change triggers
         triggerMidiEnabled = getBool("triggerMidiEnabled", false);
@@ -1041,6 +1044,7 @@ private:
         es.mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         es.artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
         es.ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
+        es.tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         engines.clear();
         engines.push_back(es);

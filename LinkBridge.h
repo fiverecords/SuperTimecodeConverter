@@ -88,7 +88,16 @@ public:
     {
         link.enable(enabled);
         enabledFlag.store(enabled, std::memory_order_relaxed);
-        if (!enabled)
+        if (enabled)
+        {
+            // Force the next setTempo() to commit immediately, even if the
+            // BPM happens to match what we last sent.  Without this, re-enabling
+            // Link after a disable leaves the session at 120 BPM (SDK default)
+            // because lastCommittedBpm still holds the old value and the
+            // hysteresis check suppresses the "identical" commit.
+            lastCommittedBpm = 0.0;
+        }
+        else
         {
             peerCount.store(0, std::memory_order_relaxed);
             lastCommittedBpm = 0.0;

@@ -250,6 +250,9 @@ public:
     void setMtcOutputOffset(int v)      { mtcOutputOffset = v; }
     void setArtnetOutputOffset(int v)   { artnetOutputOffset = v; }
     void setLtcOutputOffset(int v)      { ltcOutputOffset = v; }
+    void setTcnetOutputOffsetMs(int v)  { tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, v); }
+
+    int getTcnetOutputOffsetMs() const  { return tcnetOutputOffsetMs; }
 
     //==========================================================================
     // Protocol handlers -- direct access for device queries
@@ -382,8 +385,12 @@ public:
         proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
         resolvedXfPlayer = 0;  // force resolve on first tick
 
-        if (sharedProDJLink != nullptr && !isXfMode())
-            lastSeenTrackVersion = sharedProDJLink->getTrackVersion(proDJLinkPlayer);
+        // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
+        // This forces the first tick to detect the current track as "changed"
+        // and re-run metadata request + TrackMap lookup + cue point loading.
+        // Without this, switching away from ProDJLink and back would leave
+        // cachedTrackId=0 permanently because lastSeenTrackVersion already
+        // matched the CDJ's current value, so "track changed" never fired.
 
         if (sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
         {
@@ -425,9 +432,12 @@ public:
         proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
         resolvedXfPlayer = 0;
 
+        // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
+        // Same rationale as startProDJLinkInput -- forces track rediscovery
+        // on the first tick after switching back to StageLinQ.
+
         if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
         {
-            lastSeenTrackVersion = sharedStageLinQ->getTrackVersion(proDJLinkPlayer);
             inputStatusText = "LISTENING | " + sharedStageLinQ->getBindInfo();
             return true;
         }
@@ -1093,6 +1103,7 @@ public:
                     if (pdlRx && midiClockEnabled && triggerOutput.isMidiClockRunning())
                     {
                         double pdlClkBpm = sharedProDJLink->getMasterBPM();
+                        if (pdlClkBpm <= 0.0) pdlClkBpm = sharedProDJLink->getBPM(ep);
                         pdlClkBpm = applyBpmMultiplier(pdlClkBpm, getEffectiveBpmMultiplier());
                         if (pdlClkBpm > 0.0 && std::abs((float)pdlClkBpm - lastSentClockBpm) > 0.05f)
                         {
@@ -1105,6 +1116,7 @@ public:
                     if (pdlRx && linkBridge.isEnabled())
                     {
                         double pdlLnkBpm = sharedProDJLink->getMasterBPM();
+                        if (pdlLnkBpm <= 0.0) pdlLnkBpm = sharedProDJLink->getBPM(ep);
                         pdlLnkBpm = applyBpmMultiplier(pdlLnkBpm, getEffectiveBpmMultiplier());
                         if (pdlLnkBpm > 0.0)
                             linkBridge.setTempo(pdlLnkBpm);
@@ -1114,6 +1126,7 @@ public:
                     if (pdlRx && oscForwardEnabled && triggerOutput.isOscConnected())
                     {
                         double pdlOscBpm = sharedProDJLink->getMasterBPM();
+                        if (pdlOscBpm <= 0.0) pdlOscBpm = sharedProDJLink->getBPM(ep);
                         pdlOscBpm = applyBpmMultiplier(pdlOscBpm, getEffectiveBpmMultiplier());
                         if (pdlOscBpm > 0.0 && std::abs((float)pdlOscBpm - lastSentOscBpm) > kOscBpmThreshold)
                         {
@@ -1538,6 +1551,7 @@ private:
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
     int ltcOutputOffset    = 0;
+    int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds
 
     // Protocol handlers
     MtcInput     mtcInput;
@@ -1987,7 +2001,10 @@ public:
             if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
                 bpm = (float)sharedStageLinQ->getBPM(proDJLinkPlayer);
             else if (sharedProDJLink != nullptr)
+            {
                 bpm = (float)sharedProDJLink->getMasterBPM();
+                if (bpm <= 0.0f) bpm = (float)sharedProDJLink->getBPM(getEffectivePlayer());
+            }
             triggerOutput.startMidiClock(bpm > 0.0f ? (double)bpm : 120.0);
         }
         else

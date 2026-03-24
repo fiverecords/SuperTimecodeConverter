@@ -332,6 +332,7 @@ private:
     juce::ToggleButton btnTcnetOut  { "TCNET OUT" };
     juce::ComboBox cmbTcnetInterface; juce::Label lblTcnetInterface;
     juce::ComboBox cmbTcnetLayer; juce::Label lblTcnetLayer;
+    GainSlider sldTcnetOffset;        juce::Label lblTcnetOffset;
     int showLockFlashCountdown = 0;  // ticks remaining for flash feedback
 
     /// Returns true if Show Lock is active and the action should be blocked.

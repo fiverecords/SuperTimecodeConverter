@@ -999,6 +999,24 @@ MainComponent::MainComponent()
         saveSettings();
     };
 
+    rightContent.addAndMakeVisible(sldTcnetOffset);
+    sldTcnetOffset.setSliderStyle(juce::Slider::LinearHorizontal);
+    sldTcnetOffset.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 20);
+    sldTcnetOffset.setRange(-1000.0, 1000.0, 1.0);
+    sldTcnetOffset.setValue(0.0, juce::dontSendNotification);
+    sldTcnetOffset.setTextValueSuffix(" ms");
+    sldTcnetOffset.setDoubleClickReturnValue(true, 0.0);
+    sldTcnetOffset.setColour(juce::Slider::backgroundColourId, juce::Colour(0xFF1A1D23));
+    sldTcnetOffset.setColour(juce::Slider::trackColourId, juce::Colour(0xFF37474F));
+    sldTcnetOffset.setColour(juce::Slider::thumbColourId, juce::Colour(0xFF78909C));
+    sldTcnetOffset.setColour(juce::Slider::textBoxTextColourId, textBright);
+    sldTcnetOffset.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xFF1A1D23));
+    sldTcnetOffset.setColour(juce::Slider::textBoxOutlineColourId, borderCol);
+    rightContent.addAndMakeVisible(lblTcnetOffset);
+    lblTcnetOffset.setText("TCNET OFFSET:", juce::dontSendNotification);
+    styleLabel(lblTcnetOffset);
+    sldTcnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setTcnetOutputOffsetMs((int)sldTcnetOffset.getValue()); saveSettings(); } };
+
     addRightLabelAndCombo(lblAudioOutputTypeFilter, cmbAudioOutputTypeFilter, "AUDIO DRIVER:");
     cmbAudioOutputTypeFilter.onChange = [this]
     {
@@ -1507,6 +1525,7 @@ void MainComponent::syncUIFromEngine()
     sldMtcOffset.setValue(eng.getMtcOutputOffset(), juce::dontSendNotification);
     sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
     sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
+    sldTcnetOffset.setValue(eng.getTcnetOutputOffsetMs(), juce::dontSendNotification);
 
     // Gains
     sldLtcInputGain.setValue(eng.getLtcInput().getInputGain() * 100.0f, juce::dontSendNotification);
@@ -3126,6 +3145,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
+        eng.setTcnetOutputOffsetMs(es.tcnetOutputOffsetMs);
 
         eng.getLtcInput().setInputGain((float)es.ltcInputGain / 100.0f);
         eng.getLtcInput().setPassthruGain((float)es.thruInputGain / 100.0f);
@@ -3399,6 +3419,7 @@ void MainComponent::flushSettings()
         es.mtcOutputOffset = eng.getMtcOutputOffset();
         es.artnetOutputOffset = eng.getArtnetOutputOffset();
         es.ltcOutputOffset = eng.getLtcOutputOffset();
+        es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
 
         es.ltcInputGain = (int)(eng.getLtcInput().getInputGain() * 100.0f);
         es.thruInputGain = (int)(eng.getLtcInput().getPassthruGain() * 100.0f);
@@ -3888,6 +3909,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showTcnetConfig = eng.isOutputTcnetEnabled();
     cmbTcnetInterface.setVisible(showTcnetConfig);  lblTcnetInterface.setVisible(showTcnetConfig);
     cmbTcnetLayer.setVisible(showTcnetConfig);      lblTcnetLayer.setVisible(showTcnetConfig);
+    sldTcnetOffset.setVisible(showTcnetConfig);     lblTcnetOffset.setVisible(showTcnetConfig);
     if (showTcnetConfig) repopulateTcnetLayerCombo();
 
     bool anyDevice = (input != SrcType::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
@@ -4576,6 +4598,7 @@ void MainComponent::resized()
         btnTcnetOut.setBounds(row); rp.removeFromTop(2);
         if (cmbTcnetInterface.isVisible()) layCombo(lblTcnetInterface, cmbTcnetInterface, rp);
         if (cmbTcnetLayer.isVisible()) layCombo(lblTcnetLayer, cmbTcnetLayer, rp);
+        if (sldTcnetOffset.isVisible()) laySlider(lblTcnetOffset, sldTcnetOffset, rp);
         rp.removeFromTop(2);
     }
 
@@ -4743,7 +4766,8 @@ void MainComponent::timerCallback()
                 eng.isSourceActive(),
                 onAirFader,
                 beatInBar,
-                bpm100);
+                bpm100,
+                eng.getTcnetOutputOffsetMs());
 
             // Feed track metadata for Resolume unicast.
             // DJ sources: real artist + title from CDJ/Denon.
@@ -4964,7 +4988,18 @@ void MainComponent::timerCallback()
         }
 
         // Phase 3: update color waveform from DbServerClient cache
+        //
+        // IMPORTANT: Use the SOURCE player's IP (the CDJ that owns the media),
+        // not the deck's own IP.  When CDJ 2 loads a track from CDJ 1's USB
+        // via Link export, the cache entry is keyed by CDJ 1's IP (set by
+        // TimecodeEngine::requestDbMetadata).  Looking up with CDJ 2's IP
+        // would miss the cache entry and the waveform would never load.
         uint32_t wfTrackId = trackInfo.trackId;
+        uint8_t wfSrcPlayer = sharedProDJLinkInput.getLoadedPlayer(pdlPlayer);
+        if (wfSrcPlayer == 0) wfSrcPlayer = (uint8_t)pdlPlayer;
+        juce::String srcIP = sharedProDJLinkInput.getPlayerIP((int)wfSrcPlayer);
+        if (srcIP.isEmpty()) srcIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
+
         if (wfTrackId != 0 && wfTrackId != displayedWaveformTrackId)
         {
             // Track changed -- clear old waveform immediately (avoids stale cursor)
@@ -4975,8 +5010,7 @@ void MainComponent::timerCallback()
             displayedWaveformTrackId = wfTrackId;
 
             // Try to populate from cache (may not have waveform yet)
-            juce::String pdlIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
-            auto meta = sharedDbClient.getCachedMetadata(pdlIP, wfTrackId);
+            auto meta = sharedDbClient.getCachedMetadata(srcIP, wfTrackId);
             if (meta.hasWaveform())
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
@@ -4986,8 +5020,7 @@ void MainComponent::timerCallback()
         else if (wfTrackId != 0 && !waveformDisplay.hasWaveformData())
         {
             // Waveform not yet loaded -- retry from cache (async: arrives after metadata)
-            juce::String pdlIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
-            auto meta = sharedDbClient.getCachedMetadata(pdlIP, wfTrackId);
+            auto meta = sharedDbClient.getCachedMetadata(srcIP, wfTrackId);
             if (meta.hasWaveform())
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
