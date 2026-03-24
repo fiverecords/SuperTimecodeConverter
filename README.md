@@ -479,6 +479,12 @@ STC is open-source software and is not signed with an Apple Developer certificat
 
 This is a one-time step – macOS remembers the exception after the first launch.
 
+### TCNet: AnyDesk Port Conflict
+
+AnyDesk remote desktop software uses UDP ports 60000-60001 – the same ports used by TCNet. If AnyDesk is installed and running on the same machine as STC or Resolume, TCNet will not work. This is a known issue that also affects the official PRO DJ LINK Bridge.
+
+**Workaround:** Uninstall AnyDesk, or stop its service before using TCNet. On Windows: open Services (services.msc), find “AnyDesk Service”, and stop it. On macOS: quit AnyDesk from the menu bar.
+
 ### macOS: DJM Subscribe Race Condition
 
 On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
