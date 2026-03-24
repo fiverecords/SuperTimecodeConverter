@@ -589,9 +589,7 @@ Ableton Link is a trademark of Ableton AG. This project is not affiliated with, 
 
 ChamSys, Avolites, madMapper, and all other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
 
-The Pro DJ Link protocol implementation is based on independent community research and documentation, particularly the [DJ Link Ecosystem Analysis](https://djl-analysis.deepsymmetry.org/djl-analysis/) published by Deep Symmetry. The StageLinQ protocol implementation is based on independent open-source reverse-engineering work by [chrisle/StageLinq](https://github.com/chrisle/StageLinq) (TypeScript, MIT), [icedream/go-stagelinq](https://github.com/icedream/go-stagelinq) (Go, MIT), and [Jaxc/PyStageLinQ](https://github.com/Jaxc/PyStageLinQ) (Python, MIT). The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
-
-This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies.
+This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies. The Pro DJ Link and StageLinQ implementations are based on independent community research. The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
 
 **Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
 
