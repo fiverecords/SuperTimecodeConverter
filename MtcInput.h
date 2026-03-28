@@ -65,12 +65,18 @@ public:
 
     void stop()
     {
+        isRunningFlag.store(false, std::memory_order_release);
         if (midiInput != nullptr)
         {
             midiInput->stop();
-            midiInput = nullptr;
+            // Defer destruction: JUCE 8's BytestreamToUMPDispatcher may still be
+            // mid-callback on the platform MIDI thread when stop() returns
+            // (macOS CoreMIDI does not guarantee callback completion on disconnect).
+            // Move the stopped device to a holding member instead of destroying it
+            // immediately.  It will be freed on the next stop() or in the destructor,
+            // by which time any in-flight callback has long since returned.
+            prevMidiInput = std::move(midiInput);
         }
-        isRunningFlag.store(false, std::memory_order_relaxed);
         currentDeviceIndex = -1;
     }
 
@@ -289,6 +295,7 @@ private:
     }
 
     std::unique_ptr<juce::MidiInput> midiInput;
+    std::unique_ptr<juce::MidiInput> prevMidiInput;  // deferred destruction (see stop())
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
     std::atomic<bool> isRunningFlag { false };

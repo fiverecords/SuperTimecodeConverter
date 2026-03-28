@@ -178,6 +178,7 @@ public:
             int ep = getEffectivePlayer();
             return (ep >= 1) ? sharedStageLinQ->getPlayheadMs(ep) : 0;
         }
+        if (activeInput != InputSource::ProDJLink) return 0;  // non-DJ sources use tcToMs in TCNet
         if (sharedProDJLink == nullptr) return 0;
         int ep = getEffectivePlayer();
         if (ep < 1) return 0;
@@ -192,6 +193,7 @@ public:
             int ep = getEffectivePlayer();
             return (ep >= 1) ? sharedStageLinQ->getPlayPositionRatio(ep) : 0.0f;
         }
+        if (activeInput != InputSource::ProDJLink) return 0.0f;
         if (sharedProDJLink == nullptr) return 0.0f;
         int ep = getEffectivePlayer();
         if (ep < 1) return 0.0f;
