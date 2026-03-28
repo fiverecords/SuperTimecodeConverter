@@ -68,16 +68,26 @@ public:
         isRunningFlag.store(false, std::memory_order_release);
         if (midiInput != nullptr)
         {
-            midiInput->stop();
-            // Defer destruction: JUCE 8's BytestreamToUMPDispatcher may still be
-            // mid-callback on the platform MIDI thread when stop() returns
-            // (macOS CoreMIDI does not guarantee callback completion on disconnect).
-            // Move the stopped device to a holding member instead of destroying it
-            // immediately.  It will be freed on the next stop() or in the destructor,
-            // by which time any in-flight callback has long since returned.
-            prevMidiInput = std::move(midiInput);
+            // Do NOT call midiInput->stop() or destroy it here.  On macOS,
+            // CoreMIDI's MIDI thread may be mid-callback inside JUCE's UMP
+            // dispatcher.  Both stop() and ~MidiInput() can deadlock or crash.
+            //
+            // Move the device to a retirement list.  It stays alive until
+            // drainRetiredDevices() is called from the message thread timer
+            // (16ms later), by which time any in-flight callback has returned.
+            retiredDevices.push_back(std::move(midiInput));
         }
         currentDeviceIndex = -1;
+    }
+
+    /// Call periodically from the message thread (e.g. timerCallback at 60Hz)
+    /// to safely destroy MidiInput devices that were retired by stop().
+    /// By the time this runs (~16ms after stop()), CoreMIDI callbacks have
+    /// finished and the destructors are safe to call.
+    void drainRetiredDevices()
+    {
+        if (!retiredDevices.empty())
+            retiredDevices.clear();
     }
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
@@ -174,6 +184,10 @@ public:
     //==============================================================================
     void handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMessage& message) override
     {
+        // Guard: after stop(), the device may still deliver a queued message
+        // before CoreMIDI fully disconnects.  Ignore it.
+        if (!isRunningFlag.load(std::memory_order_acquire)) return;
+
         auto rawData = message.getRawData();
         int rawSize = message.getRawDataSize();
 
@@ -295,7 +309,7 @@ private:
     }
 
     std::unique_ptr<juce::MidiInput> midiInput;
-    std::unique_ptr<juce::MidiInput> prevMidiInput;  // deferred destruction (see stop())
+    std::vector<std::unique_ptr<juce::MidiInput>> retiredDevices;  // deferred destruction (see stop())
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
     std::atomic<bool> isRunningFlag { false };

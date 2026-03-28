@@ -757,6 +757,10 @@ public:
     //==========================================================================
     void tick()
     {
+        // Housekeeping: safely destroy MidiInput devices that were retired
+        // by MtcInput::stop().  See MtcInput.h for why this is deferred.
+        mtcInput.drainRetiredDevices();
+
         switch (activeInput)
         {
             case InputSource::SystemTime:
