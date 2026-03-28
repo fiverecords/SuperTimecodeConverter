@@ -69,6 +69,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 **Smooth timecode generation:**
 - Direct CDJ playhead display with linear interpolation between packets (60Hz smooth output from 30Hz CDJ data)
 - PLL-driven pitch calculation for LTC bit-rate scaling
+- Beat grid micro-correction: when a rekordbox beat grid is available, the PLL gently nudges toward the nearest beat position between CDJ packets, reducing interpolation drift
 - Instant resync on seek, hot cue, or track load
 - Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
 
@@ -84,6 +85,12 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - Artist, title, album, genre, key, BPM, duration
 - Album artwork
 - Color preview waveform (ThreeBand and ColorNxs2 formats)
+- High-resolution detail waveform (PWV7 3-band for CDJ-3000, PWV5 color for NXS2)
+- Beat grid (PQTZ) -- every beat's position and tempo
+- Song structure / phrase analysis (PSSI) -- Intro, Verse, Chorus, Bridge, Outro with mood classification (rekordbox 6+)
+- Rekordbox cue list (PCO2/PCOB) -- hot cues with DJ-assigned colors and comments, memory points, stored loops
+- CDJ-3000 dynamic loops (start/end from status packets)
+- Reverse play detection (from absolute position direction)
 
 ### StageLinQ Integration (Denon) -- Preliminary
 
@@ -152,6 +159,7 @@ Per-track timed triggers that fire at specific playhead positions during playbac
 - **Live editing:** cue points added or modified while a track is playing take effect immediately without reloading the track.
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
 - **Works with both Pioneer and Denon** hardware via Pro DJ Link and StageLinQ.
+- **Auto-populate from rekordbox:** when a track with a TrackMap entry loads on a CDJ, STC automatically imports the DJ's rekordbox hot cues, memory points, and loops as cue points -- with their letters and comments as labels. Only applies if the entry has no manually-configured cue points. Blocked during Show Lock.
 - Cue points are stored in the Track Map (trackmap.json) alongside the track's offset and track-change triggers.
 - Maximizable window with persisted position across sessions.
 - Blocked during Show Lock to prevent accidental changes during a live show.
@@ -177,14 +185,26 @@ Table editor with per-parameter enable/disable, editable addresses and CC/Note/D
 
 ### PDL View
 
-External window showing the full Pro DJ Link network state at 30Hz:
+External window showing the full Pro DJ Link network state at 60Hz:
 
-- 4-deck display: artwork, color waveform with playhead, track info, BPM (with multiplied value when active), play state, engine assignments
+- 4-deck display (2x2 grid or 4x1 horizontal): artwork, track info, BPM (with multiplied value when active), key, cue count, play state, pitch, engine assignments
+- **Preview waveform** with playhead cursor, rekordbox cue markers (colored by DJ assignment), minute markers, beat grid (downbeat lines), and stored loop overlays
+- **Detail waveform** (scrolling CDJ-style view) centered on playhead with:
+  - Beat grid: full-height lines (downbeats brighter, beats subtle)
+  - Song structure phrase bar (colored by section: Intro, Verse, Chorus, Bridge, Outro)
+  - Rekordbox cue markers: hot cues (colored triangles with letter + comment), memory points (red diamonds), loops (orange with body overlay)
+  - Active loop overlay (CDJ-3000 dynamic and stored loops)
+  - Zoom control: +/- buttons and scroll wheel (1-32x, per-deck)
+  - Fallback to TrackMap cue points when rekordbox data is unavailable
+- Per-deck track time: elapsed or remaining (MM:SS / MM:SS), click to toggle per deck
+- Status badges: MST (master), AIR (on-air), REV (reverse play)
 - Per-deck BPM multiplier buttons (single click for session override, double click to save to Track Map)
+- TrackMap offset row: shows mapped offset timecode or "NO MAP"
+- Engine assignment row: shows which engines monitor each player
 - Mixer strip: channel faders with segmented VU meters, crossfader, master fader with stereo VU
 - DJM-V10 enhanced view: compressor, 4-band EQ, send knobs, dual CUE A/B buttons per channel
 - DJM-A9 / DJM-V10: dual CUE A/B buttons rendered automatically when detected
-- On-air, master, and beat indicators per player
+- Beat-in-bar indicator per player
 
 ### BPM Multiplier
 
@@ -276,6 +296,14 @@ Operational controls remain active while locked: output enable/disable (for emer
 
 ## Getting Started
 
+### Download Precompiled Binaries
+
+Ready-to-use installers and app bundles are available in the [GitHub Releases](https://github.com/fiverecords/SuperTimecodeConverter/releases) page. Each release includes precompiled binaries for Windows (.exe installer) and macOS (.dmg). No build tools or dependencies required -- just download, install, and run.
+
+The sections below are for developers who want to build STC from source.
+
+---
+
 ### Prerequisites
 
 - **JUCE Framework 8.x** — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
@@ -315,7 +343,7 @@ Operational controls remain active while locked: output enable/disable (for emer
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.7.1)
+   project(SuperTimecodeConverter VERSION 1.8.0)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -325,7 +353,11 @@ Operational controls remain active while locked: output enable/disable (for emer
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.7.1"
+       VERSION "1.8.0"
+       HARDENED_RUNTIME_ENABLED TRUE
+       HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
+       MICROPHONE_PERMISSION_ENABLED TRUE
+       MICROPHONE_PERMISSION_TEXT "STC needs access to your audio interface for LTC input"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -468,6 +500,16 @@ STC is open-source software and is not signed with an Apple Developer certificat
 
 This is a one-time step -- macOS remembers the exception after the first launch.
 
+### macOS: Microphone Permission for LTC Input
+
+Since macOS Catalina, all audio input access requires explicit microphone permission -- including virtual audio devices like BlackHole, Loopback, and aggregate devices. Without permission, CoreAudio opens the device successfully but delivers silent buffers. STC will show the device name in the status bar and populate the channel selector, but the input level meter stays flat and no LTC is decoded.
+
+**CMake builds:** The `juce_add_gui_app` block in CMakeLists.txt includes `MICROPHONE_PERMISSION_ENABLED TRUE`, which embeds the `NSMicrophoneUsageDescription` key in the app bundle's Info.plist. macOS will prompt for microphone access on first launch. If STC was built from an older CMakeLists.txt without this key, macOS silently blocks input with no prompt. Rebuild with the current CMakeLists.txt to fix.
+
+**Projucer builds:** Enable "Microphone Permission" in the Projucer exporter settings (enabled by default in the .jucer project).
+
+**If permission was already denied:** Go to **System Settings > Privacy & Security > Microphone** and toggle Super Timecode Converter ON.
+
 ### AnyDesk Port Conflict (Pro DJ Link and TCNet)
 
 AnyDesk remote desktop software uses UDP ports in the 50000-60001 range -- overlapping with both **Pro DJ Link** (ports 50000-50002) and **TCNet** (ports 60000-60001). When AnyDesk is installed and its background service is running, it can intercept or block UDP traffic on these ports, causing:
@@ -482,6 +524,12 @@ This affects any software using these ports, including the official PRO DJ LINK 
 ### macOS: DJM Subscribe Race Condition
 
 On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
+
+### rekordbox Cannot Run Simultaneously with STC
+
+STC and rekordbox use the same UDP ports for Pro DJ Link communication (50000, 50001, 50002). Running both applications at the same time on the same machine causes port conflicts: CDJ discovery fails, status packets are lost, and neither application works correctly. This is the same limitation that affects the official PRO DJ LINK Bridge.
+
+**Workaround:** Close rekordbox before starting STC, or run them on separate computers on the same network. If rekordbox was running and you switch to STC, you may need to restart STC to re-bind the ports cleanly.
 
 ---
 
@@ -518,7 +566,8 @@ The application is built around a modular, header-only architecture:
 | `TimecodeCore.h` | Core timecode types, frame rate utilities, SMPTE drop-frame logic, atomic pack/unpack helpers |
 | `TimecodeEngine.h` | Per-engine state container: input/output routing, PLL, TrackMap/MixerMap forwarding |
 | `ProDJLinkInput.h` | Native Pro DJ Link protocol: player discovery, status, absolute position, DJM mixer/VU data |
-| `DbServerClient.h` | Background TCP client for CDJ metadata queries (title, artist, artwork, waveform) |
+| `DbServerClient.h` | Background TCP client for CDJ metadata queries (title, artist, artwork, waveform, beat grid, cue list, song structure, detail waveform). Two-phase request pipeline with disk cache (ANLZ) |
+| `NfsAnlzFetcher.h` | NFS download of rekordbox ANLZ files (.DAT/.EXT) directly from CDJ USB/SD. Fallback when dbserver tag queries fail on CDJ-3000 |
 | `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) with interpolation |
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
@@ -534,9 +583,13 @@ The application is built around a modular, header-only architecture:
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
-| `ProDJLinkView.h` | External window: 4-deck display with waveforms, artwork, mixer strip with VU meters (A9/V10 enhanced) |
-| `MediaDisplay.h` | Color waveform renderer (ThreeBand and ColorNxs2 formats) |
-| `WaveformCache.h` | Disk cache for waveform preview data and album artwork (offline cue editing) |
+| `StageLinQInput.h` | Native StageLinQ protocol: device discovery, StateMap, BeatInfo, mixer state |
+| `StageLinQDbClient.h` | Engine Library database access via FileTransfer + SQLite for waveform preview and artwork |
+| `StageLinQView.h` | External window: Denon deck display with track info, deck state, mixer data |
+| `ProDJLinkView.h` | External window: 4-deck display with preview + detail waveforms, rekordbox cue markers, beat grid, song structure phrases, artwork, mixer strip with VU meters |
+| `MediaDisplay.h` | Color waveform preview renderer (ThreeBand and ColorNxs2 formats) with beat grid lines, rekordbox cue markers, loop overlays, and minute markers |
+| `WaveformDetailDisplay.h` | Scrolling detail waveform (CDJ-style) with beat grid, song structure phrases, cue markers, loop overlays, zoom, and playhead cursor |
+| `WaveformCache.h` | Disk cache for waveform preview, album artwork, and ANLZ data (beat grid, cues, phrases, detail waveform) |
 | `TrackMapEditor.h` | Table editor for artist+title -> timecode offset + trigger mapping |
 | `CuePointEditor.h` | Table editor for per-track cue points with waveform strip, click + drag cursor, Capture from live playhead |
 | `MixerMapEditor.h` | Table editor for DJM parameter -> protocol output mapping |

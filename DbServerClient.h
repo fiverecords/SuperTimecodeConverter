@@ -6,7 +6,7 @@
 // Queries CDJ internal databases to retrieve track metadata (title, artist,
 // album, key, genre, artwork) for rekordbox tracks loaded on the decks.
 //
-// Protocol reference: Deep Symmetry "DJ Link Ecosystem Analysis"
+// Protocol reference: DJ Link Ecosystem Analysis
 //   https://djl-analysis.deepsymmetry.org/djl-analysis/track_metadata.html
 //
 // Thread model:
@@ -27,6 +27,10 @@
 #include <vector>
 #include <utility>
 #include <cstring>
+#include <thread>
+#include "NfsAnlzFetcher.h"
+#include "WaveformCache.h"
+#include "AppSettings.h"
 
 //==============================================================================
 // TrackMetadata -- POD-like struct for cached metadata results
@@ -41,6 +45,7 @@ struct TrackMetadata
     juce::String key;
     juce::String comment;
     juce::String dateAdded;        // "yyyy-mm-dd"
+    juce::String anlzPath;         // ANLZ file path from dbserver (e.g. "PIONEER/USBANLZ/P053/0000/ANLZ0006.DAT")
     int durationSeconds = 0;
     int bpmTimes100 = 0;           // e.g. 12800 = 128.00 BPM
     int rating = 0;                // 0-5 stars
@@ -54,11 +59,104 @@ struct TrackMetadata
     int waveformEntryCount = 0;
     int waveformBytesPerEntry = 0;  // 3 = ThreeBand, 6 = ColorNxs2
     bool waveformQueried = false;   // true once waveform fetch has been attempted
+    bool nfsAttempted = false;      // true once NFS ANLZ fetch has been attempted
+    uint32_t cacheVersion = 0;      // incremented each time any field is updated
+
+    // Detail waveform (high-res scrolling view, 150 entries/sec of audio)
+    //   PWV5 (NXS2 color): 2 bytes/entry -- height + color encoding
+    //   PWV7 (CDJ-3000 3-band): 3 bytes/entry -- {mid, high, low} heights
+    std::vector<uint8_t> detailData;
+    int detailEntryCount = 0;
+    int detailBytesPerEntry = 0;    // 2 = PWV5, 3 = PWV7
+    static constexpr int kDetailEntriesPerSecond = 150;
+
+    // Beat grid (PQTZ tag -- positions of every beat in the track)
+    struct BeatEntry
+    {
+        uint16_t beatNumber;
+        uint16_t bpmTimes100;   // BPM * 100
+        uint32_t timeMs;        // position in ms from start of track
+    };
+    std::vector<BeatEntry> beatGrid;
+
+    // Song structure / phrase analysis (PSSI tag -- rekordbox 6+)
+    struct PhraseEntry
+    {
+        uint16_t index;          // phrase sequential index
+        uint16_t beatNumber;     // first beat of this phrase
+        uint16_t kind;           // phrase type (see kPhrase* constants)
+        uint8_t  fill;           // fill-in type (0-3)
+        uint16_t beatCount;      // number of beats in this phrase
+        uint16_t beatFill;       // beat number at which fill starts
+    };
+    static constexpr uint16_t kPhraseMoodHigh = 1;
+    static constexpr uint16_t kPhraseMoodMid  = 2;
+    static constexpr uint16_t kPhraseMoodLow  = 3;
+    uint16_t phraseMood = 0;     // overall mood (1=high, 2=mid, 3=low)
+    std::vector<PhraseEntry> songStructure;
+
+    // Rekordbox cue list (hot cues + memory points + loops from CDJ)
+    // Downloaded from ANLZ PCO2 (nxs2 extended) or PCOB (standard) tags.
+    struct RekordboxCue
+    {
+        enum Type : uint8_t { MemoryPoint = 0, HotCue = 1, Loop = 2 };
+        Type     type         = MemoryPoint;
+        uint8_t  hotCueNumber = 0;      // 0=memory, 1=A, 2=B, 3=C, ...
+        uint32_t positionMs   = 0;
+        uint32_t loopEndMs    = 0;      // non-zero for loops
+        uint8_t  colorR = 30, colorG = 200, colorB = 60;  // default green
+        uint8_t  colorCode = 0;           // rekordbox color table index
+        bool     hasColor     = false;  // true if DJ assigned a custom color
+        juce::String comment;           // DJ-assigned label text
+
+        /// Hot cue letter (A, B, C...) or empty for memory points
+        juce::String hotCueLetter() const
+        {
+            if (hotCueNumber == 0) return {};
+            if (hotCueNumber <= 26)
+                return juce::String::charToString((juce::juce_wchar)('A' + hotCueNumber - 1));
+            return juce::String(hotCueNumber);
+        }
+
+        juce::Colour getColour() const
+        {
+            return juce::Colour(colorR, colorG, colorB);
+        }
+    };
+    std::vector<RekordboxCue> cueList;
 
     bool isValid() const { return trackId != 0 && title.isNotEmpty(); }
     bool hasWaveform() const { return waveformEntryCount > 0 && !waveformData.empty(); }
+    bool hasDetailWaveform() const { return detailEntryCount > 0 && !detailData.empty(); }
+    bool hasBeatGrid() const { return !beatGrid.empty(); }
+    bool hasSongStructure() const { return !songStructure.empty(); }
+    bool hasCueList() const { return !cueList.empty(); }
     bool isFullyCached() const { return isValid() && waveformQueried; }
     bool isThreeBandWaveform() const { return waveformBytesPerEntry == 3; }
+
+    /// Find the beat grid entry closest to a given ms position.
+    /// Returns nullptr if beat grid is empty.
+    const BeatEntry* getBeatAt(uint32_t ms) const
+    {
+        if (beatGrid.empty()) return nullptr;
+        // Binary search for the last beat <= ms
+        int lo = 0, hi = (int)beatGrid.size() - 1, best = 0;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) / 2;
+            if (beatGrid[(size_t)mid].timeMs <= ms)
+                { best = mid; lo = mid + 1; }
+            else
+                hi = mid - 1;
+        }
+        return &beatGrid[(size_t)best];
+    }
+
+    /// Convert ms position to detail waveform entry index.
+    int msToDetailIndex(uint32_t ms) const
+    {
+        return (int)((uint64_t)ms * kDetailEntriesPerSecond / 1000);
+    }
 };
 
 //==============================================================================
@@ -97,6 +195,10 @@ public:
 
         if (isThreadRunning())
             stopThread(3000);
+
+        // Wait for any in-flight NFS download to finish
+        if (nfsThread.joinable())
+            nfsThread.join();
 
         // Close all connections
         for (auto& conn : connections)
@@ -224,6 +326,41 @@ public:
         return {};
     }
 
+    /// Lightweight version check -- returns the cache version counter for a
+    /// track without copying any data.  Use to skip expensive getCachedMetadata
+    /// calls when nothing has changed in the background thread.
+    uint32_t getMetadataVersion(const juce::String& playerIP, uint32_t trackId) const
+    {
+        uint64_t key = makeCacheKey(playerIP, trackId);
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto it = metadataCache.find(key);
+        return (it != metadataCache.end()) ? it->second.cacheVersion : 0;
+    }
+
+    /// Same as getMetadataVersion but by trackId only (searches all players).
+    uint32_t getMetadataVersionByTrackId(uint32_t trackId) const
+    {
+        if (trackId == 0) return 0;
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        for (auto& [key, meta] : metadataCache)
+            if (meta.trackId == trackId) return meta.cacheVersion;
+        return 0;
+    }
+
+    /// Lightweight check: does the cached metadata have detail waveform data?
+    /// Used by the UI timer to avoid expensive full-copy getCachedMetadata()
+    /// when only checking if detail data has arrived yet.
+    bool hasDetailWaveformCached(const juce::String& playerIP, uint32_t trackId) const
+    {
+        uint64_t key = makeCacheKey(playerIP, trackId);
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto it = metadataCache.find(key);
+        if (it != metadataCache.end()) return it->second.hasDetailWaveform();
+        for (auto& [k, m] : metadataCache)
+            if (m.trackId == trackId) return m.hasDetailWaveform();
+        return false;
+    }
+
     /// Lightweight metadata lookup -- returns text fields and IDs only,
     /// skipping the waveform vector copy.  Use when you only need artist/title/
     /// key/BPM/artworkId (e.g. from getActiveTrackInfo at 60Hz).
@@ -325,6 +462,33 @@ public:
     uint32_t getErrorCount() const  { return errorCount.load(std::memory_order_relaxed); }
 
 private:
+    /// Internal enqueue (called from background thread for phase 2 re-enqueue).
+    void enqueueInternal(const juce::String& playerIP, const juce::String& playerModel,
+                         uint8_t slot, uint8_t trackType, uint32_t trackId,
+                         uint8_t ourPlayer, uint8_t phase)
+    {
+        const juce::SpinLock::ScopedLockType producerLock(queueProducerLock);
+        uint32_t wp = reqWritePos.load(std::memory_order_relaxed);
+        uint32_t rp = reqReadPos.load(std::memory_order_acquire);
+        if (wp - rp >= kRequestQueueSize)
+            return;  // queue full
+
+        auto& r = requestQueue[wp & kRequestQueueMask];
+        r.playerIP    = playerIP;
+        r.playerModel = playerModel;
+        r.slot        = slot;
+        r.trackType   = trackType;
+        r.trackId     = trackId;
+        r.ourPlayer   = ourPlayer;
+        r.wantArt     = false;
+        r.wantWaveform = true;
+        r.artworkId   = 0;
+        r.phase       = phase;
+
+        reqWritePos.store(wp + 1, std::memory_order_release);
+        requestSemaphore.signal();
+    }
+
     //==========================================================================
     // Constants
     //==========================================================================
@@ -349,6 +513,16 @@ private:
     static constexpr uint32_t kMagic7VWP = 0x37565750;  // "PWV7" reversed -- 3-band detail
     static constexpr uint32_t kMagicXE2  = 0x00584532;  // "2EX" reversed
 
+    // Beat grid query (standard dbserver request type)
+    static constexpr uint16_t kBeatGridRequest = 0x2204;
+
+    // ANLZ tag magic values for 0x2c04 ext requests (little-endian uint32 of ASCII)
+    // Same reversed convention as PWV4 etc.: "PQTZ" -> Z=5A T=54 Q=51 P=50
+    static constexpr uint32_t kMagicPQTZ = 0x5A545150;  // "PQTZ" reversed -- beat grid
+    static constexpr uint32_t kMagicPSSI = 0x49535350;  // "PSSI" reversed -- song structure
+    static constexpr uint32_t kMagicPCO2 = 0x324F4350;  // "PCO2" reversed -- extended cue list (nxs2+)
+    static constexpr uint32_t kMagicPCOB = 0x424F4350;  // "PCOB" reversed -- standard cue list
+
     static constexpr uint32_t kRequestQueueSize = 32;
     static constexpr uint32_t kRequestQueueMask = kRequestQueueSize - 1;
 
@@ -369,6 +543,7 @@ private:
         uint8_t  ourPlayer = 1;
         bool     wantArt   = false;
         bool     wantWaveform = false;
+        uint8_t  phase     = 1;    // 1=critical (meta+art+preview), 2=supplementary (beats+detail+cues+NFS)
     };
 
     //==========================================================================
@@ -990,8 +1165,21 @@ private:
                 case 0x002E:  // Date Added
                     meta.dateAdded = item.strArgs[3];
                     break;
+                case 0x000E:  // Analysis path (ANLZ file)
+                    meta.anlzPath = item.strArgs[3];
+#if JUCE_DEBUG
+                    if (meta.anlzPath.isNotEmpty())
+                        DBG("DbServerClient: anlzPath=" + meta.anlzPath);
+#endif
+                    break;
                 default:
-                    // Color (0x0013-0x001B) or unknown -- skip
+#if JUCE_DEBUG
+                    // Log unknown types to discover new fields
+                    if (itemType != 0 && item.strArgs[3].isNotEmpty())
+                        DBG("DbServerClient: render item type=0x"
+                            + juce::String::toHexString(itemType)
+                            + " str=" + item.strArgs[3].substring(0, 60));
+#endif
                     break;
             }
         }
@@ -1157,7 +1345,7 @@ private:
     }
 
     /// Extract the first substantial blob from a response message.
-    /// Per Deep Symmetry: blob is in arg[3] (index 3).
+    /// Blob is typically in arg[3] (index 3) per the protocol spec.
     static const juce::MemoryBlock* extractBlob(const ResponseMessage& resp)
     {
         // Prefer arg[3] (per protocol spec)
@@ -1250,6 +1438,671 @@ private:
         return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
              | (uint32_t(p[2]) << 8)  | p[3];
     }
+    static uint16_t readBE16(const uint8_t* p)
+    {
+        return (uint16_t(p[0]) << 8) | p[1];
+    }
+
+    /// Hex dump for debug logging (first N bytes).
+#if JUCE_DEBUG
+    static juce::String hexDump(const void* data, int size, int maxBytes = 64)
+    {
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        int n = juce::jmin(size, maxBytes);
+        juce::String s;
+        for (int i = 0; i < n; i++)
+        {
+            if (i > 0 && i % 16 == 0) s += "\n  ";
+            else if (i > 0) s += " ";
+            s += juce::String::toHexString(p[i]).paddedLeft('0', 2);
+        }
+        if (n < size) s += " ...(" + juce::String(size - n) + " more)";
+        return s;
+    }
+#endif
+
+    //==========================================================================
+    // BEAT GRID QUERY (PQTZ tag from .EXT via 0x2c04)
+    //==========================================================================
+
+    /// Query beat grid from CDJ. Returns vector of BeatEntry.
+    std::vector<TrackMetadata::BeatEntry> queryBeatGrid(
+        PlayerConnection& conn, uint8_t slot, uint8_t trackType,
+        uint32_t trackId, uint8_t ourPlayer)
+    {
+        if (!conn.isConnected() || !conn.contextSetUp || trackId == 0)
+            return {};
+
+        DBG("DbServerClient: requesting beat grid for track " + juce::String(trackId));
+
+        uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
+        uint32_t txId = conn.txId++;
+        auto reqMsg = buildMessage(txId, kNxs2ExtRequest,
+                                    { dmst, trackId, kMagicPQTZ, kMagicTXE });
+        if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
+            return {};
+
+        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        if (!resp.ok || resp.type == 0x4003)
+        {
+            DBG("DbServerClient: beat grid response failed -- ok=" + juce::String((int)resp.ok)
+                + " type=0x" + juce::String::toHexString((int)resp.type)
+                + " args=" + juce::String(resp.argCount));
+            return {};
+        }
+        if (resp.argCount < 3 || resp.numArgs[2] == 0)
+        {
+            DBG("DbServerClient: beat grid response empty -- args=" + juce::String(resp.argCount)
+                + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+            return {};
+        }
+
+        auto blob = extractBlob(resp);
+        if (!blob)
+        {
+            DBG("DbServerClient: beat grid extractBlob failed");
+            return {};
+        }
+
+        return parseBeatGrid(*blob);
+    }
+
+    /// Parse PQTZ tag from ANLZ blob.
+    /// Format: "PQTZ" + len_header(4be) + len_tag(4be) + unk(4) + unk(4) + num_beats(4be)
+    /// Entries at offset len_header, 8 bytes each: beat(2be) + tempo(2be) + time(4be)
+    static std::vector<TrackMetadata::BeatEntry> parseBeatGrid(const juce::MemoryBlock& blob)
+    {
+        const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
+        int size = (int)blob.getSize();
+
+        for (int i = 0; i <= size - 24; ++i)
+        {
+            if (d[i] == 'P' && d[i+1] == 'Q' && d[i+2] == 'T' && d[i+3] == 'Z')
+            {
+                uint32_t lenHeader = readBE32(d + i + 4);
+                if (lenHeader < 24 || (int)(i + lenHeader) > size) continue;
+
+                uint32_t numBeats = readBE32(d + i + 20);
+                if (numBeats == 0 || numBeats > 100000) continue;
+
+                int entriesOff = (int)(i + lenHeader);
+                int dataNeeded = (int)(numBeats * 8);
+                if (entriesOff + dataNeeded > size)
+                {
+                    DBG("DbServerClient: PQTZ data overflows blob");
+                    continue;
+                }
+
+                std::vector<TrackMetadata::BeatEntry> grid;
+                grid.reserve(numBeats);
+                for (uint32_t b = 0; b < numBeats; ++b)
+                {
+                    const uint8_t* e = d + entriesOff + b * 8;
+                    TrackMetadata::BeatEntry entry;
+                    entry.beatNumber  = readBE16(e);
+                    entry.bpmTimes100 = readBE16(e + 2);
+                    entry.timeMs      = readBE32(e + 4);
+                    grid.push_back(entry);
+                }
+
+                DBG("DbServerClient: parsed PQTZ -- " + juce::String(numBeats) + " beats");
+                return grid;
+            }
+        }
+
+        DBG("DbServerClient: PQTZ tag not found in " + juce::String(size) + " byte blob");
+        return {};
+    }
+
+    //==========================================================================
+    // DETAIL WAVEFORM QUERY (PWV5 from .EXT or PWV7 from .2EX via 0x2c04)
+    //==========================================================================
+
+    struct DetailWaveformResult
+    {
+        std::vector<uint8_t> data;
+        int entryCount = 0;
+        int bytesPerEntry = 0;   // 2 = PWV5 (NXS2), 3 = PWV7 (CDJ-3000)
+    };
+
+    /// Query detail waveform. Tries CDJ-3000 3-band (PWV7) first if model
+    /// indicates CDJ-3000, then falls back to NXS2 color (PWV5).
+    DetailWaveformResult queryDetailWaveform(
+        PlayerConnection& conn, uint8_t slot, uint8_t trackType,
+        uint32_t trackId, uint8_t ourPlayer, const juce::String& playerModel)
+    {
+        if (!conn.isConnected() || !conn.contextSetUp || trackId == 0)
+            return {};
+
+        bool threeBandFirst = isThreeBandPlayer(playerModel);
+
+        auto result = queryOneDetailFormat(conn, slot, trackType, trackId,
+                                            ourPlayer, threeBandFirst);
+        if (result.entryCount > 0) return result;
+
+        // Fallback to other format
+        DBG("DbServerClient: primary detail format failed, trying fallback");
+        return queryOneDetailFormat(conn, slot, trackType, trackId,
+                                     ourPlayer, !threeBandFirst);
+    }
+
+    DetailWaveformResult queryOneDetailFormat(
+        PlayerConnection& conn, uint8_t slot, uint8_t trackType,
+        uint32_t trackId, uint8_t ourPlayer, bool threeBand)
+    {
+        uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
+        uint32_t txId = conn.txId++;
+
+        uint32_t tagMagic = threeBand ? kMagic7VWP : kMagic5VWP;
+        uint32_t extMagic = threeBand ? kMagicXE2  : kMagicTXE;
+        const char* tagName = threeBand ? "PWV7" : "PWV5";
+        int expectedWordSize = threeBand ? 3 : 2;
+
+        DBG("DbServerClient: requesting " + juce::String(tagName)
+            + " detail waveform for track " + juce::String(trackId));
+
+        auto reqMsg = buildMessage(txId, kNxs2ExtRequest,
+                                    { dmst, trackId, tagMagic, extMagic });
+        if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
+            return {};
+
+        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        if (!resp.ok || resp.type == 0x4003) return {};
+        if (resp.argCount < 3 || resp.numArgs[2] == 0) return {};
+
+        auto blob = extractBlob(resp);
+        if (!blob) return {};
+
+        return parseDetailWaveform(*blob, tagName, expectedWordSize);
+    }
+
+    /// Parse PWV5 or PWV7 detail waveform from ANLZ blob.
+    /// Same structure as preview tags: tag(4) + len_header(4be) + len_tag(4be)
+    /// then wordSize(4be) + entryCount(4be) at offset 12, data at len_header.
+    static DetailWaveformResult parseDetailWaveform(
+        const juce::MemoryBlock& blob, const char* tagName, int expectedWordSize)
+    {
+        const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
+        int size = (int)blob.getSize();
+
+        for (int i = 0; i <= size - 20; ++i)
+        {
+            if (d[i] == tagName[0] && d[i+1] == tagName[1]
+                && d[i+2] == tagName[2] && d[i+3] == tagName[3])
+            {
+                uint32_t lenHeader = readBE32(d + i + 4);
+                int hdrOff = i + 12;
+                if (hdrOff + 8 > size) continue;
+
+                uint32_t wordSize   = readBE32(d + hdrOff);
+                uint32_t entryCount = readBE32(d + hdrOff + 4);
+
+                if ((int)wordSize != expectedWordSize) continue;
+                if (entryCount == 0 || entryCount > 5000000) continue;
+
+                int entriesOff = (int)(i + lenHeader);
+                if (entriesOff <= i || entriesOff >= size)
+                    entriesOff = hdrOff + 8;
+
+                int dataLen = (int)(wordSize * entryCount);
+                if (entriesOff + dataLen > size)
+                {
+                    DBG("DbServerClient: " + juce::String(tagName)
+                        + " detail data overflows blob");
+                    continue;
+                }
+
+                DetailWaveformResult result;
+                result.data.assign(d + entriesOff, d + entriesOff + dataLen);
+                result.entryCount = (int)entryCount;
+                result.bytesPerEntry = (int)wordSize;
+                DBG("DbServerClient: parsed " + juce::String(tagName) + " detail -- "
+                    + juce::String(entryCount) + " entries x " + juce::String(wordSize)
+                    + " bytes (" + juce::String(entryCount / 150) + "s of audio)");
+                return result;
+            }
+        }
+
+        DBG("DbServerClient: " + juce::String(tagName) + " detail tag not found in "
+            + juce::String(size) + " byte blob");
+        return {};
+    }
+
+    //==========================================================================
+    // SONG STRUCTURE QUERY (PSSI tag from .EXT via 0x2c04)
+    //==========================================================================
+
+    struct SongStructureResult
+    {
+        uint16_t mood = 0;
+        std::vector<TrackMetadata::PhraseEntry> phrases;
+    };
+
+    /// Query song structure (phrase analysis) from CDJ.
+    SongStructureResult querySongStructure(
+        PlayerConnection& conn, uint8_t slot, uint8_t trackType,
+        uint32_t trackId, uint8_t ourPlayer)
+    {
+        if (!conn.isConnected() || !conn.contextSetUp || trackId == 0)
+            return {};
+
+        DBG("DbServerClient: requesting song structure for track " + juce::String(trackId));
+
+        uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
+        uint32_t txId = conn.txId++;
+        auto reqMsg = buildMessage(txId, kNxs2ExtRequest,
+                                    { dmst, trackId, kMagicPSSI, kMagicTXE });
+        if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) != (int)reqMsg.getSize())
+            return {};
+
+        auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+        if (!resp.ok || resp.type == 0x4003)
+        {
+            DBG("DbServerClient: song structure response failed -- ok=" + juce::String((int)resp.ok)
+                + " type=0x" + juce::String::toHexString((int)resp.type));
+            return {};
+        }
+        if (resp.argCount < 3 || resp.numArgs[2] == 0)
+        {
+            DBG("DbServerClient: song structure response empty -- args=" + juce::String(resp.argCount)
+                + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+            return {};
+        }
+
+        auto blob = extractBlob(resp);
+        if (!blob)
+        {
+            DBG("DbServerClient: song structure extractBlob failed");
+            return {};
+        }
+
+        DBG("DbServerClient: song structure blob=" + juce::String((int)blob->getSize()) + " bytes");
+
+        return parseSongStructure(*blob);
+    }
+
+    /// Parse PSSI tag from ANLZ blob (with XOR unmasking).
+    /// Blob from dbserver has 4-byte LE length wrapper before "PSSI".
+    /// Verified structure from CDJ-3000 hex dumps + rekordbox_anlz.ksy:
+    ///   [+0]  "PSSI" magic
+    ///   [+4]  lenHeader (u4be, typically 32)
+    ///   [+8]  lenTag (u4be)
+    ///   [+12] lenEntryBytes (u4be, =24)
+    ///   [+16] numEntries (u2be)
+    ///   [+18] masked body: mood(u2) + pad(6) + endBeat(u2) + pad(2) + bank(u1) + pad(1) + entries[24 each]
+    ///
+    /// The body from offset +18 is XOR masked when raw_mood > 20.
+    /// Mask key: 19-byte sequence derived from numEntries (see rekordbox_anlz.ksy).
+    static SongStructureResult parseSongStructure(const juce::MemoryBlock& blob)
+    {
+        const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
+        int size = (int)blob.getSize();
+
+        for (int i = 0; i <= size - 20; ++i)
+        {
+            if (d[i] != 'P' || d[i+1] != 'S' || d[i+2] != 'S' || d[i+3] != 'I')
+                continue;
+
+            uint32_t lenHeader = readBE32(d + i + 4);
+            if (lenHeader < 20 || i + 12 + 6 > size) continue;
+
+            uint32_t entrySize  = readBE32(d + i + 12);  // u4, NOT u2
+            uint16_t numEntries = readBE16(d + i + 16);
+            if (entrySize != 24 || numEntries == 0 || numEntries > 1000) continue;
+
+            // Masked body starts at i + 18
+            int bodyOff = i + 18;
+            int bodyLen = size - bodyOff;
+            if (bodyLen < 2) continue;
+
+            // Check if masked: raw_mood (first u2 of body)
+            uint16_t rawMood = readBE16(d + bodyOff);
+            bool isMasked = (rawMood > 20);
+
+            // Unmask the body
+            std::vector<uint8_t> body(d + bodyOff, d + bodyOff + bodyLen);
+            if (isMasked)
+            {
+                uint8_t c = (uint8_t)(numEntries & 0xFF);
+                const uint8_t maskBase[19] = {
+                    0xCB, 0xE1, 0xEE, 0xFA, 0xE5, 0xEE, 0xAD, 0xEE,
+                    0xE9, 0xD2, 0xE9, 0xEB, 0xE1, 0xE9, 0xF3, 0xE8,
+                    0xE9, 0xF4, 0xE1
+                };
+                for (int j = 0; j < (int)body.size(); j++)
+                    body[(size_t)j] ^= (uint8_t)((maskBase[j % 19] + c) & 0xFF);
+            }
+
+            // Parse unmasked body:
+            //   [0-1] mood, [2-7] pad, [8-9] endBeat, [10-11] pad, [12] bank, [13] pad
+            //   [14+] entries (numEntries * 24 each)
+            if ((int)body.size() < 14) continue;
+
+            uint16_t mood = readBE16(body.data());
+
+            SongStructureResult result;
+            result.mood = mood;
+            result.phrases.reserve(numEntries);
+
+            int entriesOff = 14;
+            for (uint16_t p = 0; p < numEntries; ++p)
+            {
+                int eOff = entriesOff + p * 24;
+                if (eOff + 24 > (int)body.size()) break;
+
+                const uint8_t* e = body.data() + eOff;
+                TrackMetadata::PhraseEntry phrase;
+                phrase.index      = readBE16(e);
+                phrase.beatNumber = readBE16(e + 2);
+                phrase.kind       = readBE16(e + 4);
+                phrase.fill       = e[21];
+                phrase.beatFill   = readBE16(e + 22);
+
+                // Beat count: difference to next phrase
+                if (p + 1 < numEntries && eOff + 24 + 4 <= (int)body.size())
+                    phrase.beatCount = readBE16(body.data() + eOff + 24 + 2) - phrase.beatNumber;
+                else
+                    phrase.beatCount = 0;
+
+                result.phrases.push_back(phrase);
+            }
+
+            DBG("DbServerClient: parsed PSSI -- " + juce::String(numEntries)
+                + " phrases, mood=" + juce::String(mood)
+                + (isMasked ? " (unmasked)" : " (plain)"));
+            return result;
+        }
+
+        DBG("DbServerClient: PSSI tag not found in " + juce::String(size) + " byte blob");
+        return {};
+    }
+
+    //==========================================================================
+    // CUE LIST QUERY (PCO2 extended or PCOB standard from .EXT via 0x2c04)
+    //==========================================================================
+
+    /// Query rekordbox cue list (hot cues, memory points, loops with colors).
+    /// Tries extended nxs2 format (PCO2) first, falls back to standard (PCOB).
+    std::vector<TrackMetadata::RekordboxCue> queryCueList(
+        PlayerConnection& conn, uint8_t slot, uint8_t trackType,
+        uint32_t trackId, uint8_t ourPlayer)
+    {
+        if (!conn.isConnected() || !conn.contextSetUp || trackId == 0)
+            return {};
+
+        DBG("DbServerClient: requesting cue list for track " + juce::String(trackId));
+
+        // Try extended (PCO2) first -- has colors and comments
+        {
+            uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
+            uint32_t txId = conn.txId++;
+            auto reqMsg = buildMessage(txId, kNxs2ExtRequest,
+                                        { dmst, trackId, kMagicPCO2, kMagicTXE });
+            if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) == (int)reqMsg.getSize())
+            {
+                auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+                if (resp.ok && resp.type != 0x4003 && resp.argCount >= 3 && resp.numArgs[2] != 0)
+                {
+                    auto blob = extractBlob(resp);
+                    if (blob)
+                    {
+                        DBG("DbServerClient: PCO2 blob=" + juce::String((int)blob->getSize()) + " bytes");
+                        auto cues = parseCueListExtended(*blob);
+                        if (!cues.empty())
+                        {
+                            DBG("DbServerClient: got PCO2 extended cue list");
+                            return cues;
+                        }
+                        DBG("DbServerClient: PCO2 parse returned 0 cues");
+                    }
+                    else
+                        DBG("DbServerClient: PCO2 extractBlob failed");
+                }
+                else
+                    DBG("DbServerClient: PCO2 response -- ok=" + juce::String((int)resp.ok)
+                        + " type=0x" + juce::String::toHexString((int)resp.type)
+                        + " args=" + juce::String(resp.argCount)
+                        + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+            }
+        }
+
+        // Fallback: standard (PCOB) -- no colors/comments but has positions
+        if (!conn.isConnected()) return {};
+        {
+            uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
+            uint32_t txId = conn.txId++;
+            auto reqMsg = buildMessage(txId, kNxs2ExtRequest,
+                                        { dmst, trackId, kMagicPCOB, kMagicTXE });
+            if (conn.socket->write(reqMsg.getData(), (int)reqMsg.getSize()) == (int)reqMsg.getSize())
+            {
+                auto resp = readMessage(*conn.socket, kReadTimeoutMs);
+                if (resp.ok && resp.type != 0x4003 && resp.argCount >= 3 && resp.numArgs[2] != 0)
+                {
+                    auto blob = extractBlob(resp);
+                    if (blob)
+                    {
+                        DBG("DbServerClient: PCOB blob=" + juce::String((int)blob->getSize()) + " bytes");
+                        auto cues = parseCueListStandard(*blob);
+                        if (!cues.empty())
+                        {
+                            DBG("DbServerClient: got PCOB standard cue list");
+                            return cues;
+                        }
+                        DBG("DbServerClient: PCOB parse returned 0 cues");
+                    }
+                    else
+                        DBG("DbServerClient: PCOB extractBlob failed");
+                }
+                else
+                    DBG("DbServerClient: PCOB response -- ok=" + juce::String((int)resp.ok)
+                        + " type=0x" + juce::String::toHexString((int)resp.type)
+                        + " args=" + juce::String(resp.argCount)
+                        + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+            }
+        }
+
+        DBG("DbServerClient: cue list query returned no data");
+        return {};
+    }
+
+    /// Parse extended cue list (PCO2 tag with PCP2 entries).
+    /// Offsets verified against CDJ-3000 Wireshark captures + rekordbox_anlz.ksy:
+    ///   PCP2 entry (offsets from "PCP2" magic):
+    ///     [0x0C] hot_cue (u4be, 0=memory, 1=A, 2=B...)
+    ///     [0x10] type (u1, 1=cue, 2=loop)
+    ///     [0x14] time (u4be, ms)
+    ///     [0x18] loop_time (u4be, ms, 0xFFFFFFFF if not loop)
+    ///     [0x1C] color_id (u1)
+    ///     [0x24] loop_numerator (u2), [0x26] loop_denominator (u2)
+    ///     [0x28] len_comment (u4, byte count of UTF-16BE string)
+    ///     [0x2C] comment (UTF-16BE, len_comment bytes)
+    ///     [0x2C + len_comment] color_code (u1)
+    ///     [0x2C + len_comment + 1] color_r, +2 color_g, +3 color_b
+    static std::vector<TrackMetadata::RekordboxCue> parseCueListExtended(const juce::MemoryBlock& blob)
+    {
+        const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
+        int size = (int)blob.getSize();
+        std::vector<TrackMetadata::RekordboxCue> result;
+
+        // Search for all PCO2 sections (one for memory points, one for hot cues)
+        for (int i = 0; i <= size - 20; ++i)
+        {
+            if (d[i] != 'P' || d[i+1] != 'C' || d[i+2] != 'O' || d[i+3] != '2')
+                continue;
+
+            uint32_t lenHeader = readBE32(d + i + 4);
+            // numCues at offset 16 from tag start (body[4-5] after 12-byte section header + 4-byte type)
+            uint16_t numCues   = readBE16(d + i + 16);
+            if (numCues == 0 || numCues > 200) continue;
+
+            DBG("DbServerClient: PCO2 section found at " + juce::String(i)
+                + " lenHeader=" + juce::String(lenHeader)
+                + " numCues=" + juce::String(numCues));
+
+            int entryOff = (int)(i + lenHeader);
+
+            for (uint16_t c = 0; c < numCues; ++c)
+            {
+                // Find next PCP2 tag
+                if (entryOff + 12 > size) break;
+                if (d[entryOff] != 'P' || d[entryOff+1] != 'C'
+                    || d[entryOff+2] != 'P' || d[entryOff+3] != '2')
+                {
+                    bool found = false;
+                    for (int scan = entryOff; scan <= size - 12 && scan < entryOff + 200; ++scan)
+                    {
+                        if (d[scan] == 'P' && d[scan+1] == 'C' && d[scan+2] == 'P' && d[scan+3] == '2')
+                            { entryOff = scan; found = true; break; }
+                    }
+                    if (!found) break;
+                }
+
+                uint32_t entryLen = readBE32(d + entryOff + 8);  // total PCP2 entry size
+                if (entryLen > 4096 || entryLen < 0x1D
+                    || entryOff + (int)entryLen > size) 
+                    { entryOff += juce::jmax(12, (int)entryLen); continue; }
+
+                const uint8_t* e = d + entryOff;  // points to "PCP2" magic
+                TrackMetadata::RekordboxCue cue;
+
+                uint32_t hotCue = readBE32(e + 0x0C);  // hot cue number
+                uint8_t  ctype  = e[0x10];               // 1=cue, 2=loop
+                uint32_t timeMs = readBE32(e + 0x14);    // position ms
+                uint32_t loopMs = readBE32(e + 0x18);    // loop end ms
+
+                if (ctype == 0) { entryOff += (int)entryLen; continue; }
+
+                cue.hotCueNumber = (uint8_t)hotCue;
+                cue.positionMs   = timeMs;
+
+                if (ctype == 2 || (loopMs != 0 && loopMs != 0xFFFFFFFF))
+                {
+                    cue.type = TrackMetadata::RekordboxCue::Loop;
+                    cue.loopEndMs = loopMs;
+                }
+                else if (hotCue > 0)
+                    cue.type = TrackMetadata::RekordboxCue::HotCue;
+                else
+                    cue.type = TrackMetadata::RekordboxCue::MemoryPoint;
+
+                // Color ID (fixed offset)
+                if (entryLen >= 0x1D)
+                    cue.colorCode = e[0x1C];
+
+                // Comment (variable length)
+                uint32_t commentBytes = 0;
+                if (entryLen >= 0x2C)
+                {
+                    commentBytes = readBE32(e + 0x28);  // byte count of UTF-16BE string
+                    if (commentBytes > 0 && commentBytes < 512
+                        && 0x2C + (int)commentBytes <= (int)entryLen)
+                    {
+                        int numChars = (int)commentBytes / 2;
+                        for (int ci = 0; ci < numChars; ++ci)
+                        {
+                            uint16_t ch = readBE16(e + 0x2C + ci * 2);
+                            if (ch != 0)
+                                cue.comment += juce::String::charToString((juce::juce_wchar)ch);
+                        }
+                    }
+                }
+
+                // Color RGB (after comment)
+                int colorOff = 0x2C + (int)commentBytes;
+                if (colorOff + 4 <= (int)entryLen)
+                {
+                    cue.colorCode = e[colorOff];
+                    cue.colorR    = e[colorOff + 1];
+                    cue.colorG    = e[colorOff + 2];
+                    cue.colorB    = e[colorOff + 3];
+                    cue.hasColor  = (cue.colorR != 0 || cue.colorG != 0 || cue.colorB != 0);
+                }
+
+                result.push_back(cue);
+                entryOff += (int)entryLen;
+            }
+        }
+
+        // Sort by position
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) { return a.positionMs < b.positionMs; });
+
+#if JUCE_DEBUG
+        if (!result.empty())
+            DBG("DbServerClient: parsed PCO2 -- " + juce::String((int)result.size()) + " cues");
+#endif
+        return result;
+    }
+
+    /// Parse standard cue list (PCOB tag with PCPT entries).
+    /// PCPT entry (0x38 bytes each):
+    ///   [0x0C-0x0F] hot_cue (u4be)
+    ///   [0x1C] type (u1, 1=cue, 2=loop)
+    ///   [0x20-0x23] time (u4be, ms)
+    ///   [0x24-0x27] loop_time (u4be, ms)
+    static std::vector<TrackMetadata::RekordboxCue> parseCueListStandard(const juce::MemoryBlock& blob)
+    {
+        const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
+        int size = (int)blob.getSize();
+        std::vector<TrackMetadata::RekordboxCue> result;
+
+        for (int i = 0; i <= size - 20; ++i)
+        {
+            if (d[i] != 'P' || d[i+1] != 'C' || d[i+2] != 'O' || d[i+3] != 'B')
+                continue;
+
+            uint32_t lenHeader = readBE32(d + i + 4);
+            uint16_t numCues   = readBE16(d + i + 18);
+            if (numCues == 0 || numCues > 200) continue;
+
+            int entryOff = (int)(i + lenHeader);
+            static constexpr int kPcptSize = 0x38;
+
+            for (uint16_t c = 0; c < numCues; ++c)
+            {
+                if (entryOff + kPcptSize > size) break;
+                if (d[entryOff] != 'P' || d[entryOff+1] != 'C'
+                    || d[entryOff+2] != 'P' || d[entryOff+3] != 'T')
+                    { entryOff += kPcptSize; continue; }
+
+                const uint8_t* e = d + entryOff;
+                uint32_t hotCue = readBE32(e + 0x0C);
+                uint8_t  ctype  = e[0x1C];
+                uint32_t timeMs = readBE32(e + 0x20);
+                uint32_t loopMs = readBE32(e + 0x24);
+
+                if (ctype == 0) { entryOff += kPcptSize; continue; }
+
+                TrackMetadata::RekordboxCue cue;
+                cue.hotCueNumber = (uint8_t)hotCue;
+                cue.positionMs   = timeMs;
+
+                if (ctype == 2 || loopMs > 0)
+                {
+                    cue.type = TrackMetadata::RekordboxCue::Loop;
+                    cue.loopEndMs = loopMs;
+                }
+                else if (hotCue > 0)
+                    cue.type = TrackMetadata::RekordboxCue::HotCue;
+                else
+                    cue.type = TrackMetadata::RekordboxCue::MemoryPoint;
+
+                // No color in standard format -- use defaults
+                // Hot cues default green, memory points red, loops orange
+                if (cue.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                    { cue.colorR = 200; cue.colorG = 30; cue.colorB = 30; }
+                else if (cue.type == TrackMetadata::RekordboxCue::Loop)
+                    { cue.colorR = 255; cue.colorG = 136; cue.colorB = 0; }
+
+                result.push_back(cue);
+                entryOff += kPcptSize;
+            }
+        }
+
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b) { return a.positionMs < b.positionMs; });
+        return result;
+    }
 
     //==========================================================================
     // CACHE MANAGEMENT
@@ -1335,6 +2188,14 @@ private:
         auto* conn = getConnection(req.playerIP, req.ourPlayer);
         if (!conn)
         {
+            // Phase 2 can still run NFS (direct UDP, no dbserver connection needed)
+            if (req.phase == 2 && req.trackId != 0)
+            {
+                DBG("DbServerClient: no connection for phase 2 -- trying NFS only");
+                uint64_t cacheKey = makeCacheKey(req.playerIP, req.trackId);
+                processNfsFallback(req, cacheKey);
+                return;
+            }
             errorCount.fetch_add(1, std::memory_order_relaxed);
             DBG("DbServerClient: failed to get connection to " + req.playerIP);
             return;
@@ -1368,7 +2229,8 @@ private:
                     cacheMetadata(req.playerIP, meta);
                     DBG("DbServerClient: cached metadata for track "
                         + juce::String(req.trackId) + " -- \""
-                        + meta.artist + " - " + meta.title + "\"");
+                        + meta.artist + " - " + meta.title + "\""
+                        + (meta.anlzPath.isNotEmpty() ? " anlz=" + meta.anlzPath : " (no anlzPath)"));
                 }
                 else
                 {
@@ -1377,55 +2239,277 @@ private:
                         + juce::String(req.trackId));
                     if (!conn->isConnected())
                         conn->close();
-                    return;
+
+                    // Create a minimal cache entry so phase 2 (disk cache + NFS)
+                    // can still run.  NFS uses trackId to find ANLZ path in PDB.
+                    meta.trackId = req.trackId;
+                    cacheMetadata(req.playerIP, meta);
                 }
             }
 
-            // Artwork: fetch if not yet cached
-            if (req.wantArt && meta.artworkId != 0)
+            // Artwork and waveform queries -- only if we have valid metadata
+            // (skip when dbserver connection failed to avoid hanging on dead socket)
+            if (meta.isValid())
             {
-                bool artCached;
+                // Artwork: fetch if not yet cached
+                if (req.wantArt && meta.artworkId != 0)
                 {
-                    const juce::SpinLock::ScopedLockType lock(artCacheLock);
-                    artCached = artworkCache.count(meta.artworkId) > 0;
+                    bool artCached;
+                    {
+                        const juce::SpinLock::ScopedLockType lock(artCacheLock);
+                        artCached = artworkCache.count(meta.artworkId) > 0;
+                    }
+                    if (!artCached)
+                    {
+                        auto img = queryArtwork(*conn, req.slot, req.trackType,
+                                                 meta.artworkId, req.ourPlayer);
+                        if (img.isValid())
+                            cacheArtwork(meta.artworkId, img);
+                    }
                 }
-                if (!artCached)
+
+                // Waveform: fetch if not yet cached
+                if (req.wantWaveform && !meta.hasWaveform())
                 {
-                    auto img = queryArtwork(*conn, req.slot, req.trackType,
-                                             meta.artworkId, req.ourPlayer);
-                    if (img.isValid())
-                        cacheArtwork(meta.artworkId, img);
+                    auto wfResult = queryPreviewWaveform(
+                        *conn, req.slot, req.trackType, req.trackId,
+                        req.ourPlayer, req.playerModel);
+                    if (wfResult.entryCount > 0)
+                    {
+                        const juce::SpinLock::ScopedLockType lock(cacheLock);
+                        auto it = metadataCache.find(cacheKey);
+                        if (it != metadataCache.end())
+                        {
+                            it->second.waveformData = std::move(wfResult.data);
+                            it->second.waveformEntryCount = wfResult.entryCount;
+                            it->second.waveformBytesPerEntry =
+                                (wfResult.format == WaveformFormat::ThreeBand) ? 3 : 6;
+                            ++it->second.cacheVersion;
+                        }
+                    }
                 }
             }
 
-            // Waveform: fetch if not yet cached
-            if (req.wantWaveform && !meta.hasWaveform())
+            // --- End of Phase 1 (critical) ---
+            // Publish metadata+artwork+preview immediately so the display
+            // shows track info while supplementary data loads.
+            if (req.phase == 1 && req.wantWaveform)
             {
-                auto wfResult = queryPreviewWaveform(
-                    *conn, req.slot, req.trackType, req.trackId,
-                    req.ourPlayer, req.playerModel);
-                if (wfResult.entryCount > 0)
+                // Mark waveform as attempted so the display picks up what we have
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
                     if (it != metadataCache.end())
                     {
-                        it->second.waveformData = std::move(wfResult.data);
-                        it->second.waveformEntryCount = wfResult.entryCount;
-                        it->second.waveformBytesPerEntry =
-                            (wfResult.format == WaveformFormat::ThreeBand) ? 3 : 6;
+                        it->second.waveformQueried = true;
+                        ++it->second.cacheVersion;
                     }
                 }
+
+                // Disk cache check (instant, ~1ms) -- load beats/cues/phrases/detail
+                // from previous session BEFORE re-enqueueing phase 2.
+                std::string diskKey;
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end()
+                        && it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                        diskKey = TrackMapEntry::makeKey(
+                            it->second.artist, it->second.title, it->second.durationSeconds);
+                }
+                if (!diskKey.empty() && WaveformCache::anlzExists(diskKey))
+                {
+                    auto cached = WaveformCache::loadAnlz(diskKey);
+                    if (cached.valid)
+                    {
+                        const juce::SpinLock::ScopedLockType lock(cacheLock);
+                        auto it = metadataCache.find(cacheKey);
+                        if (it != metadataCache.end())
+                        {
+                            applyCachedAnlz(it->second, cached);
+                            ++it->second.cacheVersion;
+                            DBG("DbServerClient: phase 1 loaded ANLZ from disk cache");
+                        }
+                    }
+                }
+
+                // Re-enqueue as phase 2 for NFS refresh + any missing dbserver data
+                enqueueInternal(req.playerIP, req.playerModel, req.slot,
+                                req.trackType, req.trackId, req.ourPlayer, 2);
+                return;
             }
 
-            // Mark waveform as attempted so isFullyCached() returns true
-            // and we don't re-request indefinitely for tracks without
-            // waveform data (e.g. non-rekordbox media).
+            // --- Phase 2: supplementary queries + NFS ---
+            // This runs AFTER phase 1 has published. If a newer track request
+            // arrived while we were waiting in queue, skip slow dbserver queries
+            // and only do the essential NFS async refresh.
+
+            // Re-read meta in case disk cache already filled it in phase 1
             {
                 const juce::SpinLock::ScopedLockType lock(cacheLock);
                 auto it = metadataCache.find(cacheKey);
                 if (it != metadataCache.end())
-                    it->second.waveformQueried = true;
+                    meta = it->second;
+            }
+
+            // Check if a newer request is waiting -- if so, skip slow dbserver
+            // queries and jump directly to NFS async (which doesn't block).
+            bool hasNewerRequests = (reqWritePos.load(std::memory_order_acquire)
+                                     != reqReadPos.load(std::memory_order_relaxed));
+
+            if (hasNewerRequests)
+            {
+                DBG("DbServerClient: phase2 SKIPPING dbserver queries (newer requests in queue)");
+            }
+
+            if (!hasNewerRequests)
+            {
+
+            // Beat grid: fetch if not yet cached
+            if (req.wantWaveform && !meta.hasBeatGrid() && conn->isConnected())
+            {
+                auto grid = queryBeatGrid(*conn, req.slot, req.trackType,
+                                           req.trackId, req.ourPlayer);
+                if (!grid.empty())
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                        { it->second.beatGrid = std::move(grid); ++it->second.cacheVersion; }
+                }
+            }
+
+            // Detail waveform: fetch if not yet cached
+            if (req.wantWaveform && !meta.hasDetailWaveform() && conn->isConnected())
+            {
+                auto detail = queryDetailWaveform(*conn, req.slot, req.trackType,
+                                                   req.trackId, req.ourPlayer,
+                                                   req.playerModel);
+                DBG("DbServerClient: phase2 queryDetailWaveform trackId=" + juce::String(req.trackId)
+                    + " entries=" + juce::String(detail.entryCount)
+                    + " bpe=" + juce::String(detail.bytesPerEntry)
+                    + " dataSz=" + juce::String((int)detail.data.size()));
+                if (detail.entryCount > 0)
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                    {
+                        it->second.detailData = std::move(detail.data);
+                        it->second.detailEntryCount = detail.entryCount;
+                        it->second.detailBytesPerEntry = detail.bytesPerEntry;
+                        ++it->second.cacheVersion;
+                    }
+                }
+            }
+            else
+            {
+                DBG("DbServerClient: phase2 SKIP detail query -- wantWf=" + juce::String((int)req.wantWaveform)
+                    + " hasDetail=" + juce::String((int)meta.hasDetailWaveform())
+                    + " connected=" + juce::String((int)conn->isConnected()));
+            }
+
+            // Song structure (phrase analysis): fetch if not yet cached
+            if (req.wantWaveform && !meta.hasSongStructure() && conn->isConnected())
+            {
+                auto ss = querySongStructure(*conn, req.slot, req.trackType,
+                                              req.trackId, req.ourPlayer);
+                if (!ss.phrases.empty())
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                    {
+                        it->second.phraseMood = ss.mood;
+                        it->second.songStructure = std::move(ss.phrases);
+                        ++it->second.cacheVersion;
+                    }
+                }
+            }
+
+            // Cue list (rekordbox hot cues, memory points, loops with colors)
+            if (req.wantWaveform && !meta.hasCueList() && conn->isConnected())
+            {
+                auto cues = queryCueList(*conn, req.slot, req.trackType,
+                                          req.trackId, req.ourPlayer);
+                if (!cues.empty())
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                        { it->second.cueList = std::move(cues); ++it->second.cacheVersion; }
+                }
+            }
+
+            } // end if (!hasNewerRequests)
+
+            // Save to disk cache ALWAYS (not gated by hasNewerRequests).
+            // Even if dbserver queries were skipped, save whatever we got
+            // from disk cache + phase 1 + NFS async.
+            {
+                std::string saveDiskKey;
+                bool hasNewData = false;
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                    {
+                        hasNewData = (it->second.hasBeatGrid() || it->second.hasCueList()
+                                      || it->second.hasSongStructure() || it->second.hasDetailWaveform());
+                        if (hasNewData && it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                            saveDiskKey = TrackMapEntry::makeKey(
+                                it->second.artist, it->second.title, it->second.durationSeconds);
+                    }
+                }
+                if (!saveDiskKey.empty() && hasNewData)
+                    saveAnlzToDisk(cacheKey, saveDiskKey);
+            }
+
+            // --- NFS ANLZ Fallback ---
+            // If dbserver queries AND disk cache both failed to provide beat grid,
+            // cues, or song structure, download via NFS from CDJ USB/SD.
+            {
+                bool needsNfs = false;
+                juce::String anlzPath;
+                uint32_t trackIdForNfs = 0;
+                std::string diskCacheKey;
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end()
+                        && !it->second.nfsAttempted
+                        && (!it->second.hasBeatGrid() || !it->second.hasCueList()
+                            || !it->second.hasSongStructure()
+                            || !it->second.hasDetailWaveform()))
+                    {
+                        needsNfs = true;
+                        anlzPath = it->second.anlzPath;
+                        trackIdForNfs = req.trackId;
+
+                        if (it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                            diskCacheKey = TrackMapEntry::makeKey(
+                                it->second.artist, it->second.title,
+                                it->second.durationSeconds);
+                    }
+                }
+
+                if (needsNfs)
+                {
+                    DBG("DbServerClient: NFS LAUNCH trackId=" + juce::String(trackIdForNfs)
+                        + " anlzPath=" + anlzPath
+                        + " diskKey=" + juce::String(diskCacheKey.substr(0, 40)));
+                    {
+                        const juce::SpinLock::ScopedLockType lock(cacheLock);
+                        auto it = metadataCache.find(cacheKey);
+                        if (it != metadataCache.end())
+                            it->second.nfsAttempted = true;
+                    }
+
+                    juce::String nfsPlayerIP = req.playerIP;
+                    uint8_t nfsSlot = req.slot;
+                    launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot,
+                                   trackIdForNfs, anlzPath, diskCacheKey);
+                }
             }
         }
         else if (req.artworkId != 0)
@@ -1464,6 +2548,283 @@ private:
     // Stats
     std::atomic<uint32_t> queryCount { 0 };
     std::atomic<uint32_t> errorCount { 0 };
+
+    // NFS ANLZ fetcher -- downloads .EXT files directly from CDJ USB/SD
+    // Used as fallback when dbserver ANLZ tag queries fail (CDJ-3000).
+    // Runs on its own thread to avoid blocking metadata requests.
+    NfsAnlzFetcher nfsAnlzFetcher;
+    std::thread nfsThread;
+
+    /// Launch NFS download on a separate thread.
+    /// Only one NFS download at a time (joins previous if still running).
+    /// Run NFS fallback only (used when dbserver connection fails).
+    /// Ensures a cache entry exists and launches NFS async download.
+    void processNfsFallback(const MetadataRequest& req, uint64_t cacheKey)
+    {
+        // Ensure cache entry exists (may have been created by a previous failed attempt)
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            auto it = metadataCache.find(cacheKey);
+            if (it == metadataCache.end())
+            {
+                TrackMetadata meta;
+                meta.trackId = req.trackId;
+                meta.waveformQueried = true;
+                metadataCache[cacheKey] = std::move(meta);
+            }
+        }
+
+        bool needsNfs = false;
+        juce::String anlzPath;
+        std::string diskCacheKey;
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            auto it = metadataCache.find(cacheKey);
+            if (it != metadataCache.end()
+                && !it->second.nfsAttempted
+                && (!it->second.hasBeatGrid() || !it->second.hasCueList()
+                    || !it->second.hasSongStructure()
+                    || !it->second.hasDetailWaveform()))
+            {
+                needsNfs = true;
+                anlzPath = it->second.anlzPath;
+                it->second.nfsAttempted = true;
+
+                if (it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                    diskCacheKey = TrackMapEntry::makeKey(
+                        it->second.artist, it->second.title,
+                        it->second.durationSeconds);
+            }
+        }
+
+        if (needsNfs)
+        {
+            DBG("DbServerClient: NFS LAUNCH (no conn) trackId=" + juce::String(req.trackId));
+            launchNfsAsync(cacheKey, req.playerIP, req.slot,
+                           req.trackId, anlzPath, diskCacheKey);
+        }
+    }
+
+    void launchNfsAsync(uint64_t cacheKey, const juce::String& playerIP,
+                        uint8_t slot, uint32_t trackId,
+                        const juce::String& anlzPath,
+                        const std::string& diskCacheKey)
+    {
+        // Join previous NFS thread if still running
+        if (nfsThread.joinable())
+            nfsThread.join();
+
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, anlzPath, diskCacheKey]()
+        {
+            NfsAnlzFetcher::AnlzResult anlz;
+
+            if (anlzPath.isNotEmpty())
+            {
+                DBG("DbServerClient: NFS async (with path) -- " + anlzPath);
+                anlz = nfsAnlzFetcher.fetchAndParse(playerIP, slot, anlzPath);
+            }
+            else
+            {
+                DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
+                anlz = nfsAnlzFetcher.fetchByTrackId(playerIP, slot, trackId);
+            }
+
+            if (anlz.ok && isRunningFlag.load(std::memory_order_relaxed))
+            {
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    if (it != metadataCache.end())
+                    {
+                        // NFS data is authoritative (from USB) -- always overwrite
+                        applyNfsAnlzResult(it->second, anlz, true);
+                        ++it->second.cacheVersion;
+                        DBG("DbServerClient: NFS ANLZ applied -- beats="
+                            + juce::String((int)it->second.beatGrid.size())
+                            + " cues=" + juce::String((int)it->second.cueList.size())
+                            + " phrases=" + juce::String((int)it->second.songStructure.size())
+                            + " detailEntries=" + juce::String(it->second.detailEntryCount)
+                            + " detailBpe=" + juce::String(it->second.detailBytesPerEntry)
+                            + " detailDataSz=" + juce::String((int)it->second.detailData.size()));
+                    }
+                }
+
+                // Persist to disk cache for next session
+                if (!diskCacheKey.empty())
+                    saveAnlzToDisk(cacheKey, diskCacheKey);
+            }
+        });
+    }
+
+    /// Build a CachedAnlz from in-memory TrackMetadata and save to disk.
+    void saveAnlzToDisk(uint64_t cacheKey, const std::string& diskKey)
+    {
+        WaveformCache::CachedAnlz ca;
+
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            auto it = metadataCache.find(cacheKey);
+            if (it == metadataCache.end()) return;
+            auto& m = it->second;
+
+            for (auto& b : m.beatGrid)
+                ca.beatGrid.push_back({ b.beatNumber, b.bpmTimes100, b.timeMs });
+
+            for (auto& c : m.cueList)
+            {
+                WaveformCache::CachedAnlz::Cue cc;
+                cc.type = (uint8_t)c.type;
+                cc.hotCueNumber = c.hotCueNumber;
+                cc.positionMs = c.positionMs;
+                cc.loopEndMs = c.loopEndMs;
+                cc.colorR = c.colorR;  cc.colorG = c.colorG;  cc.colorB = c.colorB;
+                cc.colorCode = c.colorCode;
+                cc.hasColor = c.hasColor;
+                cc.comment = c.comment;
+                ca.cueList.push_back(std::move(cc));
+            }
+
+            for (auto& p : m.songStructure)
+                ca.songStructure.push_back({ p.index, p.beatNumber, p.kind, p.fill, p.beatCount, p.beatFill });
+
+            ca.phraseMood = m.phraseMood;
+            ca.detailData = m.detailData;
+            ca.detailEntryCount = m.detailEntryCount;
+            ca.detailBytesPerEntry = m.detailBytesPerEntry;
+        }
+
+        ca.valid = true;
+        WaveformCache::saveAnlz(diskKey, ca);
+        DBG("DbServerClient: ANLZ SAVE beats=" + juce::String((int)ca.beatGrid.size())
+            + " cues=" + juce::String((int)ca.cueList.size())
+            + " phrases=" + juce::String((int)ca.songStructure.size())
+            + " detailEntries=" + juce::String(ca.detailEntryCount)
+            + " detailBpe=" + juce::String(ca.detailBytesPerEntry)
+            + " detailDataSz=" + juce::String((int)ca.detailData.size())
+            + " key=" + juce::String(diskKey.substr(0, 40)));
+    }
+
+    /// Apply disk-cached ANLZ data to in-memory TrackMetadata.
+    static void applyCachedAnlz(TrackMetadata& meta, const WaveformCache::CachedAnlz& ca)
+    {
+        if (!ca.beatGrid.empty() && meta.beatGrid.empty())
+        {
+            for (auto& b : ca.beatGrid)
+            {
+                TrackMetadata::BeatEntry e;
+                e.beatNumber = b.beatNumber;  e.bpmTimes100 = b.bpmTimes100;  e.timeMs = b.timeMs;
+                meta.beatGrid.push_back(e);
+            }
+        }
+        if (!ca.cueList.empty() && meta.cueList.empty())
+        {
+            for (auto& c : ca.cueList)
+            {
+                TrackMetadata::RekordboxCue rc;
+                rc.type = (TrackMetadata::RekordboxCue::Type)c.type;
+                rc.hotCueNumber = c.hotCueNumber;
+                rc.positionMs = c.positionMs;
+                rc.loopEndMs = c.loopEndMs;
+                rc.colorR = c.colorR;  rc.colorG = c.colorG;  rc.colorB = c.colorB;
+                rc.colorCode = c.colorCode;
+                rc.hasColor = c.hasColor;
+                rc.comment = c.comment;
+                meta.cueList.push_back(rc);
+            }
+        }
+        if (!ca.songStructure.empty() && meta.songStructure.empty())
+        {
+            for (auto& p : ca.songStructure)
+            {
+                TrackMetadata::PhraseEntry pe;
+                pe.index = p.index;  pe.beatNumber = p.beatNumber;
+                pe.kind = p.kind;  pe.fill = p.fill;
+                pe.beatCount = p.beatCount;  pe.beatFill = p.beatFill;
+                meta.songStructure.push_back(pe);
+            }
+            meta.phraseMood = ca.phraseMood;
+        }
+        if (ca.detailEntryCount > 0 && meta.detailEntryCount == 0)
+        {
+            meta.detailData = ca.detailData;
+            meta.detailEntryCount = ca.detailEntryCount;
+            meta.detailBytesPerEntry = ca.detailBytesPerEntry;
+        }
+    }
+
+    //==========================================================================
+    // NFS result -> TrackMetadata conversion helpers
+    //==========================================================================
+    static void applyNfsAnlzResult(TrackMetadata& meta, const NfsAnlzFetcher::AnlzResult& anlz,
+                                    bool forceOverwrite = false)
+    {
+        if (!anlz.beatGrid.empty() && (forceOverwrite || meta.beatGrid.empty()))
+        {
+            meta.beatGrid.clear();
+            meta.beatGrid.reserve(anlz.beatGrid.size());
+            for (auto& b : anlz.beatGrid)
+            {
+                TrackMetadata::BeatEntry e;
+                e.beatNumber  = b.beatNumber;
+                e.bpmTimes100 = b.bpmTimes100;
+                e.timeMs      = b.timeMs;
+                meta.beatGrid.push_back(e);
+            }
+        }
+
+        if (!anlz.cueList.empty() && (forceOverwrite || meta.cueList.empty()))
+        {
+            meta.cueList.clear();
+            for (auto& c : anlz.cueList)
+            {
+                TrackMetadata::RekordboxCue cue;
+                cue.positionMs   = c.positionMs;
+                cue.loopEndMs    = c.loopEndMs;
+                cue.hotCueNumber = (uint8_t)c.hotCueNumber;
+                cue.colorR       = c.colorR;
+                cue.colorG       = c.colorG;
+                cue.colorB       = c.colorB;
+                cue.colorCode    = c.colorCode;
+                cue.hasColor     = c.hasColor;
+                cue.comment      = c.comment;
+                cue.type = (c.type == NfsAnlzFetcher::CueEntry::Loop)      ? TrackMetadata::RekordboxCue::Loop
+                         : (c.type == NfsAnlzFetcher::CueEntry::HotCue)    ? TrackMetadata::RekordboxCue::HotCue
+                         : TrackMetadata::RekordboxCue::MemoryPoint;
+                meta.cueList.push_back(cue);
+            }
+        }
+
+        if (!anlz.songStructure.empty() && (forceOverwrite || meta.songStructure.empty()))
+        {
+            meta.songStructure.clear();
+            meta.phraseMood = anlz.phraseMood;
+            for (auto& p : anlz.songStructure)
+            {
+                TrackMetadata::PhraseEntry pe;
+                pe.index      = p.index;
+                pe.beatNumber = p.beatNumber;
+                pe.kind       = p.kind;
+                pe.beatCount  = p.beatCount;
+                pe.fill       = p.fill;
+                pe.beatFill   = p.beatFill;
+                meta.songStructure.push_back(pe);
+            }
+        }
+
+        if (!anlz.detailData.empty())
+        {
+            // Never downgrade: PWV7 (3 bytes/entry) is better than PWV5 (2 bytes/entry).
+            // NFS .EXT only has PWV5, but dbserver can serve PWV7 on CDJ-3000.
+            bool shouldReplace = meta.detailData.empty()
+                || (forceOverwrite && anlz.detailBytesPerEntry >= meta.detailBytesPerEntry);
+            if (shouldReplace)
+            {
+                meta.detailData         = anlz.detailData;
+                meta.detailEntryCount   = anlz.detailEntryCount;
+                meta.detailBytesPerEntry = anlz.detailBytesPerEntry;
+            }
+        }
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DbServerClient)
 };

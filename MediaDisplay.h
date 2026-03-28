@@ -12,6 +12,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "DbServerClient.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -51,11 +52,33 @@ public:
         colorEntryCount = 0;
         colorBytesPerEntry = 0;
         playPosition = 0.0f;
+        durationMs = 0;
+        previewCues.clear();
+        previewBeatGrid.clear();
         invalidateCache();
         repaint();
     }
 
     bool hasWaveformData() const { return hasColorData; }
+
+    /// Set track duration for minute markers.
+    void setDurationMs(uint32_t ms) { durationMs = ms; }
+
+    /// Set beat grid for beat ruler lines on the preview.
+    void setBeatGrid(const std::vector<TrackMetadata::BeatEntry>& grid)
+    {
+        previewBeatGrid = grid;
+        invalidateCache();
+        repaint();
+    }
+
+    /// Set rekordbox cue list for colored cue markers on the preview.
+    void setRekordboxCues(const std::vector<TrackMetadata::RekordboxCue>& cues)
+    {
+        previewCues = cues;
+        invalidateCache();  // cue markers are part of the static image
+        repaint();
+    }
 
     /// Set the play cursor position (0.0 = start, 1.0 = end).
     /// Two modes based on whether this component is a real child or an orphan:
@@ -190,10 +213,74 @@ private:
 
         // Center line (static, part of cached image)
         float inset = 2.0f;
+        float drawW = bounds.getWidth() - inset * 2;
         float drawH = bounds.getHeight() - inset * 2;
         float midY = inset + drawH * 0.5f;
         ig.setColour(juce::Colour(0x40FFFFFF));
         ig.drawHorizontalLine((int)midY, inset, bounds.getWidth() - inset);
+
+        // Minute markers (white ticks below waveform)
+        if (durationMs > 0)
+        {
+            uint32_t minuteMs = 60000;
+            float botY = inset + drawH;
+            for (uint32_t ms = minuteMs; ms < durationMs; ms += minuteMs)
+            {
+                float ratio = (float)ms / (float)durationMs;
+                float xp = inset + ratio * drawW;
+                ig.setColour(juce::Colour(0x80FFFFFF));
+                ig.fillRect(xp, botY - 4.0f, 1.0f, 4.0f);
+            }
+        }
+
+        // Beat grid (downbeats only -- every 4 beats as subtle full-height lines)
+        if (!previewBeatGrid.empty() && durationMs > 0)
+        {
+            for (auto& beat : previewBeatGrid)
+            {
+                if (beat.beatNumber == 0) continue;
+                bool isDownbeat = ((beat.beatNumber - 1) % 4) == 0;
+                if (!isDownbeat) continue;  // only downbeats on preview
+
+                float ratio = (float)beat.timeMs / (float)durationMs;
+                float xp = inset + ratio * drawW;
+                ig.setColour(juce::Colour(0x12FFFFFF));
+                ig.fillRect(xp, inset, 1.0f, drawH);
+            }
+        }
+
+        // Rekordbox cue markers (colored triangles above waveform)
+        if (!previewCues.empty() && durationMs > 0)
+        {
+            for (auto& cue : previewCues)
+            {
+                if (cue.positionMs == 0 && cue.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                    continue;  // skip memory point at position 0 (track start)
+                float ratio = (float)cue.positionMs / (float)durationMs;
+                float xp = inset + ratio * drawW;
+
+                juce::Colour col = cue.hasColor ? cue.getColour()
+                    : (cue.type == TrackMetadata::RekordboxCue::HotCue
+                        ? juce::Colour(0xFF1ECC3C)
+                        : cue.type == TrackMetadata::RekordboxCue::MemoryPoint
+                            ? juce::Colour(0xFFCC2020)
+                            : juce::Colour(0xFFFF8800));
+
+                juce::Path tri;
+                tri.addTriangle(xp - 3.0f, inset, xp + 3.0f, inset, xp, inset + 4.0f);
+                ig.setColour(col);
+                ig.fillPath(tri);
+
+                // Loop end marker
+                if (cue.loopEndMs > 0 && cue.loopEndMs < durationMs)
+                {
+                    float endRatio = (float)cue.loopEndMs / (float)durationMs;
+                    float xEnd = inset + endRatio * drawW;
+                    ig.setColour(col.withAlpha(0.15f));
+                    ig.fillRect(xp, inset, xEnd - xp, drawH);
+                }
+            }
+        }
 
         cachedW = w;
         cachedH = h;
@@ -361,6 +448,9 @@ private:
     int colorBytesPerEntry = 0;  // 3=ThreeBand(CDJ-3000), 6=ColorNxs2
     bool hasColorData = false;
     float playPosition = 0.0f;   // 0.0 = start, 1.0 = end
+    uint32_t durationMs = 0;     // track duration for minute markers
+    std::vector<TrackMetadata::RekordboxCue> previewCues;  // colored cue markers
+    std::vector<TrackMetadata::BeatEntry> previewBeatGrid; // beat grid for downbeat lines
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WaveformDisplay)
 };

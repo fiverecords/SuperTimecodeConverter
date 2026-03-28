@@ -15,7 +15,7 @@
 //   - On-air / master / beat indicators
 //   - DJM mixer fader + crossfader visualization
 //
-// Architecture: Owns its own 30Hz Timer, reads data from shared objects
+// Architecture: Owns its own 60Hz Timer, reads data from shared objects
 // (ProDJLinkInput, DbServerClient, TrackMap, engines) via const getters.
 // Actively requests metadata from DbServerClient for all discovered
 // players (independently of engine assignments) so waveform, artwork,
@@ -26,6 +26,7 @@
 #include "ProDJLinkInput.h"
 #include "DbServerClient.h"
 #include "MediaDisplay.h"
+#include "WaveformDetailDisplay.h"
 #include "TimecodeEngine.h"
 #include "AppSettings.h"
 #include "CustomLookAndFeel.h"
@@ -76,7 +77,7 @@ public:
             if (onLayoutChanged) onLayoutChanged();
         };
 
-        startTimerHz(30);
+        startTimerHz(60);
     }
 
     ~ProDJLinkViewComponent() override
@@ -120,11 +121,12 @@ private:
         juce::String model, ip, playState, posSource;
         juce::String artist, title, key, offset;
         double bpm = 0.0, faderPitch = 1.0;
-        bool isOnAir = false, isMaster = false, isPlaying = false, trackMapped = false;
+        bool isOnAir = false, isMaster = false, isPlaying = false, isReverse = false, trackMapped = false;
         uint8_t beatInBar = 0;
         uint8_t xfAssign  = 0;   // 0=THRU, 1=A, 2=B (from DJM mixer data)
         uint32_t playheadMs = 0, trackLenSec = 0, trackId = 0;
         uint32_t artworkId = 0;
+        int cueCount = 0;  // rekordbox cue/hot cue/loop count
         float posRatio = 0.0f;
         juce::String fpsStr;
         Timecode timecode {};
@@ -134,9 +136,21 @@ private:
         // Per-deck waveform component (painted LIVE by paintDeck).
         // NOT a child component -- paint() is called manually with translated Graphics.
         WaveformDisplay waveform;
+        WaveformDetailDisplay detailWaveform;
         juce::Rectangle<int> wfLocalBounds;  // waveform area relative to deck (set during paintDeckStatic)
+        juce::Rectangle<int> detailLocalBounds; // detail waveform area relative to deck
+        uint32_t displayedDetailTrackId = 0;
+        int detailRetryTicks = 0;  // countdown for supplementary data retry
+        // Fed-tracking: avoid redundant full metadata copies during retry
+        bool previewCuesFed = false, previewBeatGridFed = false;
+        int  previewRetryTicks = 0;  // countdown for preview supplementary data
+        bool detailCuesFed = false, detailBeatGridFed = false, detailSongStructFed = false;
+        uint32_t lastMetaVersion = 0;  // tracks DbServerClient cache version to skip redundant copies
+        uint32_t lastDetailVersion = 0;  // separate version tracker for detail waveform section
         juce::Rectangle<int> tcLocalBounds;  // timecode row relative to deck (set during paintDeckStatic)
         juce::Rectangle<int> mapLocalBounds; // offset timecode row relative to deck
+        juce::Rectangle<int> timeLocalBounds; // track time row relative to deck (for click-to-toggle)
+        bool showRemainingTime = false;      // false=elapsed, true=remaining (per deck)
         juce::Image     cachedArtworkImg;  // cached from DbServerClient (avoid lock during paint)
         uint32_t displayedWaveformTrackId = 0;
         uint32_t displayedArtworkId = 0;
@@ -168,7 +182,7 @@ private:
         // Snapshot of last-painted state -- used to skip repaint() when nothing changed
         struct Snapshot
         {
-            bool discovered = false, isOnAir = false, isMaster = false, isPlaying = false, trackMapped = false;
+            bool discovered = false, isOnAir = false, isMaster = false, isPlaying = false, isReverse = false, trackMapped = false;
             uint8_t beatInBar = 0, xfAssign = 0;
             double bpm = -1.0, faderPitch = -1.0;
             uint32_t playheadMs = 0xFFFFFFFF, trackId = 0;
@@ -231,6 +245,51 @@ public:
                         }
                     }
                 }
+                return;
+            }
+
+            // Detail waveform zoom buttons: click + / -
+            if (ds.detailWaveform.hasDetailData()
+                && !ds.detailLocalBounds.isEmpty() && ds.detailLocalBounds.contains(localPos))
+            {
+                auto detLocal = localPos - ds.detailLocalBounds.getPosition();
+                int zoom = ds.detailWaveform.hitTestZoomButtons(detLocal);
+                if (zoom != 0)
+                {
+                    int cur = ds.detailWaveform.getScale();
+                    ds.detailWaveform.setScale(cur - zoom);  // +1 = zoom in (less entries/px)
+                    return;
+                }
+            }
+
+            // Track time area: click to toggle elapsed / remaining
+            if (!ds.timeLocalBounds.isEmpty() && ds.timeLocalBounds.contains(localPos))
+            {
+                ds.showRemainingTime = !ds.showRemainingTime;
+                ds.invalidateDeckImg();
+                repaint(deckBounds[deck]);
+                return;
+            }
+            break;
+        }
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
+    {
+        auto pos = e.getPosition();
+        for (int deck = 0; deck < 4; ++deck)
+        {
+            if (!deckBounds[deck].contains(pos)) continue;
+            auto& ds = deckState[deck];
+            auto localPos = pos - deckBounds[deck].getPosition();
+
+            if (!ds.detailLocalBounds.isEmpty() && ds.detailLocalBounds.contains(localPos))
+            {
+                int cur = ds.detailWaveform.getScale();
+                if (wheel.deltaY > 0.0f)
+                    ds.detailWaveform.setScale(cur - 1);  // zoom in
+                else if (wheel.deltaY < 0.0f)
+                    ds.detailWaveform.setScale(cur + 1);  // zoom out
                 return;
             }
             break;
@@ -379,6 +438,7 @@ public:
             ds.isOnAir       = proDJLink.isPlayerOnAir(pn);
             ds.isMaster      = proDJLink.isPlayerMaster(pn);
             ds.isPlaying     = proDJLink.isPlayerPlaying(pn);
+            ds.isReverse     = proDJLink.isPlayingReverse(pn);
             ds.beatInBar     = proDJLink.getBeatInBar(pn);
             ds.xfAssign      = proDJLink.hasMixerFaderData() ? proDJLink.getChannelXfAssign(pn) : 0;
             ds.playheadMs    = proDJLink.getPlayheadMs(pn);
@@ -437,13 +497,25 @@ public:
             if (trackChanged)
             {
                 ds.waveform.clearWaveform();
+                ds.detailWaveform.clear();
                 ds.displayedWaveformTrackId = 0;
+                ds.displayedDetailTrackId = 0;
+                ds.detailRetryTicks = 0;
+                ds.previewRetryTicks = 0;
+                ds.previewCuesFed = false;
+                ds.previewBeatGridFed = false;
+                ds.detailCuesFed = false;
+                ds.detailBeatGridFed = false;
+                ds.detailSongStructFed = false;
+                ds.lastMetaVersion = 0;
+                ds.lastDetailVersion = 0;
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
                 ds.title.clear();
                 ds.key.clear();
                 ds.artworkId = 0;
+                ds.cueCount = 0;
                 ds.invalidateDeckImg();
                 ds.prevTrackId = ds.trackId;
                 ds.metadataRequested = false;  // reset so we request for new track
@@ -452,28 +524,33 @@ public:
             // --- Request metadata independently of engines ---
             // ProDJLinkView requests metadata for ALL discovered players,
             // so waveform/artwork/info loads even without an engine assigned.
+            // IMPORTANT: resolve SOURCE player IP -- when CDJ 2 loads from
+            // CDJ 1's USB via Link Export, the metadata is on CDJ 1.
+            uint8_t srcPlayer = proDJLink.getLoadedPlayer(pn);
+            if (srcPlayer == 0) srcPlayer = (uint8_t)pn;
+            juce::String srcIP = proDJLink.getPlayerIP((int)srcPlayer);
+            if (srcIP.isEmpty()) srcIP = ds.ip;
+
             if (ds.trackId != 0 && !ds.metadataRequested
-                && !ds.ip.isEmpty() && dbClient.getIsRunning())
+                && !srcIP.isEmpty() && dbClient.getIsRunning())
             {
-                uint8_t srcPlayer = proDJLink.getLoadedPlayer(pn);
-                if (srcPlayer == 0) srcPlayer = (uint8_t)pn;
                 uint8_t slot = proDJLink.getLoadedSlot(pn);
                 if (slot != 0)
                 {
                     int dbCtx = proDJLink.getVCDJPlayerNumber();
                     juce::String model = proDJLink.getPlayerModel((int)srcPlayer);
                     dbClient.requestMetadata(
-                        ds.ip, slot, 1, ds.trackId, dbCtx, model);
+                        srcIP, slot, 1, ds.trackId, dbCtx, model);
                     ds.metadataRequested = true;
                     ds.metadataRequestTick = 0;
                 }
             }
 
-            // Retry if metadata hasn't arrived after ~3s (90 ticks at 30Hz)
+            // Retry if metadata hasn't arrived after ~3s (180 ticks at 60Hz)
             if (ds.metadataRequested && ds.artist.isEmpty()
                 && ds.displayedWaveformTrackId != ds.trackId)
             {
-                if (++ds.metadataRequestTick > 90)
+                if (++ds.metadataRequestTick > 180)
                     ds.metadataRequested = false;  // allow re-request
             }
 
@@ -485,22 +562,73 @@ public:
                 bool needMeta = ds.artist.isEmpty()
                              || ds.displayedWaveformTrackId != ds.trackId;
 
-                if (needMeta && !ds.ip.isEmpty())
+                if (needMeta && !srcIP.isEmpty())
                 {
-                    auto meta = dbClient.getCachedMetadata(ds.ip, ds.trackId);
+                    auto meta = dbClient.getCachedMetadata(srcIP, ds.trackId);
                     if (meta.isValid())
                     {
+                        ds.lastMetaVersion = meta.cacheVersion;
                         ds.artist    = meta.artist;
                         ds.title     = meta.title;
                         ds.key       = meta.key;
                         ds.artworkId = meta.artworkId;
+                        ds.cueCount  = (int)meta.cueList.size();
 
                         if (meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                         {
                             ds.waveform.setColorWaveformData(meta.waveformData,
                                 meta.waveformEntryCount, meta.waveformBytesPerEntry);
+                            if (meta.durationSeconds > 0)
+                                ds.waveform.setDurationMs((uint32_t)meta.durationSeconds * 1000);
+                            if (meta.hasCueList())
+                                { ds.waveform.setRekordboxCues(meta.cueList); ds.previewCuesFed = true; }
+                            if (meta.hasBeatGrid())
+                                { ds.waveform.setBeatGrid(meta.beatGrid); ds.previewBeatGridFed = true; }
                             ds.displayedWaveformTrackId = ds.trackId;
+                            ds.previewRetryTicks = (!ds.previewCuesFed || !ds.previewBeatGridFed) ? 180 : 0;
                             ds.invalidateDeckImg();
+                            if (!deckBounds[pn - 1].isEmpty())
+                                repaint(deckBounds[pn - 1]);
+
+                            // Save waveform + artwork to disk cache for future sessions
+                            if (meta.artist.isNotEmpty() && meta.title.isNotEmpty())
+                            {
+                                auto diskKey = TrackMapEntry::makeKey(
+                                    meta.artist, meta.title, meta.durationSeconds);
+                                if (!WaveformCache::exists(diskKey))
+                                {
+                                    uint32_t durMs = (meta.durationSeconds > 0)
+                                        ? (uint32_t)meta.durationSeconds * 1000 : 0;
+                                    WaveformCache::save(diskKey, meta.waveformData,
+                                        meta.waveformEntryCount, meta.waveformBytesPerEntry, durMs);
+                                }
+                            }
+                        }
+                        else if (!meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId
+                                 && ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+                        {
+                            // Dbserver hasn't returned waveform yet -- try disk cache
+                            // Use meta.durationSeconds (same source as save path),
+                            // fall back to ds.trackLenSec if dbserver didn't provide it.
+                            int durForKey = (meta.durationSeconds > 0)
+                                ? meta.durationSeconds : (int)ds.trackLenSec;
+                            auto diskKey = TrackMapEntry::makeKey(
+                                ds.artist, ds.title, durForKey);
+                            if (WaveformCache::exists(diskKey))
+                            {
+                                auto cached = WaveformCache::load(diskKey);
+                                if (cached.valid)
+                                {
+                                    ds.waveform.setColorWaveformData(cached.data,
+                                        cached.entryCount, cached.bytesPerEntry);
+                                    if (cached.durationMs > 0)
+                                        ds.waveform.setDurationMs(cached.durationMs);
+                                    ds.displayedWaveformTrackId = ds.trackId;
+                                    ds.invalidateDeckImg();
+                                    if (!deckBounds[pn - 1].isEmpty())
+                                        repaint(deckBounds[pn - 1]);
+                                }
+                            }
                         }
                     }
                     else
@@ -509,20 +637,81 @@ public:
                         auto metaById = dbClient.getCachedMetadataByTrackId(ds.trackId);
                         if (metaById.isValid())
                         {
+                            ds.lastMetaVersion = metaById.cacheVersion;
                             ds.artist    = metaById.artist;
                             ds.title     = metaById.title;
                             ds.key       = metaById.key;
                             ds.artworkId = metaById.artworkId;
+                            ds.cueCount  = (int)metaById.cueList.size();
 
                             if (metaById.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                             {
                                 ds.waveform.setColorWaveformData(metaById.waveformData,
                                     metaById.waveformEntryCount, metaById.waveformBytesPerEntry);
+                                if (metaById.durationSeconds > 0)
+                                    ds.waveform.setDurationMs((uint32_t)metaById.durationSeconds * 1000);
+                                if (metaById.hasCueList())
+                                    { ds.waveform.setRekordboxCues(metaById.cueList); ds.previewCuesFed = true; }
+                                if (metaById.hasBeatGrid())
+                                    { ds.waveform.setBeatGrid(metaById.beatGrid); ds.previewBeatGridFed = true; }
                                 ds.displayedWaveformTrackId = ds.trackId;
+                                ds.previewRetryTicks = (!ds.previewCuesFed || !ds.previewBeatGridFed) ? 180 : 0;
                                 ds.invalidateDeckImg();
+                                if (!deckBounds[pn - 1].isEmpty())
+                                    repaint(deckBounds[pn - 1]);
                             }
                         }
                     }
+                }
+
+                // Preview supplementary retry: cues / beat grid may arrive
+                // after the preview waveform.  Only fetch when the background
+                // thread has actually updated the cache (version changed).
+                if (ds.displayedWaveformTrackId == ds.trackId
+                    && ds.previewRetryTicks > 0
+                    && (!ds.previewCuesFed || !ds.previewBeatGridFed))
+                {
+                    uint32_t ver = dbClient.getMetadataVersion(srcIP, ds.trackId);
+                    if (ver == 0) ver = dbClient.getMetadataVersionByTrackId(ds.trackId);
+
+                    if (ver != ds.lastMetaVersion && !srcIP.isEmpty())
+                    {
+                        ds.lastMetaVersion = ver;
+                        auto pm = dbClient.getCachedMetadata(srcIP, ds.trackId);
+                        if (!pm.isValid())
+                            pm = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                        if (pm.isValid())
+                        {
+                            bool changed = false;
+                            if (!ds.previewCuesFed && pm.hasCueList())
+                            {
+                                ds.waveform.setRekordboxCues(pm.cueList);
+                                ds.previewCuesFed = true;
+                                ds.cueCount = (int)pm.cueList.size();
+                                changed = true;
+                            }
+                            if (!ds.previewBeatGridFed && pm.hasBeatGrid())
+                            {
+                                ds.waveform.setBeatGrid(pm.beatGrid);
+                                ds.previewBeatGridFed = true;
+                                changed = true;
+                            }
+                            if (changed)
+                            {
+                                ds.invalidateDeckImg();
+                                if (!deckBounds[pn - 1].isEmpty())
+                                    repaint(deckBounds[pn - 1]);
+                                DBG("PDL Preview RETRY P" + juce::String(pn)
+                                    + ": cuesFed=" + juce::String((int)ds.previewCuesFed)
+                                    + " beatsFed=" + juce::String((int)ds.previewBeatGridFed)
+                                    + " ver=" + juce::String(ver));
+                            }
+                        }
+                    }
+                    if (ds.previewCuesFed && ds.previewBeatGridFed)
+                        ds.previewRetryTicks = 0;
+                    else
+                        ds.previewRetryTicks--;
                 }
 
                 // Fallback: if still no title, show "Track #ID" from protocol
@@ -538,6 +727,37 @@ public:
                         ds.cachedArtworkImg = artImg;
                         ds.displayedArtworkId = ds.artworkId;
                         ds.invalidateDeckImg();
+                        if (!deckBounds[pn - 1].isEmpty())
+                            repaint(deckBounds[pn - 1]);
+
+                        // Save to disk for future sessions
+                        if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+                        {
+                            auto diskKey = TrackMapEntry::makeKey(
+                                ds.artist, ds.title, (int)ds.trackLenSec);
+                            if (!WaveformCache::artworkExists(diskKey))
+                                WaveformCache::saveArtwork(diskKey, artImg);
+                        }
+                    }
+                }
+
+                // Artwork fallback from disk cache
+                if (!ds.cachedArtworkImg.isValid() && ds.artist.isNotEmpty()
+                    && ds.title.isNotEmpty())
+                {
+                    auto diskKey = TrackMapEntry::makeKey(
+                        ds.artist, ds.title, (int)ds.trackLenSec);
+                    if (WaveformCache::artworkExists(diskKey))
+                    {
+                        auto cachedArt = WaveformCache::loadArtwork(diskKey);
+                        if (cachedArt.isValid())
+                        {
+                            ds.cachedArtworkImg = cachedArt;
+                            ds.displayedArtworkId = ds.artworkId;
+                            ds.invalidateDeckImg();
+                            if (!deckBounds[pn - 1].isEmpty())
+                                repaint(deckBounds[pn - 1]);
+                        }
                     }
                 }
             }
@@ -549,18 +769,283 @@ public:
                     ds.waveform.clearWaveform();
                     ds.displayedWaveformTrackId = 0;
                 }
+                if (ds.displayedDetailTrackId != 0)
+                {
+                    ds.detailWaveform.clear();
+                    ds.displayedDetailTrackId = 0;
+                    ds.detailRetryTicks = 0;
+                }
+                ds.previewRetryTicks = 0;
+                ds.previewCuesFed = false;
+                ds.previewBeatGridFed = false;
+                ds.detailCuesFed = false;
+                ds.detailBeatGridFed = false;
+                ds.detailSongStructFed = false;
+                ds.lastMetaVersion = 0;
+                ds.lastDetailVersion = 0;
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
                 ds.title.clear();
                 ds.key.clear();
                 ds.artworkId = 0;
+                ds.cueCount = 0;
                 ds.metadataRequested = false;
             }
 
             // Waveform cursor
             if (ds.waveform.hasWaveformData())
                 ds.waveform.setPlayPosition(ds.posRatio);
+
+            // Detail waveform: feed data, beat grid, song structure, cues.
+            // Data arrives asynchronously from DbServerClient (phase 2 + NFS thread).
+            // Poll periodically until detail data arrives.
+            if (ds.trackId != 0 && !srcIP.isEmpty())
+            {
+                bool needsInitial = (ds.displayedDetailTrackId != ds.trackId);
+                bool needsSupplementary = (ds.displayedDetailTrackId == ds.trackId
+                                           && (!ds.detailCuesFed || !ds.detailBeatGridFed
+                                               || !ds.detailSongStructFed
+                                               || ds.detailWaveform.getDetailBytesPerEntry() < 3));
+
+                bool doFetch = false;
+                if (needsInitial)
+                {
+                    bool hasDetail = dbClient.hasDetailWaveformCached(srcIP, ds.trackId);
+                    if (hasDetail)
+                        doFetch = true;
+                    else
+                    {
+                        ds.detailRetryTicks++;
+                        if (ds.detailRetryTicks % 60 == 1)
+                            doFetch = true;
+                    }
+
+                    // Log once per second to track progress
+                    if (ds.detailRetryTicks % 60 == 0)
+                    {
+                        DBG("PDL Detail POLL P" + juce::String(pn)
+                            + ": needsInitial tick=" + juce::String(ds.detailRetryTicks)
+                            + " hasDetail=" + juce::String((int)hasDetail)
+                            + " doFetch=" + juce::String((int)doFetch)
+                            + " trackId=" + juce::String(ds.trackId)
+                            + " srcIP=" + srcIP);
+                    }
+                }
+                else if (needsSupplementary)
+                {
+                    uint32_t curVer = dbClient.getMetadataVersion(srcIP, ds.trackId);
+                    if (curVer == 0) curVer = dbClient.getMetadataVersionByTrackId(ds.trackId);
+                    if (curVer != 0 && curVer != ds.lastDetailVersion)
+                        doFetch = true;
+                }
+
+                if (doFetch)
+                {
+                    auto meta = dbClient.getCachedMetadata(srcIP, ds.trackId);
+                    if (!meta.isValid())
+                        meta = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                    ds.lastDetailVersion = meta.cacheVersion;
+
+                    DBG("PDL Detail FETCH P" + juce::String(pn)
+                        + ": valid=" + juce::String((int)meta.isValid())
+                        + " hasDetail=" + juce::String((int)meta.hasDetailWaveform())
+                        + " detailEntries=" + juce::String(meta.detailEntryCount)
+                        + " detailBpe=" + juce::String(meta.detailBytesPerEntry)
+                        + " detailDataSz=" + juce::String((int)meta.detailData.size())
+                        + " beats=" + juce::String((int)meta.beatGrid.size())
+                        + " cues=" + juce::String((int)meta.cueList.size())
+                        + " phrases=" + juce::String((int)meta.songStructure.size())
+                        + " nfsAttempted=" + juce::String((int)meta.nfsAttempted)
+                        + " ver=" + juce::String(meta.cacheVersion));
+
+                    if (needsInitial)
+                    {
+                        if (meta.hasDetailWaveform())
+                        {
+                            uint32_t durMs = (meta.durationSeconds > 0)
+                                ? (uint32_t)meta.durationSeconds * 1000 : 0;
+                            ds.detailWaveform.setDetailData(meta.detailData,
+                                meta.detailEntryCount, meta.detailBytesPerEntry, durMs);
+                            ds.displayedDetailTrackId = ds.trackId;
+                            ds.detailRetryTicks = 0;  // stop polling
+                            ds.invalidateDeckImg();
+                            if (!deckBounds[pn - 1].isEmpty())
+                                repaint(deckBounds[pn - 1]);
+
+                            // Feed any supplementary data available in this same fetch
+                            // (avoids waiting for the next version change poll)
+                            if (meta.hasBeatGrid())
+                            {
+                                ds.detailWaveform.setBeatGrid(meta.beatGrid);
+                                ds.detailBeatGridFed = true;
+                                for (auto& eng : engines)
+                                {
+                                    if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                                        && eng->getEffectivePlayer() == pn)
+                                        eng->setBeatGrid(meta.beatGrid, ds.trackId);
+                                }
+                            }
+                            if (meta.hasSongStructure())
+                            {
+                                ds.detailWaveform.setSongStructure(meta.songStructure, meta.phraseMood);
+                                ds.detailSongStructFed = true;
+                            }
+                            if (meta.hasCueList())
+                            {
+                                ds.detailWaveform.setRekordboxCues(meta.cueList);
+                                ds.detailCuesFed = true;
+                                if (ds.cueCount == 0)
+                                    ds.cueCount = (int)meta.cueList.size();
+                            }
+
+                            // Persist ANLZ to disk (detail waveform + whatever else arrived)
+                            saveAnlzFromMeta(meta);
+                        }
+                    }
+
+                    // Feed supplementary data (may arrive after detail waveform)
+                    if (ds.displayedDetailTrackId == ds.trackId)
+                    {
+                        bool supplementaryFed = false;
+
+                        // Upgrade detail waveform if better quality arrived
+                        // (e.g. dbserver provided PWV7 3-band after NFS provided PWV5 2-byte)
+                        if (meta.hasDetailWaveform()
+                            && meta.detailBytesPerEntry > ds.detailWaveform.getDetailBytesPerEntry())
+                        {
+                            uint32_t durMs = (meta.durationSeconds > 0)
+                                ? (uint32_t)meta.durationSeconds * 1000 : 0;
+                            ds.detailWaveform.setDetailData(meta.detailData,
+                                meta.detailEntryCount, meta.detailBytesPerEntry, durMs);
+                            supplementaryFed = true;
+                            DBG("PDL Detail UPGRADE P" + juce::String(pn)
+                                + ": bpe " + juce::String(ds.detailWaveform.getDetailBytesPerEntry())
+                                + " -> " + juce::String(meta.detailBytesPerEntry));
+                        }
+
+                        if (!ds.detailBeatGridFed && meta.hasBeatGrid())
+                        {
+                            ds.detailWaveform.setBeatGrid(meta.beatGrid);
+                            ds.detailBeatGridFed = true;
+                            supplementaryFed = true;
+                            // Feed to engines for PLL micro-correction
+                            for (auto& eng : engines)
+                            {
+                                if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                                    && eng->getEffectivePlayer() == pn)
+                                    eng->setBeatGrid(meta.beatGrid, ds.trackId);
+                            }
+                        }
+                        if (!ds.detailSongStructFed && meta.hasSongStructure())
+                        {
+                            ds.detailWaveform.setSongStructure(meta.songStructure, meta.phraseMood);
+                            ds.detailSongStructFed = true;
+                            supplementaryFed = true;
+                        }
+                        if (!ds.detailCuesFed && meta.hasCueList())
+                        {
+                            ds.detailWaveform.setRekordboxCues(meta.cueList);
+                            ds.detailCuesFed = true;
+                            supplementaryFed = true;
+                            if (ds.cueCount == 0)
+                            {
+                                ds.cueCount = (int)meta.cueList.size();
+                                ds.invalidateDeckImg();
+                            }
+
+                            // Auto-populate TrackMap cue points from rekordbox
+                            // hot cues, but only if the entry exists and has NO
+                            // manually-configured cue points.
+                            // Blocked during Show Lock -- TrackMap is configuration.
+                            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
+                                && (!isShowLockedFn || !isShowLockedFn()))
+                            {
+                                int dur = (int)ds.trackLenSec;
+                                auto* mutableEntry = trackMap.find(ds.artist, ds.title, dur);
+                                if (mutableEntry != nullptr && mutableEntry->cuePoints.empty())
+                                {
+                                    for (auto& rc : meta.cueList)
+                                    {
+                                        if (rc.positionMs == 0) continue;  // skip track start
+                                        CuePoint cp;
+                                        cp.positionMs = rc.positionMs;
+                                        auto letter = rc.hotCueLetter();
+                                        if (letter.isNotEmpty())
+                                            cp.name = letter;
+                                        if (rc.comment.isNotEmpty())
+                                            cp.name += cp.name.isNotEmpty()
+                                                ? " " + rc.comment : rc.comment;
+                                        if (cp.name.isEmpty())
+                                        {
+                                            if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                                                cp.name = "MEM";
+                                            else if (rc.type == TrackMetadata::RekordboxCue::Loop)
+                                                cp.name = "LOOP";
+                                        }
+                                        mutableEntry->cuePoints.push_back(std::move(cp));
+                                    }
+                                    mutableEntry->sortCuePoints();
+                                }
+                            }
+                        }
+                        else if (!ds.detailCuesFed)
+                        {
+                            // Cues not yet from rekordbox -- fallback to TrackMap
+                            int dur = (int)ds.trackLenSec;
+                            auto* tmFallback = trackMap.find(ds.artist, ds.title, dur);
+                            if (tmFallback && !tmFallback->cuePoints.empty())
+                                ds.detailWaveform.setCuePoints(tmFallback->cuePoints);
+                        }
+
+                        // Force deck repaint when new data arrives for the detail waveform
+                        if (supplementaryFed)
+                        {
+                            ds.invalidateDeckImg();
+                            if (!deckBounds[pn - 1].isEmpty())
+                                repaint(deckBounds[pn - 1]);
+
+                            // Re-persist ANLZ to disk with updated supplementary data
+                            saveAnlzFromMeta(meta);
+                        }
+
+                        // If all sources exhausted (NFS done), mark missing data as "fed"
+                        // to stop polling for tracks that genuinely don't have cues/beats/phrases.
+                        if (meta.nfsAttempted)
+                        {
+                            if (!ds.detailBeatGridFed && !meta.hasBeatGrid())
+                                ds.detailBeatGridFed = true;
+                            if (!ds.detailSongStructFed && !meta.hasSongStructure())
+                                ds.detailSongStructFed = true;
+                            if (!ds.detailCuesFed && !meta.hasCueList())
+                                ds.detailCuesFed = true;
+                        }
+                    }
+                }
+
+            }
+
+
+            // Detail waveform: update playhead and active loop every frame
+            if (ds.detailWaveform.hasDetailData())
+            {
+                ds.detailWaveform.setPlayheadMs(ds.playheadMs, ds.isPlaying, ds.faderPitch);
+                ds.detailWaveform.setActiveLoop(
+                    proDJLink.getLoopStartMs(pn),
+                    proDJLink.getLoopEndMs(pn));
+
+                // Force repaint of detail area every frame when playing or decelerating.
+                // The detail waveform is not a real child component (painted manually
+                // in paintDeck), so its repaint() doesn't reach us. We must drive it.
+                bool needsDetailRepaint = ds.isPlaying
+                    || ds.detailWaveform.isAnimating();
+                if (needsDetailRepaint && !ds.detailLocalBounds.isEmpty()
+                    && !deckBounds[pn - 1].isEmpty())
+                {
+                    auto detAbsolute = ds.detailLocalBounds + deckBounds[pn - 1].getPosition();
+                    repaint(detAbsolute);
+                }
+            }
         }
 
         // --- Smooth VU meters ---
@@ -573,14 +1058,14 @@ public:
                 if (target > vuSmoothed[ch])
                     vuSmoothed[ch] = target;
                 else
-                    vuSmoothed[ch] *= 0.88f;  // ~120ms decay at 30Hz
+                    vuSmoothed[ch] *= 0.94f;  // ~120ms decay at 60Hz
                 if (vuSmoothed[ch] < 0.001f) vuSmoothed[ch] = 0.0f;
             }
         }
         else
         {
             for (int ch = 0; ch < ProDJLink::kVuSlots; ++ch)
-                vuSmoothed[ch] *= 0.9f;
+                vuSmoothed[ch] *= 0.95f;  // decay when no VU data at 60Hz
         }
 
         // Two levels of dirty:
@@ -595,6 +1080,7 @@ public:
                              || ds.isOnAir            != snap.isOnAir
                              || ds.isMaster           != snap.isMaster
                              || ds.isPlaying          != snap.isPlaying
+                             || ds.isReverse          != snap.isReverse
                              || ds.trackMapped        != snap.trackMapped
                              || ds.beatInBar          != snap.beatInBar
                              || ds.xfAssign           != snap.xfAssign
@@ -622,6 +1108,7 @@ public:
                 snap.isOnAir            = ds.isOnAir;
                 snap.isMaster           = ds.isMaster;
                 snap.isPlaying          = ds.isPlaying;
+                snap.isReverse          = ds.isReverse;
                 snap.trackMapped        = ds.trackMapped;
                 snap.beatInBar          = ds.beatInBar;
                 snap.xfAssign           = ds.xfAssign;
@@ -649,7 +1136,7 @@ public:
                 else if (frameDirty && !deckBounds[deck].isEmpty())
                 {
                     // Only timecode frame changed -- repaint just the live overlay
-                    // strips (TC digits + waveform cursor + offset TC).
+                    // strips (TC digits + waveform cursor + detail waveform + offset TC).
                     // This avoids compositing the full HiDPI deck image (~3MB on
                     // Retina) when only a few rows of pixels actually changed.
                     auto origin = deckBounds[deck].getPosition();
@@ -661,6 +1148,10 @@ public:
                         auto wfAbs = ds.wfLocalBounds + origin;
                         liveArea = liveArea.isEmpty() ? wfAbs : liveArea.getUnion(wfAbs);
                     }
+                    if (!ds.detailLocalBounds.isEmpty())
+                        liveArea = liveArea.isEmpty()
+                            ? (ds.detailLocalBounds + origin)
+                            : liveArea.getUnion(ds.detailLocalBounds + origin);
                     if (!ds.mapLocalBounds.isEmpty())
                         liveArea = liveArea.getUnion(ds.mapLocalBounds + origin);
                     if (!liveArea.isEmpty())
@@ -845,6 +1336,17 @@ private:
             ds.waveform.paint(g);
         }
 
+        // Detail waveform -- painted LIVE (scrolls with playhead every frame).
+        if (!ds.detailLocalBounds.isEmpty() && ds.detailWaveform.hasDetailData())
+        {
+            auto detAbsolute = ds.detailLocalBounds + area.getPosition();
+            juce::Graphics::ScopedSaveState sss(g);
+            g.reduceClipRegion(detAbsolute);
+            g.setOrigin(detAbsolute.getPosition());
+            ds.detailWaveform.setBounds(0, 0, detAbsolute.getWidth(), detAbsolute.getHeight());
+            ds.detailWaveform.paint(g);
+        }
+
         // Draw timecode live on top
         paintDeckTimecode(g, area, deckIndex);
     }
@@ -860,8 +1362,10 @@ private:
         // This prevents stale bounds from a previous larger layout being
         // used when the deck is too small to lay out (early return below).
         ds.wfLocalBounds = {};
+        ds.detailLocalBounds = {};
         ds.tcLocalBounds = {};
         ds.mapLocalBounds = {};
+        ds.timeLocalBounds = {};
 
         // Background panel
         g.setColour(bgDeck);
@@ -874,14 +1378,15 @@ private:
         int deckH = inner.getHeight();
 
         // --- Proportional layout ---
-        // Fixed chrome: header(22) + gaps(~16) + map(16) + engine(16) + bpmRow(18) = ~88px
-        // Flexible: infoRow, waveform, timecode scale with available height
-        constexpr int kFixedChrome = 88;
+        // Fixed chrome: header(22) + gaps(~20) + map(16) + engine(16) + bpmRow(18) = ~92px
+        // Flexible: infoRow, preview waveform, detail waveform, timecode
+        constexpr int kFixedChrome = 92;
         int flexH = juce::jmax(0, deckH - kFixedChrome);
 
-        // Distribute flexible space: info 35%, waveform 45%, timecode 20%
-        int infoH   = juce::jmax(50, (int)(flexH * 0.35f));
-        int wfH     = juce::jmax(30, (int)(flexH * 0.45f));
+        // Distribute flexible space: info 28%, preview 18%, detail 34%, timecode 20%
+        int infoH   = juce::jmax(50, (int)(flexH * 0.28f));
+        int wfH     = juce::jmax(24, (int)(flexH * 0.18f));
+        int detH    = juce::jmax(30, (int)(flexH * 0.34f));
         int tcH     = juce::jmax(20, (int)(flexH * 0.20f));
 
         //----------------------------------------------------------------------
@@ -946,6 +1451,16 @@ private:
                     g.setColour(accentGreen);
                     g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
                     g.drawText("AIR", ob, juce::Justification::centred);
+                    rightBadges.removeFromRight(2);
+                }
+                if (ds.isReverse)
+                {
+                    auto rb = rightBadges.removeFromRight(40).toFloat().reduced(0, 2);
+                    g.setColour(juce::Colour(0xFFCC3030).withAlpha(0.25f));
+                    g.fillRoundedRectangle(rb, 2.0f);
+                    g.setColour(juce::Colour(0xFFCC3030));
+                    g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                    g.drawText("REV", rb, juce::Justification::centred);
                 }
             }
             else
@@ -1028,6 +1543,7 @@ private:
                 }
             }
             if (ds.key.isNotEmpty()) bpmStr += "  " + ds.key;
+            if (ds.cueCount > 0) bpmStr += "  | " + juce::String(ds.cueCount) + " cues";
             g.setFont(juce::Font(juce::FontOptions(detailFs)));
             g.setColour(accentCyan.brighter(0.3f));
             g.drawText(bpmStr, bpmRow, juce::Justification::centredLeft, true);
@@ -1065,6 +1581,43 @@ private:
                 auto beatRow = infoArea.removeFromTop(juce::jmin(12, infoArea.getHeight()));
                 paintBeatIndicator(g, beatRow.removeFromLeft(60).toFloat(), ds.beatInBar);
             }
+
+            // Track time: elapsed or remaining (click to toggle)
+            if (infoArea.getHeight() >= 10 && ds.trackLenSec > 0)
+            {
+                auto timeRow = infoArea.removeFromTop(juce::jmin(lineH, infoArea.getHeight()));
+                ds.timeLocalBounds = timeRow;
+
+                uint32_t elapsedSec = ds.playheadMs / 1000;
+                juce::String timeStr;
+
+                if (ds.showRemainingTime)
+                {
+                    uint32_t totalSec = ds.trackLenSec;
+                    uint32_t remainSec = (elapsedSec < totalSec) ? (totalSec - elapsedSec) : 0;
+                    uint32_t rm = remainSec / 60;
+                    uint32_t rs = remainSec % 60;
+                    timeStr = "-" + juce::String(rm).paddedLeft('0', 2) + ":"
+                            + juce::String(rs).paddedLeft('0', 2);
+                }
+                else
+                {
+                    uint32_t em = elapsedSec / 60;
+                    uint32_t es = elapsedSec % 60;
+                    timeStr = juce::String(em).paddedLeft('0', 2) + ":"
+                            + juce::String(es).paddedLeft('0', 2);
+                }
+
+                // Total duration
+                uint32_t tm = ds.trackLenSec / 60;
+                uint32_t ts = ds.trackLenSec % 60;
+                timeStr += " / " + juce::String(tm).paddedLeft('0', 2) + ":"
+                         + juce::String(ts).paddedLeft('0', 2);
+
+                g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), detailFs, juce::Font::bold)));
+                g.setColour(ds.showRemainingTime ? accentAmber : textMid);
+                g.drawText(timeStr, timeRow, juce::Justification::centredLeft);
+            }
         }
 
         inner.removeFromTop(4);
@@ -1078,6 +1631,17 @@ private:
         ds.wfLocalBounds = wfBounds;
         g.setColour(juce::Colour(0xFF0D1117));
         g.fillRoundedRectangle(wfBounds.toFloat(), 3.0f);
+
+        inner.removeFromTop(2);
+
+        //----------------------------------------------------------------------
+        // Detail waveform area -- painted LIVE in paintDeck(), same as preview.
+        // Reserve space and fill background.
+        //----------------------------------------------------------------------
+        auto detBounds = inner.removeFromTop(detH);
+        ds.detailLocalBounds = detBounds;
+        g.setColour(juce::Colour(0xFF0A0E14));
+        g.fillRoundedRectangle(detBounds.toFloat(), 3.0f);
 
         inner.removeFromTop(4);
 
@@ -1778,6 +2342,105 @@ private:
             case FrameRate::FPS_30:   return "30";
             default:                  return "?";
         }
+    }
+
+    //==========================================================================
+    // Utility: persist ANLZ data to disk from a TrackMetadata snapshot.
+    // Called from the display-feed path so that detail waveform, beat grid,
+    // cues and phrases are cached regardless of which source provided them
+    // (dbserver phase 2, NFS async, or disk cache reload).
+    //==========================================================================
+    static void saveAnlzFromMeta(const TrackMetadata& meta)
+    {
+        if (meta.artist.isEmpty() || meta.title.isEmpty()) return;
+
+        bool hasData = meta.hasDetailWaveform() || meta.hasBeatGrid()
+                    || meta.hasCueList()        || meta.hasSongStructure();
+        if (!hasData) return;
+
+        auto diskKey = TrackMapEntry::makeKey(meta.artist, meta.title, meta.durationSeconds);
+        if (diskKey.empty()) return;
+
+        WaveformCache::CachedAnlz ca;
+
+        // Start from existing disk data (if any) so we never lose components
+        // that meta doesn't have yet.  For example: NFS wrote detail waveform,
+        // then supplementaryFed fires with cues but no detail in meta yet --
+        // without this merge, detail would be overwritten with 0 bytes.
+        if (WaveformCache::anlzExists(diskKey))
+        {
+            auto existing = WaveformCache::loadAnlz(diskKey);
+            if (existing.valid)
+                ca = std::move(existing);
+        }
+
+        // Overwrite each component only when meta has equal or better data
+        bool merged = false;
+
+        if (!meta.beatGrid.empty()
+            && meta.beatGrid.size() >= ca.beatGrid.size())
+        {
+            ca.beatGrid.clear();
+            for (auto& b : meta.beatGrid)
+                ca.beatGrid.push_back({ b.beatNumber, b.bpmTimes100, b.timeMs });
+            merged = true;
+        }
+
+        if (!meta.cueList.empty()
+            && meta.cueList.size() >= ca.cueList.size())
+        {
+            ca.cueList.clear();
+            for (auto& c : meta.cueList)
+            {
+                WaveformCache::CachedAnlz::Cue cc;
+                cc.type          = (uint8_t)c.type;
+                cc.hotCueNumber  = c.hotCueNumber;
+                cc.positionMs    = c.positionMs;
+                cc.loopEndMs     = c.loopEndMs;
+                cc.colorR        = c.colorR;
+                cc.colorG        = c.colorG;
+                cc.colorB        = c.colorB;
+                cc.colorCode     = c.colorCode;
+                cc.hasColor      = c.hasColor;
+                cc.comment       = c.comment;
+                ca.cueList.push_back(std::move(cc));
+            }
+            merged = true;
+        }
+
+        if (!meta.songStructure.empty()
+            && meta.songStructure.size() >= ca.songStructure.size())
+        {
+            ca.songStructure.clear();
+            for (auto& p : meta.songStructure)
+                ca.songStructure.push_back({ p.index, p.beatNumber, p.kind, p.fill,
+                                             p.beatCount, p.beatFill });
+            ca.phraseMood = meta.phraseMood;
+            merged = true;
+        }
+
+        if (meta.detailEntryCount > 0
+            && (meta.detailBytesPerEntry > ca.detailBytesPerEntry
+                || (meta.detailBytesPerEntry == ca.detailBytesPerEntry
+                    && meta.detailEntryCount >= ca.detailEntryCount)))
+        {
+            ca.detailData          = meta.detailData;
+            ca.detailEntryCount    = meta.detailEntryCount;
+            ca.detailBytesPerEntry = meta.detailBytesPerEntry;
+            merged = true;
+        }
+
+        if (!merged) return;  // disk already had equal or better data
+
+        ca.valid = true;
+
+        WaveformCache::saveAnlz(diskKey, ca);
+        DBG("PDL saveAnlzFromMeta: saved beats=" + juce::String((int)ca.beatGrid.size())
+            + " cues=" + juce::String((int)ca.cueList.size())
+            + " phrases=" + juce::String((int)ca.songStructure.size())
+            + " detail=" + juce::String(ca.detailEntryCount)
+            + "x" + juce::String(ca.detailBytesPerEntry)
+            + " key=" + juce::String(diskKey.substr(0, 40)));
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ProDJLinkViewComponent)

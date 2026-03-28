@@ -855,6 +855,48 @@ private:
 
         auto savedKey = entry.key();
         trackMap.addOrUpdate(entry);
+
+        // Auto-populate cue points from rekordbox for new entries.
+        // Uses the Learn player selector to know exactly which CDJ has the track.
+        // Verifies artist/title match to avoid populating wrong cues when the
+        // user creates an entry manually (Add button) while a different track
+        // is loaded on the CDJ, or if the DJ changed tracks between Learn and Save.
+        if (editingRow < 0 && dbClient != nullptr && proDJLinkInput != nullptr)
+        {
+            int player = cmbLearnLayer.getSelectedId();
+            uint32_t tid = proDJLinkInput->getTrackID(player);
+            if (tid != 0)
+            {
+                auto meta = dbClient->getCachedMetadataByTrackId(tid);
+                if (meta.isValid() && meta.hasCueList()
+                    && meta.artist.equalsIgnoreCase(entry.artist.trim())
+                    && meta.title.equalsIgnoreCase(entry.title.trim()))
+                {
+                    auto* saved = trackMap.find(entry.artist, entry.title, entry.durationSec);
+                    if (saved != nullptr && saved->cuePoints.empty())
+                    {
+                        for (auto& rc : meta.cueList)
+                        {
+                            if (rc.positionMs == 0) continue;
+                            CuePoint cp;
+                            cp.positionMs = rc.positionMs;
+                            auto letter = rc.hotCueLetter();
+                            if (letter.isNotEmpty()) cp.name = letter;
+                            if (rc.comment.isNotEmpty())
+                                cp.name += cp.name.isNotEmpty() ? " " + rc.comment : rc.comment;
+                            if (cp.name.isEmpty())
+                            {
+                                if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint) cp.name = "MEM";
+                                else if (rc.type == TrackMetadata::RekordboxCue::Loop)   cp.name = "LOOP";
+                            }
+                            saved->cuePoints.push_back(std::move(cp));
+                        }
+                        saved->sortCuePoints();
+                    }
+                }
+            }
+        }
+
         closeForm();
         notifyChanged();
 

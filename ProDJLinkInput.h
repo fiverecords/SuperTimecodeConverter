@@ -34,7 +34,7 @@
 //   - DJM mixer fader data                    (type 0x39, handled on both 50001 & 50002)
 //   - Timecode derived from playhead position in ms
 //
-// Protocol analysis: Deep Symmetry "DJ Link Ecosystem Analysis"
+// Protocol analysis: DJ Link Ecosystem Analysis
 //   https://djl-analysis.deepsymmetry.org/djl-analysis/
 // Reference impl: python-prodj-link (flesniak, Apache-2.0)
 //   https://github.com/flesniak/python-prodj-link
@@ -218,6 +218,18 @@ struct ProDJLinkPlayerState
     std::atomic<bool>     isOnAir      { false };
     std::atomic<bool>     isPlaying    { false }; // derived from state flags
 
+    // CDJ-3000 extended fields (from 0x200-byte status packets)
+    // Loop start/end in ms.  Both non-zero when a loop is active (stored
+    // from rekordbox OR dynamically set by the DJ during live performance).
+    // Raw value from bytes 0x1B6-0x1B9 / 0x1BE-0x1C1 is encoded as
+    // position * 1000 / 65536, so: ms = raw * 65536 / 1000.
+    std::atomic<uint32_t> loopStartMs  { 0 };
+    std::atomic<uint32_t> loopEndMs    { 0 };
+
+    // Reverse play detection (CDJ-3000 abspos: position decreasing while playing)
+    std::atomic<bool>     isReverse    { false };
+    uint32_t              prevAbsPosMs { 0 };     // previous abspos (non-atomic, network thread only)
+
     // Track change detection
     std::atomic<uint32_t> trackVersion { 0 };    // incremented on track change
 
@@ -253,6 +265,10 @@ struct ProDJLinkPlayerState
         isMaster.store(false, std::memory_order_relaxed);
         isOnAir.store(false, std::memory_order_relaxed);
         isPlaying.store(false, std::memory_order_relaxed);
+        loopStartMs.store(0, std::memory_order_relaxed);
+        loopEndMs.store(0, std::memory_order_relaxed);
+        isReverse.store(false, std::memory_order_relaxed);
+        prevAbsPosMs = 0;
         trackVersion.store(0, std::memory_order_relaxed);
         lastPacketTime.store(0.0, std::memory_order_relaxed);
         absPositionTs.store(0.0, std::memory_order_relaxed);
@@ -388,8 +404,20 @@ public:
 
         beatSock = std::make_unique<juce::DatagramSocket>(true);
         // NO setEnablePortReuse -- see comment above
+        //
+        // PLATFORM-SPECIFIC binding (same reasoning as keepaliveSock):
+        //   Windows: bind to bindIp so packets go out the correct NIC.
+        //   macOS: bind to INADDR_ANY because macOS does NOT deliver broadcast
+        //     packets to sockets bound to a specific IP.  Beat packets (type 0x28)
+        //     are broadcast by the CDJ.  AbsPos (0x0b) is unicast and would arrive
+        //     on a specific-IP socket, but beat packets silently don't -- causing
+        //     beatInBar to never update on macOS while everything else works.
+#ifdef _WIN32
         if (!beatSock->bindToPort(ProDJLink::kBeatPort, bindIp)
             && !beatSock->bindToPort(ProDJLink::kBeatPort))  // fallback to INADDR_ANY
+#else
+        if (!beatSock->bindToPort(ProDJLink::kBeatPort))      // INADDR_ANY for broadcast
+#endif
         {
             DBG("ProDJLink: WARNING -- Failed to bind beat socket to port " << ProDJLink::kBeatPort
                 << " (beat sync unavailable, but status/keepalive will work)");
@@ -623,6 +651,39 @@ public:
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
         return players[idx].playState.load(std::memory_order_relaxed)
             == ProDJLink::kPlayEndTrack;
+    }
+
+    /// CDJ-3000: active loop start position in ms (0 = no loop active)
+    uint32_t getLoopStartMs(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
+        return players[idx].loopStartMs.load(std::memory_order_relaxed);
+    }
+
+    /// CDJ-3000: active loop end position in ms (0 = no loop active)
+    uint32_t getLoopEndMs(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
+        return players[idx].loopEndMs.load(std::memory_order_relaxed);
+    }
+
+    /// CDJ-3000: true if a loop is currently active (stored or dynamic)
+    bool hasActiveLoop(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].loopStartMs.load(std::memory_order_relaxed) != 0
+            && players[idx].loopEndMs.load(std::memory_order_relaxed) != 0;
+    }
+
+    /// CDJ-3000: true if playing in reverse (detected from decreasing abspos)
+    bool isPlayingReverse(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].isReverse.load(std::memory_order_relaxed);
     }
 
     /// Track ID (rekordbox database ID)
@@ -1889,6 +1950,23 @@ private:
             p.absPositionTs.store(absNow, std::memory_order_relaxed);
             p.lastPacketTime.store(absNow, std::memory_order_relaxed);
 
+            // Reverse play detection: position decreasing while playing.
+            // prevAbsPosMs is non-atomic (only written from network thread).
+            // Require at least 10ms movement to avoid noise at boundaries.
+            // Suppress during active loops (loop reset jumps backward).
+            if (p.prevAbsPosMs > 0 && p.isPlaying.load(std::memory_order_relaxed))
+            {
+                bool inLoop = (p.loopStartMs.load(std::memory_order_relaxed) != 0
+                            && p.loopEndMs.load(std::memory_order_relaxed) != 0);
+                bool rev = !inLoop && (playhead + 10 < p.prevAbsPosMs);
+                p.isReverse.store(rev, std::memory_order_relaxed);
+            }
+            else
+            {
+                p.isReverse.store(false, std::memory_order_relaxed);
+            }
+            p.prevAbsPosMs = playhead;
+
             p.playheadMs.store(playhead, std::memory_order_relaxed);
 
             pktCountAbsPos.fetch_add(1, std::memory_order_relaxed);
@@ -2063,6 +2141,22 @@ private:
             }
         }
 
+        // CDJ-3000 extended fields (0x200-byte status packets)
+        if (len >= 0x1C2)
+        {
+            // Active loop start/end -- non-zero when any loop is active
+            // (stored from rekordbox or dynamically created by the DJ).
+            // Raw encoding: position_ms = raw_value * 65536 / 1000
+            uint32_t rawStart = ProDJLink::readU32BE(data + 0x1B6);
+            uint32_t rawEnd   = ProDJLink::readU32BE(data + 0x1BE);
+            uint32_t loopStart = (rawStart != 0)
+                ? (uint32_t)((uint64_t)rawStart * 65536ULL / 1000ULL) : 0;
+            uint32_t loopEnd = (rawEnd != 0)
+                ? (uint32_t)((uint64_t)rawEnd * 65536ULL / 1000ULL) : 0;
+            p.loopStartMs.store(loopStart, std::memory_order_relaxed);
+            p.loopEndMs.store(loopEnd, std::memory_order_relaxed);
+        }
+
         p.lastPacketTime.store(juce::Time::getMillisecondCounterHiRes(),
                                std::memory_order_relaxed);
     }
@@ -2141,11 +2235,14 @@ private:
         socklen_t vlen = sizeof(verify);
         ::getsockopt(fd, SOL_SOCKET, SO_BROADCAST, &verify, &vlen);
 #endif
+        (void)rc; (void)verify;  // used only in debug logging below
+#if JUCE_DEBUG
         if (rc != 0 || verify != 1)
             DBG("ProDJLink: WARNING -- SO_BROADCAST on " << label
                 << " fd=" << fd << " set_rc=" << rc << " readback=" << verify);
         else
             DBG("ProDJLink: SO_BROADCAST OK on " << label << " fd=" << fd);
+#endif
     }
 
     //==========================================================================

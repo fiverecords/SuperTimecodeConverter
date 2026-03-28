@@ -361,7 +361,7 @@ public:
         cachedTrackDurationSec = 0;
         armedCues.clear();
         lastCueCheckMs = 0;
-        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
         std::memset(trigDmxBuffer, 0, sizeof(trigDmxBuffer));
@@ -404,7 +404,7 @@ public:
     void stopProDJLinkInput()
     {
         // Reset PLL and LTC encoder state so other sources start clean.
-        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
     }
@@ -448,7 +448,7 @@ public:
     void stopStageLinQInput()
     {
         // Reset PLL and LTC encoder state so other sources start clean.
-        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
     }
@@ -859,21 +859,27 @@ public:
                         sharedProDJLink->isPositionMoving(ep)
                     );
 
+                    // Beat grid micro-correction: nudge PLL toward nearest beat
+                    if (!pdlBeatGrid.empty())
+                        pll.beatGridCorrect(pdlBeatGrid);
+
                     // Smooth timecode display using interpolation between CDJ packets.
                     uint32_t rawPlayheadMs = sharedProDJLink->getPlayheadMs(ep);
                     double now = juce::Time::getMillisecondCounterHiRes();
 
                     bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
-                    double displayMs = (double)rawPlayheadMs;  // default: raw
+
+                    // ALWAYS start from raw playhead to prevent double-offset application.
+                    // The offset is applied later and must start from a clean base.
+                    currentTimecode = ProDJLink::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
 
                     if (isNewPacket)
                     {
-                        // New CDJ data arrived -- snap to real position
+                        // New CDJ data arrived -- update snap point for interpolation
                         pdlLastPlayheadMs = rawPlayheadMs;
                         pdlSnapMs = (double)rawPlayheadMs;
                         pdlSnapTime = now;
                         pdlSnapSpeed = cdjSpeed;
-                        currentTimecode = ProDJLink::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
                     }
                     else if (pdlSnapSpeed > 0.01 && sharedProDJLink->isPlayerPlaying(ep))
                     {
@@ -882,10 +888,7 @@ public:
                         double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
                         double maxAdvance = 50.0 * pdlSnapSpeed;
                         if (elapsed <= maxAdvance)
-                        {
-                            displayMs = interpMs;
                             currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
-                        }
                     }
 
                     // Freeze timecode on end-of-track only.
@@ -953,6 +956,7 @@ public:
                             bpmPlayerOverride = kBpmNoOverride;
                             lastSentClockBpm = -1.0f;
                             lastSentOscBpm   = -1.0f;
+                            clearBeatGrid();
                             fireTrackTrigger(entry);
                             loadCuePointsForTrack(entry);
                         }
@@ -1208,13 +1212,16 @@ public:
                     double now = juce::Time::getMillisecondCounterHiRes();
 
                     bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
+
+                    // ALWAYS start from raw playhead to prevent double-offset application.
+                    currentTimecode = StageLinQ::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
+
                     if (isNewPacket)
                     {
                         pdlLastPlayheadMs = rawPlayheadMs;
                         pdlSnapMs = (double)rawPlayheadMs;
                         pdlSnapTime = now;
                         pdlSnapSpeed = slqSpeed;
-                        currentTimecode = StageLinQ::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
                     }
                     else if (pdlSnapSpeed > 0.01 && sharedStageLinQ->isPlayerPlaying(ep))
                     {
@@ -1626,7 +1633,7 @@ private:
         if (resolvedXfPlayer != 0)
         {
             resolvedXfPlayer = 0;
-            pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
     }
@@ -1692,7 +1699,7 @@ private:
         if (resolvedXfPlayer != 0)
         {
             resolvedXfPlayer = 0;
-            pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
     }
@@ -1705,7 +1712,7 @@ private:
             + juce::String(resolvedXfPlayer) + " -> " + juce::String(newPlayer));
         resolvedXfPlayer = newPlayer;
         // Reset PLL and track cache so we start clean on the new player
-        pll.reset(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         cachedTrackId = 0;
         cachedTrackArtist.clear();
@@ -1899,6 +1906,47 @@ private:
             if (positionMs < 0.0) positionMs = 0.0;
         }
 
+        /// Apply beat grid micro-correction.  Between CDJ abspos packets the
+        /// PLL interpolates at constant velocity and accumulates small drift.
+        /// When a beat grid is available, nudge the PLL position toward the
+        /// nearest beat by a small fraction each tick.  This keeps the LTC
+        /// output phase-locked to the musical grid without sudden jumps.
+        void beatGridCorrect(const std::vector<TrackMetadata::BeatEntry>& grid)
+        {
+            if (grid.empty() || !playing || positionMs < 1.0) return;
+
+            // Binary search: find nearest beat to current position
+            uint32_t posMs = (uint32_t)positionMs;
+            int lo = 0, hi = (int)grid.size() - 1, best = 0;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (grid[(size_t)mid].timeMs <= posMs)
+                    { best = mid; lo = mid + 1; }
+                else
+                    hi = mid - 1;
+            }
+
+            // Check both the beat before and after current position
+            double nearestMs = (double)grid[(size_t)best].timeMs;
+            if (best + 1 < (int)grid.size())
+            {
+                double nextMs = (double)grid[(size_t)(best + 1)].timeMs;
+                if (std::abs(nextMs - positionMs) < std::abs(nearestMs - positionMs))
+                    nearestMs = nextMs;
+            }
+
+            double beatErr = nearestMs - positionMs;
+            double absBeatErr = std::abs(beatErr);
+
+            // Only correct if within 15ms of a beat (avoids correcting during
+            // transitions between beats).  Apply 3% per tick -- gentle enough
+            // to not fight the CDJ correction, strong enough to converge in
+            // ~10 ticks (~330ms at 30Hz).
+            if (absBeatErr > 0.5 && absBeatErr < 15.0)
+                positionMs += beatErr * 0.03;
+        }
+
         uint32_t getPositionMs() const { return uint32_t(juce::jmax(0.0, positionMs)); }
     };
 
@@ -1909,6 +1957,13 @@ private:
     double pdlSnapMs = 0.0;           // playhead ms at last CDJ packet (interpolation anchor)
     double pdlSnapTime = 0.0;         // hi-res timestamp of last CDJ packet
     double pdlSnapSpeed = 1.0;        // actualSpeed at last CDJ packet
+
+    // Beat grid for PLL micro-correction (from rekordbox via DbServerClient).
+    // Between CDJ abspos packets, the PLL interpolates at constant velocity.
+    // Small timing errors accumulate.  When a beat grid is available, the PLL
+    // applies a gentle nudge toward the nearest beat position, reducing drift.
+    std::vector<TrackMetadata::BeatEntry> pdlBeatGrid;
+    uint32_t pdlBeatGridTrackId = 0;  // track ID for which beat grid is loaded
 
     LinkBridge   linkBridge;
     std::unique_ptr<AudioThru> audioThru;  // Only for primary engine
@@ -2047,6 +2102,22 @@ public:
         cachedBpmMultiplier = mult;
         lastSentClockBpm = -1.0f;
         lastSentOscBpm   = -1.0f;
+    }
+
+    /// Set the beat grid for PLL micro-correction.  Called when rekordbox
+    /// beat grid data is downloaded from the CDJ.  The grid is cleared
+    /// automatically on track change.
+    void setBeatGrid(const std::vector<TrackMetadata::BeatEntry>& grid, uint32_t trackId)
+    {
+        if (trackId == pdlBeatGridTrackId && !pdlBeatGrid.empty()) return;
+        pdlBeatGrid = grid;
+        pdlBeatGridTrackId = trackId;
+    }
+
+    void clearBeatGrid()
+    {
+        pdlBeatGrid.clear();
+        pdlBeatGridTrackId = 0;
     }
 
     // Returns the effective multiplier: session override if set, else TrackMap value.

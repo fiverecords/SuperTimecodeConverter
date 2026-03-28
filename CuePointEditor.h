@@ -48,6 +48,7 @@ public:
 
     void setDurationMs(uint32_t ms)   { durationMs = ms; repaint(); }
     void setPlayheadMs(uint32_t ms)   { playheadMs = ms; repaint(); }
+    void setPlayheadVisible(bool v)  { playheadVisible = v; repaint(); }
     uint32_t getEditCursorMs() const  { return editCursorSet ? editCursorMs : 0; }
     bool hasEditCursor() const        { return editCursorSet; }
     void clearEditCursor()            { editCursorSet = false; repaint(); }
@@ -163,7 +164,8 @@ public:
             g.fillRect(cx - 1.0f, 0.0f, 3.0f, b.getHeight());
         }
 
-        // Playhead cursor (red)
+        // Playhead cursor (red) -- only when the playing track matches
+        if (playheadVisible && durationMs > 0)
         {
             float ratio = (float)playheadMs / (float)durationMs;
             float cx = inset + ratio * drawW;
@@ -206,6 +208,7 @@ private:
     bool hasData = false;
     uint32_t durationMs = 0;
     uint32_t playheadMs = 0;
+    bool playheadVisible = true;
     uint32_t editCursorMs = 0;
     bool editCursorSet = false;
     std::vector<uint32_t> cuePositions;
@@ -296,6 +299,7 @@ public:
             else if (onCapturePlayhead)
             {
                 ms = onCapturePlayhead();
+                if (ms == UINT32_MAX) ms = 0;  // playing track doesn't match
             }
             if (ms == 0) return;
 
@@ -455,6 +459,25 @@ public:
         if (onCapturePlayhead && trackDurationMs > 0)
         {
             uint32_t ms = onCapturePlayhead();
+
+            if (ms == UINT32_MAX)
+            {
+                // Playing track doesn't match editing track -- hide red cursor
+                if (trackIsLive)
+                {
+                    trackIsLive = false;
+                    waveformStrip.setPlayheadMs(0);
+                    waveformStrip.setPlayheadVisible(false);
+                }
+                return;
+            }
+
+            // Track matches -- show live playhead
+            if (!trackIsLive)
+            {
+                trackIsLive = true;
+                waveformStrip.setPlayheadVisible(true);
+            }
             waveformStrip.setPlayheadMs(ms);
 
             // Any playhead movement (play, jog, scrub) clears the edit cursor
@@ -653,6 +676,7 @@ private:
     uint32_t trackDurationMs = 0;
     uint32_t editCursorMs = 0;
     bool editCursorActive = false;
+    bool trackIsLive = true;       // false when playing track != editing track
     uint32_t lastPlayheadMs = 0;   // for detecting playhead movement (jog/scrub/play)
 
     // Table

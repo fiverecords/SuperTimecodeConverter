@@ -454,7 +454,9 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedToggle(btnTrackMap)) return;
-        currentEngine().setTrackMapEnabled(btnTrackMap.getToggleState());
+        bool enabled = btnTrackMap.getToggleState();
+        for (auto& eng : engines)
+            eng->setTrackMapEnabled(enabled);
         updateDeviceSelectorVisibility();
         saveSettings();
     };
@@ -2142,6 +2144,57 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
         }
     }
 
+    // If no engine has this track active, search the dbClient cache directly.
+    // This covers tracks loaded on a player that no engine follows (e.g. Link Export
+    // from another CDJ, or a player the user hasn't assigned to any engine).
+    if (!foundWaveform || !foundArtwork)
+    {
+        auto entryKey = entry->key();
+        for (int pn = 1; pn <= 6; ++pn)
+        {
+            if (!sharedProDJLinkInput.isPlayerDiscovered(pn)) continue;
+            uint32_t tid = sharedProDJLinkInput.getTrackID(pn);
+            if (tid == 0) continue;
+
+            auto meta = sharedDbClient.getCachedMetadataByTrackId(tid);
+            if (!meta.isValid()) continue;
+
+            auto metaKey = TrackMapEntry::makeKey(meta.artist, meta.title, meta.durationSeconds);
+            if (metaKey != entryKey) continue;
+
+            if (!foundArtwork && meta.artworkId != 0)
+            {
+                auto art = sharedDbClient.getCachedArtwork(meta.artworkId);
+                if (art.isValid())
+                {
+                    cuePointWindow->setArtwork(art);
+                    foundArtwork = true;
+                    if (!WaveformCache::artworkExists(entry->key()))
+                        WaveformCache::saveArtwork(entry->key(), art);
+                }
+            }
+            if (!foundWaveform && meta.hasWaveform())
+            {
+                cuePointWindow->setWaveformData(meta.waveformData,
+                    meta.waveformEntryCount, meta.waveformBytesPerEntry);
+                foundWaveform = true;
+                if (!WaveformCache::exists(entry->key()))
+                {
+                    uint32_t durMs = (meta.durationSeconds > 0)
+                        ? (uint32_t)meta.durationSeconds * 1000 : 0;
+                    WaveformCache::save(entry->key(), meta.waveformData,
+                        meta.waveformEntryCount, meta.waveformBytesPerEntry, durMs);
+                }
+            }
+            if (!foundMeta && meta.durationSeconds > 0)
+            {
+                cuePointWindow->setDurationMs((uint32_t)meta.durationSeconds * 1000);
+                foundMeta = true;
+            }
+            break;
+        }
+    }
+
     // If no live waveform was found, try loading from cache
     if (!foundWaveform)
     {
@@ -2184,7 +2237,19 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
 
     cuePointWindow->setOnCapturePlayhead([this]() -> uint32_t
     {
-        return currentEngine().getSmoothedPlayheadMs();
+        // Only return live playhead if the currently playing track matches
+        // the track being edited.  Otherwise return sentinel so the editor
+        // hides the red cursor and doesn't interfere with mouse editing.
+        auto& eng = currentEngine();
+        auto info = eng.getActiveTrackInfo();
+        std::string playingKey;
+        if (info.artist.isNotEmpty() && info.title.isNotEmpty())
+            playingKey = TrackMapEntry::makeKey(info.artist, info.title, info.durationSec);
+
+        if (playingKey.empty() || playingKey != cuePointTrackKey)
+            return UINT32_MAX;  // sentinel: "no matching track"
+
+        return eng.getSmoothedPlayheadMs();
     });
 
     // Restore saved window position
@@ -5015,6 +5080,15 @@ void MainComponent::timerCallback()
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
                     meta.waveformEntryCount, meta.waveformBytesPerEntry);
+                if (meta.durationSeconds > 0)
+                    waveformDisplay.setDurationMs((uint32_t)meta.durationSeconds * 1000);
+                if (meta.hasCueList())
+                    waveformDisplay.setRekordboxCues(meta.cueList);
+                if (meta.hasBeatGrid())
+                    waveformDisplay.setBeatGrid(meta.beatGrid);
+                // Feed beat grid to engine for PLL micro-correction
+                if (meta.hasBeatGrid())
+                    eng.setBeatGrid(meta.beatGrid, wfTrackId);
             }
         }
         else if (wfTrackId != 0 && !waveformDisplay.hasWaveformData())
@@ -5025,6 +5099,14 @@ void MainComponent::timerCallback()
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
                     meta.waveformEntryCount, meta.waveformBytesPerEntry);
+                if (meta.durationSeconds > 0)
+                    waveformDisplay.setDurationMs((uint32_t)meta.durationSeconds * 1000);
+                if (meta.hasCueList())
+                    waveformDisplay.setRekordboxCues(meta.cueList);
+                if (meta.hasBeatGrid())
+                    waveformDisplay.setBeatGrid(meta.beatGrid);
+                if (meta.hasBeatGrid())
+                    eng.setBeatGrid(meta.beatGrid, wfTrackId);
             }
         }
         else if (wfTrackId == 0 && displayedWaveformTrackId != 0)
