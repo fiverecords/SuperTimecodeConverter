@@ -967,8 +967,7 @@ private:
             return;  // no source available
         }
 
-        if (learnArtist.isEmpty() || learnTitle.isEmpty()
-            || learnTitle.startsWith("Track #"))
+        if (learnTitle.isEmpty() || learnTitle.startsWith("Track #"))
             return;  // can't learn without real metadata
 
         // If entry already exists, open it for editing

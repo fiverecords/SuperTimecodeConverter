@@ -220,12 +220,29 @@ Scale the BPM sent to MIDI Clock, Ableton Link, and OSC before forwarding — us
 
 ### Ableton Link
 
-BPM from the selected CDJ player or Denon deck is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically.
+BPM from the selected CDJ player or Denon deck is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically. When using non-DJ sources (MTC, LTC, Art-Net, System Time), BPM can be detected from a live audio input instead.
+
+Link is **exclusive per engine** — only one engine can have Link active at a time. If another engine already owns the Link session, the toggle shows which engine has it. This prevents multiple engines from competing to set the session tempo.
 
 ### MIDI Clock & OSC BPM Forward
 
-- **MIDI Clock:** 24ppqn clock driven by CDJ or Denon deck BPM
-- **OSC BPM:** sends current BPM as float to configurable OSC address (default: Resolume tempo controller)
+- **MIDI Clock:** 24ppqn clock driven by CDJ/Denon BPM or audio BPM detection
+- **OSC BPM:** sends current BPM to a configurable OSC address. Two modes:
+  - **Float mode** (default): sends BPM as an OSC float argument — compatible with Resolume, TouchDesigner, and most OSC receivers. Default address: `/composition/tempocontroller/tempo`
+  - **Command template mode**: sends BPM as an OSC string argument with `%BPM%` replaced by the value — for consoles like GrandMA3 that expect string commands. Example: address `/gma3/cmd`, command `Master 3.x at %BPM%` sends `"Master 3.x at 128.5"`
+
+### Audio BPM Detection
+
+Real-time beat tracking from a live audio input, enabling BPM output for non-DJ input sources. When the engine input is MTC, LTC, Art-Net, or System Time, an independent audio device can be configured for BPM analysis. The detected tempo feeds MIDI Clock, OSC BPM forward, and Ableton Link -- the same outputs that Pro DJ Link and StageLinQ use.
+
+- **BPM display** with colour-coded confidence: green (locked), orange (tracking), dim orange (uncertain), grey (no signal)
+- **Beat LED** flashes at the detected BPM rate
+- **Smoothing slider** (0-100%) controls stability vs responsiveness — combines EMA output smoothing with BTT internal histogram tuning
+- **Gain control** for the audio input level
+- **Smart UI**: when LTC is the active source, Audio BPM shows its own separate device/channel/gain controls. For other sources, it shares the standard audio settings section.
+- **Device markers** show which engines are using which audio devices for BPM detection (same pattern as LTC markers)
+
+Useful for vinyl DJs, MIDI controller DJs, live bands, or any scenario where audio is available but no DJ protocol is present.
 
 ### TCNet Output
 
@@ -343,7 +360,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.8.0)
+   project(SuperTimecodeConverter VERSION 1.8.2)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -353,7 +370,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.8.0"
+       VERSION "1.8.2"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
@@ -583,6 +600,10 @@ The application is built around a modular, header-only architecture:
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
+| `AudioBpmInput.h` | Real-time audio BPM detection: independent AudioDeviceManager, BTT integration, EMA smoothing, atomic BPM/beat/confidence output |
+| `BTT.h` | Standalone public API header for the Beat-and-Tempo-Tracking library |
+| `btt_build.cpp` | C++ build wrapper for BTT amalgamation (MSVC compatibility, macro isolation) |
+| `btt_amalgamation.inc` | Single-file BTT library amalgamation (not added to Projucer, included by btt_build.cpp) |
 | `StageLinQInput.h` | Native StageLinQ protocol: device discovery, StateMap, BeatInfo, mixer state |
 | `StageLinQDbClient.h` | Engine Library database access via FileTransfer + SQLite for waveform preview and artwork |
 | `StageLinQView.h` | External window: Denon deck display with track info, deck state, mixer data |
@@ -604,7 +625,8 @@ The application is built around a modular, header-only architecture:
 - **Multi-engine architecture:** each engine encapsulates its own input/output state, enabling up to 8 independent timecode pipelines
 - **Lock-free audio:** LTC decode and audio passthrough use lock-free ring buffers (SPSC) for real-time safety
 - **Thread safety:** atomics with explicit memory ordering for cross-thread data, SpinLocks for composite structures, SPSC queues for producer-consumer patterns
-- **Independent audio devices:** LTC Input, LTC Output, and Audio Thru each manage their own `AudioDeviceManager`, allowing independent device selection
+- **Independent audio devices:** LTC Input, LTC Output, Audio Thru, and Audio BPM each manage their own `AudioDeviceManager`, allowing independent device selection
+- **BTT amalgamation:** the Beat-and-Tempo-Tracking library is bundled as a single-file amalgamation (same pattern as sqlite3) with `extern "C"` linkage and MSVC macro isolation (`#undef real/imag` against JUCE PCH contamination)
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
 - **Native rendering:** OpenGL context intentionally disabled to prevent GL-thread data races on juce::String refcounts (paint() vs timerCallback()). Windows DWM already hardware-accelerates the native GDI composite path, and the waveform/deck image caches minimize per-frame paint work
 - **PLL-based timecode:** Pro DJ Link input uses a phase-locked loop driven by CDJ actual motor speed for jitter-free LTC bit-rate scaling
@@ -642,6 +664,8 @@ Ableton Link is a trademark of Ableton AG. This project is not affiliated with, 
 
 ChamSys, Avolites, madMapper, and all other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
 
+grandMA3 is a trademark of MA Lighting Technology GmbH. This project is not affiliated with, endorsed by, or associated with MA Lighting Technology GmbH.
+
 This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies. The Pro DJ Link and StageLinQ implementations are based on independent community research. The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
 
 **Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
@@ -658,6 +682,8 @@ The Pro DJ Link implementation would not have been possible without the incredib
 
 The StageLinQ implementation is built on the open-source reverse-engineering work of three projects: **chrisle/StageLinq** by Chris Le and Martijn Reuvers (TypeScript, the most complete implementation including FileTransfer and database access), **icedream/go-stagelinq** by Carl Kittelberger (Go, clean protocol reference and BeatInfo), and **Jaxc/PyStageLinQ** by Jaxc (Python, byte-level protocol documentation and Wireshark dissector). Their collective work made third-party StageLinQ integration possible.
 
+Real-time audio BPM detection is powered by **[Beat-and-Tempo-Tracking (BTT)](https://github.com/michaelkrzyzaniak/Beat-and-Tempo-Tracking)** by Michael Krzyzaniak (MIT license) -- a zero-dependency ANSI C library for causal beat and tempo tracking, originally designed for musical robots at the University of Rochester.
+
 ---
 
 ## Links
@@ -667,6 +693,7 @@ The StageLinQ implementation is built on the open-source reverse-engineering wor
 - [chrisle/StageLinq -- TypeScript StageLinQ library](https://github.com/chrisle/StageLinq)
 - [icedream/go-stagelinq -- Go StageLinQ library](https://github.com/icedream/go-stagelinq)
 - [Jaxc/PyStageLinQ -- Python StageLinQ library](https://github.com/Jaxc/PyStageLinQ)
+- [Beat-and-Tempo-Tracking (BTT) -- Audio BPM detection](https://github.com/michaelkrzyzaniak/Beat-and-Tempo-Tracking)
 - [JUCE Framework](https://juce.com/)
 - [Art-Net Protocol](https://art-net.org.uk/)
 - [TCNet Protocol Specification](https://www.tc-supply.com/tcnet)

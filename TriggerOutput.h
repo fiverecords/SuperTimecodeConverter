@@ -253,6 +253,11 @@ public:
         oscSender.sendFloatDirect(address, value);
     }
 
+    void sendOscString(const juce::String& address, const juce::String& value)
+    {
+        oscSender.send(address, "s:\"" + value + "\"");
+    }
+
     //--------------------------------------------------------------------------
     // MIDI Clock -- 24 pulses per quarter note at the current BPM.
     // Runs on a dedicated HighResolutionTimer thread (1ms tick).

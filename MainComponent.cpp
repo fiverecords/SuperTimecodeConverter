@@ -578,7 +578,7 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedToggle(btnOscFwdBpm)) return;
-        currentEngine().setOscForward(btnOscFwdBpm.getToggleState(), edOscFwdBpmAddr.getText());
+        currentEngine().setOscForward(btnOscFwdBpm.getToggleState(), edOscFwdBpmAddr.getText(), edOscFwdBpmCmd.getText());
         applyTriggerSettings();  // ensure OSC connection is opened/closed
         propagateGlobalSettings();
         updateDeviceSelectorVisibility();
@@ -598,14 +598,36 @@ MainComponent::MainComponent()
     edOscFwdBpmAddr.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xFF2A2A2A));
     edOscFwdBpmAddr.setColour(juce::TextEditor::textColourId, textLight);
     edOscFwdBpmAddr.setColour(juce::TextEditor::outlineColourId, juce::Colour(0xFF444444));
-    edOscFwdBpmAddr.onReturnKey = [this]
+    auto applyOscBpmSettings = [this]
     {
-        if (!syncing && !isShowLockedRevert()) { currentEngine().setOscForward(btnOscFwdBpm.getToggleState(), edOscFwdBpmAddr.getText()); propagateGlobalSettings(); saveSettings(); }
+        if (!syncing && !isShowLockedRevert())
+        {
+            currentEngine().setOscForward(btnOscFwdBpm.getToggleState(),
+                                          edOscFwdBpmAddr.getText(),
+                                          edOscFwdBpmCmd.getText());
+            propagateGlobalSettings();
+            saveSettings();
+        }
     };
-    edOscFwdBpmAddr.onFocusLost = [this]
-    {
-        if (!syncing && !isShowLockedRevert()) { currentEngine().setOscForward(btnOscFwdBpm.getToggleState(), edOscFwdBpmAddr.getText()); propagateGlobalSettings(); saveSettings(); }
-    };
+    edOscFwdBpmAddr.onReturnKey = applyOscBpmSettings;
+    edOscFwdBpmAddr.onFocusLost = applyOscBpmSettings;
+
+    leftContent.addAndMakeVisible(lblOscFwdBpmCmd);
+    lblOscFwdBpmCmd.setVisible(false);
+    lblOscFwdBpmCmd.setText("CMD:", juce::dontSendNotification);
+    lblOscFwdBpmCmd.setFont(juce::Font(juce::FontOptions(9.0f)));
+    lblOscFwdBpmCmd.setColour(juce::Label::textColourId, textMid);
+    lblOscFwdBpmCmd.setJustificationType(juce::Justification::centredRight);
+
+    leftContent.addAndMakeVisible(edOscFwdBpmCmd);
+    edOscFwdBpmCmd.setVisible(false);
+    edOscFwdBpmCmd.setFont(juce::Font(juce::FontOptions(10.0f)));
+    edOscFwdBpmCmd.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xFF2A2A2A));
+    edOscFwdBpmCmd.setColour(juce::TextEditor::textColourId, textLight);
+    edOscFwdBpmCmd.setColour(juce::TextEditor::outlineColourId, juce::Colour(0xFF444444));
+    edOscFwdBpmCmd.setTextToShowWhenEmpty("float (empty=float, %BPM%=string)", juce::Colour(0xFF555555));
+    edOscFwdBpmCmd.onReturnKey = applyOscBpmSettings;
+    edOscFwdBpmCmd.onFocusLost = applyOscBpmSettings;
 
     leftContent.addAndMakeVisible(btnOscMixerFwd);
     btnOscMixerFwd.setVisible(false);
@@ -707,6 +729,24 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedToggle(btnLink)) return;
+
+        if (btnLink.getToggleState())
+        {
+            // Check if another engine already has Link active
+            int owner = findLinkOwnerOtherThan(selectedEngine);
+            if (owner >= 0)
+            {
+                // Block: revert toggle and show which engine has it
+                btnLink.setToggleState(false, juce::dontSendNotification);
+                lblLinkStatus.setText("Link active on " + engines[(size_t)owner]->getName(),
+                                     juce::dontSendNotification);
+                lblLinkStatus.setColour(juce::Label::textColourId, juce::Colour(0xFFFF5555));
+                lblLinkStatus.setVisible(true);
+                resized();
+                return;
+            }
+        }
+
         currentEngine().getLinkBridge().setEnabled(btnLink.getToggleState());
         propagateGlobalSettings();
         updateDeviceSelectorVisibility();
@@ -718,6 +758,101 @@ MainComponent::MainComponent()
     lblLinkStatus.setFont(juce::Font(juce::FontOptions(10.0f)));
     lblLinkStatus.setColour(juce::Label::textColourId, textMid);
     lblLinkStatus.setJustificationType(juce::Justification::centredLeft);
+
+    // --- Audio BPM detection (for non-DJ sources: MTC, LTC, ArtNet, SystemTime) ---
+    {
+        juce::Colour bpmAccent(0xFFFF9900);  // orange for audio BPM
+        leftContent.addAndMakeVisible(btnAudioBpm);
+        btnAudioBpm.setVisible(false);
+        btnAudioBpm.setColour(juce::ToggleButton::textColourId, textMid);
+        btnAudioBpm.setColour(juce::ToggleButton::tickColourId, bpmAccent);
+        btnAudioBpm.onClick = [this]
+        {
+            if (syncing) return;
+            if (isShowLockedToggle(btnAudioBpm)) return;
+            if (btnAudioBpm.getToggleState())
+            {
+                // When LTC is active, populate the separate BPM device combo
+                if (currentEngine().getActiveInput() == SrcType::LTC)
+                {
+                    cmbAudioBpmDevice.clear(juce::dontSendNotification);
+                    for (int i = 0; i < scannedAudioInputs.size(); i++)
+                    {
+                        auto marker = getDeviceInUseMarker(scannedAudioInputs[i].deviceName,
+                                                            scannedAudioInputs[i].typeName, true);
+                        cmbAudioBpmDevice.addItem(scannedAudioInputs[i].displayName + marker, i + 1);
+                    }
+                    if (cmbAudioBpmDevice.getNumItems() > 0)
+                        cmbAudioBpmDevice.setSelectedId(1, juce::dontSendNotification);
+                    populateAudioBpmChannels();
+                }
+                restartAudioBpm();
+            }
+            else
+                currentEngine().stopAudioBpm();
+            applyTriggerSettings();
+            updateDeviceSelectorVisibility();
+            resized();
+            saveSettings();
+        };
+
+        leftContent.addAndMakeVisible(lblBpmValue);
+        lblBpmValue.setVisible(false);
+        lblBpmValue.setFont(juce::Font(juce::FontOptions(18.0f, juce::Font::bold)));
+        lblBpmValue.setColour(juce::Label::textColourId, juce::Colour(0xFF666666));
+        lblBpmValue.setJustificationType(juce::Justification::centredLeft);
+        lblBpmValue.setText("--- BPM", juce::dontSendNotification);
+
+        leftContent.addAndMakeVisible(ledBeat);
+        ledBeat.setVisible(false);
+        ledBeat.setLedColour(bpmAccent);
+
+        leftContent.addAndMakeVisible(sldBpmSmoothing); styleGainSlider(sldBpmSmoothing);
+        leftContent.addAndMakeVisible(lblBpmSmoothing); lblBpmSmoothing.setText("BPM SMOOTHING:", juce::dontSendNotification); styleLabel(lblBpmSmoothing);
+        sldBpmSmoothing.setRange(0.0, 100.0, 1.0);
+        sldBpmSmoothing.setValue(50.0, juce::dontSendNotification);  // default 50% = 0.5
+        sldBpmSmoothing.setVisible(false);
+        sldBpmSmoothing.onValueChange = [this]
+        {
+            if (syncing) return;
+            float s = (float)sldBpmSmoothing.getValue() / 100.0f;
+            currentEngine().getAudioBpmInput().setSmoothing(s);
+            saveSettings();
+        };
+
+        addLabelAndCombo(lblAudioBpmDevice, cmbAudioBpmDevice, "BPM DEVICE:");
+        cmbAudioBpmDevice.onChange = [this]
+        {
+            if (syncing || isShowLockedRevert()) return;
+            populateAudioBpmChannels();
+            if (btnAudioBpm.getToggleState()) restartAudioBpm();
+            populateFilteredInputDeviceCombo();  // refresh LTC combo markers
+            saveSettings();
+        };
+
+        addLabelAndCombo(lblAudioBpmChannel, cmbAudioBpmChannel, "BPM CHANNEL:");
+        cmbAudioBpmChannel.onChange = [this]
+        {
+            if (syncing || isShowLockedRevert()) return;
+            if (btnAudioBpm.getToggleState()) restartAudioBpm();
+            saveSettings();
+        };
+
+        leftContent.addAndMakeVisible(sldBpmInputGain); styleGainSlider(sldBpmInputGain);
+        leftContent.addAndMakeVisible(lblBpmInputGain); lblBpmInputGain.setText("BPM INPUT GAIN:", juce::dontSendNotification); styleLabel(lblBpmInputGain);
+        sldBpmInputGain.setVisible(false);
+        sldBpmInputGain.onValueChange = [this]
+        {
+            if (syncing) return;
+            float gain = (float)sldBpmInputGain.getValue() / 100.0f;
+            currentEngine().getAudioBpmInput().setInputGain(gain);
+            saveSettings();
+        };
+
+        leftContent.addAndMakeVisible(mtrAudioBpm);
+        mtrAudioBpm.setMeterColour(bpmAccent);
+        mtrAudioBpm.setVisible(false);
+    }
 
     // --- BPM Multiplier buttons (per-player, ProDJLink only) ---
     // Single click: session override (temporary). Double click: save to TrackMap (persistent).
@@ -875,7 +1010,8 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        if (currentEngine().getActiveInput() == SrcType::LTC
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == SrcType::LTC
             && cmbAudioInputDevice.getSelectedId() > 0
             && cmbAudioInputDevice.getSelectedId() != kPlaceholderItemId)
         {
@@ -884,15 +1020,38 @@ MainComponent::MainComponent()
             populateAudioInputChannels();
             saveSettings();
         }
+        else if (btnAudioBpm.getToggleState()
+                 && cmbAudioInputDevice.getSelectedId() > 0
+                 && cmbAudioInputDevice.getSelectedId() != kPlaceholderItemId)
+        {
+            populateAudioInputChannels();
+            restartAudioBpm();
+            saveSettings();
+        }
     };
 
     addLabelAndCombo(lblAudioInputChannel, cmbAudioInputChannel, "LTC CHANNEL:");
-    cmbAudioInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == SrcType::LTC) { startCurrentLtcInput(); saveSettings(); } };
+    cmbAudioInputChannel.onChange = [this]
+    {
+        if (syncing || isShowLockedRevert()) return;
+        if (currentEngine().getActiveInput() == SrcType::LTC) { startCurrentLtcInput(); saveSettings(); }
+        else if (btnAudioBpm.getToggleState()) { restartAudioBpm(); saveSettings(); }
+    };
 
     leftContent.addAndMakeVisible(sldLtcInputGain); styleGainSlider(sldLtcInputGain);
     leftContent.addAndMakeVisible(lblLtcInputGain); lblLtcInputGain.setText("LTC INPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcInputGain);
     leftContent.addAndMakeVisible(mtrLtcInput); mtrLtcInput.setMeterColour(accentPurple);
-    sldLtcInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setInputGain((float)sldLtcInputGain.getValue() / 100.0f); saveSettings(); } };
+    sldLtcInputGain.onValueChange = [this]
+    {
+        if (syncing) return;
+        float gain = (float)sldLtcInputGain.getValue() / 100.0f;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == SrcType::LTC)
+            eng.getLtcInput().setInputGain(gain);
+        if (eng.isAudioBpmRunning())
+            eng.getAudioBpmInput().setInputGain(gain);
+        saveSettings();
+    };
 
     addLabelAndCombo(lblThruInputChannel, cmbThruInputChannel, "AUDIO THRU CHANNEL:");
     cmbThruInputChannel.onChange = [this] { if (!syncing && !isShowLockedRevert() && currentEngine().getActiveInput() == SrcType::LTC) { startCurrentLtcInput(); saveSettings(); } };
@@ -1530,7 +1689,10 @@ void MainComponent::syncUIFromEngine()
     sldTcnetOffset.setValue(eng.getTcnetOutputOffsetMs(), juce::dontSendNotification);
 
     // Gains
-    sldLtcInputGain.setValue(eng.getLtcInput().getInputGain() * 100.0f, juce::dontSendNotification);
+    if (eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC)
+        sldLtcInputGain.setValue(eng.getAudioBpmInput().getInputGain() * 100.0f, juce::dontSendNotification);
+    else
+        sldLtcInputGain.setValue(eng.getLtcInput().getInputGain() * 100.0f, juce::dontSendNotification);
     sldThruInputGain.setValue(eng.getLtcInput().getPassthruGain() * 100.0f, juce::dontSendNotification);
     sldLtcOutputGain.setValue(eng.getLtcOutput().getOutputGain() * 100.0f, juce::dontSendNotification);
     if (eng.getAudioThru())
@@ -1591,6 +1753,7 @@ void MainComponent::syncUIFromEngine()
         setArtNetCombosFromAddress(cmbArtMixNet, cmbArtMixSub, cmbArtMixUni, eng.getArtnetMixerUniverse());
         setArtNetCombosFromAddress(cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni, eng.getArtnetTriggerUniverse());
         edOscFwdBpmAddr.setText(eng.getOscFwdBpmAddr(), false);
+        edOscFwdBpmCmd.setText(eng.getOscFwdBpmCmd(), false);
 
         // Art-Net DMX interface (for trigger + mixer forward)
         {
@@ -1602,6 +1765,32 @@ void MainComponent::syncUIFromEngine()
 
         // Ableton Link toggle
         btnLink.setToggleState(eng.getLinkBridge().isEnabled(), juce::dontSendNotification);
+
+        // Audio BPM toggle + smoothing
+        btnAudioBpm.setToggleState(eng.isAudioBpmRunning(), juce::dontSendNotification);
+        sldBpmSmoothing.setValue(eng.getAudioBpmInput().getSmoothing() * 100.0f, juce::dontSendNotification);
+
+        // When LTC is active, Audio BPM uses separate device/channel combos
+        if (eng.getActiveInput() == SrcType::LTC && eng.isAudioBpmRunning())
+        {
+            cmbAudioBpmDevice.clear(juce::dontSendNotification);
+            for (int i = 0; i < scannedAudioInputs.size(); i++)
+            {
+                auto marker = getDeviceInUseMarker(scannedAudioInputs[i].deviceName,
+                                                    scannedAudioInputs[i].typeName, true);
+                cmbAudioBpmDevice.addItem(scannedAudioInputs[i].displayName + marker, i + 1);
+            }
+            // Select saved device
+            for (int i = 0; i < scannedAudioInputs.size(); i++)
+                if (scannedAudioInputs[i].deviceName == es.audioBpmDevice
+                    && scannedAudioInputs[i].typeName == es.audioBpmType)
+                { cmbAudioBpmDevice.setSelectedId(i + 1, juce::dontSendNotification); break; }
+            populateAudioBpmChannels();
+            int abChId = es.audioBpmChannel + 2;
+            if (abChId >= 1 && abChId <= cmbAudioBpmChannel.getNumItems())
+                cmbAudioBpmChannel.setSelectedId(abChId, juce::dontSendNotification);
+            sldBpmInputGain.setValue(eng.getAudioBpmInput().getInputGain() * 100.0f, juce::dontSendNotification);
+        }
 
         // Pro DJ Link (per-engine player)
         cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 8, es.proDJLinkPlayer), juce::dontSendNotification);
@@ -1646,8 +1835,11 @@ void MainComponent::syncUIFromEngine()
     {
         auto& es = settings.engines[(size_t)selectedEngine];
 
-        int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs,
-                                            es.audioInputType, es.audioInputDevice);
+        // Audio input device: use Audio BPM device when BPM is active on a non-LTC source
+        bool bpmUsesSharedAudio = eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC;
+        juce::String inType  = bpmUsesSharedAudio ? es.audioBpmType   : es.audioInputType;
+        juce::String inDev   = bpmUsesSharedAudio ? es.audioBpmDevice : es.audioInputDevice;
+        int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs, inType, inDev);
         cmbAudioInputDevice.setSelectedId(audioInIdx >= 0 ? audioInIdx + 1 : 0, juce::dontSendNotification);
 
         int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
@@ -1670,6 +1862,11 @@ void MainComponent::syncUIFromEngine()
             int thruCh = eng.getLtcInput().getPassthruChannel();
             if (thruCh >= 0) cmbThruInputChannel.setSelectedId(thruCh + 1, juce::dontSendNotification);
         }
+    }
+    else if (eng.isAudioBpmRunning())
+    {
+        int ch = eng.getAudioBpmInput().getSelectedChannel();
+        if (ch >= 0) cmbAudioInputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
     }
     else if (selectedEngine < (int)settings.engines.size())
     {
@@ -1919,13 +2116,13 @@ void MainComponent::propagateGlobalSettings()
     bool clockEn   = cur.isMidiClockEnabled();
     bool oscBpmEn  = cur.isOscForwardEnabled();
     auto  bpmAddr  = cur.getOscFwdBpmAddr();
+    auto  bpmCmd   = cur.getOscFwdBpmCmd();
     bool oscMixEn  = cur.isOscMixerForwardEnabled();
     bool midiMixEn = cur.isMidiMixerForwardEnabled();
     int  midiCCCh  = cur.getMidiMixerCCChannel();
     int  midiNotCh = cur.getMidiMixerNoteChannel();
     bool artMixEn  = cur.isArtnetMixerForwardEnabled();
     int  artMixUni = cur.getArtnetMixerUniverse();
-    bool linkEn    = cur.getLinkBridge().isEnabled();
 
     for (auto& engPtr : engines)
     {
@@ -1933,11 +2130,11 @@ void MainComponent::propagateGlobalSettings()
         auto& eng = *engPtr;
 
         eng.setMidiClockEnabled(clockEn);
-        eng.setOscForward(oscBpmEn, bpmAddr);
+        eng.setOscForward(oscBpmEn, bpmAddr, bpmCmd);
         eng.setOscMixerForward(oscMixEn);
         eng.setMidiMixerForward(midiMixEn, midiCCCh, midiNotCh);
         eng.setArtnetMixerForward(artMixEn, artMixUni);
-        eng.getLinkBridge().setEnabled(linkEn);
+        // Link is NOT propagated -- it's exclusive (only one engine at a time)
     }
 }
 
@@ -2052,7 +2249,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
     for (auto& eng : engines)
     {
         auto info = eng->getActiveTrackInfo();
-        if (info.artist.isNotEmpty() && info.title.isNotEmpty()
+        if (info.title.isNotEmpty()
             && TrackMapEntry::makeKey(info.artist, info.title, info.durationSec)
                 == entry->key())
         {
@@ -2243,7 +2440,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
         auto& eng = currentEngine();
         auto info = eng.getActiveTrackInfo();
         std::string playingKey;
-        if (info.artist.isNotEmpty() && info.title.isNotEmpty())
+        if (info.title.isNotEmpty())
             playingKey = TrackMapEntry::makeKey(info.artist, info.title, info.durationSec);
 
         if (playingKey.empty() || playingKey != cuePointTrackKey)
@@ -2685,6 +2882,7 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
     scannedAudioOutputs = outputs;
     populateAudioCombos();
     applyAudioSettings();
+    syncUIFromEngine();  // Re-populate Audio BPM device combo now that scan data is available
 }
 
 //==============================================================================
@@ -2846,6 +3044,16 @@ juce::String MainComponent::getDeviceInUseMarker(const juce::String& devName,
                 if (isCurrent) { result += juce::String::charToString(0x25CF); }
                 else           { return " [" + eng.getName() + "]"; }
             }
+
+            // Audio input (BPM detection)
+            if (typeName.isNotEmpty()
+                && eng.isAudioBpmRunning()
+                && eng.getAudioBpmInput().getCurrentDeviceName() == devName
+                && eng.getAudioBpmInput().getCurrentTypeName() == typeName)
+            {
+                if (isCurrent) { result += juce::String::charToString(0x25CF); }
+                else           { return " [" + eng.getName() + " BPM]"; }
+            }
         }
         else
         {
@@ -2975,6 +3183,15 @@ void MainComponent::restartAllAudioDevices()
                 int ch = eng.getAudioThru()->getSelectedChannel();
                 eng.startThruOutput(typeName, devName, ch, sr, bs);
             }
+        }
+
+        // Restart Audio BPM on all engines (independent from LTC input)
+        if (eng.isAudioBpmRunning())
+        {
+            auto devName = eng.getAudioBpmInput().getCurrentDeviceName();
+            auto typeName = eng.getAudioBpmInput().getCurrentTypeName();
+            int ch = eng.getAudioBpmInput().getSelectedChannel();
+            eng.startAudioBpm(typeName, devName, ch, sr, bs);
         }
     }
     saveSettings();
@@ -3275,7 +3492,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
         // OSC BPM forward
         if (es.oscBpmForward)
-            eng.setOscForward(true, es.oscBpmAddr);
+            eng.setOscForward(true, es.oscBpmAddr, es.oscBpmCmd);
 
         // Mixer fader forward
         if (es.oscMixerForward)
@@ -3287,8 +3504,22 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setArtnetTriggerUniverse(es.artnetTriggerUniverse);
         eng.setArtnetTriggerEnabled(es.artnetTriggerEnabled);
 
-        // Ableton Link
-        eng.getLinkBridge().setEnabled(es.linkEnabled);
+        // Ableton Link (exclusive: only one engine can have it)
+        if (es.linkEnabled)
+        {
+            bool alreadyOwned = false;
+            for (int j = 0; j < i; j++)
+                if (engines[(size_t)j]->getLinkBridge().isEnabled())
+                { alreadyOwned = true; break; }
+            if (!alreadyOwned)
+                eng.getLinkBridge().setEnabled(true);
+        }
+
+        // Audio BPM detection
+        if (es.audioBpmEnabled && !es.audioBpmDevice.isEmpty())
+            eng.startAudioBpm(es.audioBpmType, es.audioBpmDevice, es.audioBpmChannel);
+        eng.getAudioBpmInput().setSmoothing(es.audioBpmSmoothing);
+        eng.getAudioBpmInput().setInputGain((float)es.audioBpmGain / 100.0f);
 
         // Connect OSC if any feature needs it (triggers, OSC BPM forward, or mixer forward)
         if (es.triggerOscEnabled || es.oscBpmForward || es.oscMixerForward)
@@ -3503,6 +3734,7 @@ void MainComponent::flushSettings()
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();
             es.oscBpmAddr       = eng.getOscFwdBpmAddr();
+            es.oscBpmCmd        = eng.getOscFwdBpmCmd();
             es.oscMixerForward  = eng.isOscMixerForwardEnabled();
             es.midiMixerForward = eng.isMidiMixerForwardEnabled();
             es.midiMixerCCChannel   = eng.getMidiMixerCCChannel();
@@ -3546,6 +3778,40 @@ void MainComponent::flushSettings()
                 es.thruOutputStereo = (cmbThruOutputChannel.getSelectedId() == kStereoItemId);
                 es.thruOutputChannel = es.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
                 es.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
+
+                // Audio BPM device/channel
+                es.audioBpmEnabled = eng.isAudioBpmRunning();
+                if (eng.isAudioBpmRunning())
+                {
+                    if (eng.getActiveInput() == SrcType::LTC)
+                    {
+                        // LTC active: read from separate BPM combos
+                        int abSel = cmbAudioBpmDevice.getSelectedId() - 1;
+                        if (abSel >= 0 && abSel < scannedAudioInputs.size())
+                        {
+                            es.audioBpmDevice = scannedAudioInputs[abSel].deviceName;
+                            es.audioBpmType   = scannedAudioInputs[abSel].typeName;
+                        }
+                        es.audioBpmChannel = cmbAudioBpmChannel.getSelectedId() - 2;
+                    }
+                    else
+                    {
+                        // Non-LTC: read from shared AUDIO SETTINGS combos
+                        auto bpmEntry = getSelectedAudioInput();
+                        if (bpmEntry.deviceName.isNotEmpty())
+                        {
+                            es.audioBpmDevice = bpmEntry.deviceName;
+                            es.audioBpmType   = bpmEntry.typeName;
+                        }
+                        es.audioBpmChannel = cmbAudioInputChannel.getSelectedId() - 1;
+                    }
+                }
+                es.audioBpmSmoothing = (float)sldBpmSmoothing.getValue() / 100.0f;
+                // Gain: from separate slider in LTC mode, from shared slider otherwise
+                if (eng.getActiveInput() == SrcType::LTC)
+                    es.audioBpmGain = (int)sldBpmInputGain.getValue();
+                else if (eng.isAudioBpmRunning())
+                    es.audioBpmGain = (int)sldLtcInputGain.getValue();
             }
         }
         else
@@ -3586,6 +3852,7 @@ void MainComponent::flushSettings()
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();
             es.oscBpmAddr       = eng.getOscFwdBpmAddr();
+            es.oscBpmCmd        = eng.getOscFwdBpmCmd();
             es.oscMixerForward  = eng.isOscMixerForwardEnabled();
             es.midiMixerForward = eng.isMidiMixerForwardEnabled();
             es.midiMixerCCChannel   = eng.getMidiMixerCCChannel();
@@ -3594,6 +3861,17 @@ void MainComponent::flushSettings()
             es.artnetMixerUniverse = eng.getArtnetMixerUniverse();
             es.artnetTriggerUniverse = eng.getArtnetTriggerUniverse();
             es.linkEnabled = eng.getLinkBridge().isEnabled();
+
+            // Audio BPM
+            es.audioBpmEnabled = eng.isAudioBpmRunning();
+            if (eng.getAudioBpmInput().getIsRunning())
+            {
+                es.audioBpmDevice = eng.getAudioBpmInput().getCurrentDeviceName();
+                es.audioBpmType   = eng.getAudioBpmInput().getCurrentTypeName();
+                es.audioBpmChannel = eng.getAudioBpmInput().getSelectedChannel();
+            }
+            es.audioBpmSmoothing = eng.getAudioBpmInput().getSmoothing();
+            es.audioBpmGain = (int)(eng.getAudioBpmInput().getInputGain() * 100.0f);
 
             // Pro DJ Link
             es.proDJLinkPlayer = eng.getProDJLinkPlayer();
@@ -3714,7 +3992,13 @@ void MainComponent::populateAudioInputChannels()
     cmbAudioInputChannel.clear(juce::dontSendNotification);
     cmbThruInputChannel.clear(juce::dontSendNotification);
 
-    int n = juce::jmax(2, eng.getLtcInput().getChannelCount());
+    // Channel count: use whichever audio source is active
+    int n = 2;
+    if (eng.getLtcInput().getIsRunning())
+        n = juce::jmax(2, eng.getLtcInput().getChannelCount());
+    else if (eng.isAudioBpmRunning())
+        n = juce::jmax(2, eng.getAudioBpmInput().getChannelCount());
+
     for (int i = 0; i < n; i++)
     {
         auto nm = "Ch " + juce::String(i + 1);
@@ -3753,6 +4037,90 @@ void MainComponent::populateThruOutputChannels()
     if (prev == kStereoItemId && n >= 2) cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
     else if (prev > 0 && prev <= n) cmbThruOutputChannel.setSelectedId(prev, juce::dontSendNotification);
     else cmbThruOutputChannel.setSelectedId(n >= 2 ? kStereoItemId : 1, juce::dontSendNotification);
+}
+
+void MainComponent::populateAudioBpmChannels()
+{
+    int prev = cmbAudioBpmChannel.getSelectedId();
+    cmbAudioBpmChannel.clear(juce::dontSendNotification);
+
+    // Use running device channel count if available, else default 2
+    auto& eng = currentEngine();
+    int numCh = eng.getAudioBpmInput().getIsRunning()
+              ? juce::jmax(2, eng.getAudioBpmInput().getChannelCount())
+              : 2;
+
+    if (numCh >= 2)
+        cmbAudioBpmChannel.addItem("Stereo Mix", 1);  // id 1 -> channel -1
+    for (int i = 0; i < numCh; i++)
+        cmbAudioBpmChannel.addItem("Ch " + juce::String(i + 1), i + 2);  // id 2..N+1 -> channel 0..N-1
+
+    if (prev >= 1 && prev <= cmbAudioBpmChannel.getNumItems())
+        cmbAudioBpmChannel.setSelectedId(prev, juce::dontSendNotification);
+    else
+        cmbAudioBpmChannel.setSelectedId(numCh >= 2 ? 1 : 2, juce::dontSendNotification);
+}
+
+void MainComponent::restartAudioBpm()
+{
+    auto& eng = currentEngine();
+    bool ltcActive = (eng.getActiveInput() == SrcType::LTC);
+
+    juce::String typeName, deviceName;
+    int channel = 0;
+
+    if (ltcActive)
+    {
+        // LTC owns shared AUDIO SETTINGS — read from separate BPM combos
+        int devIdx = cmbAudioBpmDevice.getSelectedId() - 1;
+        if (devIdx < 0 || devIdx >= scannedAudioInputs.size())
+        {
+            eng.stopAudioBpm();
+            return;
+        }
+        typeName   = scannedAudioInputs[devIdx].typeName;
+        deviceName = scannedAudioInputs[devIdx].deviceName;
+        channel = cmbAudioBpmChannel.getSelectedId() - 2;  // id 1->-1(stereo), 2->0, 3->1...
+        if (channel < -1) channel = -1;
+    }
+    else
+    {
+        // Non-LTC — read from shared AUDIO SETTINGS combos
+        auto entry = getSelectedAudioInput();
+        if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
+        { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
+        if (entry.deviceName.isEmpty())
+        {
+            eng.stopAudioBpm();
+            return;
+        }
+        typeName   = entry.typeName;
+        deviceName = entry.deviceName;
+        channel = cmbAudioInputChannel.getSelectedId() - 1;
+        if (channel < 0) channel = 0;
+    }
+
+    double sr = getPreferredSampleRate();
+    int bs = getPreferredBufferSize();
+    eng.startAudioBpm(typeName, deviceName, channel, sr, bs);
+    float gain = ltcActive ? (float)sldBpmInputGain.getValue() / 100.0f
+                           : (float)sldLtcInputGain.getValue() / 100.0f;
+    eng.getAudioBpmInput().setInputGain(gain);
+    if (!ltcActive)
+        populateAudioInputChannels();
+    else
+        populateAudioBpmChannels();
+}
+
+int MainComponent::findLinkOwnerOtherThan(int engineIdx) const
+{
+    for (int i = 0; i < (int)engines.size(); i++)
+    {
+        if (i == engineIdx) continue;
+        if (engines[(size_t)i]->getLinkBridge().isEnabled())
+            return i;
+    }
+    return -1;
 }
 
 int MainComponent::getChannelFromCombo(const juce::ComboBox& cmb) const
@@ -3803,10 +4171,36 @@ void MainComponent::updateDeviceSelectorVisibility()
     btnBpmX4.setVisible(showProDJLinkIn);
     btnBpmD2.setVisible(showProDJLinkIn);
     btnBpmD4.setVisible(showProDJLinkIn);
-    btnMidiClock.setVisible(showProDJLinkIn);
-    btnOscFwdBpm.setVisible(showProDJLinkIn);
-    edOscFwdBpmAddr.setVisible(showProDJLinkIn && btnOscFwdBpm.getToggleState());
-    lblOscFwdBpmAddr.setVisible(showProDJLinkIn && btnOscFwdBpm.getToggleState());
+
+    // Audio BPM: available for non-DJ sources (MTC, LTC, ArtNet, SystemTime)
+    // For SystemTime there is no collapse button, so show unconditionally.
+    bool isNonDjSource = (input != SrcType::ProDJLink && input != SrcType::StageLinQ);
+    bool showAudioBpmToggle = isNonDjSource
+        && (input == SrcType::SystemTime || inputConfigExpanded);
+    bool showAudioBpmActive = showAudioBpmToggle && btnAudioBpm.getToggleState();
+    btnAudioBpm.setVisible(showAudioBpmToggle);
+    lblBpmValue.setVisible(showAudioBpmActive);
+    ledBeat.setVisible(showAudioBpmActive);
+    sldBpmSmoothing.setVisible(showAudioBpmActive);  lblBpmSmoothing.setVisible(showAudioBpmActive);
+
+    // When LTC is active, Audio BPM uses its OWN separate device/channel combos
+    // (the shared AUDIO SETTINGS section belongs to LTC).
+    // When NOT LTC, Audio BPM shares the AUDIO SETTINGS section.
+    bool bpmUsesSeparateAudio = showAudioBpmActive && showLtcIn;
+    bool bpmUsesSharedAudio   = showAudioBpmActive && !showLtcIn;
+    cmbAudioBpmDevice.setVisible(bpmUsesSeparateAudio);  lblAudioBpmDevice.setVisible(bpmUsesSeparateAudio);
+    cmbAudioBpmChannel.setVisible(bpmUsesSeparateAudio); lblAudioBpmChannel.setVisible(bpmUsesSeparateAudio);
+    sldBpmInputGain.setVisible(bpmUsesSeparateAudio);    lblBpmInputGain.setVisible(bpmUsesSeparateAudio);
+    mtrAudioBpm.setVisible(bpmUsesSeparateAudio);
+
+    // BPM output controls: visible for DJ sources OR when audio BPM is active
+    bool showBpmOutputs = showProDJLinkIn || showAudioBpmActive;
+    btnMidiClock.setVisible(showBpmOutputs);
+    btnOscFwdBpm.setVisible(showBpmOutputs);
+    edOscFwdBpmAddr.setVisible(showBpmOutputs && btnOscFwdBpm.getToggleState());
+    lblOscFwdBpmAddr.setVisible(showBpmOutputs && btnOscFwdBpm.getToggleState());
+    edOscFwdBpmCmd.setVisible(showBpmOutputs && btnOscFwdBpm.getToggleState());
+    lblOscFwdBpmCmd.setVisible(showBpmOutputs && btnOscFwdBpm.getToggleState());
     btnOscMixerFwd.setVisible(showProDJLinkIn);
     btnMidiMixerFwd.setVisible(showProDJLinkIn);
     {
@@ -3824,13 +4218,15 @@ void MainComponent::updateDeviceSelectorVisibility()
         cmbArtMixUni.setVisible(showArtMix);
         lblArtMixAddr.setVisible(showArtMix);
     }
-    btnLink.setVisible(showProDJLinkIn);
-    lblLinkStatus.setVisible(showProDJLinkIn && btnLink.getToggleState());
+    btnLink.setVisible(showBpmOutputs);
+    bool linkOwnedElsewhere = findLinkOwnerOtherThan(selectedEngine) >= 0;
+    lblLinkStatus.setVisible(showBpmOutputs && (btnLink.getToggleState() || linkOwnedElsewhere));
 
     btnTriggerMidi.setVisible(showProDJLinkIn);
     cmbTriggerMidiDevice.setVisible(showProDJLinkIn
         && (btnTriggerMidi.getToggleState() || btnMidiClock.getToggleState()
-            || btnMidiMixerFwd.getToggleState()));
+            || btnMidiMixerFwd.getToggleState())
+        || (showAudioBpmActive && btnMidiClock.getToggleState()));
     btnTriggerOsc.setVisible(showProDJLinkIn);
     btnArtnetTrigger.setVisible(showProDJLinkIn);
     {
@@ -3846,12 +4242,12 @@ void MainComponent::updateDeviceSelectorVisibility()
         cmbArtnetDmxInterface.setVisible(showArtDmxIface);
         lblArtnetDmxInterface.setVisible(showArtDmxIface);
     }
-    edOscIp.setVisible(showProDJLinkIn
-        && (btnTriggerOsc.getToggleState() || btnOscFwdBpm.getToggleState()
-            || btnOscMixerFwd.getToggleState()));
-    edOscPort.setVisible(showProDJLinkIn
-        && (btnTriggerOsc.getToggleState() || btnOscFwdBpm.getToggleState()
-            || btnOscMixerFwd.getToggleState()));
+    bool showOscConfig = (showProDJLinkIn || showAudioBpmActive)
+        && (btnOscFwdBpm.getToggleState() || btnOscMixerFwd.getToggleState());
+    bool showOscConfigFull = showOscConfig
+        || (showProDJLinkIn && btnTriggerOsc.getToggleState());
+    edOscIp.setVisible(showOscConfigFull);
+    edOscPort.setVisible(showOscConfigFull);
 
     // Pro DJ Link / StageLinQ -- separate interface combos
     bool showPdlIface = showProDJLinkIn && input == SrcType::ProDJLink;
@@ -3890,13 +4286,26 @@ void MainComponent::updateDeviceSelectorVisibility()
     artworkDisplay.setVisible(showProDJLinkIn);
     waveformDisplay.setVisible(showProDJLinkIn);
 
-    cmbAudioInputTypeFilter.setVisible(showLtcIn);    lblAudioInputTypeFilter.setVisible(showLtcIn);
-    cmbSampleRate.setVisible(showLtcIn);              lblSampleRate.setVisible(showLtcIn);
-    cmbBufferSize.setVisible(showLtcIn);              lblBufferSize.setVisible(showLtcIn);
-    cmbAudioInputDevice.setVisible(showLtcIn);        lblAudioInputDevice.setVisible(showLtcIn);
-    cmbAudioInputChannel.setVisible(showLtcIn);       lblAudioInputChannel.setVisible(showLtcIn);
-    sldLtcInputGain.setVisible(showLtcIn);            lblLtcInputGain.setVisible(showLtcIn);
-    mtrLtcInput.setVisible(showLtcIn);
+    bool showAudioInput = showLtcIn || bpmUsesSharedAudio;
+    cmbAudioInputTypeFilter.setVisible(showAudioInput);  lblAudioInputTypeFilter.setVisible(showAudioInput);
+    cmbSampleRate.setVisible(showAudioInput);             lblSampleRate.setVisible(showAudioInput);
+    cmbBufferSize.setVisible(showAudioInput);             lblBufferSize.setVisible(showAudioInput);
+    cmbAudioInputDevice.setVisible(showAudioInput);       lblAudioInputDevice.setVisible(showAudioInput);
+    cmbAudioInputChannel.setVisible(showAudioInput);      lblAudioInputChannel.setVisible(showAudioInput);
+    sldLtcInputGain.setVisible(showAudioInput);           lblLtcInputGain.setVisible(showAudioInput);
+    mtrLtcInput.setVisible(showAudioInput);
+
+    // Dynamic labels: adapt to LTC vs Audio BPM context
+    if (bpmUsesSharedAudio)
+    {
+        lblAudioInputChannel.setText("BPM CHANNEL:", juce::dontSendNotification);
+        lblLtcInputGain.setText("BPM INPUT GAIN:", juce::dontSendNotification);
+    }
+    else
+    {
+        lblAudioInputChannel.setText("LTC CHANNEL:", juce::dontSendNotification);
+        lblLtcInputGain.setText("LTC INPUT GAIN:", juce::dontSendNotification);
+    }
 
     bool showThruInput = showLtcIn && eng.isPrimary() && eng.isOutputThruEnabled();
     cmbThruInputChannel.setVisible(showThruInput);  lblThruInputChannel.setVisible(showThruInput);
@@ -4414,149 +4823,47 @@ void MainComponent::resized()
             btnTrackMap.setBounds(leftPanel.removeFromTop(22));
             leftPanel.removeFromTop(3);
         }
+    }
 
-        // --- MIDI section ---
-        if (cmbTriggerMidiDevice.isVisible() || btnMidiClock.isVisible() || btnTriggerMidi.isVisible())
+    // === Feature sections (shared: work for ProDJLink AND Audio BPM) ===
+
+    // --- Audio BPM toggle (non-DJ sources only) ---
+    bool bpmDriven = btnAudioBpm.getToggleState() && eng.getActiveInput() != SrcType::LTC;
+    bool bpmInline = btnAudioBpm.isVisible() && btnAudioBpm.getToggleState();  // BPM outputs go inline
+
+    if (btnAudioBpm.isVisible())
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "AUDIO BPM");
+        leftPanel.removeFromTop(16);
+        btnAudioBpm.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+
+        // BPM value display + beat LED (same row)
+        if (lblBpmValue.isVisible())
         {
-            leftContent.addSectionSeparator(leftPanel.getY(), "MIDI");
-            leftPanel.removeFromTop(16);
-        }
-        if (btnMidiClock.isVisible())
-        {
-            btnMidiClock.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-        }
-        if (btnMidiMixerFwd.isVisible())
-        {
-            btnMidiMixerFwd.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-            if (cmbMidiMixCCCh.isVisible())
-            {
-                auto chRow = leftPanel.removeFromTop(22);
-                int halfW = (chRow.getWidth() - 4) / 2;
-                lblMidiMixCCCh.setBounds(chRow.removeFromLeft(42));
-                cmbMidiMixCCCh.setBounds(chRow.removeFromLeft(halfW - 42));
-                chRow.removeFromLeft(4);
-                lblMidiMixNoteCh.setBounds(chRow.removeFromLeft(52));
-                cmbMidiMixNoteCh.setBounds(chRow);
-                leftPanel.removeFromTop(3);
-            }
-        }
-        if (btnTriggerMidi.isVisible())
-        {
-            btnTriggerMidi.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-        }
-        if (cmbTriggerMidiDevice.isVisible())
-        {
-            cmbTriggerMidiDevice.setBounds(leftPanel.removeFromTop(22));
+            auto bpmRow = leftPanel.removeFromTop(24);
+            ledBeat.setBounds(bpmRow.removeFromLeft(20).reduced(2));
+            bpmRow.removeFromLeft(2);
+            lblBpmValue.setBounds(bpmRow);
             leftPanel.removeFromTop(3);
         }
 
-        // --- OSC section ---
-        if (btnOscFwdBpm.isVisible() || btnTriggerOsc.isVisible())
+        if (sldBpmSmoothing.isVisible())
+            laySlider(lblBpmSmoothing, sldBpmSmoothing, leftPanel);
+        // When LTC is the source, Audio BPM has its own separate device/channel controls
+        if (cmbAudioBpmDevice.isVisible())
         {
-            leftContent.addSectionSeparator(leftPanel.getY(), "OSC");
-            leftPanel.removeFromTop(16);
-        }
-        if (btnOscFwdBpm.isVisible())
-        {
-            btnOscFwdBpm.setBounds(leftPanel.removeFromTop(22));
-            if (edOscFwdBpmAddr.isVisible())
-            {
-                leftPanel.removeFromTop(2);
-                auto bpmRow = leftPanel.removeFromTop(22);
-                lblOscFwdBpmAddr.setBounds(bpmRow.removeFromLeft(40));
-                bpmRow.removeFromLeft(2);
-                edOscFwdBpmAddr.setBounds(bpmRow);
-            }
-            leftPanel.removeFromTop(3);
-        }
-        if (btnOscMixerFwd.isVisible())
-        {
-            btnOscMixerFwd.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-        }
-        if (btnTriggerOsc.isVisible())
-        {
-            btnTriggerOsc.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-        }
-        if (edOscIp.isVisible())
-        {
-            auto oscConfRow = leftPanel.removeFromTop(22);
-            edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
-            oscConfRow.removeFromLeft(4);
-            edOscPort.setBounds(oscConfRow);
-            leftPanel.removeFromTop(3);
-        }
-
-        // --- ART-NET DMX section ---
-        if (btnArtnetMixerFwd.isVisible() || btnArtnetTrigger.isVisible())
-        {
-            leftContent.addSectionSeparator(leftPanel.getY(), "ART-NET DMX");
-            leftPanel.removeFromTop(16);
-        }
-        if (btnArtnetMixerFwd.isVisible())
-        {
-            btnArtnetMixerFwd.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-            if (cmbArtMixNet.isVisible())
-            {
-                auto addrRow = leftPanel.removeFromTop(22);
-                lblArtMixAddr.setBounds(addrRow.removeFromLeft(48));
-                addrRow.removeFromLeft(2);
-                int cmbW = (addrRow.getWidth() - 4) / 3;
-                cmbArtMixNet.setBounds(addrRow.removeFromLeft(cmbW));
-                addrRow.removeFromLeft(2);
-                cmbArtMixSub.setBounds(addrRow.removeFromLeft(cmbW));
-                addrRow.removeFromLeft(2);
-                cmbArtMixUni.setBounds(addrRow);
-                leftPanel.removeFromTop(3);
-            }
-        }
-        if (btnArtnetTrigger.isVisible())
-        {
-            btnArtnetTrigger.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
-            if (cmbArtTrigNet.isVisible())
-            {
-                auto addrRow = leftPanel.removeFromTop(22);
-                lblArtTrigAddr.setBounds(addrRow.removeFromLeft(48));
-                addrRow.removeFromLeft(2);
-                int cmbW = (addrRow.getWidth() - 4) / 3;
-                cmbArtTrigNet.setBounds(addrRow.removeFromLeft(cmbW));
-                addrRow.removeFromLeft(2);
-                cmbArtTrigSub.setBounds(addrRow.removeFromLeft(cmbW));
-                addrRow.removeFromLeft(2);
-                cmbArtTrigUni.setBounds(addrRow);
-                leftPanel.removeFromTop(3);
-            }
-        }
-        if (cmbArtnetDmxInterface.isVisible())
-            layCombo(lblArtnetDmxInterface, cmbArtnetDmxInterface, leftPanel);
-
-        // --- Ableton Link ---
-        if (btnLink.isVisible())
-        {
-            leftContent.addSectionSeparator(leftPanel.getY(), "ABLETON LINK");
-            leftPanel.removeFromTop(16);
-            btnLink.setBounds(leftPanel.removeFromTop(22));
-            if (lblLinkStatus.isVisible())
-            {
-                leftPanel.removeFromTop(2);
-                lblLinkStatus.setBounds(leftPanel.removeFromTop(13));
-            }
-            leftPanel.removeFromTop(3);
+            layCombo(lblAudioBpmDevice, cmbAudioBpmDevice, leftPanel);
+            layCombo(lblAudioBpmChannel, cmbAudioBpmChannel, leftPanel);
+            if (sldBpmInputGain.isVisible())
+                laySlider(lblBpmInputGain, sldBpmInputGain, leftPanel);
+            if (mtrAudioBpm.isVisible()) layMeter(mtrAudioBpm, leftPanel);
         }
     }
 
-    if (cmbAudioInputDevice.isVisible())
+    // Shared audio device layout block (used by both LTC and Audio BPM)
+    auto layAudioInputSettings = [&]()
     {
-        // Section separator before audio settings
-        leftContent.addSectionSeparator(leftPanel.getY(), "AUDIO SETTINGS");
-        leftPanel.removeFromTop(16);
-
         layCombo(lblAudioInputTypeFilter, cmbAudioInputTypeFilter, leftPanel);
         if (cmbSampleRate.isVisible())
         {
@@ -4578,6 +4885,213 @@ void MainComponent::resized()
             laySlider(lblThruInputGain, sldThruInputGain, leftPanel);
             if (mtrThruInput.isVisible()) layMeter(mtrThruInput, leftPanel);
         }
+    };
+
+    // When Audio BPM is active (non-LTC), audio settings go right here after the toggle
+    if (bpmDriven && cmbAudioInputDevice.isVisible())
+        layAudioInputSettings();
+
+    // BPM output toggles inline (MIDI Clock, OSC Tempo, Link) — after audio settings
+    if (bpmInline)
+    {
+        if (btnMidiClock.isVisible())
+        {
+            btnMidiClock.setBounds(leftPanel.removeFromTop(22));
+            leftPanel.removeFromTop(3);
+        }
+        if (btnOscFwdBpm.isVisible())
+        {
+            btnOscFwdBpm.setBounds(leftPanel.removeFromTop(22));
+            if (edOscFwdBpmAddr.isVisible())
+            {
+                leftPanel.removeFromTop(2);
+                auto bpmAddrRow = leftPanel.removeFromTop(22);
+                lblOscFwdBpmAddr.setBounds(bpmAddrRow.removeFromLeft(40));
+                bpmAddrRow.removeFromLeft(2);
+                edOscFwdBpmAddr.setBounds(bpmAddrRow);
+
+                leftPanel.removeFromTop(2);
+                auto cmdRow = leftPanel.removeFromTop(22);
+                lblOscFwdBpmCmd.setBounds(cmdRow.removeFromLeft(40));
+                cmdRow.removeFromLeft(2);
+                edOscFwdBpmCmd.setBounds(cmdRow);
+            }
+            if (edOscIp.isVisible())
+            {
+                leftPanel.removeFromTop(2);
+                auto oscConfRow = leftPanel.removeFromTop(22);
+                edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
+                oscConfRow.removeFromLeft(4);
+                edOscPort.setBounds(oscConfRow);
+            }
+            leftPanel.removeFromTop(3);
+        }
+        if (btnLink.isVisible())
+        {
+            btnLink.setBounds(leftPanel.removeFromTop(22));
+            if (lblLinkStatus.isVisible())
+            {
+                leftPanel.removeFromTop(2);
+                lblLinkStatus.setBounds(leftPanel.removeFromTop(13));
+            }
+            leftPanel.removeFromTop(3);
+        }
+    }
+
+    // --- MIDI section (skip BPM-only toggles already placed inline) ---
+    bool hasMidiSection = (!bpmInline && btnMidiClock.isVisible())
+                       || btnMidiMixerFwd.isVisible()
+                       || btnTriggerMidi.isVisible()
+                       || cmbTriggerMidiDevice.isVisible();
+    if (hasMidiSection)
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "MIDI");
+        leftPanel.removeFromTop(16);
+    }
+    if (!bpmInline && btnMidiClock.isVisible())
+    {
+        btnMidiClock.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+    if (btnMidiMixerFwd.isVisible())
+    {
+        btnMidiMixerFwd.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+        if (cmbMidiMixCCCh.isVisible())
+        {
+            auto chRow = leftPanel.removeFromTop(22);
+            int halfW = (chRow.getWidth() - 4) / 2;
+            lblMidiMixCCCh.setBounds(chRow.removeFromLeft(42));
+            cmbMidiMixCCCh.setBounds(chRow.removeFromLeft(halfW - 42));
+            chRow.removeFromLeft(4);
+            lblMidiMixNoteCh.setBounds(chRow.removeFromLeft(52));
+            cmbMidiMixNoteCh.setBounds(chRow);
+            leftPanel.removeFromTop(3);
+        }
+    }
+    if (btnTriggerMidi.isVisible())
+    {
+        btnTriggerMidi.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+    if (cmbTriggerMidiDevice.isVisible())
+    {
+        cmbTriggerMidiDevice.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+
+    // --- OSC section (skip BPM toggle already placed inline) ---
+    bool hasOscSection = (!bpmInline && btnOscFwdBpm.isVisible())
+                      || btnOscMixerFwd.isVisible()
+                      || btnTriggerOsc.isVisible();
+    if (hasOscSection)
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "OSC");
+        leftPanel.removeFromTop(16);
+    }
+    if (!bpmInline && btnOscFwdBpm.isVisible())
+    {
+        btnOscFwdBpm.setBounds(leftPanel.removeFromTop(22));
+        if (edOscFwdBpmAddr.isVisible())
+        {
+            leftPanel.removeFromTop(2);
+            auto bpmRow = leftPanel.removeFromTop(22);
+            lblOscFwdBpmAddr.setBounds(bpmRow.removeFromLeft(40));
+            bpmRow.removeFromLeft(2);
+            edOscFwdBpmAddr.setBounds(bpmRow);
+
+            leftPanel.removeFromTop(2);
+            auto cmdRow = leftPanel.removeFromTop(22);
+            lblOscFwdBpmCmd.setBounds(cmdRow.removeFromLeft(40));
+            cmdRow.removeFromLeft(2);
+            edOscFwdBpmCmd.setBounds(cmdRow);
+        }
+        leftPanel.removeFromTop(3);
+    }
+    if (btnOscMixerFwd.isVisible())
+    {
+        btnOscMixerFwd.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+    if (btnTriggerOsc.isVisible())
+    {
+        btnTriggerOsc.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+    }
+    if (!bpmInline && edOscIp.isVisible())
+    {
+        auto oscConfRow = leftPanel.removeFromTop(22);
+        edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
+        oscConfRow.removeFromLeft(4);
+        edOscPort.setBounds(oscConfRow);
+        leftPanel.removeFromTop(3);
+    }
+
+    // --- ART-NET DMX section ---
+    if (btnArtnetMixerFwd.isVisible() || btnArtnetTrigger.isVisible())
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "ART-NET DMX");
+        leftPanel.removeFromTop(16);
+    }
+    if (btnArtnetMixerFwd.isVisible())
+    {
+        btnArtnetMixerFwd.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+        if (cmbArtMixNet.isVisible())
+        {
+            auto addrRow = leftPanel.removeFromTop(22);
+            lblArtMixAddr.setBounds(addrRow.removeFromLeft(48));
+            addrRow.removeFromLeft(2);
+            int cmbW = (addrRow.getWidth() - 4) / 3;
+            cmbArtMixNet.setBounds(addrRow.removeFromLeft(cmbW));
+            addrRow.removeFromLeft(2);
+            cmbArtMixSub.setBounds(addrRow.removeFromLeft(cmbW));
+            addrRow.removeFromLeft(2);
+            cmbArtMixUni.setBounds(addrRow);
+            leftPanel.removeFromTop(3);
+        }
+    }
+    if (btnArtnetTrigger.isVisible())
+    {
+        btnArtnetTrigger.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
+        if (cmbArtTrigNet.isVisible())
+        {
+            auto addrRow = leftPanel.removeFromTop(22);
+            lblArtTrigAddr.setBounds(addrRow.removeFromLeft(48));
+            addrRow.removeFromLeft(2);
+            int cmbW = (addrRow.getWidth() - 4) / 3;
+            cmbArtTrigNet.setBounds(addrRow.removeFromLeft(cmbW));
+            addrRow.removeFromLeft(2);
+            cmbArtTrigSub.setBounds(addrRow.removeFromLeft(cmbW));
+            addrRow.removeFromLeft(2);
+            cmbArtTrigUni.setBounds(addrRow);
+            leftPanel.removeFromTop(3);
+        }
+    }
+    if (cmbArtnetDmxInterface.isVisible())
+        layCombo(lblArtnetDmxInterface, cmbArtnetDmxInterface, leftPanel);
+
+    // --- Ableton Link (skip when already placed inline in Audio BPM section) ---
+    if (!bpmInline && btnLink.isVisible())
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "ABLETON LINK");
+        leftPanel.removeFromTop(16);
+        btnLink.setBounds(leftPanel.removeFromTop(22));
+        if (lblLinkStatus.isVisible())
+        {
+            leftPanel.removeFromTop(2);
+            lblLinkStatus.setBounds(leftPanel.removeFromTop(13));
+        }
+        leftPanel.removeFromTop(3);
+    }
+
+    // AUDIO SETTINGS: only rendered here for LTC (Audio BPM renders it inline above)
+    if (!bpmDriven && cmbAudioInputDevice.isVisible())
+    {
+        leftContent.addSectionSeparator(leftPanel.getY(), "AUDIO SETTINGS");
+        leftPanel.removeFromTop(16);
+        layAudioInputSettings();
     }
 
     lblInputStatus.setBounds(leftPanel.removeFromTop(14));
@@ -5287,9 +5801,20 @@ void MainComponent::timerCallback()
         lblLinkStatus.setColour(juce::Label::textColourId,
             peers > 0 ? juce::Colour(0xFF00D084) : juce::Colour(0xFFFF9800));
     }
-    else
+    else if (lblLinkStatus.isVisible())
     {
-        lblLinkStatus.setText("", juce::dontSendNotification);
+        // Show which engine owns Link (if any)
+        int owner = findLinkOwnerOtherThan(selectedEngine);
+        if (owner >= 0)
+        {
+            lblLinkStatus.setText("Active on " + engines[(size_t)owner]->getName(),
+                                 juce::dontSendNotification);
+            lblLinkStatus.setColour(juce::Label::textColourId, juce::Colour(0xFF888888));
+        }
+        else
+        {
+            lblLinkStatus.setText("", juce::dontSendNotification);
+        }
     }
 
     // Update TrackMap editor window if open
@@ -5317,7 +5842,65 @@ void MainComponent::timerCallback()
     timecodeDisplay.setOutputFrameRate(eng.getEffectiveOutputFps());
 
     // Update VU meters for selected engine
-    mtrLtcInput.setLevel(eng.getSmoothedLtcInLevel());
+    if (eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC)
+        mtrLtcInput.setLevel(eng.getAudioBpmPeakLevel());
+    else
+        mtrLtcInput.setLevel(eng.getSmoothedLtcInLevel());
+    // Separate Audio BPM meter (visible when LTC owns shared meter)
+    if (mtrAudioBpm.isVisible())
+        mtrAudioBpm.setLevel(eng.getAudioBpmPeakLevel());
+
+    // Audio BPM value display + beat LED
+    if (lblBpmValue.isVisible())
+    {
+        double bpm = eng.getAudioBpm();
+        double conf = eng.getAudioBpmConfidence();
+        if (bpm > 0.0 && conf > 0.15)
+        {
+            lblBpmValue.setText(juce::String(bpm, 1) + " BPM", juce::dontSendNotification);
+            // Color: dim orange at low confidence → bright orange → green at high confidence
+            juce::Colour bpmCol;
+            if (conf > 0.6)
+                bpmCol = juce::Colour(0xFF00DD77);  // green = locked
+            else if (conf > 0.3)
+                bpmCol = juce::Colour(0xFFFF9900);  // orange = tracking
+            else
+                bpmCol = juce::Colour(0xFFCC6600);  // dim orange = uncertain
+            lblBpmValue.setColour(juce::Label::textColourId, bpmCol);
+        }
+        else
+        {
+            lblBpmValue.setText("--- BPM", juce::dontSendNotification);
+            lblBpmValue.setColour(juce::Label::textColourId, juce::Colour(0xFF555555));
+        }
+    }
+    if (ledBeat.isVisible())
+    {
+        double bpm = eng.getAudioBpm();
+        if (bpm > 20.0 && eng.isAudioBpmRunning())
+        {
+            double intervalMs = 60000.0 / bpm;
+            beatFlashAccumMs += 1000.0 / 60.0;  // ~16.67ms per tick at 60Hz timer
+            if (beatFlashAccumMs >= intervalMs)
+            {
+                beatFlashAccumMs -= intervalMs;
+                // Prevent runaway if BPM changed drastically
+                if (beatFlashAccumMs > intervalMs)
+                    beatFlashAccumMs = 0.0;
+                ledBeat.flash();
+            }
+            else
+            {
+                ledBeat.decay(0.15f);
+            }
+        }
+        else
+        {
+            beatFlashAccumMs = 0.0;
+            ledBeat.decay(0.15f);
+        }
+    }
+
     mtrThruInput.setLevel(eng.getSmoothedThruInLevel());
     mtrLtcOutput.setLevel(eng.getSmoothedLtcOutLevel());
     mtrThruOutput.setLevel(eng.getSmoothedThruOutLevel());
@@ -5455,7 +6038,7 @@ void MainComponent::updateBpmMultButtonStates()
     // Get TrackMap value directly for secondary indicator
     auto trackInfo = eng.getActiveTrackInfo();
     int map = 0;
-    if (trackInfo.artist.isNotEmpty() && trackInfo.title.isNotEmpty())
+    if (trackInfo.title.isNotEmpty())
     {
         auto* entry = settings.trackMap.find(trackInfo.artist, trackInfo.title,
                                               trackInfo.durationSec);
@@ -5502,7 +6085,7 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
 {
     auto& eng = currentEngine();
     auto info = eng.getActiveTrackInfo();
-    if (info.artist.isEmpty() || info.title.isEmpty()) return;
+    if (info.title.isEmpty()) return;
 
     auto* entry = settings.trackMap.find(info.artist, info.title, info.durationSec);
     int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;

@@ -237,7 +237,7 @@ private:
             ds.trackMapped = false;
             ds.offset = "00:00:00:00";
             ds.offsetTimecode = {};
-            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+            if (ds.title.isNotEmpty())
             {
                 tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
                 if (tmEntry != nullptr)

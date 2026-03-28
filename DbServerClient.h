@@ -2313,7 +2313,7 @@ private:
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
                     if (it != metadataCache.end()
-                        && it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                        && it->second.title.isNotEmpty())
                         diskKey = TrackMapEntry::makeKey(
                             it->second.artist, it->second.title, it->second.durationSeconds);
                 }
@@ -2456,7 +2456,7 @@ private:
                     {
                         hasNewData = (it->second.hasBeatGrid() || it->second.hasCueList()
                                       || it->second.hasSongStructure() || it->second.hasDetailWaveform());
-                        if (hasNewData && it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                        if (hasNewData && it->second.title.isNotEmpty())
                             saveDiskKey = TrackMapEntry::makeKey(
                                 it->second.artist, it->second.title, it->second.durationSeconds);
                     }
@@ -2486,7 +2486,7 @@ private:
                         anlzPath = it->second.anlzPath;
                         trackIdForNfs = req.trackId;
 
-                        if (it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                        if (it->second.title.isNotEmpty())
                             diskCacheKey = TrackMapEntry::makeKey(
                                 it->second.artist, it->second.title,
                                 it->second.durationSeconds);
@@ -2590,7 +2590,7 @@ private:
                 anlzPath = it->second.anlzPath;
                 it->second.nfsAttempted = true;
 
-                if (it->second.artist.isNotEmpty() && it->second.title.isNotEmpty())
+                if (it->second.title.isNotEmpty())
                     diskCacheKey = TrackMapEntry::makeKey(
                         it->second.artist, it->second.title,
                         it->second.durationSeconds);

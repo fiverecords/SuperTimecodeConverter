@@ -304,7 +304,7 @@ public:
     //--------------------------------------------------------------------------
     void saveBpmToTrackMap(int playerNum, DeckState& ds, int clickedMult)
     {
-        if (ds.artist.isEmpty() || ds.title.isEmpty()) return;
+        if (ds.title.isEmpty()) return;
 
         int dur = (int)ds.trackLenSec;
         auto* entry = trackMap.find(ds.artist, ds.title, dur);
@@ -459,7 +459,7 @@ public:
             ds.trackMapped = false;
             ds.offset = "00:00:00:00";
             ds.offsetTimecode = {};
-            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
+            if (ds.title.isNotEmpty()
                 && !ds.title.startsWith("Track #"))
             {
                 tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
@@ -591,7 +591,7 @@ public:
                                 repaint(deckBounds[pn - 1]);
 
                             // Save waveform + artwork to disk cache for future sessions
-                            if (meta.artist.isNotEmpty() && meta.title.isNotEmpty())
+                            if (meta.title.isNotEmpty())
                             {
                                 auto diskKey = TrackMapEntry::makeKey(
                                     meta.artist, meta.title, meta.durationSeconds);
@@ -605,7 +605,7 @@ public:
                             }
                         }
                         else if (!meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId
-                                 && ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+                                 && ds.title.isNotEmpty())
                         {
                             // Dbserver hasn't returned waveform yet -- try disk cache
                             // Use meta.durationSeconds (same source as save path),
@@ -731,7 +731,7 @@ public:
                             repaint(deckBounds[pn - 1]);
 
                         // Save to disk for future sessions
-                        if (ds.artist.isNotEmpty() && ds.title.isNotEmpty())
+                        if (ds.title.isNotEmpty())
                         {
                             auto diskKey = TrackMapEntry::makeKey(
                                 ds.artist, ds.title, (int)ds.trackLenSec);
@@ -742,8 +742,7 @@ public:
                 }
 
                 // Artwork fallback from disk cache
-                if (!ds.cachedArtworkImg.isValid() && ds.artist.isNotEmpty()
-                    && ds.title.isNotEmpty())
+                if (!ds.cachedArtworkImg.isValid() && ds.title.isNotEmpty())
                 {
                     auto diskKey = TrackMapEntry::makeKey(
                         ds.artist, ds.title, (int)ds.trackLenSec);
@@ -958,7 +957,7 @@ public:
                             // hot cues, but only if the entry exists and has NO
                             // manually-configured cue points.
                             // Blocked during Show Lock -- TrackMap is configuration.
-                            if (ds.artist.isNotEmpty() && ds.title.isNotEmpty()
+                            if (ds.title.isNotEmpty()
                                 && (!isShowLockedFn || !isShowLockedFn()))
                             {
                                 int dur = (int)ds.trackLenSec;
@@ -1377,17 +1376,44 @@ private:
         if (inner.getWidth() < 30 || inner.getHeight() < 30) return;
         int deckH = inner.getHeight();
 
-        // --- Proportional layout ---
-        // Fixed chrome: header(22) + gaps(~20) + map(16) + engine(16) + bpmRow(18) = ~92px
-        // Flexible: infoRow, preview waveform, detail waveform, timecode
-        constexpr int kFixedChrome = 92;
-        int flexH = juce::jmax(0, deckH - kFixedChrome);
+        // --- Priority-based layout ---
+        // Bottom chrome (map + engine + bpm mult): hidden progressively on tiny decks.
+        // Info section uses fixed line heights (not proportional).
+        // Waveforms get whatever space remains -- detail waveform hides first when tight.
+        constexpr int kInfoLineH = 14;
+        bool showMapRow  = deckH > 120;
+        bool showEngRow  = deckH > 140;
+        bool showBpmMult = deckH > 160;
+        int bottomChrome = (showMapRow ? 18 : 0) + (showEngRow ? 18 : 0) + (showBpmMult ? 18 : 0);
 
-        // Distribute flexible space: info 28%, preview 18%, detail 34%, timecode 20%
-        int infoH   = juce::jmax(50, (int)(flexH * 0.28f));
-        int wfH     = juce::jmax(24, (int)(flexH * 0.18f));
-        int detH    = juce::jmax(30, (int)(flexH * 0.34f));
-        int tcH     = juce::jmax(20, (int)(flexH * 0.20f));
+        // Info section: 5 base rows (title, artist, bpm/key, pitch, playState)
+        // + beat indicator and track time when there's enough room
+        int infoBaseH = 5 * kInfoLineH + 2;  // +2 for title extra height
+        int available = deckH - 22 - 4 - bottomChrome;  // 22=header, 4=gap
+
+        // Add optional rows if enough vertical space exists
+        int infoExtra = 0;
+        if (available - infoBaseH > 130) infoExtra = 2 * kInfoLineH;  // beat + time
+        else if (available - infoBaseH > 110) infoExtra = kInfoLineH;  // time only
+        int infoH = juce::jmax(42, infoBaseH + infoExtra);
+
+        // Waveform space: what remains after info + gaps around wf sections
+        int wfSpace = juce::jmax(0, available - infoH - 14);  // 14px for gaps
+        bool showDetail = wfSpace > 80;
+
+        int wfH, detH, tcH;
+        if (showDetail)
+        {
+            wfH  = juce::jmax(20, (int)(wfSpace * 0.27f));
+            detH = juce::jmax(24, (int)(wfSpace * 0.48f));
+            tcH  = juce::jmax(18, wfSpace - wfH - detH - 6);
+        }
+        else
+        {
+            wfH  = juce::jmax(20, (int)(wfSpace * 0.55f));
+            detH = 0;
+            tcH  = juce::jmax(18, wfSpace - wfH - 4);
+        }
 
         //----------------------------------------------------------------------
         // Header bar: Player number + model + status badges
@@ -1500,7 +1526,7 @@ private:
             float titleFs   = juce::jlimit(10.0f, 16.0f, infoH * 0.18f);
             float artistFs  = juce::jlimit(9.0f,  14.0f, infoH * 0.15f);
             float detailFs  = juce::jlimit(8.0f,  12.0f, infoH * 0.13f);
-            int   lineH     = juce::jmax(12, infoH / 6);
+            int   lineH     = kInfoLineH;
 
             // Title (bold, brighter)
             auto titleRow = infoArea.removeFromTop(lineH + 2);
@@ -1632,16 +1658,22 @@ private:
         g.setColour(juce::Colour(0xFF0D1117));
         g.fillRoundedRectangle(wfBounds.toFloat(), 3.0f);
 
-        inner.removeFromTop(2);
-
         //----------------------------------------------------------------------
         // Detail waveform area -- painted LIVE in paintDeck(), same as preview.
-        // Reserve space and fill background.
+        // Reserve space and fill background.  Hidden when deck is too small.
         //----------------------------------------------------------------------
-        auto detBounds = inner.removeFromTop(detH);
-        ds.detailLocalBounds = detBounds;
-        g.setColour(juce::Colour(0xFF0A0E14));
-        g.fillRoundedRectangle(detBounds.toFloat(), 3.0f);
+        if (detH > 0)
+        {
+            inner.removeFromTop(2);
+            auto detBounds = inner.removeFromTop(detH);
+            ds.detailLocalBounds = detBounds;
+            g.setColour(juce::Colour(0xFF0A0E14));
+            g.fillRoundedRectangle(detBounds.toFloat(), 3.0f);
+        }
+        else
+        {
+            ds.detailLocalBounds = {};
+        }
 
         inner.removeFromTop(4);
 
@@ -1656,14 +1688,14 @@ private:
         //----------------------------------------------------------------------
         // TrackMap offset row -- static background only (text drawn live)
         //----------------------------------------------------------------------
-        auto mapRow = inner.removeFromTop(16);
-        ds.mapLocalBounds = mapRow;
+        if (showMapRow)
         {
+            auto mapRow = inner.removeFromTop(16);
+            ds.mapLocalBounds = mapRow;
             if (ds.trackMapped)
             {
                 g.setColour(accentAmber.withAlpha(0.2f));
                 g.fillRoundedRectangle(mapRow.toFloat(), 2.0f);
-                // Small "MAP" label only (offset TC text drawn live)
                 g.setFont(juce::Font(juce::FontOptions(7.0f, juce::Font::bold)));
                 g.setColour(accentAmber.withAlpha(0.6f));
                 g.drawText("MAP", mapRow.withTrimmedLeft(4).withWidth(24),
@@ -1675,15 +1707,19 @@ private:
                 g.setFont(juce::Font(juce::FontOptions(9.0f)));
                 g.drawText("NO MAP", mapRow, juce::Justification::centred);
             }
+            inner.removeFromTop(2);
         }
-
-        inner.removeFromTop(2);
+        else
+        {
+            ds.mapLocalBounds = {};
+        }
 
         //----------------------------------------------------------------------
         // Engine assignment row
         //----------------------------------------------------------------------
-        auto engRow = inner.removeFromTop(16);
+        if (showEngRow)
         {
+            auto engRow = inner.removeFromTop(16);
             g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
             if (ds.engineNames.size() > 0)
             {
@@ -1698,71 +1734,71 @@ private:
                 g.setColour(textDim.withAlpha(0.5f));
                 g.drawText("--", engRow, juce::Justification::centred);
             }
+            inner.removeFromTop(2);
         }
-
-        inner.removeFromTop(2);
 
         //----------------------------------------------------------------------
         // BPM Multiplier row -- 5 buttons: /4  /2  1x  x2  x4
-        // Session override takes priority; TrackMap value shown dimmer when
-        // no session override is active.
         //----------------------------------------------------------------------
-        auto bpmRow = inner.removeFromTop(16);
+        if (showBpmMult)
         {
-            // Effective multiplier: session takes priority over TrackMap
-            int sess = ds.bpmSessionOverride;
-            int map  = ds.bpmTrackMapValue;
-            int eff  = (sess != TimecodeEngine::kBpmNoOverride) ? sess : map;
-
-            // Button definitions: label, multiplier value
-            struct BpmBtn { const char* label; int mult; };
-            static const BpmBtn kBtns[5] = {
-                { "/4", -2 }, { "/2", -1 }, { "1x", 0 }, { "x2", 1 }, { "x4", 2 }
-            };
-
-            int gap = 2;
-            int btnW = (bpmRow.getWidth() - gap * 4) / 5;
-            auto rowCopy = bpmRow;
-
-            for (int bi = 0; bi < 5; ++bi)
+            auto bpmRow = inner.removeFromTop(16);
             {
-                auto btnRect = (bi < 4) ? rowCopy.removeFromLeft(btnW) : rowCopy;
-                if (bi < 4) rowCopy.removeFromLeft(gap);
+                int sess = ds.bpmSessionOverride;
+                int map  = ds.bpmTrackMapValue;
+                int eff  = (sess != TimecodeEngine::kBpmNoOverride) ? sess : map;
 
-                // Store for hit-testing in mouseDown
-                ds.bpmBtnBounds[bi] = btnRect;
+                struct BpmBtn { const char* label; int mult; };
+                static const BpmBtn kBtns[5] = {
+                    { "/4", -2 }, { "/2", -1 }, { "1x", 0 }, { "x2", 1 }, { "x4", 2 }
+                };
 
-                int mult = kBtns[bi].mult;
-                bool active   = (eff == mult);
-                bool isSaved  = (map != 0 && map == mult);  // has TrackMap value on this button
+                int gap = 2;
+                int btnW = (bpmRow.getWidth() - gap * 4) / 5;
+                auto rowCopy = bpmRow;
 
-                // Background: active gets blue glow, inactive gets dim
-                juce::Colour bg, fg;
-                if (active)
+                for (int bi = 0; bi < 5; ++bi)
                 {
-                    bg = accentCyan.withAlpha(0.30f);
-                    fg = accentCyan.brighter(0.3f);
+                    auto btnRect = (bi < 4) ? rowCopy.removeFromLeft(btnW) : rowCopy;
+                    if (bi < 4) rowCopy.removeFromLeft(gap);
+
+                    ds.bpmBtnBounds[bi] = btnRect;
+
+                    int mult = kBtns[bi].mult;
+                    bool active   = (eff == mult);
+                    bool isSaved  = (map != 0 && map == mult);
+
+                    juce::Colour bg, fg;
+                    if (active)
+                    {
+                        bg = accentCyan.withAlpha(0.30f);
+                        fg = accentCyan.brighter(0.3f);
+                    }
+                    else
+                    {
+                        bg = bgDeck.brighter(0.05f);
+                        fg = textDim;
+                    }
+
+                    if (isSaved)
+                        fg = accentAmber;
+
+                    auto bf = btnRect.toFloat();
+                    g.setColour(bg);
+                    g.fillRoundedRectangle(bf, 2.0f);
+                    g.setColour(active ? accentCyan.withAlpha(0.6f) : borderCol);
+                    g.drawRoundedRectangle(bf, 2.0f, 0.5f);
+
+                    g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
+                    g.setColour(fg);
+                    g.drawText(kBtns[bi].label, btnRect, juce::Justification::centred);
                 }
-                else
-                {
-                    bg = bgDeck.brighter(0.05f);
-                    fg = textDim;
-                }
-
-                // Golden text always wins for saved TrackMap value
-                if (isSaved)
-                    fg = accentAmber;
-
-                auto bf = btnRect.toFloat();
-                g.setColour(bg);
-                g.fillRoundedRectangle(bf, 2.0f);
-                g.setColour(active ? accentCyan.withAlpha(0.6f) : borderCol);
-                g.drawRoundedRectangle(bf, 2.0f, 0.5f);
-
-                g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
-                g.setColour(fg);
-                g.drawText(kBtns[bi].label, btnRect, juce::Justification::centred);
             }
+        }
+        else
+        {
+            for (int bi = 0; bi < 5; ++bi)
+                ds.bpmBtnBounds[bi] = {};
         }
     }
 
@@ -2352,7 +2388,7 @@ private:
     //==========================================================================
     static void saveAnlzFromMeta(const TrackMetadata& meta)
     {
-        if (meta.artist.isEmpty() || meta.title.isEmpty()) return;
+        if (meta.title.isEmpty()) return;
 
         bool hasData = meta.hasDetailWaveform() || meta.hasBeatGrid()
                     || meta.hasCueList()        || meta.hasSongStructure();

@@ -40,6 +40,54 @@ public:
 };
 
 //==============================================================================
+// Small circular LED that flashes on beat detection
+class BeatLed : public juce::Component
+{
+public:
+    BeatLed() { setOpaque(false); }
+
+    void flash()
+    {
+        brightness = 1.0f;
+        repaint();
+    }
+
+    void decay(float amount = 0.12f)
+    {
+        if (brightness > 0.0f)
+        {
+            brightness = juce::jmax(0.0f, brightness - amount);
+            repaint();
+        }
+    }
+
+    void setLedColour(juce::Colour c) { onColour = c; repaint(); }
+
+    void paint(juce::Graphics& g) override
+    {
+        auto area = getLocalBounds().toFloat().reduced(1.0f);
+        float side = juce::jmin(area.getWidth(), area.getHeight());
+        auto circle = juce::Rectangle<float>(side, side)
+                        .withCentre(area.getCentre());
+
+        auto c = onColour.withAlpha(0.15f + 0.85f * brightness);
+        g.setColour(c);
+        g.fillEllipse(circle);
+
+        // Bright glow ring when active
+        if (brightness > 0.1f)
+        {
+            g.setColour(onColour.withAlpha(0.3f * brightness));
+            g.drawEllipse(circle.expanded(1.0f), 1.5f);
+        }
+    }
+
+private:
+    juce::Colour onColour { 0xFFFF9900 };
+    float brightness = 0.0f;
+};
+
+//==============================================================================
 class PanelContent : public juce::Component
 {
 public:
@@ -224,6 +272,8 @@ private:
     // FPS auto-detect change tracking (for button state updates)
     FrameRate lastDisplayedFps    = FrameRate::FPS_30;
     FrameRate lastDisplayedOutFps = FrameRate::FPS_30;
+    double    beatFlashAccumMs    = 0.0;   // accumulates ms for BPM-based beat flash
+    double    lastBeatFlashBpm    = 0.0;   // last BPM used for flash interval
 
     // --- Collapse state (per-view, not per-engine) ---
     bool inputConfigExpanded  = true;
@@ -307,6 +357,8 @@ private:
     juce::ToggleButton btnOscFwdBpm     { "OSC BPM FWD" };
     juce::TextEditor   edOscFwdBpmAddr;
     juce::Label        lblOscFwdBpmAddr;
+    juce::TextEditor   edOscFwdBpmCmd;
+    juce::Label        lblOscFwdBpmCmd;
     juce::ToggleButton btnOscMixerFwd   { "OSC MIXER FWD" };
     juce::ToggleButton btnMidiMixerFwd  { "MIDI MIXER FWD" };
     juce::ToggleButton btnArtnetMixerFwd { "ARTNET MIXER FWD" };
@@ -318,6 +370,16 @@ private:
     juce::Label        lblMidiMixNoteCh;
     juce::ToggleButton btnLink { "ABLETON LINK" };
     juce::Label        lblLinkStatus;
+
+    // Audio BPM detection (for non-DJ sources)
+    juce::ToggleButton btnAudioBpm { "AUDIO BPM" };
+    juce::Label        lblBpmValue;       // "128.0 BPM" display
+    BeatLed            ledBeat;           // beat flash indicator
+    GainSlider         sldBpmSmoothing;           juce::Label lblBpmSmoothing;
+    GainSlider         sldBpmInputGain;           juce::Label lblBpmInputGain;
+    juce::ComboBox     cmbAudioBpmDevice;   juce::Label lblAudioBpmDevice;
+    juce::ComboBox     cmbAudioBpmChannel;  juce::Label lblAudioBpmChannel;
+    LevelMeter         mtrAudioBpm;
 
     juce::Component::SafePointer<juce::DocumentWindow> trackMapWindow;
     std::unique_ptr<CuePointEditorWindow> cuePointWindow;
@@ -493,6 +555,11 @@ private:
     void populateAudioInputChannels();
     void populateAudioOutputChannels();
     void populateThruOutputChannels();
+    void populateAudioBpmChannels();
+    void restartAudioBpm();
+
+    // Returns the index of another engine that has Link active, or -1 if none.
+    int findLinkOwnerOtherThan(int engineIdx) const;
     int getChannelFromCombo(const juce::ComboBox& cmb) const;
 
     void updateInputButtonStates();

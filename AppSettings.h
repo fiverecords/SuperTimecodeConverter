@@ -153,7 +153,7 @@ struct TrackMapEntry
         return base;
     }
     std::string key() const { return makeKey(artist, title, durationSec); }
-    bool hasValidKey() const { return artist.isNotEmpty() && title.isNotEmpty(); }
+    bool hasValidKey() const { return title.isNotEmpty(); }
 
     //------------------------------------------------------------------
     // Trigger queries
@@ -579,6 +579,7 @@ struct EngineSettings
     bool trackMapEnabled = false;
     bool midiClockEnabled = false;
     juce::String oscBpmAddr = "/composition/tempocontroller/tempo";
+    juce::String oscBpmCmd;   // e.g. "Master 3.x at %BPM%" — if set, sends string instead of float
     bool oscBpmForward    = false;
     bool oscMixerForward  = false;
     bool midiMixerForward = false;
@@ -618,6 +619,14 @@ struct EngineSettings
     int ltcOutputGain = 100;
     int thruOutputGain = 100;
 
+    // Audio BPM detection (for non-DJ sources)
+    bool audioBpmEnabled = false;
+    juce::String audioBpmDevice = "";
+    juce::String audioBpmType = "";
+    int audioBpmChannel = -1;   // -1 = stereo mix
+    float audioBpmSmoothing = 0.5f;  // 0.0=fast, 1.0=stable
+    int audioBpmGain = 100;  // 0-400 (percentage, same as LTC gain)
+
     // FPS  (0=23.976, 1=24, 2=25, 3=29.97, 4=30)
     int fpsSelection = 4;
 
@@ -655,6 +664,7 @@ struct EngineSettings
         obj->setProperty("trackMapEnabled", trackMapEnabled);
         obj->setProperty("midiClockEnabled", midiClockEnabled);
         obj->setProperty("oscBpmAddr", oscBpmAddr);
+        obj->setProperty("oscBpmCmd", oscBpmCmd);
         obj->setProperty("oscBpmForward",    oscBpmForward);
         obj->setProperty("oscMixerForward",  oscMixerForward);
         obj->setProperty("midiMixerForward", midiMixerForward);
@@ -691,6 +701,13 @@ struct EngineSettings
         obj->setProperty("thruInputGain", thruInputGain);
         obj->setProperty("ltcOutputGain", ltcOutputGain);
         obj->setProperty("thruOutputGain", thruOutputGain);
+
+        obj->setProperty("audioBpmEnabled", audioBpmEnabled);
+        obj->setProperty("audioBpmDevice", audioBpmDevice);
+        obj->setProperty("audioBpmType", audioBpmType);
+        obj->setProperty("audioBpmChannel", audioBpmChannel);
+        obj->setProperty("audioBpmSmoothing", (double)audioBpmSmoothing);
+        obj->setProperty("audioBpmGain", audioBpmGain);
 
         obj->setProperty("fpsSelection", fpsSelection);
         obj->setProperty("fpsConvertEnabled", fpsConvertEnabled);
@@ -739,6 +756,7 @@ struct EngineSettings
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
         oscBpmAddr           = getString("oscBpmAddr", getString("tcnetOscBpmAddr", "/composition/tempocontroller/tempo"));
+        oscBpmCmd            = getString("oscBpmCmd");
         oscBpmForward        = getBool("oscBpmForward", getBool("tcnetOscForward", false));
         oscMixerForward      = getBool("oscMixerForward", false);
         midiMixerForward     = getBool("midiMixerForward", false);
@@ -789,6 +807,14 @@ struct EngineSettings
         thruInputGain  = clampGain(getInt("thruInputGain", 100));
         ltcOutputGain  = clampGain(getInt("ltcOutputGain", 100));
         thruOutputGain = clampGain(getInt("thruOutputGain", 100));
+
+        audioBpmEnabled  = getBool("audioBpmEnabled", false);
+        audioBpmDevice   = getString("audioBpmDevice");
+        audioBpmType     = getString("audioBpmType");
+        audioBpmChannel  = juce::jlimit(-1, 127, getInt("audioBpmChannel", -1));
+        audioBpmSmoothing = (float)juce::jlimit(0.0, 1.0,
+            obj->getProperty("audioBpmSmoothing").isVoid() ? 0.5 : (double)obj->getProperty("audioBpmSmoothing"));
+        audioBpmGain = juce::jlimit(0, 400, getInt("audioBpmGain", 100));
 
         fpsSelection       = juce::jlimit(0, 4, getInt("fpsSelection", 4));
         fpsConvertEnabled  = getBool("fpsConvertEnabled", false);
@@ -1034,6 +1060,13 @@ private:
         es.thruInputGain  = clampGain(getInt("thruInputGain", 100));
         es.ltcOutputGain  = clampGain(getInt("ltcOutputGain", 100));
         es.thruOutputGain = clampGain(getInt("thruOutputGain", 100));
+
+        es.audioBpmEnabled  = getBool("audioBpmEnabled", false);
+        es.audioBpmDevice   = getString("audioBpmDevice");
+        es.audioBpmType     = getString("audioBpmType");
+        es.audioBpmChannel  = juce::jlimit(-1, 127, getInt("audioBpmChannel", -1));
+        es.audioBpmSmoothing = (float)juce::jlimit(0.0, 1.0, getDouble("audioBpmSmoothing", 0.5));
+        es.audioBpmGain = juce::jlimit(0, 400, getInt("audioBpmGain", 100));
 
         es.fpsSelection       = juce::jlimit(0, 4, getInt("fpsSelection", 4));
         es.fpsConvertEnabled  = getBool("fpsConvertEnabled", false);

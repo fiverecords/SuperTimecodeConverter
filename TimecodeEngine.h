@@ -17,6 +17,7 @@
 #include "TriggerOutput.h"
 #include "LinkBridge.h"
 #include "AudioThru.h"
+#include "AudioBpmInput.h"
 #include "AppSettings.h"
 #include "MixerMap.h"
 #include <memory>
@@ -65,6 +66,7 @@ public:
         stopMtcInput();
         stopArtnetInput();
         stopLtcInput();
+        stopAudioBpm();
         // ProDJLink is shared -- not stopped per-engine
         // StageLinQ is shared -- not stopped per-engine
     }
@@ -142,7 +144,9 @@ public:
             cachedTrackTitle.clear();
             cachedTrackDurationSec = 0;
             // Disable Link to avoid publishing stale tempo on the network
-            linkBridge.setEnabled(false);
+            // (unless audio BPM is active -- it will keep feeding Link)
+            if (!audioBpmEnabled)
+                linkBridge.setEnabled(false);
         }
 
         // Note: actual start is deferred to the caller (MainComponent),
@@ -348,6 +352,39 @@ public:
         stopThruOutput();
         ltcInput.stop();
     }
+
+    //==========================================================================
+    // Audio BPM detection (for non-DJ input sources)
+    //==========================================================================
+    bool startAudioBpm(const juce::String& typeName, const juce::String& devName,
+                       int channel, double sampleRate = 0, int bufferSize = 0)
+    {
+        stopAudioBpm();
+        if (devName.isEmpty()) return false;
+        if (audioBpmInput.start(typeName, devName, channel, sampleRate, bufferSize))
+        {
+            audioBpmEnabled = true;
+            return true;
+        }
+        return false;
+    }
+
+    void stopAudioBpm()
+    {
+        audioBpmEnabled = false;
+        audioBpmInput.stop();
+        lastSentClockBpm = -1.0f;
+        lastSentOscBpm   = -1.0f;
+    }
+
+    bool isAudioBpmRunning() const { return audioBpmEnabled && audioBpmInput.getIsRunning(); }
+    double getAudioBpm() const { return audioBpmInput.getBpm(); }
+    double getAudioBpmConfidence() const { return audioBpmInput.getConfidence(); }
+    bool hasAudioBpm() const { return isAudioBpmRunning() && audioBpmInput.hasBpm(); }
+    float getAudioBpmPeakLevel() const { return audioBpmInput.getPeakLevel(); }
+
+    AudioBpmInput& getAudioBpmInput() { return audioBpmInput; }
+    const AudioBpmInput& getAudioBpmInput() const { return audioBpmInput; }
 
     //==========================================================================
     // Pro DJ Link input (shared across engines)
@@ -604,7 +641,7 @@ public:
     /// Force a re-lookup of the current track (e.g., after editing TrackMap)
     void refreshTrackMapLookup()
     {
-        if (!trackMapPtr || cachedTrackArtist.isEmpty()) return;
+        if (!trackMapPtr || cachedTrackTitle.isEmpty()) return;
         const auto* entry = lookupTrackInMap();
         // Reload cue points (user may have added/edited/deleted cues).
         // Preserve playhead position so cues behind the current playhead
@@ -1138,11 +1175,7 @@ public:
                         double pdlOscBpm = sharedProDJLink->getMasterBPM();
                         if (pdlOscBpm <= 0.0) pdlOscBpm = sharedProDJLink->getBPM(ep);
                         pdlOscBpm = applyBpmMultiplier(pdlOscBpm, getEffectiveBpmMultiplier());
-                        if (pdlOscBpm > 0.0 && std::abs((float)pdlOscBpm - lastSentOscBpm) > kOscBpmThreshold)
-                        {
-                            triggerOutput.sendOscFloat(oscFwdBpmAddr, (float)pdlOscBpm);
-                            lastSentOscBpm = (float)pdlOscBpm;
-                        }
+                        sendBpmOsc(pdlOscBpm);
                     }
 
                     // --- Mixer Fader Forward (OSC + MIDI CC) ---
@@ -1396,11 +1429,7 @@ public:
                         double slqOscBpm = sharedStageLinQ->getMasterBPM();
                         if (slqOscBpm <= 0.0) slqOscBpm = sharedStageLinQ->getBPM(ep);
                         slqOscBpm = applyBpmMultiplier(slqOscBpm, getEffectiveBpmMultiplier());
-                        if (slqOscBpm > 0.0 && std::abs((float)slqOscBpm - lastSentOscBpm) > kOscBpmThreshold)
-                        {
-                            triggerOutput.sendOscFloat(oscFwdBpmAddr, (float)slqOscBpm);
-                            lastSentOscBpm = (float)slqOscBpm;
-                        }
+                        sendBpmOsc(slqOscBpm);
                     }
 
                     // --- Mixer fader forward (OSC/MIDI/ArtNet) ---
@@ -1424,6 +1453,43 @@ public:
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
+        }
+
+        // --- Audio BPM forwarding (non-DJ sources only) ---
+        // ProDJLink and StageLinQ have their own precise BPM from the CDJs/Denon;
+        // audio detection is only useful for MTC, LTC, ArtNet, and SystemTime.
+        if (audioBpmEnabled && audioBpmInput.getIsRunning()
+            && activeInput != InputSource::ProDJLink
+            && activeInput != InputSource::StageLinQ)
+        {
+            double abpm = audioBpmInput.getBpm();
+            bool hasBpm = audioBpmInput.hasBpm();
+
+            if (hasBpm)
+            {
+                double bpm = applyBpmMultiplier(abpm, getEffectiveBpmMultiplier());
+
+                // MIDI Clock
+                if (midiClockEnabled && triggerOutput.isMidiClockRunning() && bpm > 0.0)
+                {
+                    if (std::abs((float)bpm - lastSentClockBpm) > 0.05f)
+                    {
+                        triggerOutput.updateMidiClockBpm(bpm);
+                        lastSentClockBpm = (float)bpm;
+                    }
+                }
+
+                // Ableton Link
+                if (linkBridge.isEnabled() && bpm > 0.0)
+                    linkBridge.setTempo(bpm);
+
+                // OSC BPM Forward
+                sendBpmOsc(bpm);
+            }
+
+            // Append BPM to status text
+            if (statusTextVisible && abpm > 0.0)
+                inputStatusText += " | " + juce::String(abpm, 1) + " BPM";
         }
 
         routeTimecodeToOutputs();
@@ -1974,6 +2040,10 @@ private:
     LinkBridge   linkBridge;
     std::unique_ptr<AudioThru> audioThru;  // Only for primary engine
 
+    // Audio BPM detection (for non-DJ sources: MTC, LTC, ArtNet, SystemTime)
+    AudioBpmInput audioBpmInput;
+    bool audioBpmEnabled = false;
+
     // Status
     juce::String inputStatusText = "SYSTEM CLOCK";
     juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText;
@@ -2038,6 +2108,7 @@ private:
     std::vector<ArmedCue> armedCues;
     uint32_t lastCueCheckMs = 0;   // last playhead position used for cue check (seek detection)
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
+    juce::String oscFwdBpmCmd;  // e.g. "Master 3.x at %BPM%" -- if non-empty, sends string instead of float
     float lastSentOscBpm = -1.0f;      // dedup: last sent OSC value
 
     static constexpr float kOscBpmThreshold = 0.05f;   // 0.05 BPM
@@ -2061,11 +2132,14 @@ public:
             float bpm = 0.0f;
             if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
                 bpm = (float)sharedStageLinQ->getBPM(proDJLinkPlayer);
-            else if (sharedProDJLink != nullptr)
+            else if (activeInput == InputSource::ProDJLink && sharedProDJLink != nullptr)
             {
                 bpm = (float)sharedProDJLink->getMasterBPM();
                 if (bpm <= 0.0f) bpm = (float)sharedProDJLink->getBPM(getEffectivePlayer());
             }
+            // Fallback: audio BPM detection (non-DJ sources)
+            if (bpm <= 0.0f && audioBpmEnabled && audioBpmInput.hasBpm())
+                bpm = (float)audioBpmInput.getBpm();
             triggerOutput.startMidiClock(bpm > 0.0f ? (double)bpm : 120.0);
         }
         else
@@ -2146,14 +2220,36 @@ public:
     }
 
     void setOscForward(bool enabled,
-                       const juce::String& bpmAddr = "/composition/tempocontroller/tempo")
+                       const juce::String& bpmAddr = "/composition/tempocontroller/tempo",
+                       const juce::String& bpmCmd = {})
     {
         oscForwardEnabled = enabled;
         oscFwdBpmAddr = bpmAddr;
+        oscFwdBpmCmd = bpmCmd;
         lastSentOscBpm = -1.0f;
     }
     bool isOscForwardEnabled() const { return oscForwardEnabled; }
     juce::String getOscFwdBpmAddr() const { return oscFwdBpmAddr; }
+    juce::String getOscFwdBpmCmd() const  { return oscFwdBpmCmd; }
+
+    // Send BPM via OSC: if command template is set, send as string; otherwise as float
+    void sendBpmOsc(double bpm)
+    {
+        if (!oscForwardEnabled || !triggerOutput.isOscConnected() || bpm <= 0.0) return;
+        if (std::abs((float)bpm - lastSentOscBpm) < kOscBpmThreshold) return;
+
+        if (oscFwdBpmCmd.isNotEmpty())
+        {
+            // Template mode: replace %BPM% with actual value
+            auto cmd = oscFwdBpmCmd.replace("%BPM%", juce::String(bpm, 1));
+            triggerOutput.sendOscString(oscFwdBpmAddr, cmd);
+        }
+        else
+        {
+            triggerOutput.sendOscFloat(oscFwdBpmAddr, (float)bpm);
+        }
+        lastSentOscBpm = (float)bpm;
+    }
 
     void setOscMixerForward(bool enabled)
     {
@@ -2240,7 +2336,7 @@ private:
     /// Returns the matched entry pointer (or nullptr if not found/malformed).
     const TrackMapEntry* lookupTrackInMap()
     {
-        if (!trackMapPtr || cachedTrackArtist.isEmpty() || cachedTrackTitle.isEmpty()
+        if (!trackMapPtr || cachedTrackTitle.isEmpty()
             || cachedTrackTitle.startsWith("Track #"))
         {
             trackMapped = false;
