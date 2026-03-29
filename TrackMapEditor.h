@@ -760,13 +760,12 @@ private:
     //--------------------------------------------------------------------------
     void onFormSave()
     {
-        // Validate artist + title (required as composite key)
+        // Validate title (required for key; artist is optional)
         juce::String formArtist = edFormArtist.getText().trim();
         juce::String formTitle  = edFormTitle.getText().trim();
-        if (formArtist.isEmpty() || formTitle.isEmpty())
+        if (formTitle.isEmpty())
         {
-            if (formArtist.isEmpty()) edFormArtist.grabKeyboardFocus();
-            else                      edFormTitle.grabKeyboardFocus();
+            edFormTitle.grabKeyboardFocus();
             return;
         }
 
@@ -941,8 +940,8 @@ private:
                 auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
                 if (meta.isValid())
                 {
-                    learnArtist = meta.artist;
-                    learnTitle  = meta.title;
+                    if (meta.artist.isNotEmpty()) learnArtist = meta.artist;
+                    if (meta.title.isNotEmpty())  learnTitle  = meta.title;
                 }
             }
 
@@ -967,8 +966,8 @@ private:
             return;  // no source available
         }
 
-        if (learnTitle.isEmpty() || learnTitle.startsWith("Track #"))
-            return;  // can't learn without real metadata
+        if (learnTitle.isEmpty())
+            return;  // can't learn without any title
 
         // If entry already exists, open it for editing
         if (trackMap.contains(learnArtist, learnTitle, learnedDurationSec))

@@ -240,6 +240,10 @@ private:
             if (ds.title.isNotEmpty())
             {
                 tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
+                if (!tmEntry && ds.trackLenSec > 0)
+                    tmEntry = trackMap.find(ds.artist, ds.title, 0);
+                if (!tmEntry)
+                    tmEntry = trackMap.findIgnoringDuration(ds.artist, ds.title);
                 if (tmEntry != nullptr)
                 {
                     ds.trackMapped = true;

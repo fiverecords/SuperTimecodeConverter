@@ -308,6 +308,10 @@ public:
 
         int dur = (int)ds.trackLenSec;
         auto* entry = trackMap.find(ds.artist, ds.title, dur);
+        if (!entry && dur > 0)
+            entry = trackMap.find(ds.artist, ds.title, 0);
+        if (!entry)
+            entry = trackMap.findIgnoringDuration(ds.artist, ds.title);
         int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
 
         // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
@@ -330,6 +334,37 @@ public:
             newEntry.title   = ds.title;
             newEntry.durationSec = dur;
             newEntry.bpmMultiplier = newValue;
+
+            // Auto-populate cue points from rekordbox if available
+            if (ds.trackId != 0)
+            {
+                auto meta = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                if (meta.isValid() && !meta.cueList.empty())
+                {
+                    for (auto& rc : meta.cueList)
+                    {
+                        if (rc.positionMs == 0) continue;
+                        CuePoint cp;
+                        cp.positionMs = rc.positionMs;
+                        auto letter = rc.hotCueLetter();
+                        if (letter.isNotEmpty())
+                            cp.name = letter;
+                        if (rc.comment.isNotEmpty())
+                            cp.name += cp.name.isNotEmpty()
+                                ? " " + rc.comment : rc.comment;
+                        if (cp.name.isEmpty())
+                        {
+                            if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                                cp.name = "MEM";
+                            else if (rc.type == TrackMetadata::RekordboxCue::Loop)
+                                cp.name = "LOOP";
+                        }
+                        newEntry.cuePoints.push_back(std::move(cp));
+                    }
+                    newEntry.sortCuePoints();
+                }
+            }
+
             trackMap.addOrUpdate(newEntry);
         }
         else
@@ -459,10 +494,13 @@ public:
             ds.trackMapped = false;
             ds.offset = "00:00:00:00";
             ds.offsetTimecode = {};
-            if (ds.title.isNotEmpty()
-                && !ds.title.startsWith("Track #"))
+            if (ds.title.isNotEmpty())
             {
                 tmEntry = trackMap.find(ds.artist, ds.title, (int)ds.trackLenSec);
+                if (!tmEntry && ds.trackLenSec > 0)
+                    tmEntry = trackMap.find(ds.artist, ds.title, 0);
+                if (!tmEntry)
+                    tmEntry = trackMap.findIgnoringDuration(ds.artist, ds.title);
                 if (tmEntry != nullptr)
                 {
                     ds.trackMapped = true;
@@ -568,8 +606,8 @@ public:
                     if (meta.isValid())
                     {
                         ds.lastMetaVersion = meta.cacheVersion;
-                        ds.artist    = meta.artist;
-                        ds.title     = meta.title;
+                        if (meta.artist.isNotEmpty()) ds.artist = meta.artist;
+                        if (meta.title.isNotEmpty())  ds.title  = meta.title;
                         ds.key       = meta.key;
                         ds.artworkId = meta.artworkId;
                         ds.cueCount  = (int)meta.cueList.size();
@@ -638,8 +676,8 @@ public:
                         if (metaById.isValid())
                         {
                             ds.lastMetaVersion = metaById.cacheVersion;
-                            ds.artist    = metaById.artist;
-                            ds.title     = metaById.title;
+                            if (metaById.artist.isNotEmpty()) ds.artist = metaById.artist;
+                            if (metaById.title.isNotEmpty())  ds.title  = metaById.title;
                             ds.key       = metaById.key;
                             ds.artworkId = metaById.artworkId;
                             ds.cueCount  = (int)metaById.cueList.size();
@@ -962,6 +1000,10 @@ public:
                             {
                                 int dur = (int)ds.trackLenSec;
                                 auto* mutableEntry = trackMap.find(ds.artist, ds.title, dur);
+                                if (!mutableEntry && dur > 0)
+                                    mutableEntry = trackMap.find(ds.artist, ds.title, 0);
+                                if (!mutableEntry)
+                                    mutableEntry = trackMap.findIgnoringDuration(ds.artist, ds.title);
                                 if (mutableEntry != nullptr && mutableEntry->cuePoints.empty())
                                 {
                                     for (auto& rc : meta.cueList)
@@ -993,6 +1035,10 @@ public:
                             // Cues not yet from rekordbox -- fallback to TrackMap
                             int dur = (int)ds.trackLenSec;
                             auto* tmFallback = trackMap.find(ds.artist, ds.title, dur);
+                            if (!tmFallback && dur > 0)
+                                tmFallback = trackMap.find(ds.artist, ds.title, 0);
+                            if (!tmFallback)
+                                tmFallback = trackMap.findIgnoringDuration(ds.artist, ds.title);
                             if (tmFallback && !tmFallback->cuePoints.empty())
                                 ds.detailWaveform.setCuePoints(tmFallback->cuePoints);
                         }

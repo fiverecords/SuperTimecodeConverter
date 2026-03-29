@@ -6042,6 +6042,10 @@ void MainComponent::updateBpmMultButtonStates()
     {
         auto* entry = settings.trackMap.find(trackInfo.artist, trackInfo.title,
                                               trackInfo.durationSec);
+        if (!entry && trackInfo.durationSec > 0)
+            entry = settings.trackMap.find(trackInfo.artist, trackInfo.title, 0);
+        if (!entry)
+            entry = settings.trackMap.findIgnoringDuration(trackInfo.artist, trackInfo.title);
         if (entry != nullptr) map = entry->bpmMultiplier;
     }
 
@@ -6088,6 +6092,10 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
     if (info.title.isEmpty()) return;
 
     auto* entry = settings.trackMap.find(info.artist, info.title, info.durationSec);
+    if (!entry && info.durationSec > 0)
+        entry = settings.trackMap.find(info.artist, info.title, 0);
+    if (!entry)
+        entry = settings.trackMap.findIgnoringDuration(info.artist, info.title);
     int currentMapValue = (entry != nullptr) ? entry->bpmMultiplier : 0;
 
     // Double-click on 1x: clear saved value. Otherwise: save (no toggle).
@@ -6111,6 +6119,37 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
         newEntry.title   = info.title;
         newEntry.durationSec = info.durationSec;
         newEntry.bpmMultiplier = newValue;
+
+        // Auto-populate cue points from rekordbox if available
+        if (info.trackId != 0)
+        {
+            auto meta = sharedDbClient.getCachedMetadataByTrackId(info.trackId);
+            if (meta.isValid() && !meta.cueList.empty())
+            {
+                for (auto& rc : meta.cueList)
+                {
+                    if (rc.positionMs == 0) continue;
+                    CuePoint cp;
+                    cp.positionMs = rc.positionMs;
+                    auto letter = rc.hotCueLetter();
+                    if (letter.isNotEmpty())
+                        cp.name = letter;
+                    if (rc.comment.isNotEmpty())
+                        cp.name += cp.name.isNotEmpty()
+                            ? " " + rc.comment : rc.comment;
+                    if (cp.name.isEmpty())
+                    {
+                        if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                            cp.name = "MEM";
+                        else if (rc.type == TrackMetadata::RekordboxCue::Loop)
+                            cp.name = "LOOP";
+                    }
+                    newEntry.cuePoints.push_back(std::move(cp));
+                }
+                newEntry.sortCuePoints();
+            }
+        }
+
         settings.trackMap.addOrUpdate(newEntry);
     }
     else

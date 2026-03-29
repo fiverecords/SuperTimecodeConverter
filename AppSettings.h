@@ -440,6 +440,37 @@ public:
         return entries.count(TrackMapEntry::makeKey(artist, title, dur)) > 0;
     }
 
+    /// Find by artist+title, ignoring duration.  Used as a last-resort fallback
+    /// when the caller's duration doesn't match the entry's saved duration.
+    const TrackMapEntry* findIgnoringDuration(const juce::String& artist,
+                                              const juce::String& title) const
+    {
+        auto base = TrackMapEntry::makeKey(artist, title, 0);  // key without duration
+        // Exact match (entry saved without duration)
+        auto it = entries.find(base);
+        if (it != entries.end()) return &it->second;
+        // Prefix match (entry saved with some duration: "base|NNN")
+        auto prefix = base + "|";
+        for (auto& [k, v] : entries)
+            if (k.size() > prefix.size() && k.substr(0, prefix.size()) == prefix)
+                return &v;
+        return nullptr;
+    }
+
+    /// Mutable version of findIgnoringDuration
+    TrackMapEntry* findIgnoringDuration(const juce::String& artist,
+                                        const juce::String& title)
+    {
+        auto base = TrackMapEntry::makeKey(artist, title, 0);
+        auto it = entries.find(base);
+        if (it != entries.end()) return &it->second;
+        auto prefix = base + "|";
+        for (auto& [k, v] : entries)
+            if (k.size() > prefix.size() && k.substr(0, prefix.size()) == prefix)
+                return &v;
+        return nullptr;
+    }
+
     //------------------------------------------------------------------
     // Mutation
     //------------------------------------------------------------------

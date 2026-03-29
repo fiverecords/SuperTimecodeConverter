@@ -129,7 +129,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 
 ### Track Map
 
-Map tracks by **artist + title + duration** to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ or Denon deck, STC automatically applies the timecode offset and fires the configured triggers. Tracks are identified universally regardless of which USB/SD they are loaded from. The duration acts as a fingerprint to distinguish different versions of the same track (e.g. radio edit vs extended mix).
+Map tracks by **title** (and optionally artist and duration) to timecode offsets and show control triggers. When a mapped track is loaded on a CDJ or Denon deck, STC automatically applies the timecode offset and fires the configured triggers. Tracks are identified universally regardless of which USB/SD they are loaded from. Artist is optional -- tracks without artist metadata (sound effects, jingles, DJ tools) work fully with TrackMap. The duration acts as a fingerprint to distinguish different versions of the same track (e.g. radio edit vs extended mix).
 
 - Per-track timecode offset (HH:MM:SS:FF)
 - Per-track BPM multiplier (/4, /2, 1x, x2, x4) -- applied to MIDI Clock, Ableton Link, and OSC BPM forward
@@ -159,7 +159,7 @@ Per-track timed triggers that fire at specific playhead positions during playbac
 - **Live editing:** cue points added or modified while a track is playing take effect immediately without reloading the track.
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
 - **Works with both Pioneer and Denon** hardware via Pro DJ Link and StageLinQ.
-- **Auto-populate from rekordbox:** when a track with a TrackMap entry loads on a CDJ, STC automatically imports the DJ's rekordbox hot cues, memory points, and loops as cue points -- with their letters and comments as labels. Only applies if the entry has no manually-configured cue points. Blocked during Show Lock.
+- **Auto-populate from rekordbox:** when a track with a TrackMap entry loads on a CDJ, STC automatically imports the DJ's rekordbox hot cues, memory points, and loops as cue points -- with their letters and comments as labels. Also applies when creating a new entry via BPM multiplier double-click. Only applies if the entry has no manually-configured cue points. Blocked during Show Lock.
 - Cue points are stored in the Track Map (trackmap.json) alongside the track's offset and track-change triggers.
 - Maximizable window with persisted position across sessions.
 - Blocked during Show Lock to prevent accidental changes during a live show.
@@ -185,7 +185,7 @@ Table editor with per-parameter enable/disable, editable addresses and CC/Note/D
 
 ### PDL View
 
-External window showing the full Pro DJ Link network state at 60Hz:
+External window showing the full Pro DJ Link network state at 60Hz. The layout uses priority-based sizing: info text stays readable at any window size, bottom chrome (map/engine/BPM mult rows) hides progressively on small decks, and the detail waveform collapses first when space is tight.
 
 - 4-deck display (2x2 grid or 4x1 horizontal): artwork, track info, BPM (with multiplied value when active), key, cue count, play state, pitch, engine assignments
 - **Preview waveform** with playhead cursor, rekordbox cue markers (colored by DJ assignment), minute markers, beat grid (downbeat lines), and stored loop overlays

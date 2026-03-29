@@ -555,8 +555,8 @@ public:
                     auto meta = dbClient->getCachedMetadataLightById(id);
                     if (meta.isValid())
                     {
-                        cachedTrackArtist = meta.artist;
-                        cachedTrackTitle  = meta.title;
+                        if (meta.artist.isNotEmpty()) cachedTrackArtist = meta.artist;
+                        if (meta.title.isNotEmpty())  cachedTrackTitle  = meta.title;
                         if (meta.durationSeconds > 0)
                         {
                             cachedTrackDurationSec = meta.durationSeconds;
@@ -630,8 +630,8 @@ public:
                 // Ensure artist/title are from dbClient if available
                 if (info.artist.isEmpty() || info.title.startsWith("Track #"))
                 {
-                    info.artist = meta.artist;
-                    info.title  = meta.title;
+                    if (meta.artist.isNotEmpty()) info.artist = meta.artist;
+                    if (meta.title.isNotEmpty())  info.title  = meta.title;
                 }
             }
         }
@@ -1013,9 +1013,9 @@ public:
                         && cachedTrackTitle.startsWith("Track #"))
                     {
                         auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
-                        if (meta.isValid())
+                        if (meta.isValid() && meta.title.isNotEmpty())
                         {
-                            cachedTrackArtist = meta.artist;
+                            if (meta.artist.isNotEmpty()) cachedTrackArtist = meta.artist;
                             cachedTrackTitle  = meta.title;
                             if (meta.durationSeconds > 0)
                             {
@@ -1123,8 +1123,7 @@ public:
                             }
 
                             if (pdlHasTC && trackMapEnabled
-                                && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty()
-                                && !cachedTrackTitle.startsWith("Track #"))
+                                && cachedTrackTitle.isNotEmpty())
                             {
                                 if (trackMapped)
                                     inputStatusText += " | MAP: " + cachedTrackTitle;
@@ -1384,7 +1383,7 @@ public:
                             }
 
                             if (slqHasTC && trackMapEnabled
-                                && cachedTrackArtist.isNotEmpty() && cachedTrackTitle.isNotEmpty())
+                                && cachedTrackTitle.isNotEmpty())
                             {
                                 if (trackMapped)
                                     inputStatusText += " | MAP: " + cachedTrackTitle;
@@ -2336,8 +2335,7 @@ private:
     /// Returns the matched entry pointer (or nullptr if not found/malformed).
     const TrackMapEntry* lookupTrackInMap()
     {
-        if (!trackMapPtr || cachedTrackTitle.isEmpty()
-            || cachedTrackTitle.startsWith("Track #"))
+        if (!trackMapPtr || cachedTrackTitle.isEmpty())
         {
             trackMapped = false;
             return nullptr;
@@ -2353,6 +2351,14 @@ private:
         // don't lose the TrackMap match (and its armed cue points).
         if (!entry && cachedTrackDurationSec > 0)
             entry = trackMapPtr->find(cachedTrackArtist, cachedTrackTitle, 0);
+
+        // Last resort: ignore duration entirely.  Catches the case where the
+        // entry was saved with a duration that differs from the engine's cached
+        // duration (e.g. PDL View saved with CDJ-reported duration while the
+        // engine's cachedTrackDurationSec was still 0 or stale from an earlier
+        // enrichment pass).
+        if (!entry)
+            entry = trackMapPtr->findIgnoringDuration(cachedTrackArtist, cachedTrackTitle);
         if (entry)
         {
             int h, m, s, f;
