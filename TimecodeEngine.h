@@ -400,7 +400,7 @@ public:
         cachedTrackDurationSec = 0;
         armedCues.clear();
         lastCueCheckMs = 0;
-        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
         std::memset(trigDmxBuffer, 0, sizeof(trigDmxBuffer));
@@ -443,7 +443,7 @@ public:
     void stopProDJLinkInput()
     {
         // Reset PLL and LTC encoder state so other sources start clean.
-        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
     }
@@ -487,7 +487,7 @@ public:
     void stopStageLinQInput()
     {
         // Reset PLL and LTC encoder state so other sources start clean.
-        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
     }
@@ -909,8 +909,38 @@ public:
                     // Smooth timecode display using interpolation between CDJ packets.
                     uint32_t rawPlayheadMs = sharedProDJLink->getPlayheadMs(ep);
                     double now = juce::Time::getMillisecondCounterHiRes();
+                    bool hasAbs = sharedProDJLink->playerHasAbsolutePosition(ep);
 
-                    bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
+                    // Beat grid precision for NXS2: replace the rough position
+                    // (beatCount x 60000/BPM) with the exact ms from the rekordbox
+                    // beat grid.  This handles variable-BPM tracks and non-zero
+                    // first-beat offsets that the simple formula misses.
+                    // CDJ-3000 already provides precise ms via abspos packets.
+                    if (!hasAbs && !pdlBeatGrid.empty())
+                    {
+                        uint32_t bc = sharedProDJLink->getBeatCount(ep);
+                        if (bc > 0 && bc <= (uint32_t)pdlBeatGrid.size())
+                            rawPlayheadMs = pdlBeatGrid[(size_t)(bc - 1)].timeMs;
+                    }
+
+                    // Detect new data from the CDJ.
+                    // CDJ-3000: position changes with every abspos packet (~30Hz)
+                    //   → simple position comparison works.
+                    // NXS2 with beat grid: position only changes at beat boundaries
+                    //   (~2Hz at 120BPM), but status packets arrive at 5Hz.
+                    //   Use absPositionTs to detect all packets so the snap point
+                    //   refreshes at 5Hz (prevents interpolation freeze between beats).
+                    double latestTs = sharedProDJLink->getAbsPositionTs(ep);
+                    bool isNewPacket;
+                    if (hasAbs)
+                    {
+                        isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
+                    }
+                    else
+                    {
+                        isNewPacket = (latestTs != pdlLastAbsPosTs);
+                        pdlLastAbsPosTs = latestTs;
+                    }
 
                     // ALWAYS start from raw playhead to prevent double-offset application.
                     // The offset is applied later and must start from a clean base.
@@ -918,18 +948,75 @@ public:
 
                     if (isNewPacket)
                     {
-                        // New CDJ data arrived -- update snap point for interpolation
+                        // Detect if the grid-corrected position actually changed
+                        // (new beat or seek) vs same beat with a new timestamp.
+                        // Compare against pdlLastPlayheadMs (previous grid value),
+                        // NOT pdlSnapMs (which drifts forward from interpolation
+                        // advancement between beats).
+                        bool positionChanged = (rawPlayheadMs != pdlLastPlayheadMs);
                         pdlLastPlayheadMs = rawPlayheadMs;
-                        pdlSnapMs = (double)rawPlayheadMs;
-                        pdlSnapTime = now;
+
+                        if (positionChanged)
+                        {
+                            // New beat or seek -- reset the interpolation anchor.
+                            // NXS2 guard: if interpolation overshot the grid position
+                            // by a small amount (<50ms), hold the interpolated position
+                            // for this tick rather than snapping backward. The anchor
+                            // resets to grid so future interpolation aligns naturally.
+                            // Defense-in-depth alongside the encoder auto-increment
+                            // (MtcOutput/ArtnetOutput).
+                            // Large jumps (seek, track change) pass through normally.
+                            // CDJ-3000 always snaps -- abspos IS the ground truth.
+                            if (!hasAbs && pdlSnapMs > (double)rawPlayheadMs
+                                && (pdlSnapMs - (double)rawPlayheadMs) < 50.0)
+                            {
+                                currentTimecode = ProDJLink::playheadToTimecode(
+                                    (uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                            }
+                            pdlSnapMs = (double)rawPlayheadMs;
+                            pdlSnapTime = now;
+                        }
+                        else if (pdlSnapSpeed > 0.01)
+                        {
+                            // Same grid position (NXS2 same beat, new status
+                            // packet).  Advance the anchor to the current
+                            // interpolated position so elapsed stays small and
+                            // doesn't hit the maxAdvance cap between beats.
+                            double elapsed = now - pdlSnapTime;
+                            if (elapsed > 0.0)
+                                pdlSnapMs += elapsed * pdlSnapSpeed;
+                            pdlSnapTime = now;
+                            // Update currentTimecode to the advanced position --
+                            // otherwise it stays at the grid value (line above)
+                            // which is behind the interpolated position, causing
+                            // a backward glitch at each 5Hz status packet.
+                            currentTimecode = ProDJLink::playheadToTimecode(
+                                (uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                        }
+                        // Always refresh speed -- the DJ may have moved the
+                        // pitch fader between beats, and the interpolation
+                        // should use the latest velocity immediately.
                         pdlSnapSpeed = cdjSpeed;
                     }
-                    else if (pdlSnapSpeed > 0.01 && sharedProDJLink->isPlayerPlaying(ep))
+                    else if (pdlSnapSpeed > 0.01
+                            && (sharedProDJLink->isPlayerPlaying(ep)
+                                || cdjSpeed > PlayheadPLL::kDeadZone))
                     {
-                        // Between packets: interpolate forward using CDJ speed
+                        // Between packets: interpolate forward using CDJ speed.
+                        // Interpolate when PLAYING, or when the motor is still
+                        // decelerating (pause ramp: playState=PAUSED but
+                        // actualSpeed > 0).  Without this, NXS2 timecode stutters
+                        // at 5Hz during the 4-5 second pause deceleration because
+                        // only isNewPacket refreshes the timecode.
+                        // CDJ-3000 (abspos ~30Hz): cap scales with speed -- limits how
+                        //   far the interpolated position advances between updates.
+                        // NXS2 (beat-derived ~5-7Hz): fixed 250ms real-time cap.
+                        //   Status packets arrive at 5Hz regardless of playback speed,
+                        //   so the gap is always ~200ms.  Speed-scaling would starve
+                        //   the interpolation at low speeds (e.g. 0.5x -> 125ms < 200ms gap).
                         double elapsed = now - pdlSnapTime;
                         double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
-                        double maxAdvance = 50.0 * pdlSnapSpeed;
+                        double maxAdvance = hasAbs ? (50.0 * pdlSnapSpeed) : 250.0;
                         if (elapsed <= maxAdvance)
                             currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
                     }
@@ -1704,7 +1791,7 @@ private:
         if (resolvedXfPlayer != 0)
         {
             resolvedXfPlayer = 0;
-            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
     }
@@ -1770,7 +1857,7 @@ private:
         if (resolvedXfPlayer != 0)
         {
             resolvedXfPlayer = 0;
-            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+            pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
     }
@@ -1783,7 +1870,7 @@ private:
             + juce::String(resolvedXfPlayer) + " -> " + juce::String(newPlayer));
         resolvedXfPlayer = newPlayer;
         // Reset PLL and track cache so we start clean on the new player
-        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0;
+        pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         cachedTrackId = 0;
         cachedTrackArtist.clear();
@@ -2025,6 +2112,7 @@ private:
     Timecode pdlFrozenTc {};          // frozen timecode on end-of-track (prevents flicker)
     bool pdlTcFrozen = false;         // true = outputting frozen timecode
     uint32_t pdlLastPlayheadMs = 0;   // last CDJ playhead for change detection
+    double pdlLastAbsPosTs = 0.0;     // last absPositionTs for NXS2 new-packet detection
     double pdlSnapMs = 0.0;           // playhead ms at last CDJ packet (interpolation anchor)
     double pdlSnapTime = 0.0;         // hi-res timestamp of last CDJ packet
     double pdlSnapSpeed = 1.0;        // actualSpeed at last CDJ packet
@@ -2314,12 +2402,32 @@ private:
             return;
         }
 
-        // Use our VCDJ player number for the dbserver query context.
-        // The CDJ only accepts queries from player numbers 1-4 on the network.
-        int dbCtx = sharedProDJLink->getVCDJPlayerNumber();
-        // Safety: if VCDJ is same as source, use the "other" low number
-        if (dbCtx == (int)srcPlayer)
-            dbCtx = (srcPlayer != 1) ? 1 : 2;
+        // Choose dbserver query identity.
+        // CDJ-3000: accepts player 5 (our VCDJ number) — use it directly.
+        // NXS2/older: rejects player 5, requires 1-4 that's present on the
+        // network.  Use suggestDbPlayerNumber() to find a valid candidate.
+        int dbCtx;
+        bool srcHasAbsPos = sharedProDJLink->playerHasAbsolutePosition((int)srcPlayer);
+        if (srcHasAbsPos)
+        {
+            dbCtx = sharedProDJLink->getVCDJPlayerNumber();
+            // Safety: if VCDJ coincidentally matches source, pick another
+            if (dbCtx == (int)srcPlayer)
+                dbCtx = (srcPlayer != 1) ? 1 : 2;
+        }
+        else
+        {
+            // NXS2: suggestDbPlayerNumber already picks a valid 1-4 excluding
+            // srcPlayer.  If it returns srcPlayer (last resort: only player on
+            // network), that's the best we can do — don't override to a
+            // non-existent player.
+            dbCtx = sharedProDJLink->suggestDbPlayerNumber((int)srcPlayer);
+            if (dbCtx == 0)
+            {
+                DBG("TimecodeEngine: SKIPPED metadata -- no valid player 1-4 for NXS2 query");
+                return;
+            }
+        }
 
         juce::String model = sharedProDJLink->getPlayerModel((int)srcPlayer);
 

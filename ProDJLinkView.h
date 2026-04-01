@@ -575,7 +575,20 @@ public:
                 uint8_t slot = proDJLink.getLoadedSlot(pn);
                 if (slot != 0)
                 {
-                    int dbCtx = proDJLink.getVCDJPlayerNumber();
+                    // Choose dbserver query identity.
+                    // CDJ-3000: accepts player 5 (VCDJ). NXS2: requires 1-4.
+                    int dbCtx;
+                    if (proDJLink.playerHasAbsolutePosition((int)srcPlayer))
+                    {
+                        dbCtx = proDJLink.getVCDJPlayerNumber();
+                        if (dbCtx == (int)srcPlayer)
+                            dbCtx = (srcPlayer != 1) ? 1 : 2;
+                    }
+                    else
+                    {
+                        dbCtx = proDJLink.suggestDbPlayerNumber((int)srcPlayer);
+                        if (dbCtx == 0) dbCtx = 1;  // last resort fallback
+                    }
                     juce::String model = proDJLink.getPlayerModel((int)srcPlayer);
                     dbClient.requestMetadata(
                         srcIP, slot, 1, ds.trackId, dbCtx, model);
@@ -611,6 +624,14 @@ public:
                         ds.key       = meta.key;
                         ds.artworkId = meta.artworkId;
                         ds.cueCount  = (int)meta.cueList.size();
+
+                        // Update trackLenSec from dbserver metadata.
+                        // CDJ-3000: already set from abspos packets (redundant but harmless).
+                        // NXS2: no abspos → trackLenSec starts at 0. Without this,
+                        // artwork disk cache is saved under a key without duration,
+                        // mismatching the TrackMap entry key and CuePointEditor lookup.
+                        if (meta.durationSeconds > 0)
+                            ds.trackLenSec = (uint32_t)meta.durationSeconds;
 
                         if (meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                         {
@@ -681,6 +702,8 @@ public:
                             ds.key       = metaById.key;
                             ds.artworkId = metaById.artworkId;
                             ds.cueCount  = (int)metaById.cueList.size();
+                            if (metaById.durationSeconds > 0)
+                                ds.trackLenSec = (uint32_t)metaById.durationSeconds;
 
                             if (metaById.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                             {

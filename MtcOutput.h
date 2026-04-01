@@ -56,6 +56,7 @@ public:
             isRunningFlag.store(true, std::memory_order_relaxed);
             paused.store(false, std::memory_order_relaxed);
             currentQFIndex.store(0, std::memory_order_relaxed);
+            mtcSeeded = false;
 
             // Full Frame is sent after the first setTimecode() call populates
             // pendingTimecode -- avoids transmitting a misleading 00:00:00.00
@@ -123,6 +124,7 @@ public:
             stopTimer();
             currentQFIndex.store(0, std::memory_order_relaxed);
             paused.store(false, std::memory_order_relaxed);
+            mtcSeeded = false;
 
             // Re-sync receivers after pause with a Full Frame message
             sendFullFrame();
@@ -148,6 +150,7 @@ public:
             return;
         // Reset QF cycle to start fresh from the new position
         currentQFIndex.store(0, std::memory_order_relaxed);
+        mtcSeeded = false;
         sendFullFrame();
     }
 
@@ -216,13 +219,46 @@ private:
         double lastSend = lastQfSendTime.load(std::memory_order_relaxed);
         while ((now - lastSend) >= qfInterval && sent < 2)
         {
-            // At QF index 0, snapshot the timecode for this entire 8-QF cycle
-            // This guarantees all 8 QFs describe the SAME timecode - no jumps
+            // At QF index 0, determine the timecode for this entire 8-QF cycle.
+            // Auto-increment: advance by 2 frames (one QF cycle = 2 frame durations).
+            // Compare with pendingTimecode and only resync on diff > 2 (seek/jump).
+            // This prevents 1-frame backward jitter from interpolation overshoot
+            // causing a full QF cycle of wrong data → MTC receiver flicker.
+            // Same architectural pattern as the LTC encoder's auto-increment.
             int qfIdx = currentQFIndex.load(std::memory_order_relaxed);
             if (qfIdx == 0)
             {
-                const juce::SpinLock::ScopedLockType lock(tcLock);
-                cycleTimecode = pendingTimecode;
+                Timecode pending;
+                {
+                    const juce::SpinLock::ScopedLockType lock(tcLock);
+                    pending = pendingTimecode;
+                }
+
+                if (!mtcSeeded)
+                {
+                    cycleTimecode = pending;
+                    mtcSeeded = true;
+                }
+                else
+                {
+                    // Auto-increment by 2 frames (1 QF cycle = 2 frame durations)
+                    cycleTimecode = incrementFrame(incrementFrame(cycleTimecode, fps), fps);
+
+                    // Resync if pending differs by more than 2 frames (seek/jump)
+                    int maxFrames = frameRateToInt(fps);
+                    auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
+                        return (int64_t)t.hours * 3600 * maxFrames
+                             + (int64_t)t.minutes * 60 * maxFrames
+                             + (int64_t)t.seconds * maxFrames
+                             + (int64_t)t.frames;
+                    };
+                    int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
+                    int64_t rawDiff = toTotal(pending) - toTotal(cycleTimecode);
+                    int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
+                    if (diff > dayFrames / 2) diff = dayFrames - diff;
+                    if (diff > 2)
+                        cycleTimecode = pending;
+                }
             }
 
             sendQuarterFrame(qfIdx, fps);
@@ -289,6 +325,7 @@ private:
     juce::SpinLock tcLock;
     Timecode pendingTimecode;   // Written by UI thread, read under tcLock
     Timecode cycleTimecode;     // Timer-thread-only: snapshot taken at QF index 0, read through QF 1-7
+    bool     mtcSeeded = false; // Auto-increment: false until first QF0 seeds cycleTimecode
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     // currentQFIndex is primarily accessed from the timer thread, but reset from
     // the UI thread in start()/setPaused() after stopTimer().  JUCE guarantees

@@ -63,6 +63,7 @@ public:
         addBtn(btnLearn,    "Learn");
         addBtn(btnAdd,      "Add");
         addBtn(btnDelete,   "Delete");
+        addBtn(btnClearAll, "Clear All");
         addBtn(btnImport,   "Import");
         addBtn(btnExport,   "Export");
 
@@ -89,6 +90,7 @@ public:
         btnLearn.onClick  = [this] { onLearn(); };
         btnAdd.onClick    = [this] { onAdd(); };
         btnDelete.onClick = [this] { onDeleteSelected(); };
+        btnClearAll.onClick = [this] { onClearAll(); };
         btnImport.onClick = [this] { onImport(); };
         btnExport.onClick = [this] { onExport(); };
 
@@ -192,6 +194,22 @@ public:
         btnFormCues.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFF00CC88));
         btnFormSave.onClick   = [this] { onFormSave(); };
         btnFormCancel.onClick = [this] { onFormCancel(); };
+
+        // Enter/Return key saves the form (same as clicking Save)
+        auto returnToSave = [this] { onFormSave(); };
+        edFormArtist.onReturnKey  = returnToSave;
+        edFormTitle.onReturnKey   = returnToSave;
+        edFormOffset.onReturnKey  = returnToSave;
+        edFormNotes.onReturnKey   = returnToSave;
+        edFormMidiCh.onReturnKey  = returnToSave;
+        edFormMidiNote.onReturnKey = returnToSave;
+        edFormMidiNoteVel.onReturnKey = returnToSave;
+        edFormMidiCC.onReturnKey  = returnToSave;
+        edFormMidiCCVal.onReturnKey = returnToSave;
+        edFormOscAddr.onReturnKey = returnToSave;
+        edFormOscArgs.onReturnKey = returnToSave;
+        edFormDmxCh.onReturnKey   = returnToSave;
+        edFormDmxVal.onReturnKey  = returnToSave;
         btnFormCues.onClick   = [this]
         {
             if (editingRow < 0 || editingRow >= (int)rows.size()) return;
@@ -288,7 +306,8 @@ public:
         lblLearnLayer.setBounds(btnRow.removeFromLeft(38));
         cmbLearnLayer.setBounds(btnRow.removeFromLeft(100));  btnRow.removeFromLeft(8);
         btnAdd.setBounds(btnRow.removeFromLeft(bw));      btnRow.removeFromLeft(4);
-        btnDelete.setBounds(btnRow.removeFromLeft(bw));
+        btnDelete.setBounds(btnRow.removeFromLeft(bw));  btnRow.removeFromLeft(4);
+        btnClearAll.setBounds(btnRow.removeFromLeft(bw));
 
         btnExport.setBounds(btnRow.removeFromRight(bw));  btnRow.removeFromRight(4);
         btnImport.setBounds(btnRow.removeFromRight(bw));
@@ -466,7 +485,7 @@ private:
     //--------------------------------------------------------------------------
     juce::TableListBox table { "TrackMapTable", this };
 
-    juce::TextButton btnLearn, btnAdd, btnDelete, btnImport, btnExport;
+    juce::TextButton btnLearn, btnAdd, btnDelete, btnClearAll, btnImport, btnExport;
     juce::Label lblLearnLayer;
     juce::ComboBox cmbLearnLayer;
 
@@ -1028,10 +1047,35 @@ private:
             });
     }
 
+    void onClearAll()
+    {
+        if (trackMap.getEntries().empty()) return;
+
+        int count = (int)trackMap.getEntries().size();
+        auto options = juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon)
+            .withTitle("Clear All Tracks")
+            .withMessage("Delete all " + juce::String(count)
+                         + " tracks from the Track Map?\n\nThis cannot be undone.")
+            .withButton("Clear All")
+            .withButton("Cancel");
+
+        deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
+            [this](int result)
+            {
+                if (result == 1)
+                {
+                    trackMap.clear();
+                    closeForm();
+                    notifyChanged();
+                }
+            });
+    }
+
     void onImport()
     {
         fileChooser = std::make_unique<juce::FileChooser>(
-            "Import Track Map", juce::File(), "*.json");
+            "Import Track Map", juce::File(), "*.json;*.xml");
 
         fileChooser->launchAsync(juce::FileBrowserComponent::openMode
                                 | juce::FileBrowserComponent::canSelectFiles,
@@ -1040,22 +1084,32 @@ private:
             auto file = fc.getResult();
             if (file == juce::File()) return;
 
-            // Parse file into a temporary list
-            auto parsed = juce::JSON::parse(file.loadFileAsString());
-            auto* obj = parsed.getDynamicObject();
-            if (!obj) return;
-
-            auto* arr = obj->getProperty("tracks").getArray();
-            if (!arr || arr->isEmpty()) return;
-
             std::vector<TrackMapEntry> entries;
-            for (auto& item : *arr)
+
+            if (file.getFileExtension().equalsIgnoreCase(".xml"))
             {
-                TrackMapEntry e;
-                e.fromVar(item);
-                if (e.hasValidKey())
-                    entries.push_back(std::move(e));
+                // rekordbox XML export (DJ_PLAYLISTS format)
+                entries = TrackMap::parseRekordboxXml(file);
             }
+            else
+            {
+                // STC JSON format
+                auto parsed = juce::JSON::parse(file.loadFileAsString());
+                auto* obj = parsed.getDynamicObject();
+                if (!obj) return;
+
+                auto* arr = obj->getProperty("tracks").getArray();
+                if (!arr || arr->isEmpty()) return;
+
+                for (auto& item : *arr)
+                {
+                    TrackMapEntry e;
+                    e.fromVar(item);
+                    if (e.hasValidKey())
+                        entries.push_back(std::move(e));
+                }
+            }
+
             if (entries.empty()) return;
 
             // Sort by artist then title

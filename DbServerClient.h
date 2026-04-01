@@ -495,7 +495,7 @@ private:
     static constexpr int kPortDiscoveryPort = 12523;
     static constexpr int kDefaultDbPort     = 1051;
     static constexpr int kConnectTimeoutMs  = 3000;
-    static constexpr int kReadTimeoutMs     = 3000;
+    static constexpr int kReadTimeoutMs     = 1000;  // CDJ responds in <10ms; 3000 was wasteful
     static constexpr int kMaxCacheEntries   = 256;
     static constexpr int kMaxArtCacheEntries = 64;
     static constexpr int kMaxConnections    = 6;
@@ -555,6 +555,7 @@ private:
         std::unique_ptr<juce::StreamingSocket> socket;
         int dbPort = 0;
         bool contextSetUp = false;
+        uint8_t contextPlayer = 0;  // player number used in setupQueryContext
         uint32_t txId = 0;
         double lastFailTime = 0.0;
 
@@ -568,6 +569,7 @@ private:
                 socket = nullptr;
             }
             contextSetUp = false;
+            contextPlayer = 0;
             txId = 0;
             dbPort = 0;
             playerIP.clear();
@@ -892,7 +894,22 @@ private:
         for (auto& conn : connections)
         {
             if (conn.playerIP == playerIP && conn.isConnected())
+            {
+                // If the query identity changed (e.g. NXS2 network topology
+                // change caused suggestDbPlayerNumber to pick a different
+                // player), the existing context is stale -- close and reconnect
+                // so setupQueryContext uses the new identity.
+                if (conn.contextPlayer != 0 && conn.contextPlayer != ourPlayer)
+                {
+                    DBG("DbServerClient: context player mismatch ("
+                        + juce::String(conn.contextPlayer) + " vs "
+                        + juce::String(ourPlayer) + ") -- reconnecting to " + playerIP);
+                    conn.close();
+                    conn.lastFailTime = 0.0;  // intentional close, not a failure
+                    break;  // fall through to new connection below
+                }
                 return &conn;
+            }
         }
 
         // Find empty slot or recycle oldest
@@ -1060,6 +1077,7 @@ private:
         DBG("DbServerClient: query context established, CDJ reports player="
             + juce::String(resp.numArgs[1]));
         conn.contextSetUp = true;
+        conn.contextPlayer = ourPlayer;
         conn.txId = 1;
         return true;
     }

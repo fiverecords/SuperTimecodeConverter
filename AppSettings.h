@@ -5,6 +5,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 //==============================================================================
@@ -588,6 +589,50 @@ public:
     const std::unordered_map<std::string, TrackMapEntry>& getEntries() const { return entries; }
 
     uint64_t getGeneration() const { return generation; }
+
+    //------------------------------------------------------------------
+    // rekordbox XML import -- parse <DJ_PLAYLISTS> into TrackMapEntry list.
+    // Returns entries with artist, title, durationSec populated.
+    // Offsets and triggers are left at defaults (user configures later).
+    // Artwork and waveform will be fetched from the CDJ on first play.
+    //------------------------------------------------------------------
+    static std::vector<TrackMapEntry> parseRekordboxXml(const juce::File& file)
+    {
+        std::vector<TrackMapEntry> result;
+        auto xml = juce::XmlDocument::parse(file);
+        if (!xml || xml->getTagName() != "DJ_PLAYLISTS") return result;
+
+        auto* collection = xml->getChildByName("COLLECTION");
+        if (!collection) return result;
+
+        // Deduplicate by key (same artist+title can appear from multiple
+        // locations, e.g. local library + USB export in the same XML).
+        std::unordered_set<std::string> seen;
+
+        for (auto* track = collection->getChildByName("TRACK");
+             track != nullptr;
+             track = track->getNextElementWithTagName("TRACK"))
+        {
+            juce::String title  = track->getStringAttribute("Name").trim();
+            juce::String artist = track->getStringAttribute("Artist").trim();
+            int duration        = track->getIntAttribute("TotalTime", 0);
+
+            if (title.isEmpty()) continue;  // hasValidKey requires title
+
+            TrackMapEntry e;
+            e.title       = title;
+            e.artist      = artist;
+            e.durationSec = duration;
+
+            auto k = e.key();
+            if (seen.count(k)) continue;
+            seen.insert(k);
+
+            result.push_back(std::move(e));
+        }
+
+        return result;
+    }
 
 private:
     std::unordered_map<std::string, TrackMapEntry> entries;

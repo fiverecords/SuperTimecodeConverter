@@ -54,7 +54,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtual CDJ, converting the DJ's playhead position into frame-accurate SMPTE timecode in real time.
 
-**Tested hardware:** CDJ-3000, CDJ-3000X, DJM-900NXS2, DJM-V10, DJM-A9. Other Pro DJ Link compatible hardware (CDJ-2000NXS2, XDJ series, etc.) should work but has not been verified yet -- please report any issues on GitHub.
+**Tested hardware:** CDJ-3000, CDJ-3000X, CDJ-2000NXS2, DJM-900NXS2, DJM-V10, DJM-A9. Other Pro DJ Link compatible hardware (XDJ series, older CDJ models) should work but has not been verified yet -- please report any issues on GitHub.
 
 **Player tracking:**
 - Automatic player discovery on the Pro DJ Link network
@@ -136,6 +136,9 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 - Duration-based track identification -- same artist+title with different lengths are treated as separate tracks
 - Learn mode: capture tracks live from any CDJ or Denon deck (auto-captures duration)
 - Auto-fill artist/title from CDJ metadata
+- **Import from rekordbox XML:** import your entire rekordbox collection into the Track Map from an XML export (File → Export Collection in xml format). Artist, title and duration are imported for each track. Artwork, waveform and cue points populate automatically the first time each track plays on a CDJ.
+- **Clear All:** remove all entries from the Track Map with a single click (with confirmation dialog)
+- **Enter/Return to save:** press Enter in any form field to save the entry directly, without clicking the Save button
 
 **Per-track triggers (any combination, fired simultaneously on track change):**
 - MIDI Note On (+ immediate Note Off)
@@ -360,7 +363,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.8.2)
+   project(SuperTimecodeConverter VERSION 1.8.3)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -370,7 +373,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.8.2"
+       VERSION "1.8.3"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE

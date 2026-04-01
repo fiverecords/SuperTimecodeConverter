@@ -99,6 +99,7 @@ public:
         isRunningFlag.store(true, std::memory_order_relaxed);
         paused.store(false, std::memory_order_relaxed);
         sendErrors.store(0, std::memory_order_relaxed);
+        artnetSeeded = false;
         updateTimerRate();
         return true;
     }
@@ -155,6 +156,7 @@ public:
         }
         else if (isRunningFlag.load(std::memory_order_relaxed))
         {
+            artnetSeeded = false;
             lastFrameSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
             updateTimerRate();
         }
@@ -171,6 +173,7 @@ public:
             || paused.load(std::memory_order_relaxed)
             || socket == nullptr)
             return;
+        artnetSeeded = false;
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
         sendArtTimeCode(fps);
     }
@@ -273,11 +276,41 @@ private:
 
     void sendArtTimeCode(FrameRate fps)
     {
-        Timecode tc;
+        Timecode pending;
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
-            tc = timecodeToSend;
+            pending = timecodeToSend;
         }
+
+        // Auto-increment: advance by 1 frame per send.  Compare with
+        // pendingTimecode and only resync on diff > 1 (seek/jump).
+        // Prevents 1-frame backward jitter from interpolation overshoot.
+        // Same architectural pattern as the LTC and MTC encoders.
+        Timecode tc;
+        if (!artnetSeeded)
+        {
+            tc = pending;
+            artnetSeeded = true;
+        }
+        else
+        {
+            tc = incrementFrame(encoderTc, fps);
+
+            int maxFrames = frameRateToInt(fps);
+            auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
+                return (int64_t)t.hours * 3600 * maxFrames
+                     + (int64_t)t.minutes * 60 * maxFrames
+                     + (int64_t)t.seconds * maxFrames
+                     + (int64_t)t.frames;
+            };
+            int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
+            int64_t rawDiff = toTotal(pending) - toTotal(tc);
+            int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
+            if (diff > dayFrames / 2) diff = dayFrames - diff;
+            if (diff > 1)
+                tc = pending;
+        }
+        encoderTc = tc;
 
         // Validate ranges -- don't send corrupt data to the network
         int maxFrames = frameRateToInt(fps);
@@ -335,6 +368,8 @@ private:
 
     juce::SpinLock tcLock;
     Timecode timecodeToSend;        // Written by UI thread under tcLock, read by timer thread under tcLock
+    Timecode encoderTc;             // Auto-increment: last sent timecode (timer thread only)
+    bool     artnetSeeded = false;  // Auto-increment: false until first frame seeds encoderTc
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
