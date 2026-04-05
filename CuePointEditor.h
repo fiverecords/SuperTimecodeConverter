@@ -755,6 +755,7 @@ private:
                 if (parts.size() >= 3 && parts[2].length() == 1) ms *= 100;
                 else if (parts.size() >= 3 && parts[2].length() == 2) ms *= 10;
                 cue.positionMs = (uint32_t)(mins * 60000 + secs * 1000 + ms);
+                edPosition.setText(CuePoint::formatPositionMs(cue.positionMs), false);
             }
         }
 

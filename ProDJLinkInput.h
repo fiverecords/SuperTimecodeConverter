@@ -1157,6 +1157,7 @@ public:
     /// `excludePlayer`, or 0 if none found (query will fail).
     int suggestDbPlayerNumber(int excludePlayer) const
     {
+        // Prefer another discovered player (ideal: the CDJ knows it exists)
         for (int pn = 1; pn <= 4; ++pn)
         {
             if (pn == excludePlayer) continue;
@@ -1164,11 +1165,19 @@ public:
             if (players[idx].discovered.load(std::memory_order_relaxed))
                 return pn;
         }
-        // No other player 1-4 found.  Last resort: use excludePlayer itself
-        // (may work if the CDJ allows self-referencing queries).
-        if (excludePlayer >= 1 && excludePlayer <= 4)
-            return excludePlayer;
-        return 0;
+        // No other discovered player.  Pick the highest FREE number (4→1)
+        // to avoid colliding with the source CDJ.  NXS2 dbserver accepts
+        // queries from non-existent player numbers 1-4, but rejects (or
+        // partially serves) queries claiming to be FROM the CDJ's own number.
+        // Starting from 4 minimises collision with real players (1 and 2
+        // are the most commonly used in a typical 2-deck setup).
+        for (int pn = 4; pn >= 1; --pn)
+        {
+            if (pn != excludePlayer)
+                return pn;
+        }
+        // All 4 slots taken by excludePlayer (impossible with int, but safe)
+        return (excludePlayer != 4) ? 4 : 3;
     }
 
     /// Is the given player on-air? (from CDJ status flags or DJM 0x29 packets)

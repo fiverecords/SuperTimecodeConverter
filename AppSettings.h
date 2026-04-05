@@ -640,6 +640,136 @@ private:
 };
 
 //==============================================================================
+// Generator preset -- named timecode range for the internal generator
+//==============================================================================
+struct GeneratorPreset
+{
+    juce::String name;                          // unique key, e.g. "INTRO"
+    juce::String startTC = "00:00:00:00";       // HH:MM:SS:FF
+    juce::String stopTC  = "00:00:00:00";       // HH:MM:SS:FF (0 = freerun)
+
+    std::string key() const { return name.toLowerCase().trim().toStdString(); }
+    bool hasValidKey() const { return name.trim().isNotEmpty(); }
+
+    juce::var toVar() const
+    {
+        auto* obj = new juce::DynamicObject();
+        obj->setProperty("name",    name);
+        obj->setProperty("startTC", startTC);
+        obj->setProperty("stopTC",  stopTC);
+        return juce::var(obj);
+    }
+
+    void fromVar(const juce::var& v)
+    {
+        auto* obj = v.getDynamicObject();
+        if (!obj) return;
+        name    = obj->getProperty("name").toString();
+        startTC = obj->getProperty("startTC").toString();
+        stopTC  = obj->getProperty("stopTC").toString();
+        if (startTC.isEmpty()) startTC = "00:00:00:00";
+        if (stopTC.isEmpty())  stopTC  = "00:00:00:00";
+    }
+};
+
+//==============================================================================
+// Generator preset map -- persistent collection of named presets
+//==============================================================================
+class GeneratorPresetMap
+{
+public:
+    static juce::File getPresetFile()
+    {
+        auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                       .getChildFile("SuperTimecodeConverter");
+        dir.createDirectory();
+        return dir.getChildFile("generator_presets.json");
+    }
+
+    void save() const
+    {
+        auto* root = new juce::DynamicObject();
+        root->setProperty("version", 1);
+
+        juce::Array<juce::var> arr;
+        for (auto& [k, preset] : entries)
+            arr.add(preset.toVar());
+
+        root->setProperty("presets", arr);
+        juce::var jsonVar(root);
+        getPresetFile().replaceWithText(juce::JSON::toString(jsonVar));
+    }
+
+    bool load()
+    {
+        auto file = getPresetFile();
+        if (!file.existsAsFile()) return false;
+
+        auto parsed = juce::JSON::parse(file.loadFileAsString());
+        auto* obj = parsed.getDynamicObject();
+        if (!obj) return false;
+
+        entries.clear();
+        auto* arr = obj->getProperty("presets").getArray();
+        if (arr)
+        {
+            for (auto& item : *arr)
+            {
+                GeneratorPreset p;
+                p.fromVar(item);
+                if (p.hasValidKey())
+                    entries[p.key()] = std::move(p);
+            }
+        }
+        return true;
+    }
+
+    const GeneratorPreset* find(const juce::String& name) const
+    {
+        auto it = entries.find(name.toLowerCase().trim().toStdString());
+        return (it != entries.end()) ? &it->second : nullptr;
+    }
+
+    GeneratorPreset* find(const juce::String& name)
+    {
+        auto it = entries.find(name.toLowerCase().trim().toStdString());
+        return (it != entries.end()) ? &it->second : nullptr;
+    }
+
+    void addOrUpdate(const GeneratorPreset& preset)
+    {
+        if (preset.hasValidKey())
+            entries[preset.key()] = preset;
+    }
+
+    bool remove(const juce::String& name)
+    {
+        return entries.erase(name.toLowerCase().trim().toStdString()) > 0;
+    }
+
+    void clear() { entries.clear(); }
+
+    size_t size() const { return entries.size(); }
+    bool   empty() const { return entries.empty(); }
+
+    std::vector<GeneratorPreset> getAllSorted() const
+    {
+        std::vector<GeneratorPreset> result;
+        result.reserve(entries.size());
+        for (auto& [k, p] : entries)
+            result.push_back(p);
+        std::sort(result.begin(), result.end(),
+                  [](const GeneratorPreset& a, const GeneratorPreset& b) {
+                      return a.name.compareIgnoreCase(b.name) < 0;
+                  });
+        return result;
+    }
+
+private:
+    std::unordered_map<std::string, GeneratorPreset> entries;
+};
+
+//==============================================================================
 // Per-engine settings
 //==============================================================================
 struct EngineSettings
@@ -650,6 +780,12 @@ struct EngineSettings
     juce::String inputSource = "SystemTime";
     juce::String midiInputDevice = "";
     int artnetInputInterface = 0;
+    int hippotizerInputInterface = 0;
+    int hippotizerTcChannel = 0;  // 0=TC1, 1=TC2
+    // Generator (internal timecode source)
+    bool   generatorClockMode = true;  // true = wall clock, false = transport
+    double generatorStartMs = 0.0;    // start TC in ms from midnight
+    double generatorStopMs  = 0.0;    // stop TC in ms (0 = freerun)
     // Pro DJ Link
     int proDJLinkPlayer = 1;
     bool trackMapEnabled = false;
@@ -677,6 +813,8 @@ struct EngineSettings
     bool thruOutEnabled = false;       // only meaningful for engine 0
     bool tcnetOutEnabled = false;      // TCNet timecode layer output
     int  tcnetLayer = 0;               // TCNet layer index 0-3 (Layer 1-4)
+    bool hippoOutEnabled = false;      // Hippotizer timecode output
+    juce::String hippotizerDestIp = "255.255.255.255";  // Hippotizer destination IP
     juce::String midiOutputDevice = "";
     int artnetOutputInterface = 0;
     juce::String audioOutputDevice = "";
@@ -736,6 +874,11 @@ struct EngineSettings
         obj->setProperty("inputSource", inputSource);
         obj->setProperty("midiInputDevice", midiInputDevice);
         obj->setProperty("artnetInputInterface", artnetInputInterface);
+        obj->setProperty("hippotizerInputInterface", hippotizerInputInterface);
+        obj->setProperty("hippotizerTcChannel", hippotizerTcChannel);
+        obj->setProperty("generatorClockMode", generatorClockMode);
+        obj->setProperty("generatorStartMs", generatorStartMs);
+        obj->setProperty("generatorStopMs", generatorStopMs);
         obj->setProperty("proDJLinkPlayer", proDJLinkPlayer);
         obj->setProperty("trackMapEnabled", trackMapEnabled);
         obj->setProperty("midiClockEnabled", midiClockEnabled);
@@ -761,6 +904,8 @@ struct EngineSettings
         obj->setProperty("thruOutEnabled", thruOutEnabled);
         obj->setProperty("tcnetOutEnabled", tcnetOutEnabled);
         obj->setProperty("tcnetLayer", tcnetLayer);
+        obj->setProperty("hippoOutEnabled", hippoOutEnabled);
+        obj->setProperty("hippotizerDestIp", hippotizerDestIp);
         obj->setProperty("midiOutputDevice", midiOutputDevice);
         obj->setProperty("artnetOutputInterface", artnetOutputInterface);
         obj->setProperty("audioOutputDevice", audioOutputDevice);
@@ -828,6 +973,11 @@ struct EngineSettings
         inputSource          = getString("inputSource", "SystemTime");
         midiInputDevice      = getString("midiInputDevice");
         artnetInputInterface = getInt("artnetInputInterface", 0);
+        hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
+        hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
+        generatorClockMode       = getBool("generatorClockMode", true);
+        generatorStartMs         = (double)getInt("generatorStartMs", 0);
+        generatorStopMs          = (double)getInt("generatorStopMs", 0);
         proDJLinkPlayer      = juce::jlimit(1, 8, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
@@ -866,6 +1016,8 @@ struct EngineSettings
         thruOutEnabled       = getBool("thruOutEnabled", false);
         tcnetOutEnabled      = getBool("tcnetOutEnabled", false);
         tcnetLayer           = juce::jlimit(0, 3, getInt("tcnetLayer", 0));
+        hippoOutEnabled      = getBool("hippoOutEnabled", false);
+        hippotizerDestIp     = getString("hippotizerDestIp", "255.255.255.255");
         midiOutputDevice     = getString("midiOutputDevice");
         artnetOutputInterface = getInt("artnetOutputInterface", 0);
         audioOutputDevice    = getString("audioOutputDevice");
@@ -933,6 +1085,11 @@ struct AppSettings
     // TCNet output (global network interface, enable is per-engine in EngineSettings)
     int  tcnetInterface = -1;    // -1 = all interfaces (broadcast 255.255.255.255)
 
+    // OSC Input (global listener for generator remote control)
+    bool oscInputEnabled = false;
+    int  oscInputPort = 9800;
+    int  oscInputInterface = 0;
+
     // Window positions/sizes (persisted as "x y w h" strings, empty = default)
     juce::String mainWindowBounds;
     juce::String pdlViewBounds;
@@ -940,6 +1097,7 @@ struct AppSettings
     juce::String trackMapBounds;
     juce::String mixerMapBounds;
     juce::String cuePointBounds;
+    juce::String genPresetBounds;
 
     // PDL View layout state
     bool pdlViewHorizontal  = false;
@@ -959,6 +1117,9 @@ struct AppSettings
 
     // Track map (Track ID -> timecode offset mapping)
     TrackMap trackMap;
+
+    // Generator presets (named timecode ranges for the internal generator)
+    GeneratorPresetMap generatorPresets;
 
     //==================================================================
     static juce::File getSettingsFile()
@@ -984,6 +1145,9 @@ struct AppSettings
         obj->setProperty("proDJLinkInterface", proDJLinkInterface);
         obj->setProperty("stageLinQInterface", stageLinQInterface);
         obj->setProperty("tcnetInterface", tcnetInterface);
+        obj->setProperty("oscInputEnabled", oscInputEnabled);
+        obj->setProperty("oscInputPort", oscInputPort);
+        obj->setProperty("oscInputInterface", oscInputInterface);
 
         if (mainWindowBounds.isNotEmpty()) obj->setProperty("mainWindowBounds", mainWindowBounds);
         if (pdlViewBounds.isNotEmpty())   obj->setProperty("pdlViewBounds",   pdlViewBounds);
@@ -991,6 +1155,7 @@ struct AppSettings
         if (trackMapBounds.isNotEmpty())   obj->setProperty("trackMapBounds",  trackMapBounds);
         if (mixerMapBounds.isNotEmpty())   obj->setProperty("mixerMapBounds",  mixerMapBounds);
         if (cuePointBounds.isNotEmpty())  obj->setProperty("cuePointBounds", cuePointBounds);
+        if (genPresetBounds.isNotEmpty()) obj->setProperty("genPresetBounds", genPresetBounds);
         obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
         obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
         obj->setProperty("slqViewHorizontal", slqViewHorizontal);
@@ -1005,6 +1170,9 @@ struct AppSettings
 
         // TrackMap is saved to its own file (trackmap.json)
         trackMap.save();
+
+        // Generator presets saved to generator_presets.json
+        generatorPresets.save();
     }
 
     bool load()
@@ -1045,6 +1213,9 @@ struct AppSettings
             proDJLinkInterface    = getInt("proDJLinkInterface", 0);
             stageLinQInterface    = getInt("stageLinQInterface", 0);
             tcnetInterface        = getInt("tcnetInterface", -1);
+            oscInputEnabled       = getInt("oscInputEnabled", 0) != 0;
+            oscInputPort          = juce::jlimit(1, 65535, getInt("oscInputPort", 9800));
+            oscInputInterface     = getInt("oscInputInterface", 0);
 
             mainWindowBounds = getString("mainWindowBounds");
             pdlViewBounds   = getString("pdlViewBounds");
@@ -1052,6 +1223,7 @@ struct AppSettings
             trackMapBounds  = getString("trackMapBounds");
             mixerMapBounds  = getString("mixerMapBounds");
             cuePointBounds  = getString("cuePointBounds");
+            genPresetBounds = getString("genPresetBounds");
             pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
             pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
             slqViewHorizontal  = getInt("slqViewHorizontal", 0) != 0;
@@ -1075,12 +1247,14 @@ struct AppSettings
 
             // TrackMap is loaded from its own file (trackmap.json)
             trackMap.load();
+            generatorPresets.load();
             return true;
         }
         else
         {
             bool ok = migrateFromV1(obj);
             trackMap.load();  // load track map even from v1 migration
+            generatorPresets.load();
             return ok;
         }
     }
@@ -1111,6 +1285,11 @@ private:
         es.inputSource          = getString("inputSource", "SystemTime");
         es.midiInputDevice      = getString("midiInputDevice");
         es.artnetInputInterface = getInt("artnetInputInterface", 0);
+        es.hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
+        es.hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
+        es.generatorClockMode   = getBool("generatorClockMode", true);
+        es.generatorStartMs     = (double)getInt("generatorStartMs", 0);
+        es.generatorStopMs      = (double)getInt("generatorStopMs", 0);
         es.audioInputDevice     = getString("audioInputDevice");
         es.audioInputType       = getString("audioInputType");
         es.audioInputChannel    = juce::jlimit(0, 127, getInt("audioInputChannel", 0));
@@ -1181,6 +1360,7 @@ public:
         root->setProperty("settings", readJsonFile(getSettingsFile()));
         root->setProperty("trackmap", readJsonFile(dir.getChildFile("trackmap.json")));
         root->setProperty("mixermap", readJsonFile(dir.getChildFile("mixermap.json")));
+        root->setProperty("generator_presets", readJsonFile(dir.getChildFile("generator_presets.json")));
         return juce::var(root);
     }
 
@@ -1193,6 +1373,7 @@ public:
         auto settingsVar = obj->getProperty("settings");
         auto trackmapVar = obj->getProperty("trackmap");
         auto mixermapVar = obj->getProperty("mixermap");
+        auto presetsVar  = obj->getProperty("generator_presets");
 
         // Write each section back to its file (only if present in bundle)
         if (!settingsVar.isVoid())
@@ -1201,6 +1382,8 @@ public:
             dir.getChildFile("trackmap.json").replaceWithText(juce::JSON::toString(trackmapVar));
         if (!mixermapVar.isVoid())
             dir.getChildFile("mixermap.json").replaceWithText(juce::JSON::toString(mixermapVar));
+        if (!presetsVar.isVoid())
+            dir.getChildFile("generator_presets.json").replaceWithText(juce::JSON::toString(presetsVar));
 
         return true;
     }

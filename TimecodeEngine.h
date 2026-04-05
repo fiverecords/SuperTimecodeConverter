@@ -13,6 +13,8 @@
 #include "LtcOutput.h"
 #include "ProDJLinkInput.h"
 #include "StageLinQInput.h"
+#include "HippotizerInput.h"
+#include "HippotizerOutput.h"
 #include "DbServerClient.h"
 #include "TriggerOutput.h"
 #include "LinkBridge.h"
@@ -37,7 +39,7 @@ inline constexpr int kMaxEngines = 8;
 class TimecodeEngine
 {
 public:
-    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ };
+    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ, Hippotizer };
 
     //--------------------------------------------------------------------------
     explicit TimecodeEngine(int index, const juce::String& name = {})
@@ -62,10 +64,12 @@ public:
         stopMtcOutput();
         stopArtnetOutput();
         stopLtcOutput();
+        stopHippotizerOutput();
         stopThruOutput();
         stopMtcInput();
         stopArtnetInput();
         stopLtcInput();
+        stopHippotizerInput();
         stopAudioBpm();
         // ProDJLink is shared -- not stopped per-engine
         // StageLinQ is shared -- not stopped per-engine
@@ -125,6 +129,7 @@ public:
             case InputSource::LTC:    stopLtcInput();    break;
             case InputSource::ProDJLink: stopProDJLinkInput(); break;
             case InputSource::StageLinQ: stopStageLinQInput(); break;
+            case InputSource::Hippotizer: stopHippotizerInput(); break;
             default: break;
         }
 
@@ -152,7 +157,10 @@ public:
         // Note: actual start is deferred to the caller (MainComponent),
         // which gathers device params from UI before calling startXxxInput().
         if (source == InputSource::SystemTime)
-            sourceActive = true;
+        {
+            sourceActive = genClockMode;  // clock mode: always active; transport mode: wait for Play
+            genLastTickTime = juce::Time::getMillisecondCounterHiRes();  // prevent time jump
+        }
     }
 
     void setFrameRate(FrameRate fps)
@@ -162,6 +170,7 @@ public:
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
         ltcOutput.setFrameRate(outRate);
+        hippotizerOutput.setFrameRate(outRate);
     }
 
     void setUserOverrodeLtcFps(bool v) { userOverrodeLtcFps = v; }
@@ -230,6 +239,7 @@ public:
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
         ltcOutput.setFrameRate(outRate);
+        hippotizerOutput.setFrameRate(outRate);
     }
 
     //==========================================================================
@@ -246,6 +256,8 @@ public:
     void setOutputThruEnabled(bool e)   { outputThruEnabled = e; }
     void setOutputTcnetEnabled(bool e)  { outputTcnetEnabled = e; }
     bool isOutputTcnetEnabled() const   { return outputTcnetEnabled; }
+    void setOutputHippoEnabled(bool e)  { outputHippoEnabled = e; }
+    bool isOutputHippoEnabled() const   { return outputHippoEnabled; }
     void setTcnetLayer(int l)           { tcnetLayer = juce::jlimit(0, 3, l); }
     int  getTcnetLayer() const          { return tcnetLayer; }
 
@@ -493,6 +505,30 @@ public:
     }
 
     //==========================================================================
+    // Hippotizer input (per-engine)
+    //==========================================================================
+    HippotizerInput& getHippotizerInput() { return hippotizerInput; }
+    HippotizerOutput& getHippotizerOutput() { return hippotizerOutput; }
+
+    bool startHippotizerInput(int interfaceIndex = 0, int port = 6091)
+    {
+        stopHippotizerInput();
+        hippotizerInput.refreshNetworkInterfaces();
+        if (interfaceIndex < 0) interfaceIndex = 0;
+        if (hippotizerInput.start(interfaceIndex, port))
+        {
+            inputStatusText = "RX ON " + hippotizerInput.getBindInfo();
+            if (hippotizerInput.didFallBackToAllInterfaces())
+                inputStatusText += " [FALLBACK]";
+            return true;
+        }
+        inputStatusText = "FAILED TO BIND PORT " + juce::String(port);
+        return false;
+    }
+
+    void stopHippotizerInput() { hippotizerInput.stop(); }
+
+    //==========================================================================
     // TrackMap -- track-to-timecode-offset mapping
     //==========================================================================
 
@@ -638,6 +674,39 @@ public:
         return info;
     }
 
+    /// Info about the next upcoming (unfired) cue point for UI display.
+    struct NextCueInfo
+    {
+        bool     valid = false;         // true if a next cue exists
+        juce::String name;             // cue name ("DROP", "LIGHTS ON", etc.)
+        uint32_t positionMs = 0;       // absolute position in track (ms)
+        int32_t  remainingMs = 0;      // ms until the cue fires (negative = overdue)
+    };
+
+    /// Returns info about the next unfired cue point relative to the current playhead.
+    /// Called from UI thread (timerCallback) for countdown display.
+    NextCueInfo getNextCueInfo() const
+    {
+        NextCueInfo info;
+        if (armedCues.empty()) return info;
+
+        uint32_t playhead = lastCueCheckMs;  // last known playhead position
+
+        // armedCues is sorted by positionMs -- find the first unfired cue
+        for (const auto& ac : armedCues)
+        {
+            if (!ac.fired)
+            {
+                info.valid       = true;
+                info.name        = ac.cue.name;
+                info.positionMs  = ac.cue.positionMs;
+                info.remainingMs = (int32_t)ac.cue.positionMs - (int32_t)playhead;
+                return info;
+            }
+        }
+        return info;  // all cues fired
+    }
+
     /// Force a re-lookup of the current track (e.g., after editing TrackMap)
     void refreshTrackMapLookup()
     {
@@ -742,6 +811,22 @@ public:
 
     void stopLtcOutput() { ltcOutput.stop(); ltcOutStatusText = ""; }
 
+    bool startHippotizerOutput(const juce::String& targetIp, int interfaceIndex = -1)
+    {
+        stopHippotizerOutput();
+        hippotizerOutput.refreshNetworkInterfaces();
+        if (hippotizerOutput.start(targetIp, interfaceIndex, 6091))
+        {
+            hippotizerOutput.setFrameRate(getEffectiveOutputFps());
+            hippoOutStatusText = "TX: " + hippotizerOutput.getDestination();
+            return true;
+        }
+        hippoOutStatusText = "FAILED TO BIND";
+        return false;
+    }
+
+    void stopHippotizerOutput() { hippotizerOutput.stop(); hippoOutStatusText = ""; }
+
     bool startThruOutput(const juce::String& typeName, const juce::String& devName,
                          int channel, double sampleRate = 0, int bufferSize = 0)
     {
@@ -801,10 +886,26 @@ public:
         switch (activeInput)
         {
             case InputSource::SystemTime:
-                updateSystemTime();
-                sourceActive = true;
-                if (statusTextVisible)
-                    inputStatusText = "SYSTEM CLOCK";
+                updateGenerator();
+                if (genClockMode)
+                {
+                    sourceActive = true;
+                    if (statusTextVisible)
+                        inputStatusText = "SYSTEM CLOCK";
+                }
+                else
+                {
+                    sourceActive = (genState == GeneratorState::Playing);
+                    if (statusTextVisible)
+                    {
+                        switch (genState)
+                        {
+                            case GeneratorState::Playing: inputStatusText = "PLAYING"; break;
+                            case GeneratorState::Paused:  inputStatusText = "PAUSED"; break;
+                            case GeneratorState::Stopped: inputStatusText = "STOPPED"; break;
+                        }
+                    }
+                }
                 break;
 
             case InputSource::MTC:
@@ -1539,6 +1640,49 @@ public:
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
+
+            case InputSource::Hippotizer:
+                if (hippotizerInput.getIsRunning())
+                {
+                    bool rx = hippotizerInput.isReceiving();
+                    if (rx)
+                    {
+                        uint32_t ms = hippotizerInput.getMsSinceMidnight();
+                        currentTimecode = wallClockToTimecode((double)ms, currentFps);
+                    }
+
+                    if (statusTextVisible)
+                    {
+                        // Build discovery suffix: "GOHIPPO (4.8.4.23374) @ 192.168.0.2"
+                        juce::String discInfo;
+                        if (hippotizerInput.isDiscovered())
+                        {
+                            discInfo = hippotizerInput.getDiscoveredName();
+                            auto fw = hippotizerInput.getDiscoveredFirmware();
+                            if (fw.isNotEmpty())
+                                discInfo += " (" + fw + ")";
+                            discInfo += " @ " + hippotizerInput.getDiscoveredIp();
+                        }
+
+                        if (rx)
+                        {
+                            inputStatusText = "RX ON " + hippotizerInput.getBindInfo();
+                            if (discInfo.isNotEmpty())
+                                inputStatusText += " | " + discInfo;
+                        }
+                        else if (discInfo.isNotEmpty())
+                        {
+                            inputStatusText = "WAITING | " + discInfo;
+                        }
+                        else
+                        {
+                            inputStatusText = "PAUSED - " + hippotizerInput.getBindInfo();
+                        }
+                    }
+                    sourceActive = rx;
+                }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
+                break;
         }
 
         // --- Audio BPM forwarding (non-DJ sources only) ---
@@ -1590,11 +1734,69 @@ public:
     juce::String getArtnetOutStatusText() const { return artnetOutStatusText; }
     juce::String getLtcOutStatusText() const { return ltcOutStatusText; }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
+    juce::String getHippoOutStatusText() const { return hippoOutStatusText; }
 
     /// Only the currently displayed engine needs to build status text strings.
     /// Call with true for the selected engine, false for background engines.
     /// Avoids ~25 juce::String heap allocations per tick on non-visible engines.
     void setStatusTextVisible(bool visible) { statusTextVisible = visible; }
+
+    //==========================================================================
+    // Generator (internal timecode source, replaces old SystemTime)
+    //==========================================================================
+    enum class GeneratorState { Stopped, Playing, Paused };
+
+    GeneratorState getGeneratorState() const { return genState; }
+
+    void generatorPlay()
+    {
+        if (genState == GeneratorState::Playing) return;
+        if (genState == GeneratorState::Stopped)
+            genCurrentMs = genStartMs;  // reset to start TC
+        genLastTickTime = juce::Time::getMillisecondCounterHiRes();
+        genState = GeneratorState::Playing;
+    }
+
+    void generatorPause()
+    {
+        if (genState == GeneratorState::Playing)
+            genState = GeneratorState::Paused;
+    }
+
+    void generatorStop()
+    {
+        genState = GeneratorState::Stopped;
+        genCurrentMs = genStartMs;
+        if (activeInput == InputSource::SystemTime)
+            currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+    }
+
+    /// Set start timecode in ms from midnight.
+    void setGeneratorStartMs(double ms)
+    {
+        genStartMs = juce::jmax(0.0, ms);
+        if (genState == GeneratorState::Stopped && activeInput == InputSource::SystemTime)
+        {
+            genCurrentMs = genStartMs;
+            currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+        }
+    }
+
+    /// Set stop timecode in ms from midnight. 0 = no stop (freerun).
+    void setGeneratorStopMs(double ms) { genStopMs = juce::jmax(0.0, ms); }
+
+    double getGeneratorStartMs() const { return genStartMs; }
+    double getGeneratorStopMs()  const { return genStopMs; }
+    double getGeneratorCurrentMs() const { return genCurrentMs; }
+
+    /// Clock mode: read wall clock (old SystemTime behavior) instead of generator transport.
+    void setGeneratorClockMode(bool useSystemClock)
+    {
+        if (useSystemClock && !genClockMode)
+            generatorStop();  // stop transport when switching to clock mode
+        genClockMode = useSystemClock;
+    }
+    bool getGeneratorClockMode() const { return genClockMode; }
 
     //==========================================================================
     // VU meter smoothed levels
@@ -1617,6 +1819,7 @@ public:
             case InputSource::LTC:        return ltcInput.getIsRunning();
             case InputSource::ProDJLink:  return sharedProDJLink != nullptr && sharedProDJLink->getIsRunning();
             case InputSource::StageLinQ:  return sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning();
+            case InputSource::Hippotizer: return hippotizerInput.getIsRunning();
             default:                      return false;
         }
     }
@@ -1627,12 +1830,13 @@ public:
         {
             case InputSource::MTC:        return "MTC";
             case InputSource::ArtNet:     return "ArtNet";
-            case InputSource::SystemTime: return "SystemTime";
+            case InputSource::SystemTime: return "Generator";
             case InputSource::LTC:        return "LTC";
             case InputSource::ProDJLink:  return "ProDJLink";
             case InputSource::StageLinQ:  return "StageLinQ";
+            case InputSource::Hippotizer: return "HippoNet";
         }
-        return "SystemTime";
+        return "Generator";
     }
 
     static InputSource stringToInputSource(const juce::String& s)
@@ -1642,7 +1846,9 @@ public:
         if (s == "LTC") return InputSource::LTC;
         if (s == "ProDJLink") return InputSource::ProDJLink;
         if (s == "StageLinQ") return InputSource::StageLinQ;
+        if (s == "HippoNet" || s == "Hippotizer") return InputSource::Hippotizer;
         if (s == "TCNet") return InputSource::ProDJLink;  // legacy migration
+        if (s == "Generator" || s == "SystemTime") return InputSource::SystemTime;  // backward compat
         return InputSource::SystemTime;
     }
 
@@ -1652,10 +1858,11 @@ public:
         {
             case InputSource::MTC:        return "MTC";
             case InputSource::ArtNet:     return "ART-NET";
-            case InputSource::SystemTime: return "SYSTEM";
+            case InputSource::SystemTime: return "GENERATOR";
             case InputSource::LTC:        return "LTC";
             case InputSource::ProDJLink:  return "PRO DJ LINK";
             case InputSource::StageLinQ:  return "STAGELINQ";
+            case InputSource::Hippotizer: return "HIPPONET";
             default:                      return "---";
         }
     }
@@ -1700,6 +1907,14 @@ private:
     bool outputsWereActive = false;  // previous sourceActive state for transition detection
     bool userOverrodeLtcFps = false;
 
+    // Generator state (internal timecode source)
+    GeneratorState genState = GeneratorState::Stopped;
+    bool   genClockMode = true;    // true = wall clock (old SystemTime), false = transport generator
+    double genStartMs   = 0.0;     // start TC in ms from midnight
+    double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
+    double genCurrentMs = 0.0;     // current position in ms
+    double genLastTickTime = 0.0;  // hiRes ms for delta calculation
+
     // FPS conversion
     bool fpsConvertEnabled = false;
     FrameRate outputFps = FrameRate::FPS_30;
@@ -1711,6 +1926,7 @@ private:
     bool outputLtcEnabled    = false;
     bool outputThruEnabled   = false;
     bool outputTcnetEnabled  = false;
+    bool outputHippoEnabled  = false;
     int  tcnetLayer          = 0;      // TCNet layer index 0-3
 
     int mtcOutputOffset    = 0;
@@ -1723,6 +1939,8 @@ private:
     MtcOutput    mtcOutput;
     ArtnetInput  artnetInput;
     ArtnetOutput artnetOutput;
+    HippotizerInput hippotizerInput;
+    HippotizerOutput hippotizerOutput;
     LtcInput     ltcInput;
     LtcOutput    ltcOutput;
     ProDJLinkInput* sharedProDJLink = nullptr;  // shared across engines
@@ -2133,7 +2351,7 @@ private:
 
     // Status
     juce::String inputStatusText = "SYSTEM CLOCK";
-    juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText;
+    juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText, hippoOutStatusText;
     bool statusTextVisible = true;  // only build inputStatusText when engine is displayed
 
     // VU meter smoothed state
@@ -2604,14 +2822,38 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    void updateSystemTime()
+    void updateGenerator()
     {
-        auto now = juce::Time::getCurrentTime();
-        double msSinceMidnight = (double)now.getHours() * 3600000.0
-                               + (double)now.getMinutes() * 60000.0
-                               + (double)now.getSeconds() * 1000.0
-                               + (double)now.getMilliseconds();
-        currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
+        // Clock mode: read wall clock directly (old SystemTime behavior)
+        if (genClockMode)
+        {
+            auto now = juce::Time::getCurrentTime();
+            double msSinceMidnight = (double)now.getHours() * 3600000.0
+                                   + (double)now.getMinutes() * 60000.0
+                                   + (double)now.getSeconds() * 1000.0
+                                   + (double)now.getMilliseconds();
+            currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
+            return;
+        }
+
+        // Generator mode: transport-controlled
+        if (genState == GeneratorState::Playing)
+        {
+            double now = juce::Time::getMillisecondCounterHiRes();
+            double delta = now - genLastTickTime;
+            genLastTickTime = now;
+            if (delta > 0.0)
+                genCurrentMs += delta;
+
+            // Auto-stop at stop TC (if set and not zero)
+            if (genStopMs > 0.0 && genCurrentMs >= genStopMs)
+            {
+                genCurrentMs = genStopMs;
+                genState = GeneratorState::Stopped;
+            }
+        }
+        // Stopped and Paused: genCurrentMs stays where it is
+        currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
     }
 
     //==========================================================================
@@ -2915,6 +3157,11 @@ private:
                 ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
                 ltcOutput.setPaused(false);
             }
+            if (outputHippoEnabled && hippotizerOutput.getIsRunning())
+            {
+                hippotizerOutput.setTimecode(baseTc);
+                hippotizerOutput.setPaused(false);
+            }
 
             // --- Seek/Hot Cue resync ---
             // PLL detected a position jump >500ms (seek, hot cue, track load).
@@ -2932,6 +3179,8 @@ private:
                     artnetOutput.forceResync();
                 if (outputLtcEnabled && ltcOutput.getIsRunning())
                     ltcOutput.reseed();
+                if (outputHippoEnabled && hippotizerOutput.getIsRunning())
+                    hippotizerOutput.forceResync();
             }
         }
         else
@@ -2956,6 +3205,11 @@ private:
                 // LTC: set final timecode so encoder finishes current frame cleanly
                 if (outputLtcEnabled && ltcOutput.getIsRunning())
                     ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
+                if (outputHippoEnabled && hippotizerOutput.getIsRunning())
+                {
+                    hippotizerOutput.setTimecode(baseTc);
+                    hippotizerOutput.forceResync();
+                }
             }
 
             // Clear seek flag if it was set during transition to inactive
@@ -2964,6 +3218,7 @@ private:
             if (outputMtcEnabled && mtcOutput.getIsRunning()) mtcOutput.setPaused(true);
             if (outputArtnetEnabled && artnetOutput.getIsRunning()) artnetOutput.setPaused(true);
             if (outputLtcEnabled && ltcOutput.getIsRunning()) ltcOutput.setPaused(true);
+            if (outputHippoEnabled && hippotizerOutput.getIsRunning()) hippotizerOutput.setPaused(true);
         }
     }
 

@@ -12,6 +12,8 @@
 #include "LevelMeter.h"
 #include "TrackMapEditor.h"
 #include "MixerMapEditor.h"
+#include "GeneratorPresetEditor.h"
+#include "OscInputServer.h"
 #include "NetworkUtils.h"
 #include "UpdateChecker.h"
 #include "MediaDisplay.h"
@@ -285,10 +287,36 @@ private:
     // --- Input buttons ---
     juce::TextButton btnMtcIn    { "MTC" };
     juce::TextButton btnArtnetIn { "ART-NET" };
-    juce::TextButton btnSysTime  { "SYSTEM" };
+    juce::TextButton btnSysTime  { "GENERATOR" };
+
+    // Generator controls (visible when input = Generator)
+    juce::ToggleButton btnGenClock { "CLOCK" };  // system clock mode toggle
+    juce::TextButton btnGenPlay   { "PLAY" };
+    juce::TextButton btnGenPause  { "PAUSE" };
+    juce::TextButton btnGenStop   { "STOP" };
+    juce::TextEditor txtGenStartTC;
+    juce::TextEditor txtGenStopTC;
+    juce::Label      lblGenStartTC;
+    juce::Label      lblGenStopTC;
+    juce::ComboBox   cmbGenPreset;
+    juce::Label      lblGenPreset;
+    juce::TextButton btnGenPrev   { "<" };
+    juce::TextButton btnGenNext   { ">" };
+    juce::TextButton btnGenGo     { "GO" };
+    juce::TextButton btnGenPresetEdit { "EDIT" };
+
+    // OSC Input (global, controls generator from external OSC sources)
+    juce::ToggleButton btnOscIn { "OSC IN" };
+    juce::ComboBox     cmbOscInputInterface;
+    juce::Label        lblOscInputInterface;
+    juce::TextEditor   txtOscInPort;
+    juce::Label        lblOscInPort;
+    juce::Label        lblOscInStatus;
+    OscInputServer     oscInputServer;
     juce::TextButton btnLtcIn    { "LTC" };
     juce::TextButton btnProDJLinkIn { "PRO DJ LINK" };
     juce::TextButton btnStageLinQIn { "STAGELINQ" };
+    juce::TextButton btnHippoIn    { "HIPPONET" };
 
     // --- Output toggles ---
     juce::ToggleButton btnMtcOut    { "MTC OUT" };
@@ -324,6 +352,8 @@ private:
     juce::ComboBox cmbBufferSize;            juce::Label lblBufferSize;
     juce::ComboBox cmbMidiInputDevice;       juce::Label lblMidiInputDevice;
     juce::ComboBox cmbArtnetInputInterface;  juce::Label lblArtnetInputInterface;
+    juce::ComboBox cmbHippoInputInterface;  juce::Label lblHippoInputInterface;
+    juce::ComboBox cmbHippoTcChannel;      juce::Label lblHippoTcChannel;
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
@@ -344,6 +374,7 @@ private:
     int lastBpmClickMult = -999;
     juce::Label lblProDJLinkTrackInfo;
     juce::Label lblProDJLinkMetadata;
+    juce::Label lblNextCue;          // "NEXT: DROP in 0:12"
     juce::Label lblMixerStatus;  // DJM model + fader values
     ArtworkDisplay artworkDisplay;               // Phase 2c: album art from CDJ
     WaveformDisplay waveformDisplay;             // Phase 3: color waveform from CDJ
@@ -382,6 +413,7 @@ private:
     LevelMeter         mtrAudioBpm;
 
     juce::Component::SafePointer<juce::DocumentWindow> trackMapWindow;
+    juce::Component::SafePointer<juce::DocumentWindow> genPresetWindow;
     std::unique_ptr<CuePointEditorWindow> cuePointWindow;
     std::string cuePointTrackKey;  // key of the entry being edited (for dangling ref safety)
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
@@ -395,6 +427,12 @@ private:
     juce::ComboBox cmbTcnetInterface; juce::Label lblTcnetInterface;
     juce::ComboBox cmbTcnetLayer; juce::Label lblTcnetLayer;
     GainSlider sldTcnetOffset;        juce::Label lblTcnetOffset;
+
+    // Hippotizer output
+    juce::ToggleButton btnHippoOut { "HIPPONET OUT" };
+    juce::TextEditor   txtHippoDestIp;    juce::Label lblHippoDestIp;
+    juce::Label        lblHippoOutStatus;
+
     int showLockFlashCountdown = 0;  // ticks remaining for flash feedback
 
     /// Returns true if Show Lock is active and the action should be blocked.
@@ -537,6 +575,7 @@ private:
     void startCurrentLtcInput();
     void startCurrentProDJLinkInput();
     void startCurrentStageLinQInput();
+    void startCurrentHippotizerInput();
     void openTrackMapEditor();
     void openCuePointEditor(TrackMapEntry* entry);
     void openMixerMapEditor();
@@ -567,6 +606,16 @@ private:
     void updateOutputFpsButtonStates();
     void updateDeviceSelectorVisibility();
     void updateStatusLabels();
+    void updateNextCueLabel(TimecodeEngine& eng);
+    static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);
+    static juce::String msToTimecodeString(double ms, FrameRate fps);
+    void populateGenPresetCombo();
+    void activateGenPreset(const juce::String& name);
+    void loadGenPresetToFields(const juce::String& name);
+    void openGeneratorPresetEditor();
+    void setupOscInputServer();
+    void startOscInput();
+    void stopOscInput();
 
     void layoutLeftPanel();
     void layoutRightPanel();

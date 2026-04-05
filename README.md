@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration, to **Denon Engine OS hardware** via StageLinQ, and to **Green Hippo Hippotizer** media servers via HippoNet — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
 [![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
@@ -24,7 +24,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 
 Run **up to 8 independent timecode engines** simultaneously. Each engine has its own input source, frame rate, output destinations, and offset settings — all running in parallel.
 
-- Route system clock to MTC on one engine while converting LTC input to Art-Net on another
+- Route internal generator to MTC on one engine while converting LTC input to Art-Net on another
 - Feed the same source to multiple outputs with different frame offsets
 - Run independent MTC, Art-Net, and LTC pipelines side by side — each with its own device assignments
 - Monitor different CDJ or Denon players on separate engines — each generating independent timecode streams
@@ -40,7 +40,8 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
-- **System Time** — use the system clock as a timecode source
+- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software.
+- **HippoNet** — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009.
 
 ### Outputs (enable any combination per engine)
 
@@ -120,7 +121,8 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 
 **Track metadata (via FileTransfer + Engine Library database):**
 - Album artwork
-- Overview waveform preview (3-band frequency display)
+- Overview waveform preview (3-band frequency display) with cue markers (colored by DJ assignment) and minute markers
+- Quick cue positions displayed on waveform (up to 8 hot cues with colors and labels from Engine DJ)
 - Extended metadata: album, genre, key, BPM, rating
 
 **Known limitations:**
@@ -163,6 +165,8 @@ Per-track timed triggers that fire at specific playhead positions during playbac
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
 - **Works with both Pioneer and Denon** hardware via Pro DJ Link and StageLinQ.
 - **Auto-populate from rekordbox:** when a track with a TrackMap entry loads on a CDJ, STC automatically imports the DJ's rekordbox hot cues, memory points, and loops as cue points -- with their letters and comments as labels. Also applies when creating a new entry via BPM multiplier double-click. Only applies if the entry has no manually-configured cue points. Blocked during Show Lock.
+- **Auto-populate from Denon Engine:** same behavior for StageLinQ -- quick cues (up to 8) from the Engine Library database are imported automatically with their labels and colors. Cue names use hot cue letters (A-H) with Engine DJ labels.
+- **Next Cue Countdown:** a live countdown to the next upcoming cue point is displayed below the waveform (format: `▶ NEXT: DROP in 1:05`). Color changes from amber (> 10s) to orange (< 10s) to red (< 3s). Works with both ProDJLink and StageLinQ sources.
 - Cue points are stored in the Track Map (trackmap.json) alongside the track's offset and track-change triggers.
 - Maximizable window with persisted position across sessions.
 - Blocked during Show Lock to prevent accidental changes during a live show.
@@ -223,7 +227,7 @@ Scale the BPM sent to MIDI Clock, Ableton Link, and OSC before forwarding — us
 
 ### Ableton Link
 
-BPM from the selected CDJ player or Denon deck is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically. When using non-DJ sources (MTC, LTC, Art-Net, System Time), BPM can be detected from a live audio input instead.
+BPM from the selected CDJ player or Denon deck is published to an Ableton Link session. Any Link-enabled peer on the LAN (Resolume, Ableton Live, Traktor, etc.) syncs automatically. When using non-DJ sources (MTC, LTC, Art-Net, Generator), BPM can be detected from a live audio input instead.
 
 Link is **exclusive per engine** — only one engine can have Link active at a time. If another engine already owns the Link session, the toggle shows which engine has it. This prevents multiple engines from competing to set the session tempo.
 
@@ -236,7 +240,7 @@ Link is **exclusive per engine** — only one engine can have Link active at a t
 
 ### Audio BPM Detection
 
-Real-time beat tracking from a live audio input, enabling BPM output for non-DJ input sources. When the engine input is MTC, LTC, Art-Net, or System Time, an independent audio device can be configured for BPM analysis. The detected tempo feeds MIDI Clock, OSC BPM forward, and Ableton Link -- the same outputs that Pro DJ Link and StageLinQ use.
+Real-time beat tracking from a live audio input, enabling BPM output for non-DJ input sources. When the engine input is MTC, LTC, Art-Net, or Generator, an independent audio device can be configured for BPM analysis. The detected tempo feeds MIDI Clock, OSC BPM forward, and Ableton Link -- the same outputs that Pro DJ Link and StageLinQ use.
 
 - **BPM display** with colour-coded confidence: green (locked), orange (tracking), dim orange (uncertain), grey (no signal)
 - **Beat LED** flashes at the detected BPM rate
@@ -263,7 +267,7 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 - Broadcast: OptIn + Status on port 60000 (1Hz), Time on port 60001 (60Hz)
 - Unicast: automatic slave discovery, Request/Response negotiation, Metrics streaming at 30Hz, Metadata + Artwork on track change
 - Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector
-- Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, System Time
+- Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator
 
 Protocol reference: https://www.tc-supply.com/tcnet
 
@@ -363,7 +367,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.8.3)
+   project(SuperTimecodeConverter VERSION 1.9.0)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -373,7 +377,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.8.3"
+       VERSION "1.9.0"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
@@ -485,7 +489,7 @@ The **Refresh Devices** button scans for newly connected MIDI devices, audio int
 
 ### Configuration Backup & Restore
 
-The **Backup** and **Restore** buttons in the title bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, and Mixer Map mappings into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes.
+The **Backup** and **Restore** buttons in the title bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes.
 
 ### Settings
 
@@ -593,6 +597,7 @@ The application is built around a modular, header-only architecture:
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
 | `ArtnetOutput.h` | Art-Net timecode and DMX broadcaster (UDP) with drift-free timing |
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
+| `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC) |
 | `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
@@ -601,6 +606,7 @@ The application is built around a modular, header-only architecture:
 | `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
 | `MixerMap.h` | DJM parameter mapping with three-tier model support (900NXS2 / A9 / V10) and ParamType-aware value mapping (Continuous / Toggle / Discrete) |
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
+| `OscInputServer.h` | OSC 1.0 UDP listener with message parsing and dispatch for generator remote control |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
 | `AudioBpmInput.h` | Real-time audio BPM detection: independent AudioDeviceManager, BTT integration, EMA smoothing, atomic BPM/beat/confidence output |
@@ -616,6 +622,7 @@ The application is built around a modular, header-only architecture:
 | `WaveformCache.h` | Disk cache for waveform preview, album artwork, and ANLZ data (beat grid, cues, phrases, detail waveform) |
 | `TrackMapEditor.h` | Table editor for artist+title -> timecode offset + trigger mapping |
 | `CuePointEditor.h` | Table editor for per-track cue points with waveform strip, click + drag cursor, Capture from live playhead |
+| `GeneratorPresetEditor.h` | Table editor for generator presets (Name, Start TC, Stop TC) |
 | `MixerMapEditor.h` | Table editor for DJM parameter -> protocol output mapping |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
 | `LevelMeter.h` | Real-time VU meter component with clipping indicator |
@@ -667,11 +674,13 @@ Ableton Link is a trademark of Ableton AG. This project is not affiliated with, 
 
 ChamSys, Avolites, madMapper, and all other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
 
+Hippotizer is a trademark of Green Hippo Ltd (a tvONE brand). This project is not affiliated with, endorsed by, or associated with Green Hippo Ltd or tvONE. The HippoNet protocol implementation is based on independent Wireshark capture analysis.
+
 grandMA3 is a trademark of MA Lighting Technology GmbH. This project is not affiliated with, endorsed by, or associated with MA Lighting Technology GmbH.
 
 This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies. The Pro DJ Link and StageLinQ implementations are based on independent community research. The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
 
-**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ, HippoNet). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
 
 ---
 
