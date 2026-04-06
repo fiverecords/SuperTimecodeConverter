@@ -245,8 +245,8 @@ struct TrackMapEntry
         if (title.isEmpty())
         {
             auto idVal = obj->getProperty("trackId");
-            if (!idVal.isVoid() && (int64_t)idVal != 0)
-                title = "Track #" + juce::String((int64_t)idVal);
+            if (!idVal.isVoid() && (juce::int64)idVal != 0)
+                title = "Track #" + juce::String((juce::int64)idVal);
         }
 
         // Validate timecodeOffset: must parse as valid HH:MM:SS:FF
