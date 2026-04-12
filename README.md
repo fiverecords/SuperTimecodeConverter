@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration, to **Denon Engine OS hardware** via StageLinQ, and to **Green Hippo Hippotizer** media servers via HippoNet — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. **Green Hippo Hippotizer** support via HippoNet is in development. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Downloads&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
 [![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
@@ -41,7 +41,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
 - **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software.
-- **HippoNet** — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009.
+- **HippoNet** *(coming soon)* — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009. *Currently disabled pending hardware validation.*
 
 ### Outputs (enable any combination per engine)
 
@@ -367,7 +367,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.0)
+   project(SuperTimecodeConverter VERSION 1.9.1)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -377,7 +377,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.0"
+       VERSION "1.9.1"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE

@@ -102,6 +102,10 @@ MainComponent::MainComponent()
     {
         sharedStageLinQDb.start(ip, port, token);
     };
+    sharedProDJLinkInput.onPlayerLost = [this](const juce::String& playerIP)
+    {
+        sharedDbClient.invalidatePlayer(playerIP);
+    };
     engines[0]->setDbServerClient(&sharedDbClient);
     engines[0]->setTrackMap(&settings.trackMap);
     engines[0]->setMixerMap(&sharedMixerMap);
@@ -128,8 +132,10 @@ MainComponent::MainComponent()
     rightViewport.setScrollBarsShown(true, false);
 
     // --- Input buttons ---
-    for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnHippoIn, &btnSysTime, &btnLtcIn, &btnProDJLinkIn, &btnStageLinQIn })
+    for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnSysTime, &btnLtcIn, &btnProDJLinkIn, &btnStageLinQIn })
     { leftContent.addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
+    // HippoNet input hidden pending hardware validation (code preserved in HippotizerInput.h)
+    btnHippoIn.setVisible(false);
 
     btnMtcIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
@@ -3796,7 +3802,9 @@ void MainComponent::loadAndApplyNonAudioSettings()
         }
         else if (src == SrcType::Hippotizer)
         {
-            eng.startHippotizerInput(es.hippotizerInputInterface);
+            // HippoNet input disabled pending hardware validation -- fall back to Generator
+            DBG("MainComponent: HippoNet input disabled, falling back to Generator");
+            eng.setInputSource(SrcType::SystemTime);
         }
 
         // Generator start/stop TC (applies regardless of current source)
@@ -5501,7 +5509,7 @@ void MainComponent::resized()
     auto& eng = currentEngine();
     struct IBI { juce::TextButton* btn; SrcType src; };
     IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
-    for (auto& ib : iBtns) { ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
+    for (auto& ib : iBtns) { if (!ib.btn->isVisible()) continue; ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
 
     // Section separator after input source buttons
     leftContent.addSectionSeparator(leftPanel.getY());
@@ -7115,6 +7123,29 @@ void MainComponent::updateInputButtonStates()
     struct I { juce::TextButton* b; SrcType s; };
     I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
     for (auto& i : bs) styleInputButton(*i.b, active == i.s, getInputColour(i.s));
+
+    // Stop shared network inputs when no engine uses them.
+    // Without this, StageLinQ keeps broadcasting discovery (~1 pps) and
+    // ProDJLink keeps sending keepalives even when all engines switched away.
+    bool anySlq = false, anyPdl = false;
+    for (auto& e : engines)
+    {
+        auto src = e->getActiveInput();
+        if (src == SrcType::StageLinQ)  anySlq = true;
+        if (src == SrcType::ProDJLink)  anyPdl = true;
+    }
+    if (!anySlq && sharedStageLinQInput.getIsRunning())
+    {
+        DBG("MainComponent: no engine uses StageLinQ — stopping shared input");
+        sharedStageLinQDb.stop();
+        sharedStageLinQInput.stop();
+    }
+    if (!anyPdl && sharedProDJLinkInput.getIsRunning())
+    {
+        DBG("MainComponent: no engine uses ProDJLink — stopping shared input");
+        sharedDbClient.stop();
+        sharedProDJLinkInput.stop();
+    }
 }
 
 void MainComponent::updateFpsButtonStates()

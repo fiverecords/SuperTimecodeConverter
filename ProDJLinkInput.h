@@ -498,6 +498,10 @@ public:
     // Virtual CDJ configuration
     //==========================================================================
     int  getVCDJPlayerNumber() const    { return vCDJPlayerNumber; }
+
+    /// Called when a player disappears from the network (10s keepalive timeout).
+    /// Wire this to DbServerClient::invalidatePlayer() to close stale connections.
+    std::function<void(const juce::String& playerIP)> onPlayerLost;
     void setVCDJPlayerNumber(int n)     { vCDJPlayerNumber = juce::jlimit(1, 127, n); }
 
 
@@ -1668,12 +1672,12 @@ private:
         pkt[42] = 0x03;
         pkt[43] = 0x01;
 
-        // Original path: statusSock (sport=50002) -> CDJ:50002  -- works on Windows
-        statusSock->write(cdjIp, ProDJLink::kStatusPort, pkt, sizeof(pkt));
-
-        // Additional: bridgeSock (ephemeral port) -> CDJ:50002  -- for macOS compat
-        if (bridgeSock)
-            bridgeSock->write(cdjIp, ProDJLink::kStatusPort, pkt, sizeof(pkt));
+        // Send from bridgeSock (ephemeral port) if available, matching Pioneer Bridge
+        // behavior (~port 50006). Fallback to statusSock if bridgeSock unavailable.
+        // CRITICAL: do NOT send from both -- CDJ registers each source port as a
+        // separate subscriber, doubling (or worse) the status traffic it sends back.
+        auto* sock = bridgeSock ? bridgeSock.get() : statusSock.get();
+        sock->write(cdjIp, ProDJLink::kStatusPort, pkt, sizeof(pkt));
     }
 
     void sendBridgeNotifyToAll()
@@ -2263,8 +2267,14 @@ private:
                 double last = players[i].lastPacketTime.load(std::memory_order_relaxed);
                 if ((now - last) > 10000.0)
                 {
-                    DBG("ProDJLink: Player " << (i + 1) << " timed out");
+                    juce::String lostIp(players[i].ipStr);
+                    DBG("ProDJLink: Player " << (i + 1) << " timed out (" << lostIp << ")");
                     players[i].reset();
+
+                    // Notify DbServerClient to close stale TCP connections
+                    // and clear cached metadata for this player
+                    if (onPlayerLost && lostIp.isNotEmpty())
+                        onPlayerLost(lostIp);
                 }
             }
         }

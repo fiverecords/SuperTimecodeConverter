@@ -28,6 +28,12 @@
 #include <utility>
 #include <cstring>
 #include <thread>
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+#else
+    #include <netinet/tcp.h>
+#endif
 #include "NfsAnlzFetcher.h"
 #include "WaveformCache.h"
 #include "AppSettings.h"
@@ -500,6 +506,7 @@ private:
     static constexpr int kMaxArtCacheEntries = 64;
     static constexpr int kMaxConnections    = 6;
     static constexpr int kReconnectCooldownMs = 5000;
+    static constexpr double kIdleTimeoutMs   = 30000.0;  // close connections idle for >30s
 
     // NXS2 extension constants for color waveform
     static constexpr uint32_t kNxs2ExtRequest  = 0x2c04;
@@ -558,6 +565,7 @@ private:
         uint8_t contextPlayer = 0;  // player number used in setupQueryContext
         uint32_t txId = 0;
         double lastFailTime = 0.0;
+        double lastActivityTime = 0.0;  // hiRes ms -- for idle timeout
 
         bool isConnected() const { return socket && socket->isConnected(); }
 
@@ -572,6 +580,7 @@ private:
             contextPlayer = 0;
             txId = 0;
             dbPort = 0;
+            lastActivityTime = 0.0;
             playerIP.clear();
         }
     };
@@ -908,6 +917,7 @@ private:
                     conn.lastFailTime = 0.0;  // intentional close, not a failure
                     break;  // fall through to new connection below
                 }
+                conn.lastActivityTime = juce::Time::getMillisecondCounterHiRes();
                 return &conn;
             }
         }
@@ -962,6 +972,19 @@ private:
             return nullptr;
         }
 
+        // Disable Nagle's algorithm -- ensure each dbserver message is sent as
+        // a single TCP segment. Some players fail to parse messages that arrive
+        // split across multiple packets.
+        {
+            auto fd = sock->getRawSocketHandle();
+            if (fd >= 0)
+            {
+                int flag = 1;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                           reinterpret_cast<const char*>(&flag), sizeof(flag));
+            }
+        }
+
         // Step 3: Send initial handshake -- [0x11, 0x00000001]
         {
             uint8_t hello[] = { 0x11, 0x00, 0x00, 0x00, 0x01 };
@@ -986,6 +1009,7 @@ private:
         slot->playerIP = playerIP;
         slot->dbPort = dbPort;
         slot->contextSetUp = false;
+        slot->lastActivityTime = now;
         slot->txId = 0;
         slot->lastFailTime = 0.0;
 
@@ -1001,8 +1025,37 @@ private:
         return slot;
     }
 
-    /// Discover the dbserver port by querying TCP 12523
+    /// Discover the dbserver port by querying TCP 12523.
+    /// Retries a few times because the player may not be ready to respond
+    /// immediately after booting or loading media.
     int discoverDbPort(const juce::String& playerIP)
+    {
+        static constexpr int kMaxRetries = 3;
+        static constexpr int kRetryDelayMs = 1000;
+
+        for (int attempt = 0; attempt < kMaxRetries; ++attempt)
+        {
+            if (attempt > 0)
+            {
+                DBG("DbServerClient: port discovery retry " + juce::String(attempt)
+                    + "/" + juce::String(kMaxRetries - 1) + " for " + playerIP);
+                juce::Thread::sleep(kRetryDelayMs);
+                if (!isRunningFlag.load(std::memory_order_relaxed))
+                    return 0;
+            }
+
+            int port = discoverDbPortOnce(playerIP);
+            if (port > 0)
+                return port;
+        }
+
+        DBG("DbServerClient: port discovery failed after " + juce::String(kMaxRetries)
+            + " attempts for " + playerIP);
+        return 0;
+    }
+
+    /// Single attempt at port discovery via TCP 12523
+    int discoverDbPortOnce(const juce::String& playerIP)
     {
         DBG("DbServerClient: discovering db port on " + playerIP + ":12523");
 
@@ -1040,9 +1093,10 @@ private:
         int port = (int(response[0]) << 8) | response[1];
         DBG("DbServerClient: discovered db port " + juce::String(port) + " on " + playerIP);
 
-        if (port <= 0 || port > 65535)
+        if (port <= 0 || port >= 65535)
         {
-            DBG("DbServerClient: invalid port " + juce::String(port));
+            DBG("DbServerClient: invalid port " + juce::String(port)
+                + " (0xFFFF = no service available)");
             return 0;
         }
 
@@ -2179,6 +2233,25 @@ private:
         {
             // Wait for a request (with timeout for shutdown checks)
             requestSemaphore.wait(500);
+
+            if (threadShouldExit()) break;
+
+            // Close idle connections — prevents zombie TCP connections from
+            // holding CDJ NFS slots (CDJ-2000NXS2 has limited slots).
+            {
+                double now = juce::Time::getMillisecondCounterHiRes();
+                for (auto& conn : connections)
+                {
+                    if (conn.isConnected() && conn.lastActivityTime > 0.0
+                        && (now - conn.lastActivityTime) > kIdleTimeoutMs)
+                    {
+                        DBG("DbServerClient: closing idle connection to "
+                            + conn.playerIP + ":" + juce::String(conn.dbPort)
+                            + " (idle " + juce::String((int)((now - conn.lastActivityTime) / 1000.0)) + "s)");
+                        conn.close();
+                    }
+                }
+            }
 
             if (threadShouldExit()) break;
 
