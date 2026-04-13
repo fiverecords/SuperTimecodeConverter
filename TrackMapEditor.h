@@ -799,13 +799,15 @@ private:
         }
         offset = TrackMapEntry::formatTimecodeString(h, m, s, f);
 
-        // Preserve cuePoints and durationSec from existing entry BEFORE any removal
+        // Preserve cuePoints, durationSec, and sortOrder from existing entry BEFORE any removal
         std::vector<CuePoint> preservedCuePoints;
         int preservedDurationSec = 0;
+        int preservedSortOrder = 0;
         if (editingRow >= 0 && editingRow < (int)rows.size())
         {
             preservedCuePoints = rows[(size_t)editingRow]->cuePoints;
             preservedDurationSec = rows[(size_t)editingRow]->durationSec;
+            preservedSortOrder = rows[(size_t)editingRow]->sortOrder;
         }
 
         // If editing an existing row whose artist/title changed, remove the old entry
@@ -859,11 +861,12 @@ private:
             else                   entry.bpmMultiplier =  0;
         }
 
-        // Apply preserved cuePoints and durationSec
+        // Apply preserved cuePoints, durationSec, and sortOrder
         if (editingRow >= 0)
         {
             entry.cuePoints   = std::move(preservedCuePoints);
             entry.durationSec = preservedDurationSec;
+            entry.sortOrder   = preservedSortOrder;
         }
         else
         {
@@ -1084,12 +1087,21 @@ private:
             auto file = fc.getResult();
             if (file == juce::File()) return;
 
-            std::vector<TrackMapEntry> entries;
-
             if (file.getFileExtension().equalsIgnoreCase(".xml"))
             {
-                // rekordbox XML export (DJ_PLAYLISTS format)
-                entries = TrackMap::parseRekordboxXml(file);
+                // rekordbox XML — check for playlists
+                auto playlists = TrackMap::listRekordboxPlaylists(file);
+
+                if (playlists.isEmpty())
+                {
+                    // No playlists found — import entire collection
+                    importRekordboxEntries(TrackMap::parseRekordboxXml(file));
+                }
+                else
+                {
+                    // Show playlist picker
+                    showPlaylistPicker(file, playlists);
+                }
             }
             else
             {
@@ -1101,6 +1113,7 @@ private:
                 auto* arr = obj->getProperty("tracks").getArray();
                 if (!arr || arr->isEmpty()) return;
 
+                std::vector<TrackMapEntry> entries;
                 for (auto& item : *arr)
                 {
                     TrackMapEntry e;
@@ -1108,19 +1121,86 @@ private:
                     if (e.hasValidKey())
                         entries.push_back(std::move(e));
                 }
+
+                if (entries.empty()) return;
+                std::sort(entries.begin(), entries.end(),
+                    [](const TrackMapEntry& a, const TrackMapEntry& b) {
+                        int cmp = a.artist.compareIgnoreCase(b.artist);
+                        return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
+                    });
+                showImportPreview(std::move(entries));
             }
-
-            if (entries.empty()) return;
-
-            // Sort by artist then title
-            std::sort(entries.begin(), entries.end(),
-                [](const TrackMapEntry& a, const TrackMapEntry& b) {
-                    int cmp = a.artist.compareIgnoreCase(b.artist);
-                    return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
-                });
-
-            showImportPreview(std::move(entries));
         });
+    }
+
+    void importRekordboxEntries(std::vector<TrackMapEntry> entries)
+    {
+        if (entries.empty()) return;
+        showImportPreview(std::move(entries), false);
+    }
+
+    void showPlaylistPicker(const juce::File& xmlFile, const juce::StringArray& playlists)
+    {
+        auto alert = std::make_shared<juce::AlertWindow>(
+            "Import from rekordbox XML",
+            "Apply a playlist to reorder the Track Map (existing cues and triggers are preserved), "
+            "or select which tracks to import.",
+            juce::MessageBoxIconType::QuestionIcon, this);
+
+        alert->addComboBox("playlist", playlists);
+        alert->addButton("Apply Playlist Order", 1);
+        alert->addButton("Import Tracks", 2);
+        alert->addButton("Cancel", 0);
+
+        auto fileCopy = xmlFile;
+        juce::Component::SafePointer<TrackMapEditor> safeThis(this);
+
+        alert->enterModalState(true, juce::ModalCallbackFunction::create(
+            [safeThis, fileCopy, alert](int result)
+        {
+            if (!safeThis || result == 0) return;
+
+            if (result == 1)
+            {
+                // Apply playlist order: reorder existing + add missing, keep cues/triggers
+                auto* combo = alert->getComboBoxComponent("playlist");
+                if (!combo) return;
+                juce::String selected = combo->getText();
+
+                auto entries = TrackMap::parseRekordboxXml(fileCopy, selected);
+                if (!entries.empty())
+                {
+                    int before = (int)safeThis->trackMap.size();
+                    safeThis->trackMap.applyPlaylistOrder(entries);
+                    safeThis->trackMap.save();
+                    safeThis->rebuildRows();
+                    safeThis->table.updateContent();
+                    safeThis->repaint();
+
+                    int added = (int)safeThis->trackMap.size() - before;
+                    juce::String msg = "Playlist applied: " + juce::String((int)entries.size())
+                        + " tracks reordered";
+                    if (added > 0)
+                        msg += ", " + juce::String(added) + " new tracks added";
+                    juce::AlertWindow::showMessageBoxAsync(
+                        juce::MessageBoxIconType::InfoIcon, "Playlist Import", msg);
+                }
+            }
+            else
+            {
+                // Import entire collection as new entries (sorted alphabetically)
+                auto entries = TrackMap::parseRekordboxXml(fileCopy);
+                if (!entries.empty())
+                {
+                    std::sort(entries.begin(), entries.end(),
+                        [](const TrackMapEntry& a, const TrackMapEntry& b) {
+                            int cmp = a.artist.compareIgnoreCase(b.artist);
+                            return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
+                        });
+                    safeThis->showImportPreview(std::move(entries), false);
+                }
+            }
+        }));
     }
 
     //--------------------------------------------------------------------------
@@ -1131,15 +1211,20 @@ private:
     {
     public:
         ImportPreview(std::vector<TrackMapEntry> entries,
-                      const TrackMap& existingMap)
-            : items(std::move(entries))
+                      const TrackMap& existingMap,
+                      bool showOffsetColumn = true)
+            : items(std::move(entries)), showOffset(showOffsetColumn)
         {
-            selected.resize(items.size(), true);
-
-            // Mark duplicates
+            // Mark duplicates and default-select only NEW tracks
             for (size_t i = 0; i < items.size(); ++i)
-                isDuplicate.push_back(existingMap.contains(items[i].artist, items[i].title,
-                                                          items[i].durationSec));
+            {
+                bool dup = existingMap.contains(items[i].artist, items[i].title,
+                                                items[i].durationSec)
+                        || existingMap.findIgnoringDuration(items[i].artist,
+                                                           items[i].title) != nullptr;
+                isDuplicate.push_back(dup);
+                selected.push_back(!dup);  // new = selected, existing = deselected
+            }
 
             setSize(600, 400);
 
@@ -1156,7 +1241,8 @@ private:
             hdr.addColumn("",          1,  28, 28,  28, juce::TableHeaderComponent::notSortable);
             hdr.addColumn("Artist",    2, 160, 60, 250, juce::TableHeaderComponent::notSortable);
             hdr.addColumn("Title",     3, 170, 60, 300, juce::TableHeaderComponent::notSortable);
-            hdr.addColumn("Offset",    4,  90, 70, 110, juce::TableHeaderComponent::notSortable);
+            if (showOffset)
+                hdr.addColumn("Offset",4,  90, 70, 110, juce::TableHeaderComponent::notSortable);
             hdr.addColumn("Status",    5,  80, 60, 100, juce::TableHeaderComponent::notSortable);
 
             addAndMakeVisible(btnSelectAll);
@@ -1170,6 +1256,16 @@ private:
             btnSelectNone.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF14161C));
             btnSelectNone.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFCFD8DC));
             btnSelectNone.onClick = [this] { std::fill(selected.begin(), selected.end(), false); table.repaint(); updateInfoLabel(); };
+
+            addAndMakeVisible(btnSelectNew);
+            btnSelectNew.setButtonText("Select New");
+            btnSelectNew.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF14161C));
+            btnSelectNew.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFCFD8DC));
+            btnSelectNew.onClick = [this] {
+                for (size_t i = 0; i < items.size(); ++i)
+                    selected[i] = !isDuplicate[i];
+                table.repaint(); updateInfoLabel();
+            };
 
             addAndMakeVisible(btnImport);
             btnImport.setButtonText("Import Selected");
@@ -1213,6 +1309,8 @@ private:
             btnImport.setBounds(btnRow.removeFromRight(110));
             btnRow.removeFromRight(12);
             btnSelectNone.setBounds(btnRow.removeFromRight(85));
+            btnRow.removeFromRight(4);
+            btnSelectNew.setBounds(btnRow.removeFromRight(80));
             btnRow.removeFromRight(4);
             btnSelectAll.setBounds(btnRow.removeFromRight(75));
 
@@ -1292,9 +1390,10 @@ private:
         std::vector<TrackMapEntry> items;
         std::vector<bool> selected;
         std::vector<bool> isDuplicate;
+        bool showOffset = true;
 
         juce::TableListBox table { "ImportPreview", this };
-        juce::TextButton btnSelectAll, btnSelectNone, btnImport, btnCancel;
+        juce::TextButton btnSelectAll, btnSelectNone, btnSelectNew, btnImport, btnCancel;
         juce::Label lblInfo;
 
         void updateInfoLabel()
@@ -1312,13 +1411,13 @@ private:
 
     juce::Component::SafePointer<juce::DialogWindow> importPreviewWindow;
 
-    void showImportPreview(std::vector<TrackMapEntry> entries)
+    void showImportPreview(std::vector<TrackMapEntry> entries, bool showOffset = true)
     {
         // Close any existing preview
         if (importPreviewWindow != nullptr)
             delete importPreviewWindow.getComponent();
 
-        auto* preview = new ImportPreview(std::move(entries), trackMap);
+        auto* preview = new ImportPreview(std::move(entries), trackMap, showOffset);
 
         preview->onImportSelected = [this, preview]
         {

@@ -138,7 +138,7 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 - Duration-based track identification -- same artist+title with different lengths are treated as separate tracks
 - Learn mode: capture tracks live from any CDJ or Denon deck (auto-captures duration)
 - Auto-fill artist/title from CDJ metadata
-- **Import from rekordbox XML:** import your entire rekordbox collection into the Track Map from an XML export (File → Export Collection in xml format). Artist, title and duration are imported for each track. Artwork, waveform and cue points populate automatically the first time each track plays on a CDJ.
+- **Import from rekordbox XML:** import your entire rekordbox collection into the Track Map from an XML export (File → Export Collection in xml format). Artist, title and duration are imported for each track. If the XML contains playlists, STC offers to **apply a playlist order** — reordering the Track Map to match the setlist while preserving all existing cue points, triggers and offsets. Artwork, waveform and cue points populate automatically the first time each track plays on a CDJ.
 - **Clear All:** remove all entries from the Track Map with a single click (with confirmation dialog)
 - **Enter/Return to save:** press Enter in any form field to save the entry directly, without clicking the Save button
 
@@ -367,7 +367,7 @@ The sections below are for developers who want to build STC from source.
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.1)
+   project(SuperTimecodeConverter VERSION 1.9.2)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -377,7 +377,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.1"
+       VERSION "1.9.2"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE

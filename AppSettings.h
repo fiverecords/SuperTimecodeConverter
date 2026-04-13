@@ -6,6 +6,7 @@
 #include <JuceHeader.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <functional>
 #include <string>
 
 //==============================================================================
@@ -120,6 +121,9 @@ struct TrackMapEntry
     juce::String timecodeOffset  = "00:00:00:00";   // HH:MM:SS:FF
     juce::String notes;
 
+    // Sort order (0 = default/alphabetical, >0 = explicit position from playlist import)
+    int          sortOrder       = 0;
+
     // MIDI triggers (independent -- any combination can fire simultaneously)
     int          midiChannel     = 0;       // 0-15 (displayed as 1-16), shared across all MIDI types
     int          midiNoteNum     = -1;      // Note On: note number (-1 = disabled, 0-127)
@@ -182,6 +186,8 @@ struct TrackMapEntry
             obj->setProperty("durationSec", durationSec);
         obj->setProperty("timecodeOffset", timecodeOffset);
         obj->setProperty("notes",          notes);
+        if (sortOrder > 0)
+            obj->setProperty("sortOrder",  sortOrder);
 
         // MIDI triggers (independent)
         obj->setProperty("midiChannel",  midiChannel);
@@ -239,6 +245,7 @@ struct TrackMapEntry
         title          = getString("title");
         durationSec    = juce::jmax(0, getInt("durationSec", 0));
         notes          = getString("notes");
+        sortOrder      = juce::jmax(0, getInt("sortOrder", 0));
 
         // Legacy migration: if entry has trackId but no title, generate a placeholder
         // so imported v1.5 entries don't vanish (user can edit them later).
@@ -498,6 +505,45 @@ public:
     /// Clear all entries
     void clear() { entries.clear(); ++generation; }
 
+    /// Apply playlist order: reorder existing tracks, add missing ones.
+    /// Does NOT touch cues, triggers, offsets, or notes of existing entries.
+    /// Tracks not in the playlist have their sortOrder reset to 0 (appear after playlist).
+    void applyPlaylistOrder(const std::vector<TrackMapEntry>& playlist)
+    {
+        // Reset all existing sortOrders
+        for (auto& [k, entry] : entries)
+            entry.sortOrder = 0;
+
+        // Apply playlist positions: update sortOrder on existing, add new
+        int pos = 1;
+        for (auto& pe : playlist)
+        {
+            if (!pe.hasValidKey()) continue;
+
+            // Try exact key (artist|title|duration) first, then fallback
+            // to artist|title only — duration from XML may differ from CDJ
+            auto key = pe.key();
+            auto it = entries.find(key);
+            if (it != entries.end())
+            {
+                it->second.sortOrder = pos;
+            }
+            else if (auto* existing = findIgnoringDuration(pe.artist, pe.title))
+            {
+                existing->sortOrder = pos;
+            }
+            else
+            {
+                // New entry — add with playlist position
+                TrackMapEntry newEntry = pe;
+                newEntry.sortOrder = pos;
+                entries[key] = std::move(newEntry);
+            }
+            ++pos;
+        }
+        ++generation;
+    }
+
     //------------------------------------------------------------------
     // Iteration & info
     //------------------------------------------------------------------
@@ -529,8 +575,17 @@ public:
         for (auto& [k, entry] : entries)
             result.push_back(&entry);
 
+        // Sort by sortOrder first (0 = unordered, sorts after explicit positions).
+        // Within the same sortOrder (or both 0), sort alphabetically by artist/title.
         std::sort(result.begin(), result.end(),
                   [](const TrackMapEntry* a, const TrackMapEntry* b) {
+                      // Both have explicit order → compare by order
+                      if (a->sortOrder > 0 && b->sortOrder > 0)
+                          return a->sortOrder < b->sortOrder;
+                      // Only one has explicit order → it comes first
+                      if (a->sortOrder > 0) return true;
+                      if (b->sortOrder > 0) return false;
+                      // Neither has order → alphabetical
                       int cmp = a->artist.compareIgnoreCase(b->artist);
                       return cmp != 0 ? cmp < 0 : a->title.compareIgnoreCase(b->title) < 0;
                   });
@@ -598,6 +653,14 @@ public:
     //------------------------------------------------------------------
     static std::vector<TrackMapEntry> parseRekordboxXml(const juce::File& file)
     {
+        return parseRekordboxXml(file, "");
+    }
+
+    /// Parse rekordbox XML export.  If playlistName is non-empty, only return
+    /// tracks from that playlist in playlist order.  Otherwise return all tracks.
+    static std::vector<TrackMapEntry> parseRekordboxXml(const juce::File& file,
+                                                        const juce::String& playlistName)
+    {
         std::vector<TrackMapEntry> result;
         auto xml = juce::XmlDocument::parse(file);
         if (!xml || xml->getTagName() != "DJ_PLAYLISTS") return result;
@@ -605,10 +668,8 @@ public:
         auto* collection = xml->getChildByName("COLLECTION");
         if (!collection) return result;
 
-        // Deduplicate by key (same artist+title can appear from multiple
-        // locations, e.g. local library + USB export in the same XML).
-        std::unordered_set<std::string> seen;
-
+        // Build TrackID → entry map from COLLECTION
+        std::unordered_map<int, TrackMapEntry> trackById;
         for (auto* track = collection->getChildByName("TRACK");
              track != nullptr;
              track = track->getNextElementWithTagName("TRACK"))
@@ -616,21 +677,139 @@ public:
             juce::String title  = track->getStringAttribute("Name").trim();
             juce::String artist = track->getStringAttribute("Artist").trim();
             int duration        = track->getIntAttribute("TotalTime", 0);
+            int trackId         = track->getIntAttribute("TrackID", 0);
 
-            if (title.isEmpty()) continue;  // hasValidKey requires title
+            if (title.isEmpty() || trackId <= 0) continue;
 
             TrackMapEntry e;
             e.title       = title;
             e.artist      = artist;
             e.durationSec = duration;
-
-            auto k = e.key();
-            if (seen.count(k)) continue;
-            seen.insert(k);
-
-            result.push_back(std::move(e));
+            trackById[trackId] = std::move(e);
         }
 
+        // If a playlist is requested, filter and order by playlist
+        if (playlistName.isNotEmpty())
+        {
+            auto* playlists = xml->getChildByName("PLAYLISTS");
+            if (!playlists) return result;
+
+            // Traverse by full path (e.g. "Shows / Saturday") to handle
+            // duplicate playlist names in different folders.
+            // Path segments skip ROOT (same as listRekordboxPlaylists).
+            juce::XmlElement* playlistNode = nullptr;
+            {
+                // Split path into segments: "Shows / Saturday" → ["Shows", "Saturday"]
+                juce::StringArray segments;
+                if (playlistName.contains(" / "))
+                    segments.addTokens(playlistName, " / ", "");
+                else
+                    segments.add(playlistName);
+                // Remove empty tokens from split
+                for (int i = segments.size() - 1; i >= 0; --i)
+                    if (segments[i].isEmpty()) segments.remove(i);
+
+                // Start from ROOT node (first Type=0 child of PLAYLISTS)
+                juce::XmlElement* current = nullptr;
+                for (auto* child = playlists->getFirstChildElement();
+                     child != nullptr; child = child->getNextElement())
+                {
+                    if (child->getTagName() == "NODE"
+                        && child->getIntAttribute("Type", -1) == 0)
+                    { current = child; break; }
+                }
+
+                // Walk path segments: folders first, last segment is the playlist
+                for (int si = 0; current != nullptr && si < segments.size(); ++si)
+                {
+                    bool isLast = (si == segments.size() - 1);
+                    int wantType = isLast ? 1 : 0;  // 1=playlist, 0=folder
+                    juce::XmlElement* found = nullptr;
+                    for (auto* child = current->getFirstChildElement();
+                         child != nullptr; child = child->getNextElement())
+                    {
+                        if (child->getTagName() == "NODE"
+                            && child->getStringAttribute("Name") == segments[si]
+                            && child->getIntAttribute("Type", -1) == wantType)
+                        { found = child; break; }
+                    }
+                    current = found;
+                }
+                playlistNode = current;
+            }
+            if (!playlistNode) return result;
+
+            // Collect tracks in playlist order
+            std::unordered_set<std::string> seen;
+            for (auto* tr = playlistNode->getChildByName("TRACK");
+                 tr != nullptr;
+                 tr = tr->getNextElementWithTagName("TRACK"))
+            {
+                int key = tr->getIntAttribute("Key", 0);
+                auto it = trackById.find(key);
+                if (it != trackById.end())
+                {
+                    auto k = it->second.key();
+                    if (!seen.count(k))
+                    {
+                        seen.insert(k);
+                        result.push_back(it->second);
+                    }
+                }
+            }
+            return result;
+        }
+
+        // No playlist specified — return all tracks from COLLECTION
+        std::unordered_set<std::string> seen;
+        for (auto& [id, entry] : trackById)
+        {
+            auto k = entry.key();
+            if (seen.count(k)) continue;
+            seen.insert(k);
+            result.push_back(std::move(entry));
+        }
+        return result;
+    }
+
+    /// List available playlist names in a rekordbox XML file
+    static juce::StringArray listRekordboxPlaylists(const juce::File& file)
+    {
+        juce::StringArray result;
+        auto xml = juce::XmlDocument::parse(file);
+        if (!xml || xml->getTagName() != "DJ_PLAYLISTS") return result;
+
+        auto* playlists = xml->getChildByName("PLAYLISTS");
+        if (!playlists) return result;
+
+        // Recursive scan for Type=1 (playlist) nodes with entries.
+        // ROOT is always the top-level folder in rekordbox — skip it in the path.
+        std::function<void(juce::XmlElement*, const juce::String&)> scan =
+            [&](juce::XmlElement* node, const juce::String& path)
+        {
+            for (auto* child = node->getFirstChildElement();
+                 child != nullptr; child = child->getNextElement())
+            {
+                if (child->getTagName() != "NODE") continue;
+                juce::String name = child->getStringAttribute("Name");
+                int type = child->getIntAttribute("Type", -1);
+
+                if (type == 1)  // playlist
+                {
+                    int entries = child->getIntAttribute("Entries", 0);
+                    if (entries > 0)
+                        result.add(path.isEmpty() ? name : path + " / " + name);
+                }
+                else if (type == 0)  // folder
+                {
+                    // Skip ROOT — it's always the top-level node in rekordbox XML
+                    juce::String childPath = name.equalsIgnoreCase("ROOT") ? path
+                        : (path.isEmpty() ? name : path + " / " + name);
+                    scan(child, childPath);
+                }
+            }
+        };
+        scan(playlists, "");
         return result;
     }
 
