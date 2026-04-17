@@ -193,6 +193,22 @@ MainComponent::MainComponent()
     styleOutputToggle(btnThruOut, accentCyan);
     styleOutputToggle(btnTcnetOut, juce::Colour(0xFF00CC66));
 
+    // On-air gate lives in the ProDJLink input panel (it gates input activity,
+    // not a particular output). Use the small tick-style toggle like btnLink
+    // to match the look of the ProDJLink panel controls, not the big output
+    // toggles on the right side.
+    leftContent.addAndMakeVisible(btnOnAirGate);
+    btnOnAirGate.setColour(juce::ToggleButton::textColourId, textMid);
+    btnOnAirGate.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xFFE040FB));
+
+    btnOnAirGate.onClick = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedToggle(btnOnAirGate)) return;
+        currentEngine().setOnAirGateEnabled(btnOnAirGate.getToggleState());
+        saveSettings();
+    };
+
     auto outputToggleHandler = [this]
     {
         if (syncing) return;
@@ -1673,17 +1689,24 @@ MainComponent::~MainComponent()
 
     settings.save();
 
-    // 7. Stop metadata client (before ProDJLink -- it queries player IPs)
-    sharedDbClient.stop();
-
-    // 8. Stop ProDJLink receiver
+    // 7. Stop ProDJLink receiver FIRST. This joins its thread, so no more
+    //    gcPlayers() calls can fire onPlayerLost after this returns.
     sharedProDJLinkInput.stop();
 
-    // 9. Stop StageLinQ database client (before receiver)
-    sharedStageLinQDb.stop();
+    // 8. Now it's safe to disconnect the callback and stop DbClient.
+    //    Reassigning std::function from another thread while the ProDJLink
+    //    thread might be invoking it would be a race (std::function is not
+    //    atomic). Doing it after stop() ensures the callback isn't running.
+    sharedProDJLinkInput.onPlayerLost = nullptr;
+    sharedDbClient.stop();
 
-    // 10. Stop StageLinQ receiver
+    // 9. Stop StageLinQ receiver first to join its thread, so the callbacks
+    //    (onMetadataRequest, onFileTransferAvailable) can't fire into a
+    //    stopped StageLinQ db client.
     sharedStageLinQInput.stop();
+
+    // 10. Now stop StageLinQ database client
+    sharedStageLinQDb.stop();
 
     // 10. Explicitly shut down each engine (timers, threads, sockets)
     //    BEFORE engines.clear() destroys the objects, so all HighResolutionTimer
@@ -1970,6 +1993,9 @@ void MainComponent::syncUIFromEngine()
     btnHippoOut.setToggleState(eng.isOutputHippoEnabled(), juce::dontSendNotification);
     if (selectedEngine < (int)settings.engines.size())
         txtHippoDestIp.setText(settings.engines[(size_t)selectedEngine].hippotizerDestIp, false);
+
+    // On-air gate
+    btnOnAirGate.setToggleState(eng.isOnAirGateEnabled(), juce::dontSendNotification);
 
     // Generator TC fields
     btnGenClock.setToggleState(eng.getGeneratorClockMode(), juce::dontSendNotification);
@@ -3750,6 +3776,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setOutputTcnetEnabled(es.tcnetOutEnabled);
         eng.setTcnetLayer(es.tcnetLayer);
         eng.setOutputHippoEnabled(es.hippoOutEnabled);
+        eng.setOnAirGateEnabled(es.onAirGateEnabled);
 
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
@@ -4059,6 +4086,7 @@ void MainComponent::flushSettings()
         es.tcnetOutEnabled = eng.isOutputTcnetEnabled();
         es.tcnetLayer = eng.getTcnetLayer();
         es.hippoOutEnabled = eng.isOutputHippoEnabled();
+        es.onAirGateEnabled = eng.isOnAirGateEnabled();
         es.generatorClockMode = eng.getGeneratorClockMode();
         es.generatorStartMs = eng.getGeneratorStartMs();
         es.generatorStopMs  = eng.getGeneratorStopMs();
@@ -4772,6 +4800,9 @@ void MainComponent::updateDeviceSelectorVisibility()
     btnHippoOut.setVisible(false);
     txtHippoDestIp.setVisible(false);      lblHippoDestIp.setVisible(false);
     lblHippoOutStatus.setVisible(false);
+
+    // On-air gate: only relevant for ProDJLink
+    btnOnAirGate.setVisible(input == SrcType::ProDJLink);
 
     bool anyDevice = (input != SrcType::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
     btnRefreshDevices.setVisible(anyDevice);
@@ -5597,6 +5628,13 @@ void MainComponent::resized()
     if (cmbProDJLinkPlayer.isVisible())
     {
         layCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, leftPanel);
+
+        // ON-AIR ONLY toggle (gate engine output by DJM on-air flag)
+        if (btnOnAirGate.isVisible())
+        {
+            btnOnAirGate.setBounds(leftPanel.removeFromTop(22));
+            leftPanel.removeFromTop(3);
+        }
 
         // BPM Multiplier row (5 equal buttons: 1x x2 x4 /2 /4)
         if (btnBpmOff.isVisible())
@@ -7137,14 +7175,19 @@ void MainComponent::updateInputButtonStates()
     if (!anySlq && sharedStageLinQInput.getIsRunning())
     {
         DBG("MainComponent: no engine uses StageLinQ — stopping shared input");
-        sharedStageLinQDb.stop();
+        // Stop the receiver first to join its thread and prevent further
+        // onMetadataRequest / onFileTransferAvailable callbacks firing into
+        // a stopped StageLinQ db client.
         sharedStageLinQInput.stop();
+        sharedStageLinQDb.stop();
     }
     if (!anyPdl && sharedProDJLinkInput.getIsRunning())
     {
         DBG("MainComponent: no engine uses ProDJLink — stopping shared input");
-        sharedDbClient.stop();
+        // Stop ProDJLink first to join its thread and prevent further
+        // onPlayerLost callbacks firing into a stopped DbClient.
         sharedProDJLinkInput.stop();
+        sharedDbClient.stop();
     }
 }
 

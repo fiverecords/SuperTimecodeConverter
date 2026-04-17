@@ -42,13 +42,17 @@ public:
         table.getHeader().setStretchToFitActive(true);
 
         auto& hdr = table.getHeader();
-        hdr.addColumn("Artist",    ColArtist,  140, 80, 300, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Title",     ColTitle,   130, 80, 300, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Offset",    ColOffset,  100, 80, 130, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("#",         ColPlaylistPos, 36, 30, 50);  // playlist order
+        hdr.addColumn("Artist",    ColArtist,  140, 80, 300);
+        hdr.addColumn("Title",     ColTitle,   130, 80, 300);
+        hdr.addColumn("Offset",    ColOffset,  100, 80, 130);
         hdr.addColumn("BPM",       ColBpm,      46, 40,  70, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Trig",      ColTrig,     40, 30,  60, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Cues",      ColCues,     40, 30,  60, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Notes",     ColNotes,   100, 60, 400, juce::TableHeaderComponent::notSortable);
+
+        // Default: sort by playlist position (ascending)
+        hdr.setSortColumnId(ColPlaylistPos, true);
 
         // --- Buttons ---
         auto addBtn = [this](juce::TextButton& btn, const juce::String& text)
@@ -337,6 +341,15 @@ public:
     //==========================================================================
     int getNumRows() override { return (int)rows.size(); }
 
+    void sortOrderChanged(int newSortColumnId, bool isForwards) override
+    {
+        activeSortColumn = newSortColumnId;
+        sortForwards = isForwards;
+        rebuildRows();
+        table.updateContent();
+        table.repaint();
+    }
+
     void paintRowBackground(juce::Graphics& g, int rowNumber,
                             int /*w*/, int /*h*/, bool isSelected) override
     {
@@ -366,6 +379,16 @@ public:
         juce::String text;
         switch (columnId)
         {
+            case ColPlaylistPos:
+                // Show playlist position (sortOrder) or "--" if not in a playlist
+                if (entry.sortOrder > 0)
+                    text = juce::String(entry.sortOrder);
+                else
+                {
+                    text = "--";
+                    g.setColour(textBright.withAlpha(0.4f));
+                }
+                break;
             case ColArtist:  text = entry.artist; break;
             case ColTitle:   text = entry.title; break;
             case ColOffset:  text = entry.timecodeOffset; break;
@@ -416,7 +439,11 @@ public:
             case ColNotes:   text = entry.notes; break;
         }
 
-        g.drawText(text, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
+        // Playlist position column reads better centered
+        auto justification = (columnId == ColPlaylistPos)
+            ? juce::Justification::centred
+            : juce::Justification::centredLeft;
+        g.drawText(text, 4, 0, width - 8, height, justification, true);
     }
 
     void cellDoubleClicked(int rowNumber, int /*columnId*/,
@@ -457,6 +484,8 @@ private:
     DbServerClient* dbClient = nullptr;  // Phase 2: metadata cache for Learn
 
     std::vector<const TrackMapEntry*> rows;   // sorted snapshot (ptrs into trackMap) for display
+    int  activeSortColumn = ColPlaylistPos;     // default: playlist order
+    bool sortForwards     = true;
     uint64_t rowsGeneration = 0;               // generation at which rows were built
     std::string activeTrackKey;  // artist|title key of currently playing track
     int editingRow = -1;               // -1 = adding new, >= 0 = editing existing
@@ -478,7 +507,7 @@ private:
     //--------------------------------------------------------------------------
     // Column IDs
     //--------------------------------------------------------------------------
-    enum { ColArtist = 1, ColTitle, ColOffset, ColBpm, ColTrig, ColCues, ColNotes };
+    enum { ColPlaylistPos = 1, ColArtist, ColTitle, ColOffset, ColBpm, ColTrig, ColCues, ColNotes };
 
     //--------------------------------------------------------------------------
     // UI components
@@ -526,7 +555,59 @@ private:
     //--------------------------------------------------------------------------
     void rebuildRows()
     {
-        rows = trackMap.getAllSortedPtrs();
+        // Default view (or any unknown column): playlist order ascending.
+        // This also covers the case where JUCE reports no sort (columnId==0).
+        if (activeSortColumn <= 0
+            || (activeSortColumn == ColPlaylistPos && sortForwards))
+        {
+            rows = trackMap.getAllSortedPtrs();
+            rowsGeneration = trackMap.getGeneration();
+            return;
+        }
+
+        // Custom column sort: snapshot all entries then sort
+        rows.clear();
+        rows.reserve(trackMap.size());
+        for (auto& [k, entry] : trackMap.getEntries())
+            rows.push_back(&entry);
+
+        auto cmpStr = [this](const juce::String& a, const juce::String& b) {
+            int c = a.compareIgnoreCase(b);
+            return sortForwards ? (c < 0) : (c > 0);
+        };
+
+        std::sort(rows.begin(), rows.end(),
+            [&](const TrackMapEntry* a, const TrackMapEntry* b) {
+                switch (activeSortColumn)
+                {
+                    case ColPlaylistPos:
+                    {
+                        // Tracks without a playlist position (sortOrder==0) always
+                        // come LAST, regardless of sort direction. This keeps the
+                        // "# == --" group at the bottom where the user expects it.
+                        bool aHas = (a->sortOrder > 0);
+                        bool bHas = (b->sortOrder > 0);
+                        if (aHas != bHas) return aHas;  // the one with an order wins
+                        if (aHas)  // both have sort orders
+                            return sortForwards ? (a->sortOrder < b->sortOrder)
+                                                : (a->sortOrder > b->sortOrder);
+                        // Neither has a sort order -- tiebreak by artist/title
+                        if (a->artist.compareIgnoreCase(b->artist) != 0)
+                            return a->artist.compareIgnoreCase(b->artist) < 0;
+                        return a->title.compareIgnoreCase(b->title) < 0;
+                    }
+                    case ColArtist:
+                        if (a->artist.compareIgnoreCase(b->artist) != 0)
+                            return cmpStr(a->artist, b->artist);
+                        return cmpStr(a->title, b->title);  // tiebreak by title
+                    case ColTitle:
+                        return cmpStr(a->title, b->title);
+                    case ColOffset:
+                        return cmpStr(a->timecodeOffset, b->timecodeOffset);
+                    default:
+                        return false;
+                }
+            });
         rowsGeneration = trackMap.getGeneration();
     }
 
@@ -1173,15 +1254,23 @@ private:
                     int before = (int)safeThis->trackMap.size();
                     safeThis->trackMap.applyPlaylistOrder(entries);
                     safeThis->trackMap.save();
+                    // Reset sort to playlist order so the user sees the new
+                    // order immediately. setSortColumnId may or may not trigger
+                    // sortOrderChanged depending on prior state, so we also
+                    // rebuild explicitly to guarantee the display updates.
+                    safeThis->table.getHeader().setSortColumnId(ColPlaylistPos, true);
                     safeThis->rebuildRows();
                     safeThis->table.updateContent();
                     safeThis->repaint();
 
                     int added = (int)safeThis->trackMap.size() - before;
-                    juce::String msg = "Playlist applied: " + juce::String((int)entries.size())
-                        + " tracks reordered";
+                    int reordered = (int)entries.size() - added;
+                    juce::String msg = "Playlist applied (" + juce::String((int)entries.size())
+                                     + " tracks)";
+                    if (reordered > 0)
+                        msg += ": " + juce::String(reordered) + " reordered";
                     if (added > 0)
-                        msg += ", " + juce::String(added) + " new tracks added";
+                        msg += (reordered > 0 ? ", " : ": ") + juce::String(added) + " added";
                     juce::AlertWindow::showMessageBoxAsync(
                         juce::MessageBoxIconType::InfoIcon, "Playlist Import", msg);
                 }
@@ -1369,8 +1458,8 @@ private:
                     g.drawText(e.timecodeOffset, 4, 0, w - 8, h, juce::Justification::centredLeft);
                     break;
                 case 5:
-                    g.setColour(dup ? juce::Colour(0xFFE65100) : juce::Colour(0xFF2E7D32));
-                    g.drawText(dup ? "overwrite" : "new", 4, 0, w - 8, h, juce::Justification::centredLeft);
+                    g.setColour(dup ? juce::Colour(0xFF78909C) : juce::Colour(0xFF2E7D32));
+                    g.drawText(dup ? "exists" : "new", 4, 0, w - 8, h, juce::Justification::centredLeft);
                     break;
             }
         }
@@ -1422,14 +1511,25 @@ private:
         preview->onImportSelected = [this, preview]
         {
             auto selected = preview->getSelectedEntries();
+            int imported = 0;
             for (auto& e : selected)
+            {
+                // Preserve existing entries completely -- don't overwrite
+                // cues, triggers, offsets, notes. If the user explicitly
+                // selected a duplicate to import, we interpret that as
+                // "make sure it's in the map" rather than "reset it".
+                if (trackMap.contains(e.artist, e.title, e.durationSec)
+                    || trackMap.findIgnoringDuration(e.artist, e.title) != nullptr)
+                    continue;
+
                 trackMap.addOrUpdate(e);
+                ++imported;
+            }
 
-            int count = (int)selected.size();
-
-            // Defer destruction -- we're inside a callback of a child component
             juce::Component::SafePointer<TrackMapEditor> safeThis(this);
-            juce::MessageManager::callAsync([safeThis, count]
+            int skipped = (int)selected.size() - imported;
+            int count = imported;
+            juce::MessageManager::callAsync([safeThis, count, skipped]
             {
                 if (auto* self = safeThis.getComponent())
                 {
@@ -1438,12 +1538,20 @@ private:
 
                     self->notifyChanged();
 
-                    if (count > 0)
+                    if (count > 0 || skipped > 0)
                     {
+                        juce::String msg;
+                        if (count > 0)
+                            msg = juce::String(count) + " track(s) imported";
+                        if (skipped > 0)
+                        {
+                            if (msg.isNotEmpty()) msg += ". ";
+                            msg += juce::String(skipped) + " already exist(s) -- kept existing config";
+                        }
                         juce::AlertWindow::showAsync(juce::MessageBoxOptions()
                             .withIconType(juce::MessageBoxIconType::InfoIcon)
                             .withTitle("Import Complete")
-                            .withMessage(juce::String(count) + " track(s) imported.")
+                            .withMessage(msg)
                             .withButton("OK"),
                             nullptr);
                     }

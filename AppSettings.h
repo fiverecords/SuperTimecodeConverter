@@ -699,13 +699,20 @@ public:
             // Path segments skip ROOT (same as listRekordboxPlaylists).
             juce::XmlElement* playlistNode = nullptr;
             {
-                // Split path into segments: "Shows / Saturday" → ["Shows", "Saturday"]
+                // Split path into segments on the " / " SUBSTRING.
+                // (Do NOT use addTokens — it treats the second arg as a set
+                //  of break CHARACTERS, which would split on every space.)
                 juce::StringArray segments;
-                if (playlistName.contains(" / "))
-                    segments.addTokens(playlistName, " / ", "");
-                else
-                    segments.add(playlistName);
-                // Remove empty tokens from split
+                juce::String remaining = playlistName;
+                int pos = remaining.indexOf(" / ");
+                while (pos >= 0)
+                {
+                    segments.add(remaining.substring(0, pos));
+                    remaining = remaining.substring(pos + 3);
+                    pos = remaining.indexOf(" / ");
+                }
+                segments.add(remaining);
+                // Drop any empty segments (shouldn't happen but defensive)
                 for (int i = segments.size() - 1; i >= 0; --i)
                     if (segments[i].isEmpty()) segments.remove(i);
 
@@ -994,6 +1001,9 @@ struct EngineSettings
     int  tcnetLayer = 0;               // TCNet layer index 0-3 (Layer 1-4)
     bool hippoOutEnabled = false;      // Hippotizer timecode output
     juce::String hippotizerDestIp = "255.255.255.255";  // Hippotizer destination IP
+
+    // On-air gate: engine only active when CDJ is flagged on-air by the DJM
+    bool onAirGateEnabled = false;
     juce::String midiOutputDevice = "";
     int artnetOutputInterface = 0;
     juce::String audioOutputDevice = "";
@@ -1083,6 +1093,8 @@ struct EngineSettings
         obj->setProperty("thruOutEnabled", thruOutEnabled);
         obj->setProperty("tcnetOutEnabled", tcnetOutEnabled);
         obj->setProperty("tcnetLayer", tcnetLayer);
+        if (onAirGateEnabled)
+            obj->setProperty("onAirGateEnabled", onAirGateEnabled);
         obj->setProperty("hippoOutEnabled", hippoOutEnabled);
         obj->setProperty("hippotizerDestIp", hippotizerDestIp);
         obj->setProperty("midiOutputDevice", midiOutputDevice);
@@ -1195,6 +1207,7 @@ struct EngineSettings
         thruOutEnabled       = getBool("thruOutEnabled", false);
         tcnetOutEnabled      = getBool("tcnetOutEnabled", false);
         tcnetLayer           = juce::jlimit(0, 3, getInt("tcnetLayer", 0));
+        onAirGateEnabled     = getBool("onAirGateEnabled", false);
         hippoOutEnabled      = getBool("hippoOutEnabled", false);
         hippotizerDestIp     = getString("hippotizerDestIp", "255.255.255.255");
         midiOutputDevice     = getString("midiOutputDevice");

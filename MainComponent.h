@@ -433,6 +433,11 @@ private:
     juce::TextEditor   txtHippoDestIp;    juce::Label lblHippoDestIp;
     juce::Label        lblHippoOutStatus;
 
+    // On-air gate (Pro DJ Link only): require the CDJ to be flagged on-air
+    // by the DJM before the engine produces active timecode. Lets the DJ
+    // preview tracks on a deck without triggering output.
+    juce::ToggleButton btnOnAirGate { "ON-AIR ONLY" };
+
     int showLockFlashCountdown = 0;  // ticks remaining for flash feedback
 
     /// Returns true if Show Lock is active and the action should be blocked.

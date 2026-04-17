@@ -272,6 +272,32 @@ public:
 
     int getTcnetOutputOffsetMs() const  { return tcnetOutputOffsetMs; }
 
+    // On-air gate (requires CDJ on-air flag from DJM for engine to be active)
+    bool isOnAirGateEnabled() const     { return onAirGateEnabled; }
+    void setOnAirGateEnabled(bool e)    { onAirGateEnabled = e; }
+
+    /// Returns true if the on-air gate allows the engine to be active.
+    /// If the gate is disabled, always returns true. Otherwise consults the
+    /// CDJ's on-air flag -- this reflects the DJM mixer's full gating logic
+    /// (channel fader + cross-fader + EQ kill + mute), computed by the mixer
+    /// itself and transmitted to the CDJs. The DJ sees the same "ON AIR"
+    /// indicator light on the CDJ display.
+    bool isOnAirGateOpen() const
+    {
+        if (!onAirGateEnabled) return true;
+        if (activeInput != InputSource::ProDJLink) return true;
+        if (sharedProDJLink == nullptr) return true;
+        // If no DJM is active on the network, the on-air flag is meaningless
+        // (CDJs default to false without a DJM broadcast). Keep the gate open
+        // so the engine isn't silenced just because the DJ unplugged the mixer.
+        if (!sharedProDJLink->hasMixerFaderData()) return true;
+        int ep = getEffectivePlayer();
+        // If XF mode hasn't resolved yet (ep == 0) or is out of range,
+        // don't block the engine.
+        if (ep < 1 || ep > 4) return true;
+        return sharedProDJLink->isPlayerOnAir(ep);
+    }
+
     //==========================================================================
     // Protocol handlers -- direct access for device queries
     //==========================================================================
@@ -427,8 +453,11 @@ public:
         lastSentClockBpm = -1.0f;
         lastSentOscBpm = -1.0f;
 
-        // ProDJLink has no fps auto-detection -- use configured output fps
-        currentFps = outputFps;
+        // NOTE: do NOT overwrite currentFps here. The user's fps choice is
+        // already set via setFrameRate() from settings load or the FPS buttons.
+        // Previously this was "currentFps = outputFps" which would overwrite
+        // a user-selected 25fps with outputFps=30 (the default) when loading
+        // settings, because startProDJLinkInput runs after the initial load.
 
         // LTC direct mode is now toggled dynamically per tick
         // (direct in transient, auto-increment in stable)
@@ -477,8 +506,7 @@ public:
         dmxHighWaterMark = 0;
         lastDmxSendTime = 0.0;
 
-        // StageLinQ has no fps auto-detection -- use configured output fps
-        currentFps = outputFps;
+        // NOTE: do NOT overwrite currentFps here (see startProDJLinkInput).
 
         proDJLinkPlayer = juce::jlimit(1, kPlayerXfB, player);
         resolvedXfPlayer = 0;
@@ -1393,7 +1421,8 @@ public:
                     bool wasActive = sourceActive;
                     sourceActive = pdlRx && pdlHasData
                                 && (speed >= PlayheadPLL::kMinEncodingPitch)
-                                && !isEOT;
+                                && !isEOT
+                                && isOnAirGateOpen();
 
                     // Reseed LTC encoder on pause->active transition
                     // so it starts a fresh frame instead of continuing a stale one
@@ -1928,6 +1957,12 @@ private:
     bool outputTcnetEnabled  = false;
     bool outputHippoEnabled  = false;
     int  tcnetLayer          = 0;      // TCNet layer index 0-3
+
+    // On-air gate: when enabled, the engine only produces active timecode
+    // when the current CDJ is flagged on-air by the DJM mixer. This uses the
+    // mixer's own gating logic (fader + cross-fader + EQ + mute), so no
+    // threshold or channel selection is needed.
+    bool onAirGateEnabled = false;
 
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;

@@ -209,6 +209,12 @@ public:
         // Close all connections
         for (auto& conn : connections)
             conn.close();
+
+        // Clear any pending invalidation requests
+        {
+            const juce::ScopedLock sl(pendingInvalidateLock);
+            pendingInvalidateIPs.clear();
+        }
     }
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
@@ -436,11 +442,12 @@ public:
                     ++it;
             }
         }
-        // Close connection to this player
-        for (auto& conn : connections)
+        // Queue this player for connection close by the worker thread.
+        // Closing the socket directly from here would race against the worker
+        // which may be in the middle of a TCP query using that socket.
         {
-            if (conn.playerIP == playerIP)
-                conn.close();
+            const juce::ScopedLock sl(pendingInvalidateLock);
+            pendingInvalidateIPs.addIfNotAlreadyThere(playerIP);
         }
     }
 
@@ -2236,6 +2243,28 @@ private:
 
             if (threadShouldExit()) break;
 
+            // Process pending invalidations — close connections for players
+            // that were reported lost by ProDJLink. Safe to do here because
+            // we're between TCP queries on this thread.
+            {
+                juce::StringArray ips;
+                {
+                    const juce::ScopedLock sl(pendingInvalidateLock);
+                    ips.swapWith(pendingInvalidateIPs);
+                }
+                for (auto& ip : ips)
+                {
+                    for (auto& conn : connections)
+                    {
+                        if (conn.playerIP == ip)
+                        {
+                            DBG("DbServerClient: closing connection to lost player " + ip);
+                            conn.close();
+                        }
+                    }
+                }
+            }
+
             // Close idle connections — prevents zombie TCP connections from
             // holding CDJ NFS slots (CDJ-2000NXS2 has limited slots).
             {
@@ -2627,6 +2656,12 @@ private:
 
     // TCP connections (one per CDJ, max 6)
     std::array<PlayerConnection, kMaxConnections> connections;
+
+    // Deferred invalidation: external threads (e.g. ProDJLink onPlayerLost)
+    // queue IPs here; the worker thread closes the matching connections
+    // between TCP queries. Avoids closing sockets while they are in use.
+    juce::StringArray pendingInvalidateIPs;
+    juce::CriticalSection pendingInvalidateLock;
 
     // Metadata cache (protected by SpinLock)
     mutable juce::SpinLock cacheLock;
