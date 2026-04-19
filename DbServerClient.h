@@ -449,6 +449,11 @@ public:
             const juce::ScopedLock sl(pendingInvalidateLock);
             pendingInvalidateIPs.addIfNotAlreadyThere(playerIP);
         }
+        // Drop cached db port — if the player reappears it may have changed.
+        {
+            const juce::ScopedLock sl(knownDbPortsLock);
+            knownDbPorts.erase(playerIP.toStdString());
+        }
     }
 
     /// Clear all caches
@@ -578,6 +583,22 @@ private:
 
         void close()
         {
+            if (socket && socket->isConnected())
+            {
+                // Polite dbserver protocol teardown so the CDJ closes the connection
+                // from its side and properly releases its session resources.
+                // Format: magic | TxID=0xfffffffe | type=0x0100 | argc=0 | 12 zero tag bytes.
+                // Documented in djl-analysis (Deep-Symmetry); used by beat-link.
+                static const uint8_t teardown[] = {
+                    0x11, 0x87,0x23,0x49,0xae,        // magic field (0f-prefixed 4-byte)
+                    0x11, 0xff,0xff,0xff,0xfe,        // TxID = 0xfffffffe
+                    0x10, 0x01,0x00,                  // type = 0x0100 (2-byte)
+                    0x0f, 0x00,                       // argc = 0
+                    0x14, 0x00,0x00,0x00,0x0c,        // blob, length = 12
+                    0,0,0,0,0,0,0,0,0,0,0,0           // 12 zero tag bytes
+                };
+                socket->write(teardown, (int)sizeof(teardown));
+            }
             if (socket)
             {
                 socket->close();
@@ -960,13 +981,24 @@ private:
         if (now - slot->lastFailTime < kReconnectCooldownMs)
             return nullptr;
 
-        // Step 1: Discover database port via port 12523
-        int dbPort = discoverDbPort(playerIP);
+        // Step 1: Discover database port via port 12523 (cached after first success)
+        int dbPort = 0;
+        {
+            const juce::ScopedLock sl(knownDbPortsLock);
+            auto it = knownDbPorts.find(playerIP.toStdString());
+            if (it != knownDbPorts.end()) dbPort = it->second;
+        }
         if (dbPort <= 0)
         {
-            DBG("DbServerClient: no valid db port found for " + playerIP);
-            slot->lastFailTime = now;
-            return nullptr;
+            dbPort = discoverDbPort(playerIP);
+            if (dbPort <= 0)
+            {
+                DBG("DbServerClient: no valid db port found for " + playerIP);
+                slot->lastFailTime = now;
+                return nullptr;
+            }
+            const juce::ScopedLock sl(knownDbPortsLock);
+            knownDbPorts[playerIP.toStdString()] = dbPort;
         }
 
         // Step 2: Connect to database port
@@ -2656,6 +2688,13 @@ private:
 
     // TCP connections (one per CDJ, max 6)
     std::array<PlayerConnection, kMaxConnections> connections;
+
+    // Cache of discovered db ports per player IP. Once we know the port
+    // (1051 for NXS2, 1052 for CDJ-3000), reusing it on reconnect avoids
+    // the 12523 port-discovery TCP dance and saves one round-trip per
+    // reconnect. Port doesn't change between reconnects to the same CDJ.
+    std::unordered_map<std::string, int> knownDbPorts;
+    juce::CriticalSection knownDbPortsLock;
 
     // Deferred invalidation: external threads (e.g. ProDJLink onPlayerLost)
     // queue IPs here; the worker thread closes the matching connections
