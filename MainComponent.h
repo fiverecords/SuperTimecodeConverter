@@ -296,11 +296,13 @@ private:
     bool artnetOutExpanded    = true;
     bool ltcOutExpanded       = true;
     bool thruOutExpanded      = true;
+    bool laNetTCOutExpanded   = true;
 
     // --- Input buttons ---
     juce::TextButton btnMtcIn    { "MTC" };
     juce::TextButton btnArtnetIn { "ART-NET" };
     juce::TextButton btnSysTime  { "GENERATOR" };
+    juce::TextButton btnLANetTCIn { "LA-NET" };
 
     // Generator controls (visible when input = Generator)
     juce::ToggleButton btnGenClock { "CLOCK" };  // system clock mode toggle
@@ -364,6 +366,7 @@ private:
     juce::ToggleButton btnArtnetOut { "ART-NET OUT" };
     juce::ToggleButton btnLtcOut    { "LTC OUT" };
     juce::ToggleButton btnThruOut   { "AUDIO THRU" };
+    juce::ToggleButton btnLANetTCOut { "LA-NET OUT" };
 
     // --- FPS buttons ---
     juce::TextButton btnFps2398 { "23.976" };
@@ -386,6 +389,7 @@ private:
     juce::TextButton btnCollapseArtnetOut { "" };
     juce::TextButton btnCollapseLtcOut    { "" };
     juce::TextButton btnCollapseThruOut   { "" };
+    juce::TextButton btnCollapseLANetTCOut { "" };
 
     // --- Left panel (input config) ---
     juce::ComboBox cmbAudioInputTypeFilter;  juce::Label lblAudioInputTypeFilter;
@@ -395,6 +399,7 @@ private:
     juce::ComboBox cmbArtnetInputInterface;  juce::Label lblArtnetInputInterface;
     juce::ComboBox cmbHippoInputInterface;  juce::Label lblHippoInputInterface;
     juce::ComboBox cmbHippoTcChannel;      juce::Label lblHippoTcChannel;
+    juce::ComboBox cmbLANetTCInputInterface; juce::Label lblLANetTCInputInterface;
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
@@ -557,6 +562,7 @@ private:
     juce::ComboBox cmbAudioOutputTypeFilter; juce::Label lblAudioOutputTypeFilter;
     juce::ComboBox cmbMidiOutputDevice;      juce::Label lblMidiOutputDevice;
     juce::ComboBox cmbArtnetOutputInterface; juce::Label lblArtnetOutputInterface;
+    juce::ComboBox cmbLANetTCOutputInterface; juce::Label lblLANetTCOutputInterface;
     juce::ComboBox cmbAudioOutputDevice;     juce::Label lblAudioOutputDevice;
     juce::ComboBox cmbAudioOutputChannel;    juce::Label lblAudioOutputChannel;
     GainSlider sldLtcOutputGain;             juce::Label lblLtcOutputGain;
@@ -573,6 +579,8 @@ private:
     juce::Label lblOutputLtcStatus;
     GainSlider sldLtcOffset;                 juce::Label lblLtcOffset;
     juce::Label lblOutputThruStatus;
+    juce::Label lblOutputLANetTCStatus;
+    GainSlider sldLANetTCOffset;             juce::Label lblLANetTCOffset;
 
     juce::TextButton btnRefreshDevices { "Refresh Devices" };
     juce::HyperlinkButton btnGitHub { "github.com/fiverecords/SuperTimecodeConverter",
@@ -638,6 +646,7 @@ private:
     void startCurrentProDJLinkInput();
     void startCurrentStageLinQInput();
     void startCurrentHippotizerInput();
+    void startCurrentLANetTCInput();
     void openTrackMapEditor();
     void openCuePointEditor(TrackMapEntry* entry);
     void openMixerMapEditor();
@@ -650,6 +659,7 @@ private:
     void startCurrentThruOutput();
     void startCurrentMtcOutput();
     void startCurrentArtnetOutput();
+    void startCurrentLANetTCOutput();
     void startCurrentLtcOutput();
     void startCurrentGenAudio();
     void updateCurrentOutputStates();
