@@ -132,7 +132,7 @@ MainComponent::MainComponent()
     rightViewport.setScrollBarsShown(true, false);
 
     // --- Input buttons ---
-    for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnSysTime, &btnLtcIn, &btnProDJLinkIn, &btnStageLinQIn })
+    for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnSysTime, &btnLtcIn, &btnProDJLinkIn, &btnStageLinQIn, &btnLANetTCIn })
     { leftContent.addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
     // HippoNet input hidden pending hardware validation (code preserved in HippotizerInput.h)
     btnHippoIn.setVisible(false);
@@ -148,6 +148,12 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::ArtNet) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
         else { inputConfigExpanded = true; eng.setInputSource(SrcType::ArtNet); startCurrentArtnetInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
+    };
+    btnLANetTCIn.onClick = [this] {
+        if (syncing || isShowLocked()) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == SrcType::LANetTC) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::LANetTC); startCurrentLANetTCInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
     btnSysTime.onClick = [this] {
         if (syncing || isShowLocked()) return;
@@ -212,11 +218,12 @@ MainComponent::MainComponent()
     };
 
     // --- Output toggles ---
-    for (auto* btn : { &btnMtcOut, &btnArtnetOut, &btnLtcOut, &btnThruOut, &btnTcnetOut })
+    for (auto* btn : { &btnMtcOut, &btnArtnetOut, &btnLtcOut, &btnThruOut, &btnTcnetOut, &btnLANetTCOut })
         rightContent.addAndMakeVisible(btn);
 
     styleOutputToggle(btnMtcOut, accentRed);
     styleOutputToggle(btnArtnetOut, accentOrange);
+    styleOutputToggle(btnLANetTCOut, juce::Colour{0xFF63D8FB});
     styleOutputToggle(btnLtcOut, accentPurple);
     styleOutputToggle(btnThruOut, accentCyan);
     styleOutputToggle(btnTcnetOut, juce::Colour(0xFF00CC66));
@@ -244,6 +251,7 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         eng.setOutputMtcEnabled(btnMtcOut.getToggleState());
         eng.setOutputArtnetEnabled(btnArtnetOut.getToggleState());
+        eng.setOutputLANetTCEnabled(btnLANetTCOut.getToggleState());
         eng.setOutputLtcEnabled(btnLtcOut.getToggleState());
         eng.setOutputThruEnabled(btnThruOut.getToggleState());
         eng.setOutputTcnetEnabled(btnTcnetOut.getToggleState());
@@ -274,10 +282,10 @@ MainComponent::MainComponent()
         resized();
         saveSettings();
     };
-    btnMtcOut.onClick = btnArtnetOut.onClick = btnLtcOut.onClick = btnThruOut.onClick = btnTcnetOut.onClick = outputToggleHandler;
+    btnMtcOut.onClick = btnArtnetOut.onClick = btnLtcOut.onClick = btnThruOut.onClick = btnTcnetOut.onClick = btnLANetTCOut.onClick = outputToggleHandler;
 
     // --- Collapse toggle buttons for outputs ---
-    for (auto* btn : { &btnCollapseMtcOut, &btnCollapseArtnetOut, &btnCollapseLtcOut, &btnCollapseThruOut })
+    for (auto* btn : { &btnCollapseMtcOut, &btnCollapseArtnetOut, &btnCollapseLtcOut, &btnCollapseThruOut, &btnCollapseLANetTCOut })
     {
         rightContent.addAndMakeVisible(btn);
         styleCollapseButton(*btn);
@@ -292,10 +300,12 @@ MainComponent::MainComponent()
     };
     btnCollapseMtcOut.onClick    = makeCollapseHandler(mtcOutExpanded,    btnCollapseMtcOut);
     btnCollapseArtnetOut.onClick = makeCollapseHandler(artnetOutExpanded, btnCollapseArtnetOut);
+    btnCollapseLANetTCOut.onClick = makeCollapseHandler(laNetTCOutExpanded, btnCollapseLANetTCOut);
     btnCollapseLtcOut.onClick    = makeCollapseHandler(ltcOutExpanded,    btnCollapseLtcOut);
     btnCollapseThruOut.onClick   = makeCollapseHandler(thruOutExpanded,   btnCollapseThruOut);
     updateCollapseButtonText(btnCollapseMtcOut, mtcOutExpanded);
     updateCollapseButtonText(btnCollapseArtnetOut, artnetOutExpanded);
+    updateCollapseButtonText(btnCollapseLANetTCOut, laNetTCOutExpanded);
     updateCollapseButtonText(btnCollapseLtcOut, ltcOutExpanded);
     updateCollapseButtonText(btnCollapseThruOut, thruOutExpanded);
 
@@ -432,6 +442,24 @@ MainComponent::MainComponent()
             // If bind fell back, update combo to actual interface before repopulate
             int actualId = currentEngine().getArtnetInput().getSelectedInterface() + 1;
             cmbArtnetInputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
+            saveSettings();
+        }
+    };
+
+    addLabelAndCombo(lblLANetTCInputInterface, cmbLANetTCInputInterface, "LA-NET INPUT DEVICE:");
+    cmbLANetTCInputInterface.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        if (currentEngine().getActiveInput() == SrcType::LANetTC)
+        {
+            int sel = cmbLANetTCInputInterface.getSelectedId() - 1;
+            currentEngine().stopLANetTCInput();
+            currentEngine().startLANetTCInput(sel);
+            // If bind fell back, update combo to actual interface before repopulate
+            int actualId = currentEngine().getLANetTCInput().getSelectedInterface() + 1;
+            cmbLANetTCInputInterface.setSelectedId(actualId, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
         }
@@ -1573,6 +1601,29 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblArtnetOffset); lblArtnetOffset.setText("ART-NET OFFSET:", juce::dontSendNotification); styleLabel(lblArtnetOffset);
     sldArtnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setArtnetOutputOffset((int)sldArtnetOffset.getValue()); saveSettings(); } };
 
+    addRightLabelAndCombo(lblLANetTCOutputInterface, cmbLANetTCOutputInterface, "LA-NET OUTPUT DEVICE:");
+    cmbLANetTCOutputInterface.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        auto& eng = currentEngine();
+        if (eng.isOutputLANetTCEnabled())
+        {
+            int sel = cmbLANetTCOutputInterface.getSelectedId() - 3;
+            eng.stopLANetTCOutput();
+            eng.startLANetTCOutput(sel);
+            // Update combo to actual interface before repopulate (handles fallback)
+            int actualId = eng.getLANetTCOutput().getSelectedInterface() + 3;
+            cmbLANetTCOutputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
+            saveSettings();
+        }
+    };
+    rightContent.addAndMakeVisible(lblOutputLANetTCStatus); styleLabel(lblOutputLANetTCStatus); lblOutputLANetTCStatus.setColour(juce::Label::textColourId, accentOrange);
+    rightContent.addAndMakeVisible(sldLANetTCOffset); styleOffsetSlider(sldLANetTCOffset);
+    rightContent.addAndMakeVisible(lblLANetTCOffset); lblLANetTCOffset.setText("LA-NET OFFSET:", juce::dontSendNotification); styleLabel(lblLANetTCOffset);
+    sldLANetTCOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLANetTCOutputOffset((int)sldLANetTCOffset.getValue()); saveSettings(); } };
+
     // TCNet interface combo (shown when TCNET OUT is enabled)
     addRightLabelAndCombo(lblTcnetInterface, cmbTcnetInterface, "TCNET INTERFACE:");
     cmbTcnetInterface.onChange = [this]
@@ -1923,10 +1974,12 @@ MainComponent::~MainComponent()
         eng->getTriggerOutput().disconnectOsc();
         eng->stopMtcOutput();
         eng->stopArtnetOutput();
+        eng->stopLANetTCOutput();
         eng->stopLtcOutput();
         eng->stopThruOutput();
         eng->stopMtcInput();
         eng->stopArtnetInput();
+        eng->stopLANetTCInput();
         eng->stopLtcInput();
     }
 
@@ -1993,10 +2046,12 @@ void MainComponent::removeEngine(int index)
     engines[(size_t)index]->getTriggerOutput().setSharedMidiOutput(nullptr);
     engines[(size_t)index]->stopMtcOutput();
     engines[(size_t)index]->stopArtnetOutput();
+    engines[(size_t)index]->stopLANetTCOutput();
     engines[(size_t)index]->stopLtcOutput();
     engines[(size_t)index]->stopThruOutput();
     engines[(size_t)index]->stopMtcInput();
     engines[(size_t)index]->stopArtnetInput();
+    engines[(size_t)index]->stopLANetTCInput();
     engines[(size_t)index]->stopLtcInput();
 
     // Detach waveform views from the engine about to be deleted so we never
@@ -2075,7 +2130,7 @@ void MainComponent::selectEngine(int index)
 
     selectedEngine = index;
     inputConfigExpanded = true;
-    mtcOutExpanded = artnetOutExpanded = ltcOutExpanded = thruOutExpanded = true;
+    mtcOutExpanded = artnetOutExpanded = ltcOutExpanded = thruOutExpanded = laNetTCOutExpanded = true;
 
     // Reset FPS tracking so buttons update immediately for new engine
     lastDisplayedFps    = engines[(size_t)index]->getCurrentFps();
@@ -2209,6 +2264,7 @@ void MainComponent::syncUIFromEngine()
     // Output toggles
     btnMtcOut.setToggleState(eng.isOutputMtcEnabled(), juce::dontSendNotification);
     btnArtnetOut.setToggleState(eng.isOutputArtnetEnabled(), juce::dontSendNotification);
+    btnLANetTCOut.setToggleState(eng.isOutputLANetTCEnabled(), juce::dontSendNotification);
     btnLtcOut.setToggleState(eng.isOutputLtcEnabled(), juce::dontSendNotification);
 
     // AudioThru toggle: only show for primary engine
@@ -2237,6 +2293,7 @@ void MainComponent::syncUIFromEngine()
     // Offsets
     sldMtcOffset.setValue(eng.getMtcOutputOffset(), juce::dontSendNotification);
     sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
+    sldLANetTCOffset.setValue(eng.getLANetTCOutputOffset(), juce::dontSendNotification);
     sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
     sldTcnetOffset.setValue(eng.getTcnetOutputOffsetMs(), juce::dontSendNotification);
 
@@ -2279,6 +2336,11 @@ void MainComponent::syncUIFromEngine()
         if (artInId <= cmbArtnetInputInterface.getNumItems())
             cmbArtnetInputInterface.setSelectedId(artInId, juce::dontSendNotification);
 
+        int laNetTCInId = es.laNetTCInputInterface + 1;   // combo id is 1-based (1 = All Interfaces)
+        if (laNetTCInId < 1) laNetTCInId = 1;                // handle legacy -1 default
+        if (laNetTCInId <= cmbLANetTCInputInterface.getNumItems())
+            cmbLANetTCInputInterface.setSelectedId(laNetTCInId, juce::dontSendNotification);
+
         int hippoInId = es.hippotizerInputInterface + 1;
         if (hippoInId < 1) hippoInId = 1;
         if (hippoInId <= cmbHippoInputInterface.getNumItems())
@@ -2290,6 +2352,11 @@ void MainComponent::syncUIFromEngine()
         if (artOutId < 1) artOutId = 1;              // handle legacy -1 default
         if (artOutId <= cmbArtnetOutputInterface.getNumItems())
             cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
+
+        int laNetTCOutId = es.laNetTCOutputInterface + 1;
+        if (laNetTCOutId < 1) laNetTCOutId = 1;
+        if (laNetTCOutId <= cmbLANetTCOutputInterface.getNumItems())
+            cmbLANetTCOutputInterface.setSelectedId(laNetTCOutId, juce::dontSendNotification);
 
         // TCNet interface combo (global setting, not per-engine)
         int tcnetIfId = settings.tcnetInterface + 2;  // -1->1(All), 0->2, 1->3...
@@ -2545,6 +2612,13 @@ void MainComponent::startCurrentArtnetInput()
     auto& eng = currentEngine();
     int sel = cmbArtnetInputInterface.getSelectedId() - 1;
     eng.startArtnetInput(sel);
+}
+
+void MainComponent::startCurrentLANetTCInput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbLANetTCInputInterface.getSelectedId() - 1;
+    eng.startLANetTCInput(sel);
 }
 
 void MainComponent::startCurrentLtcInput()
@@ -3413,6 +3487,13 @@ void MainComponent::startCurrentArtnetOutput()
     eng.startArtnetOutput(sel);
 }
 
+void MainComponent::startCurrentLANetTCOutput()
+{
+    auto& eng = currentEngine();
+    int sel = cmbLANetTCOutputInterface.getSelectedId() - 3;
+    eng.startLANetTCOutput(sel);
+}
+
 void MainComponent::startCurrentLtcOutput()
 {
     auto& eng = currentEngine();
@@ -3497,6 +3578,9 @@ void MainComponent::updateCurrentOutputStates()
 
     if (eng.isOutputArtnetEnabled() && !eng.getArtnetOutput().getIsRunning()) startCurrentArtnetOutput();
     else if (!eng.isOutputArtnetEnabled() && eng.getArtnetOutput().getIsRunning()) eng.stopArtnetOutput();
+
+    if (eng.isOutputLANetTCEnabled() && !eng.getLANetTCOutput().getIsRunning()) startCurrentLANetTCOutput();
+    else if (!eng.isOutputLANetTCEnabled() && eng.getLANetTCOutput().getIsRunning()) eng.stopLANetTCOutput();
 
     if (eng.isOutputLtcEnabled() && !eng.getLtcOutput().getIsRunning() && !scannedAudioOutputs.isEmpty()) startCurrentLtcOutput();
     else if (!eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning()) eng.stopLtcOutput();
@@ -3940,7 +4024,9 @@ void MainComponent::populateMidiAndNetworkCombos()
     int savedMidiOut  = cmbMidiOutputDevice.getSelectedId();
     int savedArtIn    = cmbArtnetInputInterface.getSelectedId();
     int savedHippoIn  = cmbHippoInputInterface.getSelectedId();
+    int savedLAIn     = cmbLANetTCInputInterface.getSelectedId();
     int savedArtOut   = cmbArtnetOutputInterface.getSelectedId();
+    int savedLAOut    = cmbLANetTCOutputInterface.getSelectedId();
     int savedArtDmx   = cmbArtnetDmxInterface.getSelectedId();
     int savedTcnetIf  = cmbTcnetInterface.getSelectedId();
 
@@ -3967,6 +4053,10 @@ void MainComponent::populateMidiAndNetworkCombos()
     cmbArtnetInputInterface.clear(juce::dontSendNotification);
     cmbArtnetOutputInterface.clear(juce::dontSendNotification);
     cmbArtnetDmxInterface.clear(juce::dontSendNotification);
+
+    // LaserAnimation Net-Timecode Interfaces
+    cmbLANetTCInputInterface.clear(juce::dontSendNotification);
+    cmbLANetTCOutputInterface.clear(juce::dontSendNotification);
 
     // Helper: check if an Art-Net interface combo ID is in use by another engine
     auto getArtnetMarker = [&](int comboId, bool isInput) -> juce::String
@@ -4000,11 +4090,47 @@ void MainComponent::populateMidiAndNetworkCombos()
         return currentDot;
     };
 
+    auto getLANetTCMarker = [&](int comboId, bool isInput) -> juce::String
+    {
+        juce::String currentDot;
+
+        for (int i = 0; i < (int)engines.size(); i++)
+        {
+            auto& eng = *engines[(size_t)i];
+            bool isCurrent = (i == selectedEngine);
+
+            if (isInput && eng.getLANetTCInput().getIsRunning())
+            {
+                int inUseComboId = eng.getLANetTCInput().getSelectedInterface() + 1;
+                if (inUseComboId == comboId)
+                {
+                    if (isCurrent) currentDot = juce::String(" ") + juce::String::charToString(0x25CF);
+                    else           return " [" + eng.getName() + "]";
+                }
+            }
+            if (!isInput && eng.getLANetTCOutput().getIsRunning())
+            {
+                int inUseComboId = eng.getLANetTCOutput().getSelectedInterface() + 3;
+                if (inUseComboId == comboId)
+                {
+                    if (isCurrent) currentDot = juce::String(" ") + juce::String::charToString(0x25CF);
+                    else           return " [" + eng.getName() + "]";
+                }
+            }
+        }
+        return currentDot;
+    };
+
     cmbArtnetInputInterface.addItem("All Interfaces" + getArtnetMarker(1, true), 1);
     cmbArtnetOutputInterface.addItem("All Interfaces (Broadcast)" + getArtnetMarker(1, false), 1);
     cmbArtnetDmxInterface.addItem("All Interfaces (Broadcast)", 1);
     cmbTcnetInterface.clear(juce::dontSendNotification);
     cmbTcnetInterface.addItem("All Interfaces (Broadcast)", 1);
+
+    cmbLANetTCInputInterface.addItem("All Interfaces" + getLANetTCMarker(1, true), 1);
+    cmbLANetTCOutputInterface.addItem("All Interfaces (Broadcast)" + getLANetTCMarker(1, false), 1);
+    cmbLANetTCOutputInterface.addItem("Localhost (127.0.0.1)" + getLANetTCMarker(2, false), 2);
+
     for (int i = 0; i < nets.size(); i++)
     {
         auto label = nets[i].name + " (" + nets[i].ip + ")";
@@ -4012,6 +4138,8 @@ void MainComponent::populateMidiAndNetworkCombos()
         cmbArtnetOutputInterface.addItem(label + getArtnetMarker(i + 2, false), i + 2);
         cmbArtnetDmxInterface.addItem(label, i + 2);
         cmbTcnetInterface.addItem(label, i + 2);
+        cmbLANetTCInputInterface.addItem(label + getLANetTCMarker(i + 2, true), i + 2);
+        cmbLANetTCOutputInterface.addItem(label + getLANetTCMarker(i + 3, false), i + 3);
     }
 
     // Pro DJ Link interfaces
@@ -4086,6 +4214,11 @@ void MainComponent::populateMidiAndNetworkCombos()
         cmbTcnetInterface.setSelectedId(savedTcnetIf, juce::dontSendNotification);
     else if (cmbTcnetInterface.getNumItems() > 0)
         cmbTcnetInterface.setSelectedId(1, juce::dontSendNotification);  // default: All Interfaces
+
+    if (savedLAIn > 0 && savedLAIn <= cmbLANetTCInputInterface.getNumItems())
+        cmbLANetTCInputInterface.setSelectedId(savedLAIn, juce::dontSendNotification);
+    if (savedLAOut > 0 && savedLAOut <= cmbLANetTCOutputInterface.getNumItems())
+        cmbLANetTCOutputInterface.setSelectedId(savedLAOut, juce::dontSendNotification);
 }
 
 void MainComponent::populateAudioCombos()
@@ -4166,6 +4299,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
         eng.setOutputMtcEnabled(es.mtcOutEnabled);
         eng.setOutputArtnetEnabled(es.artnetOutEnabled);
+        eng.setOutputLANetTCEnabled(es.laNetTCOutEnabled);
         eng.setOutputLtcEnabled(es.ltcOutEnabled);
         eng.setOutputThruEnabled(es.thruOutEnabled);
         eng.setOutputTcnetEnabled(es.tcnetOutEnabled);
@@ -4175,6 +4309,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
+        eng.setLANetTCOutputOffset(es.laNetTCOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
         eng.setTcnetOutputOffsetMs(es.tcnetOutputOffsetMs);
 
@@ -4227,6 +4362,10 @@ void MainComponent::loadAndApplyNonAudioSettings()
             // HippoNet input disabled pending hardware validation -- fall back to Generator
             DBG("MainComponent: HippoNet input disabled, falling back to Generator");
             eng.setInputSource(SrcType::SystemTime);
+        }
+        else if (src == SrcType::LANetTC)
+        {
+            eng.startLANetTCInput(es.laNetTCInputInterface);
         }
 
         // Generator start/stop TC (applies regardless of current source)
@@ -4321,6 +4460,9 @@ void MainComponent::loadAndApplyNonAudioSettings()
         // HippoNet output disabled in this version (pending hardware validation)
         // if (es.hippoOutEnabled)
         //     eng.startHippotizerOutput(es.hippotizerDestIp);
+
+        if (es.laNetTCOutEnabled)
+            eng.startLANetTCOutput(es.laNetTCOutputInterface - 2);  // saved as combo-2; LANetTCOutput needs -2=All, -1=Localost, 0=firstNIC
     }
 
     // Start TCNet output if any engine has it enabled
@@ -4508,6 +4650,7 @@ void MainComponent::flushSettings()
 
         es.mtcOutEnabled = eng.isOutputMtcEnabled();
         es.artnetOutEnabled = eng.isOutputArtnetEnabled();
+        es.laNetTCOutEnabled = eng.isOutputLANetTCEnabled();
         es.ltcOutEnabled = eng.isOutputLtcEnabled();
         es.thruOutEnabled = eng.isOutputThruEnabled();
         es.tcnetOutEnabled = eng.isOutputTcnetEnabled();
@@ -4520,6 +4663,7 @@ void MainComponent::flushSettings()
 
         es.mtcOutputOffset = eng.getMtcOutputOffset();
         es.artnetOutputOffset = eng.getArtnetOutputOffset();
+        es.laNetTCOutputOffset = eng.getLANetTCOutputOffset();
         es.ltcOutputOffset = eng.getLtcOutputOffset();
         es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
 
@@ -4535,6 +4679,7 @@ void MainComponent::flushSettings()
             es.midiInputDevice = stripComboMarker(cmbMidiInputDevice.getText());
             es.midiOutputDevice = stripComboMarker(cmbMidiOutputDevice.getText());
             es.artnetInputInterface = cmbArtnetInputInterface.getSelectedId() - 1;
+            es.laNetTCInputInterface = cmbLANetTCInputInterface.getSelectedId() - 1;
             es.hippotizerInputInterface = cmbHippoInputInterface.getSelectedId() - 1;
             es.hippotizerTcChannel = cmbHippoTcChannel.getSelectedId() - 1;
             es.hippotizerDestIp = txtHippoDestIp.getText().trim();
@@ -4543,6 +4688,7 @@ void MainComponent::flushSettings()
             es.generatorStartMs = eng.getGeneratorStartMs();
             es.generatorStopMs  = eng.getGeneratorStopMs();
             es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
+            es.laNetTCOutputInterface = cmbLANetTCOutputInterface.getSelectedId() - 1;
             es.trackMapEnabled = eng.isTrackMapEnabled();
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();
@@ -5017,6 +5163,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     auto input = eng.getActiveInput();
     bool showMidiIn   = (input == SrcType::MTC)    && inputConfigExpanded;
     bool showArtnetIn = (input == SrcType::ArtNet)  && inputConfigExpanded;
+    bool showLANetTCIn = (input == SrcType::LANetTC)  && inputConfigExpanded;
     bool showHippoIn  = (input == SrcType::Hippotizer) && inputConfigExpanded;
     bool showLtcIn    = (input == SrcType::LTC)     && inputConfigExpanded;
     bool showGenerator = (input == SrcType::SystemTime) && inputConfigExpanded;
@@ -5029,6 +5176,7 @@ void MainComponent::updateDeviceSelectorVisibility()
 
     cmbMidiInputDevice.setVisible(showMidiIn);       lblMidiInputDevice.setVisible(showMidiIn);
     cmbArtnetInputInterface.setVisible(showArtnetIn); lblArtnetInputInterface.setVisible(showArtnetIn);
+    cmbLANetTCInputInterface.setVisible(showLANetTCIn); lblLANetTCInputInterface.setVisible(showLANetTCIn);
     cmbHippoInputInterface.setVisible(showHippoIn);   lblHippoInputInterface.setVisible(showHippoIn);
     cmbHippoTcChannel.setVisible(showHippoIn);        lblHippoTcChannel.setVisible(showHippoIn);
     btnGenClock.setVisible(showGenerator);
@@ -5252,15 +5400,18 @@ void MainComponent::updateDeviceSelectorVisibility()
     // Output sections
     bool showMtcConfig    = eng.isOutputMtcEnabled()    && mtcOutExpanded;
     bool showArtnetConfig = eng.isOutputArtnetEnabled() && artnetOutExpanded;
+    bool showLANetTCConfig = eng.isOutputLANetTCEnabled()  && laNetTCOutExpanded;
     bool showLtcConfig    = eng.isOutputLtcEnabled()    && ltcOutExpanded;
     bool showThruConfig   = eng.isPrimary() && eng.isOutputThruEnabled() && thruOutExpanded;
 
     btnCollapseMtcOut.setVisible(eng.isOutputMtcEnabled());
     btnCollapseArtnetOut.setVisible(eng.isOutputArtnetEnabled());
+    btnCollapseLANetTCOut.setVisible(eng.isOutputLANetTCEnabled());
     btnCollapseLtcOut.setVisible(eng.isOutputLtcEnabled());
     btnCollapseThruOut.setVisible(eng.isPrimary() && eng.isOutputThruEnabled());
     updateCollapseButtonText(btnCollapseMtcOut, mtcOutExpanded);
     updateCollapseButtonText(btnCollapseArtnetOut, artnetOutExpanded);
+    updateCollapseButtonText(btnCollapseLANetTCOut, laNetTCOutExpanded);
     updateCollapseButtonText(btnCollapseLtcOut, ltcOutExpanded);
     updateCollapseButtonText(btnCollapseThruOut, thruOutExpanded);
 
@@ -5271,6 +5422,10 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbArtnetOutputInterface.setVisible(showArtnetConfig); lblArtnetOutputInterface.setVisible(showArtnetConfig);
     sldArtnetOffset.setVisible(showArtnetConfig);          lblArtnetOffset.setVisible(showArtnetConfig);
     lblOutputArtnetStatus.setVisible(eng.isOutputArtnetEnabled());
+
+    cmbLANetTCOutputInterface.setVisible(showLANetTCConfig);   lblLANetTCOutputInterface.setVisible(showLANetTCConfig);
+    sldLANetTCOffset.setVisible(showLANetTCConfig);            lblLANetTCOffset.setVisible(showLANetTCConfig);
+    lblOutputLANetTCStatus.setVisible(eng.isOutputLANetTCEnabled());
 
     cmbAudioOutputTypeFilter.setVisible(showAudioOut && (showLtcConfig || showThruConfig));
     lblAudioOutputTypeFilter.setVisible(showAudioOut && (showLtcConfig || showThruConfig));
@@ -5306,7 +5461,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     // On-air gate: only relevant for ProDJLink
     btnOnAirGate.setVisible(input == SrcType::ProDJLink);
 
-    bool anyDevice = (input != SrcType::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled());
+    bool anyDevice = (input != SrcType::SystemTime) || eng.isOutputMtcEnabled() || eng.isOutputArtnetEnabled() || eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled()) || eng.isOutputLANetTCEnabled();
     btnRefreshDevices.setVisible(anyDevice);
 
     resized();
@@ -5332,6 +5487,11 @@ void MainComponent::updateStatusLabels()
         lblOutputArtnetStatus.setText(eng.getArtnetOutput().isPaused() ? "PAUSED" : eng.getArtnetOutStatusText(), juce::dontSendNotification);
     else
         lblOutputArtnetStatus.setText(eng.getArtnetOutStatusText(), juce::dontSendNotification);
+
+    if (eng.isOutputLANetTCEnabled() && eng.getLANetTCOutput().getIsRunning())
+        lblOutputLANetTCStatus.setText(eng.getLANetTCOutput().isPaused() ? "PAUSED" : eng.getLANetTCOutStatusText(), juce::dontSendNotification);
+    else
+        lblOutputLANetTCStatus.setText(eng.getLANetTCOutStatusText(), juce::dontSendNotification);
 
     if (eng.isOutputLtcEnabled())
     {
@@ -6241,7 +6401,7 @@ void MainComponent::resized()
     // Input buttons
     auto& eng = currentEngine();
     struct IBI { juce::TextButton* btn; SrcType src; };
-    IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
+    IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ}, {&btnLANetTCIn,SrcType::LANetTC}};
     for (auto& ib : iBtns) { if (!ib.btn->isVisible()) continue; ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
 
     // Section separator after input source buttons
@@ -6255,6 +6415,7 @@ void MainComponent::resized()
     if (cmbArtnetInputInterface.isVisible()) layCombo(lblArtnetInputInterface, cmbArtnetInputInterface, leftPanel);
     if (cmbHippoInputInterface.isVisible()) layCombo(lblHippoInputInterface, cmbHippoInputInterface, leftPanel);
     if (cmbHippoTcChannel.isVisible()) layCombo(lblHippoTcChannel, cmbHippoTcChannel, leftPanel);
+    if (cmbLANetTCInputInterface.isVisible()) layCombo(lblLANetTCInputInterface, cmbLANetTCInputInterface, leftPanel);
 
     // Generator clock toggle + transport + start/stop TC
     if (btnGenClock.isVisible())
@@ -6845,6 +7006,17 @@ void MainComponent::resized()
         rp.removeFromTop(2);
     }
 
+    // LaserAnimation Net-Timecode OUT
+    {
+        auto row = rp.removeFromTop(btnH);
+        if (btnCollapseLANetTCOut.isVisible()) { btnCollapseLANetTCOut.setBounds(row.removeFromRight(colBtnW)); row.removeFromRight(3); }
+        btnLANetTCOut.setBounds(row); rp.removeFromTop(2);
+        if (cmbLANetTCOutputInterface.isVisible()) layCombo(lblLANetTCOutputInterface, cmbLANetTCOutputInterface, rp);
+        if (sldLANetTCOffset.isVisible()) laySlider(lblLANetTCOffset, sldLANetTCOffset, rp);
+        if (lblOutputLANetTCStatus.isVisible()) layStatus(lblOutputLANetTCStatus, rp);
+        rp.removeFromTop(2);
+    }
+
     if (btnRefreshDevices.isVisible())
     { rp.removeFromTop(4); btnRefreshDevices.setBounds(rp.removeFromTop(26)); }
 
@@ -6922,7 +7094,7 @@ void MainComponent::timerCallback()
 
     // Tick ALL engines (not just selected).
     // NOTE: tick() feeds timecode values to the output protocol handlers.
-    // MTC and ArtNet outputs use their own HighResolutionTimers (1ms) for
+    // MTC and ArtNet and LA Net-Timecode outputs use their own HighResolutionTimers (1ms) for
     // actual transmission timing, so the 60Hz UI timer only updates the
     // target timecode -- it does NOT limit output precision.  LTC output
     // uses its own audio-callback-driven auto-increment, so it's similarly
@@ -7156,6 +7328,7 @@ void MainComponent::timerCallback()
                     case SrcType::ProDJLink:   artist = "Pro DJ Link";      break;
                     case SrcType::StageLinQ:   artist = "StageLinQ";        break;
                     case SrcType::Hippotizer:  artist = "HippoNet";       break;
+                    case SrcType::LANetTC:     artist = "LA-Net Input";     break;
                     default:                   artist = "STC";              break;
                 }
                 title = eng.getName();
@@ -7968,7 +8141,7 @@ void MainComponent::timerCallback()
     mtrThruOutput.setLevel(eng.getSmoothedThruOutLevel());
 
     // Auto-update FPS button states when the frame rate changes
-    // (e.g. from protocol auto-detection in MTC/ArtNet/LTC inputs)
+    // (e.g. from protocol auto-detection in MTC/ArtNet/LTC/LA-Net inputs)
     {
         FrameRate curFps = eng.getCurrentFps();
         FrameRate curOutFps = eng.getEffectiveOutputFps();
@@ -8242,7 +8415,7 @@ void MainComponent::updateInputButtonStates()
     auto& eng = currentEngine();
     auto active = eng.getActiveInput();
     struct I { juce::TextButton* b; SrcType s; };
-    I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
+    I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ}, {&btnLANetTCIn,SrcType::LANetTC} };
     for (auto& i : bs) styleInputButton(*i.b, active == i.s, getInputColour(i.s));
 
     // Stop shared network inputs when no engine uses them.
@@ -8307,6 +8480,7 @@ juce::Colour MainComponent::getInputColour(SrcType s) const
         case SrcType::ProDJLink:  return juce::Colour(0xFF00AAFF);  // bright blue
         case SrcType::StageLinQ:  return juce::Colour(0xFF00CC66);  // Denon green
         case SrcType::Hippotizer: return juce::Colour(0xFF66BBAA);  // Green Hippo teal
+        case SrcType::LANetTC:    return juce::Colour{0xFF63D8FB};  // LaserAnimation turquois
         default:                      return textMid;
     }
 }

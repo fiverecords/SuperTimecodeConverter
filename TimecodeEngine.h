@@ -9,6 +9,8 @@
 #include "MtcOutput.h"
 #include "ArtnetInput.h"
 #include "ArtnetOutput.h"
+#include "LANetTimecodeInput.h"
+#include "LANetTimecodeOutput.h"
 #include "LtcInput.h"
 #include "LtcOutput.h"
 #include "ProDJLinkInput.h"
@@ -40,7 +42,7 @@ inline constexpr int kMaxEngines = 8;
 class TimecodeEngine
 {
 public:
-    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ, Hippotizer };
+    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ, Hippotizer, LANetTC };
 
     //--------------------------------------------------------------------------
     explicit TimecodeEngine(int index, const juce::String& name = {})
@@ -64,11 +66,13 @@ public:
         // Shutdown order: outputs first, then inputs
         stopMtcOutput();
         stopArtnetOutput();
+        stopLANetTCOutput();
         stopLtcOutput();
         stopHippotizerOutput();
         stopThruOutput();
         stopMtcInput();
         stopArtnetInput();
+        stopLANetTCInput();
         stopLtcInput();
         stopHippotizerInput();
         stopAudioBpm();
@@ -131,6 +135,7 @@ public:
             case InputSource::ProDJLink: stopProDJLinkInput(); break;
             case InputSource::StageLinQ: stopStageLinQInput(); break;
             case InputSource::Hippotizer: stopHippotizerInput(); break;
+            case InputSource::LANetTC: stopLANetTCInput(); break;
             default: break;
         }
 
@@ -201,6 +206,7 @@ public:
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
+        laNetTCOutput.setFrameRate(outRate);
         ltcOutput.setFrameRate(outRate);
         hippotizerOutput.setFrameRate(outRate);
 
@@ -277,6 +283,7 @@ public:
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
+        laNetTCOutput.setFrameRate(outRate);
         ltcOutput.setFrameRate(outRate);
         hippotizerOutput.setFrameRate(outRate);
     }
@@ -288,12 +295,14 @@ public:
     bool isOutputArtnetEnabled() const  { return outputArtnetEnabled; }
     bool isOutputLtcEnabled() const     { return outputLtcEnabled; }
     bool isOutputThruEnabled() const    { return outputThruEnabled; }
+    bool isOutputLANetTCEnabled() const { return outputLANetTCEnabled; }
 
     void setOutputMtcEnabled(bool e)    { outputMtcEnabled = e; }
     void setOutputArtnetEnabled(bool e) { outputArtnetEnabled = e; }
     void setOutputLtcEnabled(bool e)    { outputLtcEnabled = e; }
     void setOutputThruEnabled(bool e)   { outputThruEnabled = e; }
     void setOutputTcnetEnabled(bool e)  { outputTcnetEnabled = e; }
+    void setOutputLANetTCEnabled(bool e) { outputLANetTCEnabled = e; }
     bool isOutputTcnetEnabled() const   { return outputTcnetEnabled; }
     void setOutputHippoEnabled(bool e)  { outputHippoEnabled = e; }
     bool isOutputHippoEnabled() const   { return outputHippoEnabled; }
@@ -303,11 +312,13 @@ public:
     int getMtcOutputOffset() const      { return mtcOutputOffset; }
     int getArtnetOutputOffset() const   { return artnetOutputOffset; }
     int getLtcOutputOffset() const      { return ltcOutputOffset; }
+    int getLANetTCOutputOffset() const  { return laNetTCOutputOffset; }
 
     void setMtcOutputOffset(int v)      { mtcOutputOffset = v; }
     void setArtnetOutputOffset(int v)   { artnetOutputOffset = v; }
     void setLtcOutputOffset(int v)      { ltcOutputOffset = v; }
     void setTcnetOutputOffsetMs(int v)  { tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, v); }
+    void setLANetTCOutputOffset(int v)  { laNetTCOutputOffset = v; }
 
     int getTcnetOutputOffsetMs() const  { return tcnetOutputOffsetMs; }
 
@@ -349,6 +360,8 @@ public:
     ProDJLinkInput& getProDJLinkInput()   { jassert(sharedProDJLink != nullptr); return *sharedProDJLink; }
     void setSharedProDJLinkInput(ProDJLinkInput* shared) { sharedProDJLink = shared; }
     StageLinQInput& getStageLinQInput()   { jassert(sharedStageLinQ != nullptr); return *sharedStageLinQ; }
+    LANetTimecodeInput&   getLANetTCInput()   { return laNetTCInput; }
+    LANetTimecodeOutput&  getLANetTCOutput()  { return laNetTCOutput; }
     void setSharedStageLinQInput(StageLinQInput* shared) { sharedStageLinQ = shared; }
     void setDbServerClient(DbServerClient* client) { dbClient = client; }
     int  getProDJLinkPlayer() const     { return proDJLinkPlayer; }
@@ -407,6 +420,24 @@ public:
     }
 
     void stopArtnetInput() { artnetInput.stop(); }
+
+    bool startLANetTCInput(int interfaceIndex)
+    {
+        stopLANetTCInput();
+        if (interfaceIndex < 0) interfaceIndex = 0;
+        laNetTCInput.refreshNetworkInterfaces();
+        if (laNetTCInput.start(interfaceIndex, 8201))
+        {
+            inputStatusText = "RX ON " + laNetTCInput.getBindInfo();
+            if (laNetTCInput.didFallBackToAllInterfaces())
+                inputStatusText += " [FALLBACK]";
+            return true;
+        }
+        inputStatusText = "FAILED TO BIND PORT 8201";
+        return false;
+    }
+
+    void stopLANetTCInput() { laNetTCInput.stop(); }
 
     bool startLtcInput(const juce::String& typeName, const juce::String& devName,
                        int ltcChannel, int thruChannel = -1,
@@ -851,6 +882,22 @@ public:
 
     void stopArtnetOutput() { artnetOutput.stop(); artnetOutStatusText = ""; }
 
+    bool startLANetTCOutput(int interfaceIndex)
+    {
+        stopLANetTCOutput();
+        laNetTCOutput.refreshNetworkInterfaces();
+        if (laNetTCOutput.start(interfaceIndex, 8201))
+        {
+            laNetTCOutput.setFrameRate(getEffectiveOutputFps());
+            laNetTCOutStatusText = "TX: " + laNetTCOutput.getBroadcastIp() + ":8201";
+            return true;
+        }
+        laNetTCOutStatusText = "FAILED TO BIND";
+        return false;
+    }
+
+    void stopLANetTCOutput() { laNetTCOutput.stop(); laNetTCOutStatusText = ""; }
+
     bool startLtcOutput(const juce::String& typeName, const juce::String& devName,
                         int channel, double sampleRate = 0, int bufferSize = 0)
     {
@@ -1009,6 +1056,25 @@ public:
                     }
                     else if (statusTextVisible)
                         inputStatusText = "PAUSED - " + artnetInput.getBindInfo();
+                    sourceActive = rx;
+                }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
+                break;
+
+            case InputSource::LANetTC:
+                if (laNetTCInput.getIsRunning())
+                {
+                    currentTimecode = laNetTCInput.getCurrentTimecode();
+                    bool rx = laNetTCInput.isReceiving();
+                    if (rx)
+                    {
+                        auto d = laNetTCInput.getDetectedFrameRate();
+                        if (d != currentFps) setFrameRate(d);
+                        if (statusTextVisible)
+                            inputStatusText = "RX ON " + laNetTCInput.getBindInfo();
+                    }
+                    else if (statusTextVisible)
+                        inputStatusText = "PAUSED - " + laNetTCInput.getBindInfo();
                     sourceActive = rx;
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
@@ -1844,6 +1910,7 @@ public:
     juce::String getLtcOutStatusText() const { return ltcOutStatusText; }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
     juce::String getHippoOutStatusText() const { return hippoOutStatusText; }
+    juce::String getLANetTCOutStatusText() const { return laNetTCOutStatusText; }
 
     /// Only the currently displayed engine needs to build status text strings.
     /// Call with true for the selected engine, false for background engines.
@@ -2154,6 +2221,7 @@ public:
             case InputSource::ProDJLink:  return sharedProDJLink != nullptr && sharedProDJLink->getIsRunning();
             case InputSource::StageLinQ:  return sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning();
             case InputSource::Hippotizer: return hippotizerInput.getIsRunning();
+            case InputSource::LANetTC:    return laNetTCInput.getIsRunning();
             default:                      return false;
         }
     }
@@ -2169,6 +2237,7 @@ public:
             case InputSource::ProDJLink:  return "ProDJLink";
             case InputSource::StageLinQ:  return "StageLinQ";
             case InputSource::Hippotizer: return "HippoNet";
+            case InputSource::LANetTC:    return "LANetTC";
         }
         return "Generator";
     }
@@ -2183,6 +2252,7 @@ public:
         if (s == "HippoNet" || s == "Hippotizer") return InputSource::Hippotizer;
         if (s == "TCNet") return InputSource::ProDJLink;  // legacy migration
         if (s == "Generator" || s == "SystemTime") return InputSource::SystemTime;  // backward compat
+        if (s == "LANetTC") return InputSource::LANetTC;
         return InputSource::SystemTime;
     }
 
@@ -2197,6 +2267,7 @@ public:
             case InputSource::ProDJLink:  return "PRO DJ LINK";
             case InputSource::StageLinQ:  return "STAGELINQ";
             case InputSource::Hippotizer: return "HIPPONET";
+            case InputSource::LANetTC:    return "LA-NET";
             default:                      return "---";
         }
     }
@@ -2268,6 +2339,7 @@ private:
     // Output state
     bool outputMtcEnabled    = false;
     bool outputArtnetEnabled = false;
+    bool outputLANetTCEnabled = false;
     bool outputLtcEnabled    = false;
     bool outputThruEnabled   = false;
     bool outputTcnetEnabled  = false;
@@ -2282,6 +2354,7 @@ private:
 
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
+    int laNetTCOutputOffset = 0;
     int ltcOutputOffset    = 0;
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds
 
@@ -2290,6 +2363,8 @@ private:
     MtcOutput    mtcOutput;
     ArtnetInput  artnetInput;
     ArtnetOutput artnetOutput;
+    LANetTimecodeInput  laNetTCInput;
+    LANetTimecodeOutput laNetTCOutput;
     HippotizerInput hippotizerInput;
     HippotizerOutput hippotizerOutput;
     LtcInput     ltcInput;
@@ -2742,7 +2817,7 @@ private:
 
     // Status
     juce::String inputStatusText = "SYSTEM CLOCK";
-    juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText, hippoOutStatusText;
+    juce::String mtcOutStatusText, artnetOutStatusText, ltcOutStatusText, thruOutStatusText, hippoOutStatusText, laNetTCOutStatusText;
     bool statusTextVisible = true;  // only build inputStatusText when engine is displayed
 
     // VU meter smoothed state
@@ -3653,6 +3728,11 @@ private:
                 artnetOutput.setTimecode(offsetTimecode(baseTc, artnetOutputOffset, outRate));
                 artnetOutput.setPaused(false);
             }
+            if (outputLANetTCEnabled && laNetTCOutput.getIsRunning())
+            {
+                laNetTCOutput.setTimecode(offsetTimecode(baseTc, laNetTCOutputOffset, outRate));
+                laNetTCOutput.setPaused(false);
+            }
             if (outputLtcEnabled && ltcOutput.getIsRunning())
             {
                 ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
@@ -3678,6 +3758,8 @@ private:
                     mtcOutput.forceResync();
                 if (outputArtnetEnabled && artnetOutput.getIsRunning())
                     artnetOutput.forceResync();
+                if (outputLANetTCEnabled && laNetTCOutput.getIsRunning())
+                    laNetTCOutput.forceResync();
                 if (outputLtcEnabled && ltcOutput.getIsRunning())
                     ltcOutput.reseed();
                 if (outputHippoEnabled && hippotizerOutput.getIsRunning())
@@ -3703,6 +3785,11 @@ private:
                     artnetOutput.setTimecode(offsetTimecode(baseTc, artnetOutputOffset, outRate));
                     artnetOutput.forceResync();
                 }
+                if (outputLANetTCEnabled && laNetTCOutput.getIsRunning())
+                {
+                    laNetTCOutput.setTimecode(offsetTimecode(baseTc, laNetTCOutputOffset, outRate));
+                    laNetTCOutput.forceResync();
+                }
                 // LTC: set final timecode so encoder finishes current frame cleanly
                 if (outputLtcEnabled && ltcOutput.getIsRunning())
                     ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
@@ -3718,6 +3805,7 @@ private:
 
             if (outputMtcEnabled && mtcOutput.getIsRunning()) mtcOutput.setPaused(true);
             if (outputArtnetEnabled && artnetOutput.getIsRunning()) artnetOutput.setPaused(true);
+            if (outputLANetTCEnabled && laNetTCOutput.getIsRunning()) laNetTCOutput.setPaused(true);
             if (outputLtcEnabled && ltcOutput.getIsRunning()) ltcOutput.setPaused(true);
             if (outputHippoEnabled && hippotizerOutput.getIsRunning()) hippotizerOutput.setPaused(true);
         }

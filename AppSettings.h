@@ -1121,6 +1121,7 @@ struct EngineSettings
     int artnetInputInterface = 0;
     int hippotizerInputInterface = 0;
     int hippotizerTcChannel = 0;  // 0=TC1, 1=TC2
+    int laNetTCInputInterface = 0;
     // Generator (internal timecode source)
     bool   generatorClockMode = true;  // true = wall clock, false = transport
     double generatorStartMs = 0.0;    // start TC in ms from midnight
@@ -1158,6 +1159,7 @@ struct EngineSettings
     // Output
     bool mtcOutEnabled = false;
     bool artnetOutEnabled = false;
+    bool laNetTCOutEnabled = false;
     bool ltcOutEnabled = false;
     bool thruOutEnabled = false;       // only meaningful for engine 0
     bool tcnetOutEnabled = false;      // TCNet timecode layer output
@@ -1169,6 +1171,7 @@ struct EngineSettings
     bool onAirGateEnabled = false;
     juce::String midiOutputDevice = "";
     int artnetOutputInterface = 0;
+    int laNetTCOutputInterface = 0;
     juce::String audioOutputDevice = "";
     juce::String audioOutputType = "";
     int audioOutputChannel = 0;
@@ -1206,6 +1209,7 @@ struct EngineSettings
     // Output offsets (frames, -30 to +30)
     int mtcOutputOffset = 0;
     int artnetOutputOffset = 0;
+    int laNetTCOutputOffset = 0;
     int ltcOutputOffset = 0;
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds, -1000 to +1000
 
@@ -1228,6 +1232,7 @@ struct EngineSettings
         obj->setProperty("artnetInputInterface", artnetInputInterface);
         obj->setProperty("hippotizerInputInterface", hippotizerInputInterface);
         obj->setProperty("hippotizerTcChannel", hippotizerTcChannel);
+        obj->setProperty("laNetTCInputInterface", laNetTCInputInterface);
         obj->setProperty("generatorClockMode", generatorClockMode);
         obj->setProperty("generatorStartMs", generatorStartMs);
         obj->setProperty("generatorStopMs", generatorStopMs);
@@ -1261,6 +1266,7 @@ struct EngineSettings
 
         obj->setProperty("mtcOutEnabled", mtcOutEnabled);
         obj->setProperty("artnetOutEnabled", artnetOutEnabled);
+        obj->setProperty("laNetTCOutEnabled", laNetTCOutEnabled);
         obj->setProperty("ltcOutEnabled", ltcOutEnabled);
         obj->setProperty("thruOutEnabled", thruOutEnabled);
         obj->setProperty("tcnetOutEnabled", tcnetOutEnabled);
@@ -1271,6 +1277,7 @@ struct EngineSettings
         obj->setProperty("hippotizerDestIp", hippotizerDestIp);
         obj->setProperty("midiOutputDevice", midiOutputDevice);
         obj->setProperty("artnetOutputInterface", artnetOutputInterface);
+        obj->setProperty("laNetTCOutputInterface", laNetTCOutputInterface);
         obj->setProperty("audioOutputDevice", audioOutputDevice);
         obj->setProperty("audioOutputType", audioOutputType);
         obj->setProperty("audioOutputChannel", audioOutputChannel);
@@ -1300,6 +1307,7 @@ struct EngineSettings
 
         obj->setProperty("mtcOutputOffset", mtcOutputOffset);
         obj->setProperty("artnetOutputOffset", artnetOutputOffset);
+        obj->setProperty("laNetTCOutputOffset", laNetTCOutputOffset);
         obj->setProperty("ltcOutputOffset", ltcOutputOffset);
         obj->setProperty("tcnetOutputOffsetMs", tcnetOutputOffsetMs);
 
@@ -1342,6 +1350,7 @@ struct EngineSettings
         artnetInputInterface = getInt("artnetInputInterface", 0);
         hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
         hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
+        laNetTCInputInterface    = getInt("laNetTCInputInterface", 0);
         generatorClockMode       = getBool("generatorClockMode", true);
         generatorStartMs         = (double)getInt("generatorStartMs", 0);
         generatorStopMs          = (double)getInt("generatorStopMs", 0);
@@ -1389,6 +1398,7 @@ struct EngineSettings
 
         mtcOutEnabled        = getBool("mtcOutEnabled", false);
         artnetOutEnabled     = getBool("artnetOutEnabled", false);
+        laNetTCOutEnabled    = getBool("laNetTCOutEnabled", false);
         ltcOutEnabled        = getBool("ltcOutEnabled", false);
         thruOutEnabled       = getBool("thruOutEnabled", false);
         tcnetOutEnabled      = getBool("tcnetOutEnabled", false);
@@ -1398,6 +1408,7 @@ struct EngineSettings
         hippotizerDestIp     = getString("hippotizerDestIp", "255.255.255.255");
         midiOutputDevice     = getString("midiOutputDevice");
         artnetOutputInterface = getInt("artnetOutputInterface", 0);
+        laNetTCOutputInterface = getInt("laNetTCOutputInterface", 0);
         audioOutputDevice    = getString("audioOutputDevice");
         audioOutputType      = getString("audioOutputType");
         audioOutputChannel   = juce::jlimit(0, 127, getInt("audioOutputChannel", 0));
@@ -1430,6 +1441,7 @@ struct EngineSettings
         auto clampOffset = [](int val) { return juce::jlimit(-30, 30, val); };
         mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
+        laNetTCOutputOffset  = clampOffset(getInt("laNetTCOutputOffset", 0));
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
@@ -1668,6 +1680,7 @@ private:
         es.artnetInputInterface = getInt("artnetInputInterface", 0);
         es.hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
         es.hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
+        es.laNetTCInputInterface = getInt("laNetTCInputInterface", 0);
         es.generatorClockMode   = getBool("generatorClockMode", true);
         es.generatorStartMs     = (double)getInt("generatorStartMs", 0);
         es.generatorStopMs      = (double)getInt("generatorStopMs", 0);
@@ -1677,10 +1690,12 @@ private:
 
         es.mtcOutEnabled        = getBool("mtcOutEnabled", false);
         es.artnetOutEnabled     = getBool("artnetOutEnabled", false);
+        es.laNetTCOutEnabled    = getBool("laNetTCOutEnabled", false);
         es.ltcOutEnabled        = getBool("ltcOutEnabled", false);
         es.thruOutEnabled       = getBool("thruOutEnabled", false);
         es.midiOutputDevice     = getString("midiOutputDevice");
         es.artnetOutputInterface = getInt("artnetOutputInterface", 0);
+        es.laNetTCOutputInterface = getInt("laNetTCOutputInterface", 0);
         es.audioOutputDevice    = getString("audioOutputDevice");
         es.audioOutputType      = getString("audioOutputType");
         es.audioOutputChannel   = juce::jlimit(0, 127, getInt("audioOutputChannel", 0));
@@ -1712,6 +1727,7 @@ private:
         auto clampOffset = [](int v) { return juce::jlimit(-30, 30, v); };
         es.mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         es.artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
+        es.laNetTCOutputOffset = clampOffset(getInt("laNetTCOutputOffset", 0));
         es.ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         es.tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 

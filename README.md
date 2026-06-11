@@ -632,6 +632,8 @@ The application is built around a modular, header-only architecture:
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
 | `ArtnetOutput.h` | Art-Net timecode and DMX broadcaster (UDP) with drift-free timing |
+| `LANetTimecodeInput.h` | LaserAnimation Net-Timecode receiver (UDP) with bind fallback |
+| `LANetTimecodeOutput.h` | LaserAnimation Net-Timecode broadcaster (UDP) with drift-free timing |
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
 | `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
