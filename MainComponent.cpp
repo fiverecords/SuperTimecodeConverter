@@ -1791,6 +1791,16 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(mtrLtcOutput); mtrLtcOutput.setMeterColour(accentPurple);
     sldLtcOutputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); } };
 
+    rightContent.addAndMakeVisible(btnLtcHoldOnPause);
+    styleOutputToggle(btnLtcHoldOnPause, accentPurple);
+    btnLtcHoldOnPause.onClick = [this]
+    {
+        if (syncing) return;
+        if (isShowLocked()) { btnLtcHoldOnPause.setToggleState(!btnLtcHoldOnPause.getToggleState(), juce::dontSendNotification); return; }
+        currentEngine().getLtcOutput().setHoldOnPause(btnLtcHoldOnPause.getToggleState());
+        saveSettings();
+    };
+
     rightContent.addAndMakeVisible(lblOutputLtcStatus); styleLabel(lblOutputLtcStatus); lblOutputLtcStatus.setColour(juce::Label::textColourId, accentPurple);
     rightContent.addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
@@ -2401,6 +2411,7 @@ void MainComponent::syncUIFromEngine()
         sldLtcInputGain.setValue(eng.getLtcInput().getInputGain() * 100.0f, juce::dontSendNotification);
     sldThruInputGain.setValue(eng.getLtcInput().getPassthruGain() * 100.0f, juce::dontSendNotification);
     sldLtcOutputGain.setValue(eng.getLtcOutput().getOutputGain() * 100.0f, juce::dontSendNotification);
+    btnLtcHoldOnPause.setToggleState(eng.getLtcOutput().getHoldOnPause(), juce::dontSendNotification);
     if (eng.getAudioThru())
         sldThruOutputGain.setValue(eng.getAudioThru()->getOutputGain() * 100.0f, juce::dontSendNotification);
 
@@ -4416,6 +4427,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.getLtcInput().setInputGain((float)es.ltcInputGain / 100.0f);
         eng.getLtcInput().setPassthruGain((float)es.thruInputGain / 100.0f);
         eng.getLtcOutput().setOutputGain((float)es.ltcOutputGain / 100.0f);
+        eng.getLtcOutput().setHoldOnPause(es.ltcHoldOnPause);
         if (eng.getAudioThru())
             eng.getAudioThru()->setOutputGain((float)es.thruOutputGain / 100.0f);
 
@@ -4799,6 +4811,7 @@ void MainComponent::flushSettings()
         es.ltcInputGain = (int)(eng.getLtcInput().getInputGain() * 100.0f);
         es.thruInputGain = (int)(eng.getLtcInput().getPassthruGain() * 100.0f);
         es.ltcOutputGain = (int)(eng.getLtcOutput().getOutputGain() * 100.0f);
+        es.ltcHoldOnPause = eng.getLtcOutput().getHoldOnPause();
         if (eng.getAudioThru())
             es.thruOutputGain = (int)(eng.getAudioThru()->getOutputGain() * 100.0f);
 
@@ -5595,6 +5608,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbAudioOutputDevice.setVisible(showLtcConfig);  lblAudioOutputDevice.setVisible(showLtcConfig);
     cmbAudioOutputChannel.setVisible(showLtcConfig); lblAudioOutputChannel.setVisible(showLtcConfig);
     sldLtcOutputGain.setVisible(showLtcConfig);      lblLtcOutputGain.setVisible(showLtcConfig);
+    btnLtcHoldOnPause.setVisible(showLtcConfig);
     mtrLtcOutput.setVisible(showLtcConfig);
     sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
     txtLtcUserBits.setVisible(showLtcConfig);          lblLtcUserBits.setVisible(showLtcConfig);
@@ -6130,6 +6144,15 @@ void MainComponent::setupOscInputServer()
             else if (cmd == "/stc/gen/pause")
             {
                 eng.generatorPause();
+            }
+            else if (cmd == "/stc/gen/jog")
+            {
+                float deltaSec = msg.getFloat(0, 0.0f);
+                if (deltaSec != 0.0f)
+                {
+                    double newMs = eng.getGeneratorCurrentMs() + (double)deltaSec * 1000.0;
+                    eng.setGeneratorPosition(newMs);
+                }
             }
             else if (cmd == "/stc/gen/stop")
             {
@@ -7296,6 +7319,7 @@ void MainComponent::resized()
             layCombo(lblAudioOutputDevice, cmbAudioOutputDevice, rp);
             layCombo(lblAudioOutputChannel, cmbAudioOutputChannel, rp);
             laySlider(lblLtcOutputGain, sldLtcOutputGain, rp);
+            if (btnLtcHoldOnPause.isVisible()) btnLtcHoldOnPause.setBounds(rp.removeFromTop(btnH));
             if (mtrLtcOutput.isVisible()) layMeter(mtrLtcOutput, rp);
             if (sldLtcOffset.isVisible()) laySlider(lblLtcOffset, sldLtcOffset, rp);
             if (cmbLtcUserBitsMode.isVisible()) layCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, rp);

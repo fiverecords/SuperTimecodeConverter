@@ -560,6 +560,7 @@ private:
     juce::ComboBox cmbAudioOutputDevice;     juce::Label lblAudioOutputDevice;
     juce::ComboBox cmbAudioOutputChannel;    juce::Label lblAudioOutputChannel;
     GainSlider sldLtcOutputGain;             juce::Label lblLtcOutputGain;
+    juce::ToggleButton btnLtcHoldOnPause { "HOLD ON PAUSE" };
     LevelMeter mtrLtcOutput;
     juce::ComboBox cmbThruOutputDevice;      juce::Label lblThruOutputDevice;
     juce::ComboBox cmbThruOutputChannel;     juce::Label lblThruOutputChannel;

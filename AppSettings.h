@@ -1192,6 +1192,7 @@ struct EngineSettings
     int ltcInputGain = 100;
     int thruInputGain = 100;
     int ltcOutputGain = 100;
+    bool ltcHoldOnPause = false;
     int thruOutputGain = 100;
 
     // Audio BPM detection (for non-DJ sources)
@@ -1303,6 +1304,7 @@ struct EngineSettings
         obj->setProperty("ltcInputGain", ltcInputGain);
         obj->setProperty("thruInputGain", thruInputGain);
         obj->setProperty("ltcOutputGain", ltcOutputGain);
+        obj->setProperty("ltcHoldOnPause", ltcHoldOnPause);
         obj->setProperty("thruOutputGain", thruOutputGain);
 
         obj->setProperty("audioBpmEnabled", audioBpmEnabled);
@@ -1438,6 +1440,7 @@ struct EngineSettings
         ltcInputGain   = clampGain(getInt("ltcInputGain", 100));
         thruInputGain  = clampGain(getInt("thruInputGain", 100));
         ltcOutputGain  = clampGain(getInt("ltcOutputGain", 100));
+        ltcHoldOnPause = getBool("ltcHoldOnPause", false);
         thruOutputGain = clampGain(getInt("thruOutputGain", 100));
 
         audioBpmEnabled  = getBool("audioBpmEnabled", false);
@@ -1764,6 +1767,7 @@ private:
         es.ltcInputGain   = clampGain(getInt("ltcInputGain", 100));
         es.thruInputGain  = clampGain(getInt("thruInputGain", 100));
         es.ltcOutputGain  = clampGain(getInt("ltcOutputGain", 100));
+        es.ltcHoldOnPause = getBool("ltcHoldOnPause", false);
         es.thruOutputGain = clampGain(getInt("thruOutputGain", 100));
 
         es.audioBpmEnabled  = getBool("audioBpmEnabled", false);
