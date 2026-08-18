@@ -122,6 +122,9 @@ public:
     }
     bool isPaused() const             { return paused.load(std::memory_order_relaxed); }
 
+    void setHoldOnPause(bool h)       { holdOnPause.store(h, std::memory_order_relaxed); }
+    bool getHoldOnPause() const       { return holdOnPause.load(std::memory_order_relaxed); }
+
     void setOutputGain(float gain)    { outputGain.store(juce::jlimit(0.0f, 2.0f, gain), std::memory_order_relaxed); }
     float getOutputGain() const       { return outputGain.load(std::memory_order_relaxed); }
 
@@ -144,6 +147,7 @@ private:
     std::atomic<uint64_t> packedPendingTc { 0 };
     std::atomic<FrameRate> pendingFps { FrameRate::FPS_25 };
     std::atomic<bool> paused { false };
+    std::atomic<bool> holdOnPause { false };
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };
     std::atomic<double> pitchMultiplier { 1.0 };
@@ -307,7 +311,7 @@ private:
             if (outputChannelData[ch])
                 std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
 
-        if (paused.load(std::memory_order_relaxed))
+        if (paused.load(std::memory_order_relaxed) && !holdOnPause.load(std::memory_order_relaxed))
             return;
 
         int selCh = selectedChannel.load(std::memory_order_relaxed);
