@@ -661,7 +661,7 @@ struct StageLinQDeckState
     std::atomic<double>   beatInfoBeat { 0.0 };       // current beat position
     std::atomic<double>   beatInfoTotalBeats { 0.0 };  // total beats in track
     std::atomic<double>   beatInfoBPM { 0.0 };         // BPM from BeatInfo
-    std::atomic<double>   beatInfoTimeline { 0.0 };    // timeline position (ms?)
+    std::atomic<double>   beatInfoTimeline { 0.0 };    // current sample position
 
     // Mixer (per-channel)
     std::atomic<double>   faderPosition { 0.0 };   // from /Mixer/CH{N}faderPosition (0-1)
@@ -1624,26 +1624,22 @@ private:
             auto& dk = decks[i];
             if (!dk.active.load(std::memory_order_relaxed)) continue;
 
-            // Compute playhead from BeatInfo: beat position + BPM.
-            // This is the most reliable method -- both values are confirmed
-            // correct by all three reference implementations.
+            // Compute absolute playhead from the BeatInfo sample-position field.
             //
-            // The "timeline" field (called "samples" in chrisle/StageLinq) has
-            // unknown units -- could be audio samples, not milliseconds.
-            // Using beat/BPM avoids the ambiguity entirely.
-            double beat = dk.beatInfoBeat.load(std::memory_order_relaxed);
-            double bpm  = dk.beatInfoBPM.load(std::memory_order_relaxed);
+            // Real-hardware testing on an SC5000 running Engine OS 5.0.4 confirms
+            // that beatInfoTimeline is the current position in audio samples.
+            // Dividing by Track/SampleRate yields the absolute position in the
+            // source track and prevents pitch changes from shifting the playhead.
+            double samples    = dk.beatInfoTimeline.load(std::memory_order_relaxed);
+            double sampleRate = dk.sampleRate.load(std::memory_order_relaxed);
+            double bpm        = dk.beatInfoBPM.load(std::memory_order_relaxed);
 
-            // Gate on BPM only -- BPM > 0 means BeatInfo is active and a track
-            // is loaded.  beat=0 is valid (track cued to the very beginning).
-            if (bpm > 0.0)
+            // BPM > 0 confirms BeatInfo is active and a track is loaded.
+            // samples=0 is valid at the beginning of a track.
+            if (bpm > 0.0 && sampleRate > 0.0)
             {
-                // beat is the current beat position (e.g. 128.5 = halfway through beat 129)
-                // playheadMs = (beat / BPM) * 60000
-                // Clamp beat >= 0 -- negative values (scratch before start) would
-                // cause undefined behavior when cast to uint32_t.
-                double clampedBeat = juce::jmax(0.0, beat);
-                double ms = (clampedBeat / bpm) * 60000.0;
+                double clampedSamples = juce::jmax(0.0, samples);
+                double ms = (clampedSamples / sampleRate) * 1000.0;
                 dk.playheadMs.store((uint32_t)ms, std::memory_order_relaxed);
             }
         }
