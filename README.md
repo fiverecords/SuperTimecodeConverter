@@ -40,14 +40,17 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
-- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below.
+- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. Supports an **A/B loop**: set the loop in and out points at the current position and arm the LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
+- **LA-Net (LaserAnimation Net-Timecode)** — receive Net-Timecode over the network from LaserAnimation systems (configurable interface)
+- **Winamp / WACUP** *(Windows only)* — follow playback position from a running Winamp or WACUP instance. The input attaches automatically as soon as a Winamp window appears, so it can be selected before the player is launched. On macOS and Linux this source falls back to the Generator.
 - **HippoNet** *(coming soon)* — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009. *Currently disabled pending hardware validation.*
 
 ### Outputs (enable any combination per engine)
 
 - **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
-- **LTC Out** — generate LTC audio signal on any audio output device and channel
+- **LTC Out** — generate LTC audio signal on any audio output device and channel. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops
+- **LA-Net Out** — broadcast LaserAnimation Net-Timecode on any network interface
 - **TCNet Out** — broadcast TCNet timecode, playhead, BPM, and beat data (see below)
 - **Audio Thru** — passthrough audio from the LTC input device to a separate output device (Engine 1 only, since it shares the audio device with LTC input)
 
@@ -73,6 +76,16 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - Beat grid micro-correction: when a rekordbox beat grid is available, the PLL gently nudges toward the nearest beat position between CDJ packets, reducing interpolation drift
 - Instant resync on seek, hot cue, or track load
 - Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
+- Multi-deck all-in-one units (XDJ-XZ) are detected from their status stream, so both decks appear even though the unit announces a single network identity
+
+**Network identity (advanced):**
+
+STC announces itself on the network the way a Pioneer PRO DJ LINK Bridge does — this is what unlocks the DJM mixer data that a plain Virtual CDJ cannot see. Two settings next to the Pro DJ Link interface selector control that announcement, and the defaults work on the rigs tested so far:
+
+- **Bridge identity** — captures of real bridges show that the identity bytes are chosen per session rather than fixed, and mixers can refuse an announcement that does not fit the network they are on. The default reproduces the previously shipped behaviour; the **AUTO** option observes the network before announcing and derives the value from what the other devices report, which is the option to try first if a DJM is discovered but its faders and VU meters never appear.
+- **CDJ 95 B keepalive** — some CDJ firmware needs an extra unicast keepalive before it will stream status; others ignore it. Choose all players, CDJ-3000 only, or off.
+
+Both settings take effect on the next connection. A mixer decides whether to accept a bridge from the first keepalive it sees, so after changing the identity it is worth stopping and restarting the Pro DJ Link input — and if a DJM has already refused an earlier announcement, power-cycling the mixer.
 
 **DJM mixer integration:**
 - Real-time mixer data from DJM-900NXS2, DJM-A9, and DJM-V10
@@ -212,6 +225,8 @@ External window showing the full Pro DJ Link network state at 60Hz. The layout u
 - DJM-V10 enhanced view: compressor, 4-band EQ, send knobs, dual CUE A/B buttons per channel
 - DJM-A9 / DJM-V10: dual CUE A/B buttons rendered automatically when detected
 - Beat-in-bar indicator per player
+- **Layout cycle** — the toolbar button cycles the deck arrangement through **2x2 grid**, **4x1 horizontal**, and **alternating**, so the view can be matched to the shape of the screen it runs on. The button label shows the layout the next click will apply, and the choice is remembered between sessions.
+- **Diagnostics readout** — the toolbar shows the bridge identity currently on the wire, the 95 B keepalive mode, and per-player packet counters, so a single screenshot captures what STC is doing on the network
 
 ### BPM Multiplier
 
@@ -267,6 +282,7 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 - Broadcast: OptIn + Status on port 60000 (1Hz), Time on port 60001 (60Hz)
 - Unicast: automatic slave discovery, Request/Response negotiation, Metrics streaming at 30Hz, Metadata + Artwork on track change
 - Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector
+- **Global offset** (-2000 to +2000 ms) applied to every TCNet layer, to compensate for the latency of the receiving system without touching the per-engine frame offsets
 - Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator
 
 Protocol reference: https://www.tc-supply.com/tcnet
@@ -297,6 +313,20 @@ A visual companion to the Generator audio playback: a waveform view of the loade
 ### Shared MIDI Output
 
 When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port, STC automatically shares the connection. No configuration needed — both features work simultaneously on a single port, even on Windows where MIDI ports allow only one handle at a time.
+
+### LTC User Bits
+
+Every SMPTE LTC frame carries 32 **user bits** (also called binary groups) alongside the timecode — eight independent 4-bit groups that are free for the operator to use. Typical uses are a reel or scene number, a creation date, or a value that receiving equipment checks before acting on the timecode.
+
+**On output**, the source is selectable:
+
+- **Manual value** — an 8-digit hexadecimal value you enter
+- **From LTC in** — passthrough of the user bits arriving on the LTC input. If the incoming signal drops out the last received value is held rather than falling back to zeros, so equipment gating on user bits does not lose them during a glitch
+- **System date** — the current date, written as `YYYYMMDD` and updated automatically
+
+**On input**, the recovered value is displayed alongside the incoming timecode. User bits are conventionally filled with BCD (one decimal digit per 4-bit group), so the display also shows the decimal reading and a `YYYY-MM-DD` interpretation when the digits form a plausible date.
+
+User bits are specific to LTC. The Art-Net and TCNet timecode packets have no equivalent field, so the value cannot be carried on those outputs.
 
 ### Frame Rate Support
 
@@ -637,8 +667,9 @@ The application is built around a modular, header-only architecture:
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
 | `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
-| `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC) |
-| `LtcOutput.h` | LTC audio encoder with auto-increment and biphase parity |
+| `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC), including user bits |
+| `LtcOutput.h` | LTC audio encoder with auto-increment, user bits, and SMPTE 12M binary group flags |
+| `WinampInput.h` | Winamp / WACUP playback position reader (Windows; stub on other platforms) |
 | `AudioThru.h` | Audio passthrough with independent device routing (Engine 1 only) |
 | `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
 | `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
