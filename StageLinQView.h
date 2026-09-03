@@ -945,7 +945,7 @@ public:
                 auto centre = b.getCentre();
                 bool onScreen = false;
                 for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
-                    if (disp.totalArea.contains(centre)) { onScreen = true; break; }
+                    if (disp.logicalBounds.contains(centre.toFloat())) { onScreen = true; break; }
                 if (onScreen)
                     setBounds(b);
             }

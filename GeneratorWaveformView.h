@@ -216,6 +216,52 @@ private:
                        juce::Justification::centredLeft, false);
         }
 
+        // --- A/B loop range (drawn under cues but above waveform body) ---
+        // Tinted overlay between In and Out + two distinctive vertical
+        // markers.  Active when loop is enabled and Out > In; otherwise
+        // markers are still drawn if individual points are placed, so the
+        // operator can see where they would land before arming the loop.
+        if (engine != nullptr)
+        {
+            const double startMs       = engine->getGeneratorStartMs();
+            const double loopInMs      = engine->getGeneratorLoopInMs();
+            const double loopOutMs     = engine->getGeneratorLoopOutMs();
+            const bool   loopActive    = engine->isGeneratorLoopActive();
+
+            auto msToX = [&](double absMs) -> int
+            {
+                const double posSec = (absMs - startMs) / 1000.0;
+                if (posSec < 0.0 || posSec > totalLen) return INT_MIN;
+                return waveArea.getX() + (int)((posSec / totalLen) * waveArea.getWidth());
+            };
+
+            const int inX  = (loopInMs  > 0.0) ? msToX(loopInMs)  : INT_MIN;
+            const int outX = (loopOutMs > 0.0) ? msToX(loopOutMs) : INT_MIN;
+
+            // Range fill -- amber tint between In and Out, lighter when
+            // loop is armed, dimmer when only markers are set.
+            if (inX != INT_MIN && outX != INT_MIN && outX > inX)
+            {
+                g.setColour(loopActive ? juce::Colour(0x33FFA500)   // amber 20%
+                                       : juce::Colour(0x14FFA500)); // amber 8%
+                g.fillRect(inX, waveArea.getY(), outX - inX, waveArea.getHeight());
+            }
+
+            // In marker -- amber line, slightly thicker than cues.
+            if (inX != INT_MIN)
+            {
+                g.setColour(juce::Colour(0xFFFFAA00));
+                g.fillRect(inX, waveArea.getY(), 2, waveArea.getHeight());
+            }
+            // Out marker -- same colour, distinguishable by being the right
+            // edge of the tinted band.
+            if (outX != INT_MIN)
+            {
+                g.setColour(juce::Colour(0xFFFFAA00));
+                g.fillRect(outX - 1, waveArea.getY(), 2, waveArea.getHeight());
+            }
+        }
+
         // --- Cue markers (drawn before the cursor so the cursor stays
         // visible on top when it crosses a cue) ---
         if (engine != nullptr)

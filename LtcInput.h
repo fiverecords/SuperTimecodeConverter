@@ -121,6 +121,13 @@ public:
         return detectedFps.load(std::memory_order_relaxed);
     }
 
+    /// User bits recovered from the incoming LTC (32-bit binary groups).
+    /// 0 until the first good frame is decoded.
+    uint32_t getUserBits() const
+    {
+        return userBitsIn.load(std::memory_order_relaxed);
+    }
+
     bool isReceiving() const
     {
         auto now = juce::Time::getMillisecondCounterHiRes();
@@ -231,6 +238,10 @@ private:
     }
 
     std::atomic<uint64_t> packedTimecode { 0 };
+    // LTC user bits recovered from the incoming stream (32-bit binary
+    // groups; 0 until the first good frame).  Written by the audio thread
+    // once per decoded frame, read by the UI for display.
+    std::atomic<uint32_t> userBitsIn { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameTime  { 0.0 };
 
@@ -324,6 +335,25 @@ private:
         }
 
         samplesSinceLastSync = 0.0;
+
+        // --- User bits (SMPTE 12M binary groups) ---
+        // Same layout as the encoder: eight 4-bit groups at bit offsets
+        // 4,12,20,28,36,44,52,60, LSB-first within each group, group 1 as
+        // the most significant hex digit.  Reassembled into a 32-bit word
+        // so a value written by an STC output reads back identically.
+        // Only stored on good frames (we are past the range check above).
+        {
+            static constexpr int kUserGroupStart[8] =
+                { 4, 12, 20, 28, 36, 44, 52, 60 };
+            uint32_t ub = 0;
+            for (int g = 0; g < 8; ++g)
+            {
+                const uint32_t nibble =
+                    static_cast<uint32_t>((d >> kUserGroupStart[g]) & 0xF);
+                ub |= nibble << ((7 - g) * 4);
+            }
+            userBitsIn.store(ub, std::memory_order_relaxed);
+        }
 
         packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
                              std::memory_order_relaxed);

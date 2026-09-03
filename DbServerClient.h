@@ -189,6 +189,30 @@ public:
         if (isThreadRunning()) return;
         DBG("DbServerClient: starting background thread...");
         isRunningFlag.store(true, std::memory_order_relaxed);
+        dbPortInboundCount.store(0, std::memory_order_relaxed);
+
+        // Spawn the dbserver-port-discovery listener (TCP 12523).
+        // See dbPortListenerLoop() for protocol details.  Non-fatal on bind
+        // failure (port may be in use by another DJ Link tool on the same
+        // machine, in which case that tool takes care of replying).
+        if (!dbPortListenSock)
+        {
+            dbPortListenSock = std::make_unique<juce::StreamingSocket>();
+            if (dbPortListenSock->createListener(kPortDiscoveryPort, /*localHost*/ {}))
+            {
+                DBG("DbServerClient: listening on TCP " + juce::String(kPortDiscoveryPort)
+                    + " (replies port 0 / no service)");
+                dbPortListenerThread = std::thread([this]() { dbPortListenerLoop(); });
+            }
+            else
+            {
+                DBG("DbServerClient: could not bind TCP listener on port "
+                    + juce::String(kPortDiscoveryPort)
+                    + " (another DJ Link tool already running?)");
+                dbPortListenSock.reset();
+            }
+        }
+
         startThread(juce::Thread::Priority::low);
     }
 
@@ -205,6 +229,14 @@ public:
         // Wait for any in-flight NFS download to finish
         if (nfsThread.joinable())
             nfsThread.join();
+
+        // Tear down the dbserver-port listener.  Closing the socket unblocks
+        // waitForNextConnection() inside dbPortListenerLoop so it can exit.
+        if (dbPortListenSock)
+            dbPortListenSock->close();
+        if (dbPortListenerThread.joinable())
+            dbPortListenerThread.join();
+        dbPortListenSock.reset();
 
         // Close all connections
         for (auto& conn : connections)
@@ -479,6 +511,11 @@ public:
     uint32_t getQueryCount() const  { return queryCount.load(std::memory_order_relaxed); }
     uint32_t getErrorCount() const  { return errorCount.load(std::memory_order_relaxed); }
 
+    /// Inbound TCP connections accepted on port 12523 since start().
+    /// Diagnostic for the NXS2 dbserver-probe storm (v1.9.11-beta15):
+    /// see dbPortListenerLoop().  Displayed in the PDL View toolbar.
+    uint32_t getDbPortInboundCount() const { return dbPortInboundCount.load(std::memory_order_relaxed); }
+
 private:
     /// Internal enqueue (called from background thread for phase 2 re-enqueue).
     void enqueueInternal(const juce::String& playerIP, const juce::String& playerModel,
@@ -518,7 +555,22 @@ private:
     static constexpr int kMaxArtCacheEntries = 64;
     static constexpr int kMaxConnections    = 6;
     static constexpr int kReconnectCooldownMs = 5000;
-    static constexpr double kIdleTimeoutMs   = 1000.0;   // close connections idle for >1s.
+    // Idle connection lifetime.  Set to 30 s to mirror the way Beat Link's
+    // ConnectionManager keeps a Client open between successive queries to the
+    // same player (see ConnectionManager.invokeWithClientSession in the
+    // open-source reference implementation).  At 1 s -- the value used by all
+    // releases up to and including v1.9.9 -- back-to-back metadata requests
+    // every ~1.7 s for the same loaded track caused a full close + reconnect
+    // every cycle: STC's polite teardown waits 200 ms, then the next query
+    // re-runs discoverDbPort (one TCP to 12523), opens dbserver (one TCP to
+    // 1051 or 1052), exchanges the 5-byte greeting, and re-runs
+    // setupQueryContext, all before any payload moves.  In Joren2087's
+    // capture this produced 72 separate dbserver TCP sessions to the
+    // USB-holder NXS2 in 124 s.  The old comment justifying the 1 s value
+    // claimed it freed "CDJ NFS slots", but the NFSv2 server runs on UDP/2049
+    // and is independent of the dbserver TCP slot count, so the 1 s value was
+    // free pressure on the player with no corresponding benefit.
+    static constexpr double kIdleTimeoutMs   = 30000.0;
                                                          // Holding dbserver sessions open for
                                                          // longer correlates (per packet captures)
                                                          // with NXS2 firmware entering its
@@ -2473,8 +2525,9 @@ private:
                 }
             }
 
-            // Close idle connections — prevents zombie TCP connections from
-            // holding CDJ NFS slots (CDJ-2000NXS2 has limited slots).
+            // Close idle connections after kIdleTimeoutMs.  See the comment
+            // on kIdleTimeoutMs above for the rationale -- the previous 1 s
+            // value caused excessive TCP churn against NXS2 dbservers.
             {
                 double now = juce::Time::getMillisecondCounterHiRes();
                 for (auto& conn : connections)
@@ -2596,8 +2649,33 @@ private:
                     }
                 }
 
-                // Waveform: fetch if not yet cached
-                if (req.wantWaveform && !meta.hasWaveform())
+                // Waveform: fetch if not yet cached.
+                //
+                // For non-CDJ-3000 hardware the dbserver waveform path has
+                // shown the following symptoms in field captures (issues #6
+                // and #9):
+                //   - In Joren2087's player1_link_error capture STC opened
+                //     72 dbserver TCP sessions to the USB-holder NXS2 across
+                //     ~120 s for the same loaded track, all of which the
+                //     player accepted but none of which produced a usable
+                //     waveform on the CDJ side (the user reported the CDJ
+                //     hung with "metadata only, no waveform / no audio").
+                //   - The same captures show zero NFS traffic from STC,
+                //     because the existing NFS Fallback only runs when one
+                //     of the has*() flags is false -- and the dbserver
+                //     waveform query was filling at least one of them with
+                //     something that was not actually usable downstream.
+                // Beat Link's CrateDigger documents the same NXS2 dbserver
+                // unreliability and is the de-facto reference for getting
+                // around it ("the NFSv2 server is stateless, does not care
+                // what player number we are using, and can be used no matter
+                // how many players are on the network").  v1.9.10 therefore
+                // skips the dbserver preview-waveform query for non-3000
+                // hardware and lets the NFS pipeline (further below) fetch
+                // the analysis files directly; for CDJ-3000-class hardware
+                // the dbserver path is left exactly as it shipped in v1.9.9.
+                const bool isCdj3000Class = req.playerModel.containsIgnoreCase("3000");
+                if (req.wantWaveform && !meta.hasWaveform() && isCdj3000Class)
                 {
                     auto wfResult = queryPreviewWaveform(
                         *conn, req.slot, req.trackType, req.trackId,
@@ -2693,8 +2771,19 @@ private:
             if (!hasNewerRequests)
             {
 
+            // Phase-2 dbserver waveform / analysis queries.  Same reasoning
+            // as the preview-waveform skip in phase 1 above: for non-3000
+            // hardware we gate every dbserver-based query below on
+            // phase2Cdj3000Class so that NFS gets a clean shot at the
+            // analysis files (PQTZ / PCO2 / PCOB / PSSI / PWV4 / PWV5)
+            // without our previous query having already filled the cache
+            // with a partial / wrong-format dbserver answer that would
+            // suppress the NFS fallback further down.  For CDJ-3000 every
+            // query keeps running exactly as in v1.9.9.
+            const bool phase2Cdj3000Class = req.playerModel.containsIgnoreCase("3000");
+
             // Beat grid: fetch if not yet cached
-            if (req.wantWaveform && !meta.hasBeatGrid() && conn->isConnected())
+            if (req.wantWaveform && !meta.hasBeatGrid() && conn->isConnected() && phase2Cdj3000Class)
             {
                 auto grid = queryBeatGrid(*conn, req.slot, req.trackType,
                                            req.trackId, req.ourPlayer);
@@ -2708,7 +2797,7 @@ private:
             }
 
             // Detail waveform: fetch if not yet cached
-            if (req.wantWaveform && !meta.hasDetailWaveform() && conn->isConnected())
+            if (req.wantWaveform && !meta.hasDetailWaveform() && conn->isConnected() && phase2Cdj3000Class)
             {
                 auto detail = queryDetailWaveform(*conn, req.slot, req.trackType,
                                                    req.trackId, req.ourPlayer,
@@ -2734,11 +2823,12 @@ private:
             {
                 DBG("DbServerClient: phase2 SKIP detail query -- wantWf=" + juce::String((int)req.wantWaveform)
                     + " hasDetail=" + juce::String((int)meta.hasDetailWaveform())
-                    + " connected=" + juce::String((int)conn->isConnected()));
+                    + " connected=" + juce::String((int)conn->isConnected())
+                    + " cdj3000=" + juce::String((int)phase2Cdj3000Class));
             }
 
             // Song structure (phrase analysis): fetch if not yet cached
-            if (req.wantWaveform && !meta.hasSongStructure() && conn->isConnected())
+            if (req.wantWaveform && !meta.hasSongStructure() && conn->isConnected() && phase2Cdj3000Class)
             {
                 auto ss = querySongStructure(*conn, req.slot, req.trackType,
                                               req.trackId, req.ourPlayer);
@@ -2756,7 +2846,7 @@ private:
             }
 
             // Cue list (rekordbox hot cues, memory points, loops with colors)
-            if (req.wantWaveform && !meta.hasCueList() && conn->isConnected())
+            if (req.wantWaveform && !meta.hasCueList() && conn->isConnected() && phase2Cdj3000Class)
             {
                 auto cues = queryCueList(*conn, req.slot, req.trackType,
                                           req.trackId, req.ourPlayer);
@@ -2888,6 +2978,7 @@ private:
 
     // Stats
     std::atomic<uint32_t> queryCount { 0 };
+    std::atomic<uint32_t> dbPortInboundCount { 0 };  // TCP 12523 accepts (diagnostic)
     std::atomic<uint32_t> errorCount { 0 };
 
     // NFS ANLZ fetcher -- downloads .EXT files directly from CDJ USB/SD
@@ -2895,6 +2986,79 @@ private:
     // Runs on its own thread to avoid blocking metadata requests.
     NfsAnlzFetcher nfsAnlzFetcher;
     std::thread nfsThread;
+
+    // dbserver port-discovery listener (TCP 12523).
+    //
+    // CDJs that interpret a peer as running a Pioneer-style dbserver attempt
+    // to discover that peer's database port by opening TCP to 12523 (see
+    // discoverDbPortOnce() above for the protocol).  In the trickofdjequip
+    // capture (issue #6) we observed a CDJ-2000NXS2 doing exactly this to
+    // STC at a sustained ~25 SYN/s for the entire ~180 s capture: every
+    // unanswered SYN got RST from the host TCP stack, the player retried
+    // with the next source port (1055, 1056, 1057 ...), and the burst was
+    // heavy enough to congest the link-local segment.  v1.9.10 stops the
+    // 95 B unicast that triggers most of that behaviour, but we cannot rule
+    // out other paths -- firmware revisions, link-load handshakes, or simple
+    // probing -- by which a player decides to ask STC's 12523.
+    //
+    // Rather than rely solely on stopping the trigger, STC also now answers
+    // the protocol correctly: accept the TCP connection, read the 19-byte
+    // "RemoteDBServer\0" query, write back 0xFF 0xFF (the protocol's "no
+    // service available" sentinel, which STC's own discoverDbPort() decodes
+    // as "no service" via the `port >= 65535` check at the top of that
+    // function), and close.  This is the same response a player with no
+    // media mounted gives on its own port 12523, so it is on the well-known
+    // side of the protocol.  CDJs that receive 0xFFFF stop retrying.
+    //
+    // If port 12523 is already bound by another DJ Link tool running on the
+    // same machine (Beat Link Trigger, the official rekordbox bridge, etc.)
+    // STC logs the failure and yields gracefully -- whatever is bound there
+    // will take care of replying.
+    std::unique_ptr<juce::StreamingSocket> dbPortListenSock;
+    std::thread dbPortListenerThread;
+
+    void dbPortListenerLoop()
+    {
+        if (!dbPortListenSock) return;
+        while (isRunningFlag.load(std::memory_order_relaxed))
+        {
+            auto* client = dbPortListenSock->waitForNextConnection();
+            if (!client) break;  // shutdown signalled or socket closed
+            std::unique_ptr<juce::StreamingSocket> conn(client);
+
+            // Diagnostic (v1.9.11-beta15): count inbound 12523 connections.
+            // Each one is a CDJ probing us for a dbserver because a 95B
+            // keepalive told it we are a Pioneer bridge.  With the 95B off
+            // and the C0 identity this MUST stay at 0 (the reference bridge
+            // capture shows zero TCP) -- a non-zero value under those
+            // settings falsifies the hypothesis.  Shown in the PDL View.
+            dbPortInboundCount.fetch_add(1, std::memory_order_relaxed);
+
+            // Best-effort read of the protocol query (19 B), then reply.
+            // Even if the read times out or fails we still send the 2-byte
+            // "no service" response so the caller does not retry.
+            uint8_t buf[32] = {};
+            if (conn->waitUntilReady(true, 1000) == 1)
+                (void) conn->read(buf, (int)sizeof(buf), false);
+
+            // The dbserver port-discovery protocol returns the TCP port
+            // where the dbserver listens, as a 2-byte big-endian integer.
+            // Port 0 = "no dbserver on this peer" -- this is the response
+            // a CDJ-3000 gives because CDJ-3000 doesn't run a dbserver
+            // (it shares analysis files via NFS only).  When the client
+            // (an NXS2 trying to interrogate us as if we were a Bridge
+            // with its own dbserver) gets port = 0 it stops retrying and
+            // falls back to NFS access.  v1.9.10-beta replied 0xFFFF
+            // which the NXS2 interpreted as port 65535 and then opened a
+            // SYN flood at that port instead of the original 12523, just
+            // moving the flood without stopping it.  v1.9.11 returns the
+            // canonical port = 0 sentinel as documented by Deep Symmetry
+            // and observed in CDJ-3000 reference traces.
+            const uint8_t noService[2] = { 0x00, 0x00 };
+            (void) conn->write(noService, (int)sizeof(noService));
+            // unique_ptr will close on destruct
+        }
+    }
 
     /// Launch NFS download on a separate thread.
     /// Only one NFS download at a time (joins previous if still running).

@@ -11,7 +11,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.9.9"; }
+    const juce::String getApplicationVersion() override { return "1.9.11"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
@@ -66,7 +66,7 @@ public:
                     {
                         auto c = b.getCentre();
                         for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                            if (d.totalArea.contains(c)) { setBounds(b); break; }
+                            if (d.logicalBounds.contains(c.toFloat())) { setBounds(b); break; }
                     }
                 }
             }

@@ -74,6 +74,7 @@ namespace ProDJLink
     static constexpr int kKeepalivePort = 50000;
     static constexpr int kBeatPort      = 50001;
     static constexpr int kStatusPort    = 50002;
+    static constexpr int kBridgeSubPort = 50006;  // real bridge's 0x57/0x55 source port (Prueba_prodjlink_bridge.pcapng)
 
     // Announcement-port packet types (byte 10) -- received on port 50000.
     //
@@ -153,10 +154,68 @@ namespace ProDJLink
     // keepalive includes the Pioneer bridge identification strings.
     static constexpr int     kDefaultVCDJNumber = 5;
     static constexpr double  kKeepaliveInterval = 1.5;   // seconds
-    static constexpr double  kBridgeSubInterval = 2.0;   // seconds between 0x57 re-subscriptions (DJM requires ~2s keepalive)
+    static constexpr double  kAutoListenMs      = 3500.0; // AUTO profile: listen-before-announce window (>= 1 full peer keepalive cycle)
+    static constexpr double  kBridgeSubInterval = 1.0;   // seconds between 0x57 re-subscriptions (real bridge: exactly 1.0s, Prueba_prodjlink_bridge.pcapng)
 
     // Bridge subscription
     static constexpr uint8_t kBridgeSubType     = 0x57;  // mixer subscribe packet type
+
+    //==========================================================================
+    // Bridge identity profiles
+    //==========================================================================
+    // THREE captures of real, working bridges show THREE different values for
+    // the two "identity" bytes of the 54B keepalive (0x24 = device number,
+    // 0x30) -- everything else in the packet is byte-identical:
+    //
+    //   F9 profile: 0x24=0xF9, 0x30=0x04 -- Bridge_Original.pcapng (A9 rig).
+    //   C0 profile: 0x24=0xC0, 0x30=0x03 -- 2000nxs2_PDL_bridge.pcapng
+    //               (2x CDJ-2000NXS2, no DJM).
+    //   E4 profile: 0x24=0xE4, 0x30=0x05 -- Prueba_prodjlink_bridge.pcapng
+    //               (3x CDJ-3000 + DJM-A9).  On that rig the A9 unicasts
+    //               0x39 faders 96ms after this keepalive; the SAME A9 sent
+    //               nothing in 7+ minutes to STC 1.9.9's 0xF9/0x04
+    //               (Prueba_stc.pcapng) -- which falsifies the old claim
+    //               that the A9 "requires 0xF9".
+    //
+    // Conclusion: the device number is DYNAMIC (the bridge picks a value in
+    // the high range per session), so peers cannot be whitelisting specific
+    // values.  Byte 0x30 varies with the rig; in the two fully-enumerable
+    // captures it equals the total device count including the bridge itself
+    // (NXS2 rig: 2 CDJs + bridge = 3; fresh rig: 3 CDJs + A9 + bridge = 5).
+    // "Count" is a hypothesis, not proven causation -- hence AUTO below is
+    // an experimental profile, and the three observed pairs remain available
+    // as-captured for controlled A/B.  Pairs are never mixed.
+    //
+    // Field A/B on the A9 + 3x3000 rig (beta16): E4 unlocked the DJM; F9,
+    // C0 and the then-per-tick AUTO did not.  AUTO's failure despite
+    // converging to 0xE4/0x05 shows the DJM judges the FIRST keepalive it
+    // sees and does not re-evaluate -- AUTO is listen-then-announce since
+    // beta17 (see run()).
+    //
+    // REFINEMENT (Prueba_stc_beta.pcapng, the beta16 success capture): b30
+    // is a network HIGH-WATER MARK, not a count.  The CDJ-3000s' own b30
+    // moved from 0x04 to 0x05 after a bridge announcing 0x05 had been on
+    // the wire (devices adopt the highest value seen), and the A9 accepted
+    // STC's 0x05 on a 4-device network -- falsifying exact-count
+    // acceptance.  Model fitting all sessions: acceptance requires
+    // b30 >= current mark; AUTO emits max(mark, count incl. self), which
+    // reproduces every accepted value on record (0x03, 0x05, 0x05).
+    static constexpr int kBridgeIdentityF9   = 0;  // 0xF9 / 0x04 (default, shipping behaviour)
+    static constexpr int kBridgeIdentityC0   = 1;  // 0xC0 / 0x03 (NXS2 reference)
+    static constexpr int kBridgeIdentityE4   = 2;  // 0xE4 / 0x05 (A9 + 3x3000 reference)
+    static constexpr int kBridgeIdentityAuto = 3;  // 0xE4 / b30 = max(network mark, count incl. self) (experimental)
+
+    // 95B dbserver-keepalive scope (see sendDbServerKeepaliveToAll):
+    static constexpr int kDbKeepaliveAll     = 0; // every discovered player (beta14 behaviour)
+    static constexpr int kDbKeepalive3000    = 1; // CDJ-3000 models only (v1.9.10 behaviour)
+    static constexpr int kDbKeepaliveOff     = 2; // never (reference-bridge behaviour)
+
+    // NOTE (v1.9.11-beta15): the dual CDJ identity (B21=02, self-assigned
+    // player 7-15, added in beta4) has been REMOVED.  It never ran against
+    // hardware, its claim packets were malformed (sendCdjJoinHello had an
+    // out-of-bounds stack write), and the reference capture proves a single
+    // correctly-announced bridge identity is sufficient for the NXS2 to
+    // stream status + abs position.  See STC_PRODJLINK_AUDIT.md section 6.
 
     //==========================================================================
     // Byte-level helpers (big-endian)
@@ -261,7 +320,19 @@ struct ProDJLinkPlayerState
 
     // Timing
     std::atomic<double>   lastPacketTime { 0.0 };  // juce::Time::getMillisecondCounterHiRes()
+    // Status-based ("phantom") discovery scratch -- network thread only.
+    // Counts consecutive status packets from a stable IP for a player that
+    // never keepalives (multi-deck all-in-one units).  See handleStatusPacket.
+    int  statusSeenCount = 0;
+    char statusSeenIp[16] = {0};
     std::atomic<double>   absPositionTs  { 0.0 };  // timestamp of last abs position (for interpolation)
+
+    // Diagnostic counters (v1.9.11-beta15) -- the single most diagnostic
+    // numbers for the NXS2 identity question: a player streaming 0x0a and
+    // 0x0b to us has accepted our bridge identity.  Displayed in the PDL
+    // View toolbar so a tester screenshot answers the whole hypothesis.
+    std::atomic<uint32_t> cntStatusPkts { 0 };     // 0x0a unicast status received
+    std::atomic<uint32_t> cntAbsPosPkts { 0 };     // 0x0b abs position received
 
     void reset()
     {
@@ -297,7 +368,11 @@ struct ProDJLinkPlayerState
         prevAbsPosMs = 0;
         trackVersion.store(0, std::memory_order_relaxed);
         lastPacketTime.store(0.0, std::memory_order_relaxed);
+        statusSeenCount = 0;
+        statusSeenIp[0] = '\0';
         absPositionTs.store(0.0, std::memory_order_relaxed);
+        cntStatusPkts.store(0, std::memory_order_relaxed);
+        cntAbsPosPkts.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -463,15 +538,24 @@ public:
             return false;
         }
 
-        // Extra send-only socket on ephemeral port for 0x57 subscribe / 0x55 notify.
-        // Pioneer Bridge uses a separate port (~50006) for these; some DJM firmware
-        // ignores subscribes whose source port matches a well-known ProDJLink port.
-        // Non-fatal: if it fails, subscribe/notify still go via beatSock/statusSock.
+        // Extra send-only socket for 0x57 subscribe / 0x55 notify.
+        // The real bridge sends these from exactly UDP 50006 (confirmed in
+        // Prueba_prodjlink_bridge.pcapng); STC previously bound this socket
+        // to an ephemeral port, which is one of the observable deltas vs the
+        // working reference on a DJM-A9.  Bind 50006 first; fall back to
+        // ephemeral if it is taken (another DJ Link tool on the machine).
+        // Non-fatal: if all binds fail, subscribe/notify go via beatSock.
         bridgeSock = std::make_unique<juce::DatagramSocket>(false);
-        if (!bridgeSock->bindToPort(0, bindIp) && !bridgeSock->bindToPort(0))
+        if (!bridgeSock->bindToPort(ProDJLink::kBridgeSubPort, bindIp)
+            && !bridgeSock->bindToPort(ProDJLink::kBridgeSubPort))
         {
-            DBG("ProDJLink: bridgeSock creation failed (non-fatal)");
-            bridgeSock = nullptr;
+            DBG("ProDJLink: could not bind bridgeSock to UDP "
+                << ProDJLink::kBridgeSubPort << " -- falling back to ephemeral");
+            if (!bridgeSock->bindToPort(0, bindIp) && !bridgeSock->bindToPort(0))
+            {
+                DBG("ProDJLink: bridgeSock creation failed (non-fatal)");
+                bridgeSock = nullptr;
+            }
         }
 
         // Reset player states
@@ -500,7 +584,6 @@ public:
         bridgeSock    = nullptr;
 
         vCDJPlayerNumber = ProDJLink::kDefaultVCDJNumber;
-        joinCompleted.store(false, std::memory_order_release);
         { const juce::ScopedLock sl(djmIpLock); djmIps.clear(); djmModels.clear(); djmLastSeen.clear(); }
 
         // Reset mixer state + packet counters for clean restart
@@ -530,6 +613,39 @@ public:
     /// Wire this to DbServerClient::invalidatePlayer() to close stale connections.
     std::function<void(const juce::String& playerIP)> onPlayerLost;
     void setVCDJPlayerNumber(int n)     { vCDJPlayerNumber = juce::jlimit(1, 127, n); }
+
+    /// Bridge identity profile for the 54B keepalive (see constants above).
+    /// kBridgeIdentityF9 / C0 / E4 = the three as-captured byte pairs;
+    /// kBridgeIdentityAuto = dev 0xE4 + b30 computed as the discovered device
+    /// count including ourselves (experimental "count" hypothesis).
+    /// Applied on the next keepalive tick; for a clean protocol A/B the caller
+    /// should stop() + start() so the join replays under the new identity and
+    /// peers re-register us from scratch.
+    void setBridgeIdentityProfile(int p)
+    {
+        bridgeIdentityProfile.store(juce::jlimit((int)ProDJLink::kBridgeIdentityF9,
+                                                 (int)ProDJLink::kBridgeIdentityAuto, p),
+                                    std::memory_order_release);
+    }
+    int getBridgeIdentityProfile() const { return bridgeIdentityProfile.load(std::memory_order_acquire); }
+    /// The identity bytes last emitted on the wire (0x24 / 0x30 of the 54B).
+    uint8_t getLastKeepaliveDev() const { return lastKaDev.load(std::memory_order_relaxed); }
+    uint8_t getLastKeepaliveB30() const { return lastKaB30.load(std::memory_order_relaxed); }
+
+    /// 95B dbserver-keepalive scope (see constants above).
+    /// kDbKeepaliveAll = every discovered player (beta14 behaviour, default),
+    /// kDbKeepalive3000 = CDJ-3000 models only (v1.9.10 behaviour),
+    /// kDbKeepaliveOff = never (reference-bridge behaviour).
+    /// Applied live on the next keepalive tick -- no restart required, which
+    /// deliberately allows the "does status keep flowing once the 95B stops"
+    /// experiment mid-session.
+    void setDbKeepaliveMode(int m)
+    {
+        dbKeepaliveMode.store(juce::jlimit((int)ProDJLink::kDbKeepaliveAll,
+                                           (int)ProDJLink::kDbKeepaliveOff, m),
+                              std::memory_order_release);
+    }
+    int getDbKeepaliveMode() const { return dbKeepaliveMode.load(std::memory_order_acquire); }
 
 
     //==========================================================================
@@ -622,8 +738,9 @@ public:
     }
 
     /// Does this player have usable timecode data?
-    /// CDJ-3000: absolute position packets provide ms playhead directly.
-    /// NXS2/older: position derived from beatCount x (60000/BPM) in status packets.
+    /// Abs position (0x0b) provides ms playhead directly -- CDJ-3000 always,
+    /// NXS2 once it accepts our bridge identity (see handleBeatPacket).
+    /// Fallback: position derived from beatCount x (60000/BPM) in status packets.
     bool hasTimecodeData(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1196,32 +1313,63 @@ public:
         return "NONE";
     }
 
+    /// Diagnostic counters per player (v1.9.11-beta15): unicast status (0x0a)
+    /// and abs position (0x0b) packets received.  Non-zero values mean the
+    /// player has accepted our bridge identity -- the decisive evidence for
+    /// the identity-profile A/B test.  Displayed in the PDL View toolbar.
+    uint32_t getPlayerStatusCount(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
+        return players[idx].cntStatusPkts.load(std::memory_order_relaxed);
+    }
+    uint32_t getPlayerAbsPosCount(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
+        return players[idx].cntAbsPosPkts.load(std::memory_order_relaxed);
+    }
+
     /// Suggest a player number for dbserver queries to NXS2.
     /// NXS2 dbserver only accepts player numbers 1-4 that are actually present
     /// on the network.  Returns a discovered player (1-4) that is not
     /// `excludePlayer`, or 0 if none found (query will fail).
     int suggestDbPlayerNumber(int excludePlayer) const
     {
+        const char* srcIp = (excludePlayer >= 1 && excludePlayer <= ProDJLink::kMaxPlayers)
+                                ? players[excludePlayer - 1].ipStr : "";
+
         // Prefer another discovered player (ideal: the CDJ knows it exists)
+        // -- but NEVER one that shares the source player's IP.  Multi-deck
+        // all-in-one units (XDJ-XZ) expose several player numbers on ONE
+        // box; a dbserver query claiming to come from the box's own other
+        // deck is silently ignored (audit 12.10: the XZ completed the
+        // handshake, then never answered a 0x2002 metadata query sent with
+        // context player 2 -- its own deck B).
         for (int pn = 1; pn <= 4; ++pn)
         {
             if (pn == excludePlayer) continue;
             int idx = pn - 1;
-            if (players[idx].discovered.load(std::memory_order_relaxed))
-                return pn;
+            if (!players[idx].discovered.load(std::memory_order_relaxed)) continue;
+            if (srcIp[0] != '\0'
+                && std::strncmp(players[idx].ipStr, srcIp, 15) == 0) continue;
+            return pn;
         }
-        // No other discovered player.  Pick the highest FREE number (4→1)
-        // to avoid colliding with the source CDJ.  NXS2 dbserver accepts
-        // queries from non-existent player numbers 1-4, but rejects (or
-        // partially serves) queries claiming to be FROM the CDJ's own number.
-        // Starting from 4 minimises collision with real players (1 and 2
-        // are the most commonly used in a typical 2-deck setup).
+        // No usable discovered player.  Pick the highest number 4->1 that is
+        // genuinely FREE (not discovered -- a discovered-but-skipped number
+        // here would be a same-box deck, the exact collision to avoid).
+        // NXS2 dbserver accepts queries from non-existent player numbers
+        // 1-4 but rejects or ignores queries claiming to be FROM a number
+        // the box itself owns.  Starting from 4 minimises collision with
+        // real players (1 and 2 are the most common in a 2-deck setup).
         for (int pn = 4; pn >= 1; --pn)
         {
-            if (pn != excludePlayer)
-                return pn;
+            if (pn == excludePlayer) continue;
+            if (players[pn - 1].discovered.load(std::memory_order_relaxed)) continue;
+            return pn;
         }
-        // All 4 slots taken by excludePlayer (impossible with int, but safe)
+        // Pathological: players 1-4 all real devices.  Any non-source number
+        // is equally (in)valid; keep the old behaviour.
         return (excludePlayer != 4) ? 4 : 3;
     }
 
@@ -1298,11 +1446,23 @@ private:
     {
         DBG("ProDJLink: Thread started, bound to " << bindIp);
 
-        // --- Bridge announce sequence (must happen before keepalives) ---
-        // Bridge announce: hello 0x0A (player=5) -> claim 0x02 (player=0xC0)
-        // -> then starts 54B keepalive 0x06 (player=0xC1).
-        // The DJM needs to see this announce before it activates fader delivery.
-        performBridgeJoinSequence();
+        // --- No join sequence (v1.9.11-beta16) ---
+        // The fresh reference capture (Prueba_prodjlink_bridge.pcapng, real
+        // bridge + DJM-A9 + 3x CDJ-3000) shows the bridge sending ZERO join
+        // packets: no hello, no claims -- its very first packet is the 54B
+        // keepalive, and the A9 starts unicasting 0x39 faders 96ms later.
+        // STC's old join (2x hello 0x0a + 11x claim 0x02, all BROADCAST,
+        // all claiming device 5) leaked a second identity to the DJM before
+        // the 0xF9 keepalives began -- exactly the "two identities from one
+        // IP/MAC" condition the 54B/95B split was designed to avoid -- and
+        // added ~6.1s of blocking sleeps before the first keepalive.
+        // (Bridge_Original.pcapng did show a hello+claim join, so bridge
+        // versions differ; the version that demonstrably works with this
+        // DJM-A9 sends none, and CDJs need none either.)
+
+        autoIdentityB30.store(0, std::memory_order_release);
+        maxPeerB30.store(0, std::memory_order_release);
+        const double threadStartMs = juce::Time::getMillisecondCounterHiRes();
 
         double lastKeepaliveSend  = 0.0;
         double lastBridgeSubSend  = 0.0;
@@ -1317,25 +1477,78 @@ private:
             // --- Dual keepalive system ---
             // Two keepalives serve different purposes:
             //
-            // 1) 54B bridge keepalive BROADCAST (player=0xC1)
+            // 1) 54B bridge keepalive BROADCAST (device number per the active
+            //    bridge identity profile, see sendBridgeKeepalive)
             //    -> DJM discovers us as bridge -> activates fader (0x39) delivery
             //    -> This is the standard bridge broadcast keepalive
             //
             // 2) 95B dbserver keepalive UNICAST to each CDJ (player=5)
-            //    -> CDJ-3000 registers us as a valid peer with PIONEER identification
+            //    -> CDJ registers us as a valid peer with PIONEER identification
             //    -> CDJ sends unicast Status + AbsPos data to our IP
+            //    -> Scope controlled by dbKeepaliveMode; the reference bridge
+            //       never sends it (see sendDbServerKeepaliveToAll)
             //
             // CRITICAL: The 95B MUST be unicast to CDJ IPs only -- NEVER broadcast.
-            // If the DJM receives both player=5 (95B) and player=0xC1 (54B) from
-            // the same IP/MAC, it detects conflicting identities and refuses faders.
-            // By unicasting the 95B, the DJM only ever sees the 54B broadcast.
+            // If the DJM receives both player=5 (95B) and the bridge device
+            // number (54B) from the same IP/MAC, it detects conflicting
+            // identities and refuses faders.  By unicasting the 95B, the DJM
+            // only ever sees the 54B broadcast.
             if ((now - lastKeepaliveSend) >= ProDJLink::kKeepaliveInterval * 1000.0)
             {
-                sendBridgeKeepalive();           // 54B BROADCAST -> DJM faders
-                sendDbServerKeepaliveToAll();     // 95B UNICAST to CDJs -> CDJ status data
-                lastKeepaliveSend = now;
-                if (firstKeepaliveSent == 0.0)
-                    firstKeepaliveSent = now;
+                // AUTO profile: listen-before-announce (v1.9.11-beta17).
+                // Field result on the A9 + 3x CDJ-3000 rig: static E4 (0xE4/
+                // 0x05) unlocked the DJM, but AUTO-as-shipped-in-beta16 did
+                // NOT -- even though it converges to the same pair -- because
+                // it computed b30 per tick and the first keepalives went out
+                // with b30=0x02 before discovery had registered anyone.  The
+                // DJM evidently judges a bridge on its first keepalive and
+                // does not re-evaluate.  The real bridge never has this
+                // problem: it observes the network before announcing (its
+                // first packet in the reference capture arrives with the
+                // correct count already).  So AUTO now stays silent for
+                // kAutoListenMs (discovery keeps running below), computes
+                // b30 once, freezes it for the session, and only then starts
+                // announcing -- first impression correct, value stable, like
+                // the reference (x9 identical keepalives in the capture).
+                const bool autoProfile =
+                    bridgeIdentityProfile.load(std::memory_order_acquire)
+                        == ProDJLink::kBridgeIdentityAuto;
+                bool readyToAnnounce = true;
+                if (autoProfile
+                    && autoIdentityB30.load(std::memory_order_acquire) == 0)
+                {
+                    if ((now - threadStartMs) < ProDJLink::kAutoListenMs)
+                        readyToAnnounce = false;   // still listening
+                    else
+                    {
+                        // b30 = max(network high-water mark, device count+1),
+                        // clamped.  This reproduces every accepted value on
+                        // record: NXS2 rig (mark ~0x02, count+1=3 -> 0x03),
+                        // first A9 rig session (mark 0x04, count+1=5 -> 0x05),
+                        // and the beta16 success capture (mark 0x05,
+                        // count+1=4 -> 0x05, the exact value the A9
+                        // accepted on a 4-device network -- count+1 alone
+                        // would have emitted a rejected 0x04).
+                        const int mark  = (int) maxPeerB30.load(std::memory_order_relaxed);
+                        const int count = countNetworkDevices() + 1;
+                        const uint8_t b30 = (uint8_t) juce::jlimit(
+                            2, 7, juce::jmax(mark, count));
+                        autoIdentityB30.store(b30, std::memory_order_release);
+                        DBG("ProDJLink: AUTO identity computed -- b30=0x"
+                            << juce::String::toHexString((int) b30)
+                            << " (mark=0x" << juce::String::toHexString(mark)
+                            << ", peers+self=" << count << ")");
+                    }
+                }
+
+                if (readyToAnnounce)
+                {
+                    sendBridgeKeepalive();           // 54B BROADCAST -> DJM faders
+                    sendDbServerKeepaliveToAll();     // 95B UNICAST to CDJs -> CDJ status data
+                    lastKeepaliveSend = now;
+                    if (firstKeepaliveSent == 0.0)
+                        firstKeepaliveSent = now;
+                }
             }
 
             // --- Send bridge subscribe (0x57) to all known DJMs ---
@@ -1427,7 +1640,7 @@ private:
                     uint8_t buf[600];
                     int n = beatSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
-                        handleBeatPacket(buf, n);
+                        handleBeatPacket(buf, n, sender);
                     ++beatDrained;
                 }
             }
@@ -1441,7 +1654,7 @@ private:
                     uint8_t buf[1200];
                     int n = statusSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
-                        handleStatusPacket(buf, n);
+                        handleStatusPacket(buf, n, sender);
                     ++statusDrained;
                 }
             }
@@ -1458,18 +1671,22 @@ private:
     //
     // Two keepalives are sent in parallel, each serving a different device:
     //
-    //   1) sendBridgeKeepalive()       -- 54B BROADCAST (player=0xC1)
+    //   1) sendBridgeKeepalive()       -- 54B BROADCAST (device number from the
+    //      active bridge identity profile: 0xF9 or 0xC0, see that function)
     //      -> DJM discovers us as bridge -> activates fader (0x39) delivery
     //      -> Standard bridge broadcast keepalive
     //
     //   2) sendDbServerKeepaliveToAll() -- 95B UNICAST to each CDJ (player=5)
-    //      -> CDJ-3000 validates PIONEER DJ CORP / PRODJLINK BRIDGE strings
+    //      -> CDJ validates PIONEER DJ CORP / PRODJLINK BRIDGE strings
     //      -> CDJ registers us as a valid peer -> sends Status + AbsPos unicast
+    //      -> Scope controlled by dbKeepaliveMode (all / 3000-only / off).
+    //         The reference bridge sends NO 95B at all -- see the function.
     //
     // The DJM NEVER sees the 95B packet (it's sent unicast to CDJ IPs only).
-    // From the DJM's perspective, we have a single identity: player=0xC1.
+    // From the DJM's perspective, we have a single identity: the 54B device
+    // number of the active profile.
     //
-    // History:
+    // History (device number was 0xC1 in the v1.5 era):
     //   - v1.5a: 95B BROADCAST + 54B UNICAST -> CDJ[OK] DJM[FAIL] (DJM saw 2 identities)
     //   - v1.5b: 54B BROADCAST only          -> CDJ[FAIL] DJM[OK] (CDJ ignored player=0xC1)
     //   - v1.5c: 54B BROADCAST + 95B UNICAST -> CDJ[OK] DJM[OK] (DJM only sees broadcast)
@@ -1481,7 +1698,7 @@ private:
     // for sending unicast Status + AbsPos data to our IP.
     //
     // CRITICAL: This must be UNICAST to CDJ IPs only -- NEVER broadcast.
-    // The DJM must only see the 54B bridge keepalive (player=0xC1).
+    // The DJM must only see the 54B bridge keepalive (profile device number).
     // If the DJM sees this 95B packet (player=5), it registers a conflicting
     // identity from the same IP and refuses to activate fader delivery.
     void sendDbServerKeepalive(const juce::String& cdjIp)
@@ -1515,12 +1732,82 @@ private:
 
     void sendDbServerKeepaliveToAll()
     {
+        // The 95 B unicast keepalive carries the "PIONEER DJ CORP" /
+        // "PRODJLINK BRIDGE" identification strings starting at byte 54
+        // and exists to make Pioneer CDJs accept the sender as a Pro DJ Link
+        // Bridge peer.  Without it the CDJ-2000NXS2 sees STC's standard 54 B
+        // bridge keepalive but never adds STC to the unicast status
+        // destination list, so STC receives beat packets (which are
+        // broadcast and contain pitch + nominal BPM) but no status packets
+        // (which are unicast and contain trackId, play state, abspos, etc.).
+        //
+        // ============================================================
+        //  v1.9.10-beta history (reverted in v1.9.11, RE-READ in beta15)
+        // ============================================================
+        // v1.9.10-beta suppressed this 95 B unicast for non-CDJ-3000
+        // hardware on the theory that the captures of the official
+        // PRO DJ LINK Bridge talking to CDJ-2000NXS2s did not show 95 B
+        // unicasts, so the 95 B was deemed unnecessary.  Field testing
+        // (Joren2087 traces 1.9.10_no_waveform_no_metadata.pcapng and
+        // 1.9.10-no-waveform-pitch-fine-bpm-not-no-metadata-player1.pcapng)
+        // showed that with the 95 B suppressed STC receives zero unicast
+        // packets from the CDJ-2000NXS2 -- no status, no abspos -- only
+        // the broadcast beat stream.  The conclusion drawn at the time was
+        // "the 95 B is our only working subscription mechanism for the
+        // NXS2", and v1.9.11 reverted the suppression.
+        //
+        // The reference capture (2000nxs2_PDL_bridge.pcapng, rev 3 audit)
+        // forces a re-read of that result: the real bridge sends ZERO 95 B
+        // packets and the NXS2 streams it status + abs position anyway,
+        // within 10ms of the first 54 B keepalive.  So the correct reading
+        // of v1.9.10 is not "the 95 B is necessary" -- it is "STC's 54 B
+        // bridge identity is not accepted by the NXS2, and the 95 B was
+        // papering over that".  The 95 B is also the trigger for the TCP
+        // 12523 SYN storm (the NXS2 believes the sender runs a dbserver and
+        // probes for it at ~25 SYN/s, exhausting its port table -> freeze).
+        // See STC_PRODJLINK_AUDIT.md sections 0-4.
+        //
+        // Hence dbKeepaliveMode: the 95 B must NOT be removed before the
+        // 54 B identity is fixed (that reproduces v1.9.10 exactly), so both
+        // knobs ship together and the tester flips them in one session:
+        //   kDbKeepaliveAll  (default) -- every discovered player (beta14)
+        //   kDbKeepalive3000           -- CDJ-3000 models only   (v1.9.10)
+        //   kDbKeepaliveOff            -- never                  (reference bridge)
+        //
+        // The TCP listener on port 12523 in DbServerClient (answers
+        // "no dbserver here", port = 0) stays as a belt-and-braces
+        // mitigation regardless of mode.  See dbPortListenerLoop().
+        const int mode = dbKeepaliveMode.load(std::memory_order_acquire);
+        if (mode == ProDJLink::kDbKeepaliveOff)
+            return;
+
+        // Multi-deck units expose several player numbers on one IP
+        // (XDJ-XZ: players 1+2, one box) -- send each physical box ONE 95B
+        // per tick, not one per deck.
+        const char* sentIps[ProDJLink::kMaxPlayers] = {};
+        int numSent = 0;
         for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
         {
             if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
+
+            // 3000-only mode: model[] is written once by this same network
+            // thread when the player is first registered, so reading it
+            // here is race-free.
+            if (mode == ProDJLink::kDbKeepalive3000
+                && std::strstr(players[i].model, "3000") == nullptr)
+                continue;
+
+            bool dup = false;
+            for (int k = 0; k < numSent; ++k)
+                if (std::strncmp(sentIps[k], players[i].ipStr, 15) == 0) { dup = true; break; }
+            if (dup) continue;
+
             juce::String ip(players[i].ipStr);
             if (ip.isNotEmpty())
+            {
                 sendDbServerKeepalive(ip);
+                sentIps[numSent++] = players[i].ipStr;
+            }
         }
     }
 
@@ -1539,6 +1826,23 @@ private:
     // that can cause the DJM to never see the broadcast keepalive even though it
     // reaches the wire. Unicasting a copy ensures the DJM sees our bridge identity.
     // The DJM receives the same player=0xC1 identity both ways -- no conflict.
+    /// Count of PDL devices currently visible on the wire: discovered CDJ
+    /// players + registered DJMs.  Used by the AUTO identity profile
+    /// (b30 = this + 1 for ourselves).  Rekordbox instances are not tracked
+    /// by STC and therefore not counted -- a known limitation of the
+    /// experimental profile, documented in the audit addendum.
+    int countNetworkDevices()
+    {
+        int n = 0;
+        for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
+            if (players[i].discovered.load(std::memory_order_relaxed)) ++n;
+        {
+            const juce::ScopedLock sl(djmIpLock);
+            n += (int) djmIps.size();
+        }
+        return n;
+    }
+
     void sendBridgeKeepalive()
     {
         if (!keepaliveSock) return;
@@ -1548,19 +1852,47 @@ private:
         pkt[0x0a] = 0x06;
         std::strncpy(reinterpret_cast<char*>(pkt + 0x0c), "TCS-SHOWKONTROL", 19);
         pkt[0x20] = 0x01;  pkt[0x21] = 0x01;  pkt[0x23] = 0x36;
-        // Player number byte: the official Pioneer Bridge uses 0xF9 here on
-        // both platforms (verified against Bridge_Original.pcapng capture).
-        // Older STC builds used 0xC1 on Windows -- some DJM models (V10,
-        // 900NXS2) accepted it but the DJM-A9 firmware rejects anything but
-        // the canonical 0xF9, ignoring the 0x57 subscribe and never sending
-        // fader/VU data back.  Unifying both platforms on 0xF9 matches the
-        // reference Bridge byte-for-byte.
-        pkt[0x24] = 0xF9;  pkt[0x25] = 0x00;
+        // Bytes 0x24 (device number) and 0x30 are the ONLY two bytes where
+        // real-bridge captures vary -- three captures, three pairs -- and the
+        // prime suspect for peers refusing STC as a bridge.  See the profile
+        // constants in namespace ProDJLink for the full provenance table and
+        // the falsification of the old "A9 requires 0xF9" claim.
+        // AUTO implements the "count" hypothesis: b30 = discovered devices
+        // (CDJs + DJMs) + 1 for ourselves, which matches both fully
+        // enumerable reference captures (3 on the 2-NXS2 rig, 5 on the
+        // 3x3000+A9 rig).  Clamped [2,7] defensively.
+        uint8_t dev = 0xF9, b30 = 0x04;
+        switch (bridgeIdentityProfile.load(std::memory_order_acquire))
+        {
+            case ProDJLink::kBridgeIdentityC0:   dev = 0xC0; b30 = 0x03; break;
+            case ProDJLink::kBridgeIdentityE4:   dev = 0xE4; b30 = 0x05; break;
+            case ProDJLink::kBridgeIdentityAuto:
+            {
+                dev = 0xE4;
+                // Use the session-frozen value computed after the listen
+                // window (see run()); never recompute per tick -- the ramp
+                // is exactly what failed in the beta16 field test.
+                uint8_t frozen = autoIdentityB30.load(std::memory_order_acquire);
+                if (frozen == 0)   // defensive: any path that announces
+                {                  // before the gate computes it here, once
+                    frozen = (uint8_t) juce::jlimit(2, 7,
+                        juce::jmax((int) maxPeerB30.load(std::memory_order_relaxed),
+                                   countNetworkDevices() + 1));
+                    autoIdentityB30.store(frozen, std::memory_order_release);
+                }
+                b30 = frozen;
+                break;
+            }
+            default: break;  // kBridgeIdentityF9
+        }
+        pkt[0x24] = dev;   pkt[0x25] = 0x00;
         std::memcpy(pkt + 0x26, ownMacBytes, 6);
         std::memcpy(pkt + 0x2c, ownIpBytes, 4);
-        // Byte 0x30: official Bridge sends 0x04, not 0x03.  Same reason as
-        // above -- aligning with the captured reference behaviour.
-        pkt[0x30] = 0x04;  pkt[0x34] = 0x05;  pkt[0x35] = 0x20;
+        pkt[0x30] = b30;   pkt[0x34] = 0x05;  pkt[0x35] = 0x20;
+        // Record the bytes actually emitted for the PDL View diagnostics line
+        // (with AUTO the pair is computed, so screenshots must show reality).
+        lastKaDev.store(dev, std::memory_order_relaxed);
+        lastKaB30.store(b30, std::memory_order_relaxed);
 
         // 1) Standard broadcast (all devices see it)
         keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, pkt, sizeof(pkt));
@@ -1577,114 +1909,11 @@ private:
     // (Old CDJ 4-phase join sequence removed -- STC uses bridge join only)
 
     //==========================================================================
-    // Bridge join sequence -- announces our presence on the network.
-    //
-    // From capture analysis: the DJM responds in <0.2s after the FIRST
-    // 54B keepalive broadcast. The 21 claims the reference implementation sends are its
-    // own slot-reservation process -- not a DJM requirement.
-    //
-    // Pioneer Bridge sends 2 hellos + 11 claims (~6s). More claims gives the
-    // DJM more time to register the bridge identity. Additive -- won't break
-    // platforms where fewer claims already worked.
+    // NOTE (v1.9.11-beta16): the bridge join sequence (hello 0x0a x2 +
+    // claim 0x02 x11, broadcast, claiming device 5) has been REMOVED.
+    // The working reference (Prueba_prodjlink_bridge.pcapng) sends zero
+    // join packets; see the note at the top of run().
     //==========================================================================
-    void performBridgeJoinSequence()
-    {
-        if (!keepaliveSock) return;
-        DBG("ProDJLink: Starting bridge join sequence (2 hello + 11 claims)");
-
-        // Hello announce x 2 (Pioneer Bridge does this)
-        for (int h = 0; h < 2; ++h)
-        {
-            if (threadShouldExit()) return;
-            sendBridgeJoinHello();
-            juce::Thread::sleep(300);
-        }
-
-        // 11 IP claims (~500ms apart, matching Pioneer Bridge timing)
-        for (int n = 1; n <= 11; ++n)
-        {
-            if (threadShouldExit()) return;
-            sendBridgeJoinClaim(n);
-            juce::Thread::sleep(500);
-        }
-
-        joinCompleted.store(true, std::memory_order_release);
-        DBG("ProDJLink: Bridge join complete - keepalive starting");
-    }
-
-    //--------------------------------------------------------------------------
-    // Bridge hello (0x0A) -- 37 bytes broadcast
-    //
-    // Packet format:
-    //   [0x00-0x09] Magic "Qspt1WmJOL"
-    //   [0x0a]      0x0A (type = hello)
-    //   [0x0b]      0x00
-    //   [0x0c-0x1f] Device name (20 bytes, null-padded)
-    //   [0x20]      0x01
-    //   [0x21]      0x01  (subtype = bridge)
-    //   [0x22]      0x00
-    //   [0x23]      0x25  (packet length = 37)
-    //   [0x24]      player number (5)
-    //--------------------------------------------------------------------------
-    void sendBridgeJoinHello()
-    {
-        uint8_t p[37] = {};
-        std::memcpy(p, ProDJLink::kMagic, 10);
-        p[0x0a] = 0x0a;  // type = hello
-        // p[0x0b] = 0x00 (already zero)
-        std::strncpy(reinterpret_cast<char*>(p + 0x0c), "TCS-SHOWKONTROL", 19);
-        p[0x20] = 0x01;
-        p[0x21] = 0x01;  // subtype = bridge
-        // p[0x22] = 0x00;
-        p[0x23] = 0x25;  // length = 37
-        p[0x24] = uint8_t(vCDJPlayerNumber);  // player = 5
-        keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, p, sizeof(p));
-    }
-
-    //--------------------------------------------------------------------------
-    // Bridge IP claim (0x02) -- 50 bytes broadcast
-    //
-    // Packet format:
-    //   [0x00-0x09] Magic
-    //   [0x0a]      0x02 (type = IP claim)
-    //   [0x0b]      0x00
-    //   [0x0c-0x1f] Device name (20 bytes)
-    //   [0x20]      0x01
-    //   [0x21]      0x01  (subtype = bridge)
-    //   [0x22]      0x00
-    //   [0x23]      0x32  (packet length = 50)
-    //   [0x24-0x27] IP address
-    //   [0x28-0x2d] MAC address
-    //   [0x2e]      auto-increment byte (varies, protocol-internal)
-    //   [0x2f]      counter (1, 2, 3, ... up to claim round count)
-    //   [0x30]      player number (5)
-    //   [0x31]      0x00
-    //--------------------------------------------------------------------------
-    void sendBridgeJoinClaim(int counter)
-    {
-        uint8_t p[50] = {};
-        std::memcpy(p, ProDJLink::kMagic, 10);
-        p[0x0a] = 0x02;  // type = IP claim
-        std::strncpy(reinterpret_cast<char*>(p + 0x0c), "TCS-SHOWKONTROL", 19);
-        p[0x20] = 0x01;
-        p[0x21] = 0x01;  // subtype = bridge
-        p[0x23] = 0x32;  // length = 50
-        std::memcpy(p + 0x24, ownIpBytes, 4);   // IP
-        std::memcpy(p + 0x28, ownMacBytes, 6);   // MAC
-        // [0x2e] = auto-increment token (XOR-based hash -- the exact value
-        // doesn't appear to affect DJM fader activation, only the overall
-        // claim structure matters)
-        p[0x2e] = uint8_t(ownMacBytes[5] ^ uint8_t(counter * 3 + 0xFB));
-        p[0x2f] = uint8_t(counter);              // counter
-        // [0x30] = player number being claimed.  The official Pioneer Bridge
-        // uses its actual player number (5) here on both platforms, verified
-        // against Bridge_Original.pcapng.  Older STC builds used 0xC0 on
-        // Windows, which DJM-A9 firmware rejects -- aligning with the
-        // captured reference makes the claim acceptable to all DJM models.
-        p[0x30] = uint8_t(vCDJPlayerNumber);
-        p[0x31] = 0x00;
-        keepaliveSock->write(broadcastIp, ProDJLink::kKeepalivePort, p, sizeof(p));
-    }
 
     //==========================================================================
     // Bridge notify (0x55) -- sent to each CDJ on port 50002.
@@ -1730,10 +1959,16 @@ private:
 
     void sendBridgeNotifyToAll()
     {
-        // Send 0x55 to all discovered CDJ players (not DJMs)
+        // Send 0x55 to discovered CDJ players (not DJMs) -- but NOT to
+        // CDJ-3000s: the reference bridge sends zero 0x55 on an all-3000 rig
+        // (Prueba_prodjlink_bridge.pcapng), and in the paired STC capture the
+        // 3000s ignored all 648 of ours (zero 0x56 replies).  The 0x55/0x56
+        // exchange is an NXS2-era metadata mechanism (see audit section 5);
+        // on 3000s STC gets metadata via the TCP dbserver instead.
         for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
         {
             if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
+            if (std::strstr(players[i].model, "3000") != nullptr) continue;
             juce::String ip(players[i].ipStr);
             if (ip.isNotEmpty())
                 sendBridgeNotify(ip);
@@ -1741,6 +1976,7 @@ private:
     }
 
     //==========================================================================
+
     // DJM on-air broadcast handler (type 0x03, port 50001)
     //
     // The DJM broadcasts this on port 50001 regardless of bridge presence.
@@ -1822,8 +2058,11 @@ private:
     }
 
     // Bridge subscribe (0x57) -- 40B sent to DJM on beat port (50001).
-    // Triggers DJM fader (0x39->50002) and VU meter (0x58->50001) delivery.
-    // Byte [33] is the subscription bitmask.
+    // Triggers DJM VU meter (0x58->50001) delivery; fader (0x39->50002)
+    // delivery is gated by the keepalive identity, not by this packet
+    // (Prueba_prodjlink_bridge.pcapng: first 0x39 arrives 96ms after the
+    // bridge's first keepalive, BEFORE its first 0x57; first 0x58 arrives
+    // 10ms after the first 0x57).
     void sendBridgeSubscribe(const std::string& djmIp)
     {
         if (!beatSock) return;
@@ -1835,22 +2074,28 @@ private:
         std::strncpy(reinterpret_cast<char*>(pkt + 11), name, 15);
         pkt[31] = 0x01;
         pkt[32] = 0x00;
-#ifdef __APPLE__
-        pkt[33] = 0xFE;  // macOS: full subscription (faders + VU)
-#else
-        pkt[33] = 0x87;  // Windows: proven bitmask (faders + VU)
-#endif
+        // Byte 33: the ONLY content byte where STC's subscribe differed from
+        // the real bridge's (Prueba_prodjlink_bridge.pcapng, DJM-A9 rig,
+        // x8 identical packets).  The reference sends 0x98; STC's previous
+        // 0x87 (Windows) / 0xFE (macOS) produced total 0x58 silence from the
+        // same DJM-A9 in the paired capture (Prueba_stc.pcapng, x216
+        // subscribes, zero replies).  The DJM-900NXS2 also ignored 0x87
+        // (BACKLOG) -- plausibly the same fix.  Single value, no platform
+        // split: the reference is one product emitting one byte.
+        pkt[33] = 0x98;
         pkt[34] = 0x00;
-        pkt[35] = 0x04;  // subtype
+        pkt[35] = 0x04;  // payload length (bytes 34-35 = 0x0004 BE)
         pkt[36] = 0x01;  // subscribe = 1
 
         auto djmStr = juce::String(djmIp);
 
-        // Send ONLY from bridgeSock (ephemeral port), matching the real Bridge
-        // which uses a dedicated port (~50006) for subscribe/notify traffic.
-        // NOT from beatSock (50001) -- that port is for receiving beats.
-        // The DJM may reject subscribes from a port it also sends data to.
-        // Fallback to beatSock only if bridgeSock is unavailable.
+        // Send ONLY from bridgeSock (port 50006), matching the real Bridge
+        // which subscribes from exactly UDP 50006 (confirmed in
+        // Prueba_prodjlink_bridge.pcapng; STC previously used an ephemeral
+        // port despite intending 50006).  NOT from beatSock (50001) -- that
+        // port is for receiving beats, and the DJM may reject subscribes
+        // from a port it also sends data to.  Fallback to beatSock only if
+        // bridgeSock is unavailable.
         auto* sock = bridgeSock ? bridgeSock.get() : beatSock.get();
         sock->write(djmStr, ProDJLink::kBeatPort, pkt, sizeof(pkt));
 
@@ -1914,6 +2159,12 @@ private:
             else if (type == ProDJLink::kKeepAliveTypeClaimStage3 && len > 0x24)
                 claimingNumber = data[0x24];
 
+            // Collision here means another peer is claiming one of our bridge
+            // identities (player 5 on the 95B, 0xC0/0xC1/0xF9 on the 54B).
+            // Those are not standard CDJ numbers, so a collision is operator
+            // error (two STC instances, or another bridge on the network) --
+            // silent recovery is not the right behaviour, so we only surface
+            // it in the log.
             const bool collidesWithUs =
                    claimingNumber != 0
                 && (claimingNumber == uint8_t(vCDJPlayerNumber)
@@ -1944,13 +2195,32 @@ private:
 
         pktCountKeepalive.fetch_add(1, std::memory_order_relaxed);
 
+        // Track the network's b30 high-water mark (byte 0x30 of peer
+        // keepalives).  Prueba_stc_beta.pcapng revealed that the CDJ-3000s'
+        // own b30 is NOT a firmware constant: they broadcast 0x04 in the
+        // early captures and 0x05 after a bridge announcing 0x05 had been on
+        // the wire -- devices ADOPT the highest value seen.  The A9's
+        // acceptance behaviour across the beta16 A/B (0x05 accepted at both
+        // 5 and 4 devices; 0x04, 0x03 and a 0x02 ramp all rejected while the
+        // mark was 0x05) fits "bridge b30 must be >= the current mark" and
+        // falsifies exact-count acceptance.  The AUTO profile therefore needs
+        // this mark, not just the device count.  Single writer (the network
+        // thread), so load/compare/store is race-free.
+        if (len >= 54 && sender != bindIp)
+        {
+            const uint8_t peerB30 = data[0x30];
+            if (peerB30 > maxPeerB30.load(std::memory_order_relaxed)
+                && peerB30 <= 0x10)   // sanity: reject garbage from malformed packets
+                maxPeerB30.store(peerB30, std::memory_order_relaxed);
+        }
+
         uint8_t pn = 0;
         if (len >= 54)
             pn = data[36];  // player_number in content
 
-        // Identity-collision diagnostic: if someone else advertises a stable
-        // keepalive for a number we are using, log it.  We only observe;
-        // active defense is not implemented (see note above).
+        // Identity-collision diagnostic: another peer keepalive-advertising
+        // one of our bridge identities means a second STC instance or a real
+        // bridge is on the network.  Surface it in the log; do not fight it.
         if (pn != 0
             && (pn == uint8_t(vCDJPlayerNumber) || pn == 0xC0 || pn == 0xC1 || pn == 0xF9)
             && sender != bindIp)
@@ -1963,7 +2233,10 @@ private:
 #endif
         }
 
-        if (pn == 0 || pn == uint8_t(vCDJPlayerNumber) || pn == 0xC0 || pn == 0xC1 || pn == 0xF9) return;  // ignore self + bridge identities
+        if (pn == 0
+            || pn == uint8_t(vCDJPlayerNumber)
+            || pn == 0xC0 || pn == 0xC1 || pn == 0xF9)
+            return;  // ignore self + bridge identities
 
         // Detect DJM mixers: device_type=0x02 AND player_number >= 0x21.
         // (CDJs also use device_type=0x02 but have player_number 1-6;
@@ -2023,7 +2296,21 @@ private:
                                std::memory_order_relaxed);
     }
 
-    void handleBeatPacket(const uint8_t* data, int len)
+    /// Find the player slot registered (via keepalive discovery) at the given
+    /// source IP.  Returns the 0-based index, or -1 if no discovered player
+    /// matches.  Network thread only: ipStr is written by this same thread at
+    /// discovery time, so the read is race-free.
+    int findPlayerIndexByIp(const juce::String& ip) const
+    {
+        for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
+        {
+            if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
+            if (ip == players[i].ipStr) return i;
+        }
+        return -1;
+    }
+
+    void handleBeatPacket(const uint8_t* data, int len, const juce::String& senderIp)
     {
         // Beat packet minimum: 36 bytes header + content
         if (len < 36) return;
@@ -2064,6 +2351,102 @@ private:
             return;
         }
 
+        // --- 0x0b Absolute Position: two wire formats share this type/size ---
+        //
+        // CDJ-3000 format (parsed further below):
+        //   byte[33] = player number (1-6); playhead ms UNSIGNED at [40];
+        //   track_len at [36]; bpm at [56].
+        //
+        // CDJ-2000NXS2 format (reference capture 2000nxs2_PDL_bridge.pcapng,
+        // STC_PRODJLINK_AUDIT.md section 2 -- 60 B, ~55 Hz, unicast):
+        //   bytes [32-33] = ROLLING COUNTER (not a player number!);
+        //   [40-43] = int32 BE = NEGATED playback position in ms
+        //             (position_ms = -int32_BE(pkt + 0x28));
+        //   remaining fields are constants -- no track_len, no bpm, no pitch.
+        //
+        // Discriminator: int32_BE(data+40) < 0 -> NXS2 format.  A genuine
+        // CDJ-3000 playhead would need to exceed 2^31 ms (~596 hours) to read
+        // negative, which cannot happen; the NXS2 value observed in the
+        // capture is always <= -48 while a track is loaded.
+        //
+        // Attribution MUST be by source IP for this format: byte[33] cycles
+        // 0x00-0xFF, so routing it through the player-number gate below would
+        // silently drop most packets and misattribute the rest to random
+        // players (with a garbage position of ~4.29e9 ms from the unsigned
+        // read).  This is why "just un-gating the NXS2" was never enough.
+        if (type == ProDJLink::kBeatTypeAbsPosition && len >= 60)
+        {
+            int32_t rawPos = (int32_t) ProDJLink::readU32BE(data + 40);
+            if (rawPos < 0)
+            {
+                int idx = findPlayerIndexByIp(senderIp);
+                if (idx < 0)
+                    return;  // 0x0b from an IP we have not registered via keepalive yet
+                auto& p = players[idx];
+
+                // CDJ-3000s ALSO emit a second 0x0b variant alongside the
+                // primary one: byte[33] in 0x80-0xFF and a negative int32 at
+                // [40] -- structurally indistinguishable from the NXS2 format.
+                // beta14 dropped those via the player-number gate; plausibly
+                // they are the legacy-encoded position kept for ecosystem
+                // backwards compatibility, but until a capture proves the
+                // negated value matches the primary packet's position, keep
+                // dropping them for 3000 models.  Their primary 0x0b already
+                // provides the position, and mis-parsing here would corrupt
+                // the one path that currently works on real hardware.
+                // (Verification recipe: in any CDJ-3000 capture, compare
+                // -int32_BE(+40) of the high-byte[33] packets against
+                // uint32_BE(+40) of the adjacent low-byte[33] packets.)
+                if (std::strstr(p.model, "3000") != nullptr)
+                    return;
+
+                uint32_t playhead = (uint32_t)(-(int64_t)rawPos);
+
+                p.hasAbsolutePosition.store(true, std::memory_order_relaxed);
+                // Real abs position supersedes the beatCount*60000/BPM
+                // derivation -- clear the flag so position-source reporting
+                // and any beat-derived consumers treat this player exactly
+                // like a CDJ-3000 from here on.  (TimecodeEngine's beat-grid
+                // correction already keys on hasAbsolutePosition and becomes
+                // a fallback automatically.)
+                p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
+
+                double absNow = juce::Time::getMillisecondCounterHiRes();
+                p.absPositionTs.store(absNow, std::memory_order_relaxed);
+                p.lastPacketTime.store(absNow, std::memory_order_relaxed);
+
+                // Reverse play detection -- same logic as the CDJ-3000 path.
+                // NXS2 status packets never populate loopStartMs/loopEndMs
+                // (extended loop fields are 0x200-byte 3000 status only), so
+                // inLoop stays false here, which is the correct behaviour.
+                if (p.prevAbsPosMs > 0 && p.isPlaying.load(std::memory_order_relaxed))
+                {
+                    bool inLoop = (p.loopStartMs.load(std::memory_order_relaxed) != 0
+                                && p.loopEndMs.load(std::memory_order_relaxed) != 0);
+                    bool rev = !inLoop && (playhead + 10 < p.prevAbsPosMs);
+                    p.isReverse.store(rev, std::memory_order_relaxed);
+                }
+                else
+                {
+                    p.isReverse.store(false, std::memory_order_relaxed);
+                }
+                p.prevAbsPosMs = playhead;
+
+                p.playheadMs.store(playhead, std::memory_order_relaxed);
+
+                // Deliberately NOT touched here: trackLenSec, bpmRaw, pitchRaw.
+                // In this format those offsets hold constants, not data --
+                // BPM/pitch keep coming from status (0x0a) and beat (0x28)
+                // packets, track length from metadata as before.
+
+                pktCountAbsPos.fetch_add(1, std::memory_order_relaxed);
+                p.cntAbsPosPkts.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // rawPos >= 0: fall through to the classic player-number-addressed
+            // CDJ-3000 parse below.
+        }
+
         uint8_t pn   = data[33];  // player_number
 
         if (pn == 0 || pn > ProDJLink::kMaxPlayers) return;
@@ -2072,13 +2455,32 @@ private:
 
         if (type == ProDJLink::kBeatTypeAbsPosition && len >= 60)
         {
-            // Absolute Position packet (CDJ-3000)
+            // Source-IP cross-check (v1.9.11-beta15): a 0x0b claiming player N
+            // must arrive from player N's registered IP.  This closes the
+            // residual misattribution vector left by the sign discriminator
+            // above: a rolling-counter-format 0x0b whose int32 at [40] reads
+            // exactly 0 (e.g. an NXS2 with no track loaded -- the capture only
+            // proves <= -48 WITH a track) would fall through to here, and if
+            // its counter byte happens to land on 1-6 it would write the
+            // constant at [36] (0x27ffff50 = 671M "seconds") into a random
+            // player's trackLen plus garbage bpm.  A genuine CDJ-3000-format
+            // 0x0b always comes from the player it names, so this check is
+            // free for the working path.  (Pre-discovery packets are dropped
+            // too: ipStr is empty until the player's first keepalive, but a
+            // CDJ only starts unicasting 0x0b after it has registered US,
+            // which is always after we have registered IT.)
+            if (senderIp != p.ipStr)
+                return;
+
+            // Absolute Position packet (CDJ-3000 format)
             //
             // The CDJ-3000 sends PAIRS of 0x0b packets every ~30ms:
             //   1) Real position data: byte[33] = player number (1-6)
-            //   2) Unknown variant:    byte[33] = high random value (0x80-0xFF)
-            // The second variant has garbage in the position fields and is
-            // already filtered by the pn > kMaxPlayers check above.
+            //   2) Legacy/NXS2-format variant: byte[33] = rolling counter
+            //      (0x80-0xFF range observed), negative int32 at [40].
+            // The second variant is sign-discriminated and dropped for 3000
+            // models in the block above (see the rationale there); packets
+            // reaching this point have byte[33] = a valid player number.
             // Confirmed from Wireshark captures on both Mac and Windows.
             //
             // Content at offset 36:
@@ -2132,6 +2534,7 @@ private:
             p.playheadMs.store(playhead, std::memory_order_relaxed);
 
             pktCountAbsPos.fetch_add(1, std::memory_order_relaxed);
+            p.cntAbsPosPkts.fetch_add(1, std::memory_order_relaxed);
         }
         else if (type == ProDJLink::kBeatTypeBeat && len >= 96)
         {
@@ -2154,13 +2557,18 @@ private:
                 p.pitchRaw.store(pitch, std::memory_order_relaxed);
                 p.bpmRaw.store(bpm, std::memory_order_relaxed);
 
-                // --- NXS2 beat-derived position advancement ---
+                // --- NXS2 beat-derived position advancement (FALLBACK) ---
                 // Beat packets arrive at the exact moment of each beat (~2Hz at 120BPM).
-                // For NXS2 (no abspos), advance beatCount by 1 and derive a fresh
+                // While no abs position flows (identity not yet accepted by the
+                // player, or 0x0b lost), advance beatCount by 1 and derive a fresh
                 // playhead position.  This gives additional position anchors between
                 // the 5Hz status packets, reducing the interpolation gap from ~200ms
                 // to ~80ms at 120BPM.  The next status packet corrects beatCount to
                 // the authoritative CDJ value (self-correcting).
+                // NOTE (beta15): the NXS2 DOES send 0x0b (~55Hz) once it accepts
+                // our bridge identity -- see the NXS2-format parser in this
+                // function.  The hasAbsolutePosition gate above makes this whole
+                // block dormant the moment real abs position arrives.
                 if (p.hasBeatDerivedPosition.load(std::memory_order_relaxed))
                 {
                     uint32_t bc = p.beatCount.load(std::memory_order_relaxed);
@@ -2185,7 +2593,7 @@ private:
         }
     }
 
-    void handleStatusPacket(const uint8_t* data, int len)
+    void handleStatusPacket(const uint8_t* data, int len, const juce::String& sender)
     {
         // DJM packets can also arrive on port 50002 depending on firmware/network.
         // Route them to the appropriate handler before the CDJ length check.
@@ -2217,7 +2625,56 @@ private:
         int idx = pn - 1;
         auto& p = players[idx];
 
+        // --- Status-based ("phantom") discovery (v1.9.11-beta19) ---
+        // Multi-deck all-in-one units announce ONE keepalive identity but
+        // stream status and beat packets for TWO player numbers.  Field
+        // case: the XDJ-XZ keepalives only as device 1 yet unicasts full
+        // 0x0a status for players 1 AND 2 from the same IP
+        // (Wireshark_Capture_XDJ_XZ_after_IP_Change.pcapng, audit 12.10).
+        // Keepalive-only discovery left deck 2 permanently undiscovered:
+        // dead PDL View tile, no metadata requests, no 95B, no timecode
+        // routing.  Register a player from its status stream after 3
+        // consecutive packets from a stable source IP -- the threshold
+        // keeps one corrupted datagram from creating a ghost, and at ~5Hz
+        // status cadence adds <1s of discovery latency.  Liveness is
+        // already status-driven (lastPacketTime below), so no flapping.
+        if (!p.discovered.load(std::memory_order_relaxed))
+        {
+            const auto senderStd = sender.toStdString();
+            if (p.statusSeenCount > 0
+                && std::strncmp(p.statusSeenIp, senderStd.c_str(), 15) != 0)
+                p.statusSeenCount = 0;   // source IP changed: start over
+            if (p.statusSeenCount == 0)
+            {
+                std::strncpy(p.statusSeenIp, senderStd.c_str(), 15);
+                p.statusSeenIp[15] = '\0';
+            }
+            if (++p.statusSeenCount >= 3)
+            {
+                p.playerNumber.store(pn, std::memory_order_relaxed);
+                // Device name travels in the status packet too (bytes 11-30,
+                // one byte earlier than in keepalives: no subtype byte).
+                std::memset(p.model, 0, sizeof(p.model));
+                {
+                    int copyLen = std::min(20, len - 11);
+                    if (copyLen > 0)
+                        std::memcpy(p.model, data + 11, copyLen);
+                    p.model[20] = '\0';
+                    for (int c = 0; c < 20 && p.model[c] != '\0'; ++c)
+                        if (static_cast<unsigned char>(p.model[c]) > 127)
+                            p.model[c] = '?';
+                }
+                std::strncpy(p.ipStr, senderStd.c_str(), 15);
+                p.ipStr[15] = '\0';
+                p.discovered.store(true, std::memory_order_release);
+                DBG("ProDJLink: Player " << (int)pn << " STATUS-discovered ("
+                    << p.model << ") at " << sender
+                    << " -- multi-deck device, this deck sends no keepalive");
+            }
+        }
+
         pktCountStatus.fetch_add(1, std::memory_order_relaxed);
+        p.cntStatusPkts.fetch_add(1, std::memory_order_relaxed);
 
         // --- Parse key fields ---
         // Byte offsets determined from python-prodj-link Construct struct:
@@ -2309,9 +2766,13 @@ private:
         {
             uint32_t bc = ProDJLink::readU32BE(data + 160);
 
-            // --- Beat-derived playhead for non-CDJ-3000 models ---
-            // NXS2 and older players don't send Absolute Position packets (0x0b).
-            // Derive playhead from: beatCount x (60000 / BPM).
+            // --- Beat-derived playhead (FALLBACK while no abs position flows) ---
+            // Historically documented as "NXS2 and older players don't send
+            // 0x0b" -- disproved by the reference capture (rev 3 audit): the
+            // NXS2 streams 0x0b at ~55Hz to a bridge identity it accepts.  It
+            // just never sent it to *us* while our 54B identity was rejected.
+            // This derivation (beatCount x 60000/BPM) therefore remains as the
+            // fallback for players that have not (yet) accepted our identity.
             // Updated at ~5Hz (status packet rate). PLL smooths between updates
             // using actualSpeed (offset 152) or dp/dt fallback.
             //
@@ -2995,6 +3456,24 @@ private:
     // Bridge config
     int vCDJPlayerNumber = ProDJLink::kDefaultVCDJNumber;  // always 5 for bridge mode
 
+    // Bridge identity profile for the 54B keepalive + 95B keepalive scope.
+    // See the ProDJLink namespace constants for rationale and provenance.
+    // Both are user settings applied by MainComponent; they intentionally
+    // survive reset() so a stop()/start() cycle keeps the operator's choice.
+    std::atomic<int> bridgeIdentityProfile { ProDJLink::kBridgeIdentityF9 };
+    std::atomic<int> dbKeepaliveMode       { ProDJLink::kDbKeepaliveAll };
+    // Last identity bytes actually emitted in the 54B keepalive (for the PDL
+    // View diagnostics line; with AUTO these are computed per tick).
+    std::atomic<uint8_t> lastKaDev { 0xF9 };
+    std::atomic<uint8_t> lastKaB30 { 0x04 };
+    // AUTO profile: b30 computed ONCE per session after the listen window,
+    // then frozen (0 = not yet computed).  Cleared at thread start so a
+    // stop()/start() re-listens and re-announces with a fresh count.
+    std::atomic<uint8_t> autoIdentityB30 { 0 };
+    // Highest b30 observed in peer keepalives this session (the network's
+    // "high-water mark").  See handleKeepalivePacket for provenance.
+    std::atomic<uint8_t> maxPeerB30 { 0 };
+
     // Known DJM mixers for bridge subscription (protected by djmIpLock)
     juce::CriticalSection         djmIpLock;
     std::vector<std::string>      djmIps;
@@ -3009,7 +3488,6 @@ private:
 
     // Run flag
     std::atomic<bool> isRunningFlag { false };
-    std::atomic<bool> joinCompleted { false };
 
     // Diagnostics
     std::atomic<uint32_t> pktCountKeepalive  { 0 };

@@ -50,14 +50,32 @@ public:
 
         // --- Toolbar buttons ---
         addAndMakeVisible(btnLayout);
-        btnLayout.setButtonText("4x1");
         btnLayout.setColour(juce::TextButton::buttonColourId, bgDeck);
         btnLayout.setColour(juce::TextButton::textColourOffId, textMid);
         btnLayout.setClickingTogglesState(false);
+        updateLayoutButtonLabel();  // initial label from current state
+        // 3-state cycle: 2x2 grid -> 4x1 horizontal -> alternating -> 2x2.
+        // The button text shows the NEXT state (continuing the original
+        // 2-state convention), so the operator always sees what a click
+        // will do.  The cycle deliberately clears layoutHorizontal when
+        // leaving alternating mode, so the next click after ALT always
+        // lands back at the 2x2 starting point (predictable round-trip).
         btnLayout.onClick = [this]
         {
-            layoutHorizontal = !layoutHorizontal;
-            btnLayout.setButtonText(layoutHorizontal ? "2x2" : "4x1");
+            if (layoutAlternating)
+            {
+                layoutAlternating = false;
+                layoutHorizontal  = false;   // ALT -> 2x2
+            }
+            else if (layoutHorizontal)
+            {
+                layoutAlternating = true;    // 4x1 -> ALT
+            }
+            else
+            {
+                layoutHorizontal = true;     // 2x2 -> 4x1
+            }
+            updateLayoutButtonLabel();
             resized();
             repaint();
             if (onLayoutChanged) onLayoutChanged();
@@ -99,7 +117,13 @@ public:
     void setLayoutHorizontal(bool h)
     {
         layoutHorizontal = h;
-        btnLayout.setButtonText(layoutHorizontal ? "2x2" : "4x1");
+        updateLayoutButtonLabel();
+        resized(); repaint();
+    }
+    void setLayoutAlternating(bool a)
+    {
+        layoutAlternating = a;
+        updateLayoutButtonLabel();
         resized(); repaint();
     }
     void setShowMixer(bool m)
@@ -108,8 +132,9 @@ public:
         btnShowMixer.setToggleState(m, juce::dontSendNotification);
         resized(); repaint();
     }
-    bool getLayoutHorizontal() const { return layoutHorizontal; }
-    bool getShowMixer()        const { return showMixer; }
+    bool getLayoutHorizontal()  const { return layoutHorizontal;  }
+    bool getLayoutAlternating() const { return layoutAlternating; }
+    bool getShowMixer()         const { return showMixer; }
 
 private:
     //==========================================================================
@@ -407,6 +432,8 @@ public:
         btnLayout.setBounds(toolbar.removeFromLeft(40));
         toolbar.removeFromLeft(6);
         btnShowMixer.setBounds(toolbar.removeFromLeft(60));
+        toolbar.removeFromLeft(8);
+        diagBounds = toolbar;   // PDL diagnostics readout (v1.9.11-beta15)
         bounds.removeFromTop(4);
 
         // --- Mixer panel (right side, conditional) ---
@@ -424,7 +451,25 @@ public:
         // --- Deck layout ---
         int gapH = 4, gapV = 4;
 
-        if (layoutHorizontal)
+        if (layoutAlternating)
+        {
+            // Alternating (1x4 vertical stack): each deck takes the full
+            // remaining width and 1/4 of remaining height.  The deck's
+            // own paintDeckStatic lays its waveform across the full deck
+            // width, so a wide window gives a wide waveform -- this is
+            // the whole point of the mode (phrase structure / breakdown
+            // visibility) compared with 4x1 horizontal where each deck
+            // is squeezed to ~25 % of the window width.
+            int totalDeckH = juce::jmax(0, bounds.getHeight() - gapV * 3);
+
+            for (int i = 0; i < 4; ++i)
+            {
+                int h = totalDeckH * (i + 1) / 4 - totalDeckH * i / 4;
+                deckBounds[i] = bounds.removeFromTop(h);
+                if (i < 3) bounds.removeFromTop(gapV);
+            }
+        }
+        else if (layoutHorizontal)
         {
             // 4x1: four decks side by side, evenly distributed
             int totalDeckW = juce::jmax(0, bounds.getWidth() - gapH * 3);
@@ -459,6 +504,16 @@ public:
     //==========================================================================
     void timerCallback() override
     {
+        // Refresh the PDL diagnostics readout (~2Hz).  Everything below
+        // repaints deck regions only, which would otherwise leave the
+        // toolbar counters frozen at their first-paint values.
+        if (++diagRefreshTick >= 30)
+        {
+            diagRefreshTick = 0;
+            if (!diagBounds.isEmpty())
+                repaint(diagBounds);
+        }
+
         for (int deck = 0; deck < 4; ++deck)
         {
             int pn = deck + 1; // 1-based player number
@@ -1292,6 +1347,50 @@ public:
         // Paint mixer (only if visible)
         if (showMixer && !mixerBounds.isEmpty())
             paintMixer(g, mixerBounds);
+
+        paintPdlDiagnostics(g);
+    }
+
+    //==========================================================================
+    // PDL diagnostics readout (v1.9.11-beta15)
+    //
+    // One line in the toolbar with everything a tester screenshot must
+    // answer for the NXS2 identity A/B (STC_PRODJLINK_AUDIT.md):
+    //   ID    -- active 54B bridge identity profile (F9 or C0)
+    //   95B   -- 95B keepalive scope (ALL / 3000 / OFF)
+    //   TCP12523 -- inbound dbserver probes accepted since start (the SYN
+    //               storm detector: must be 0 with C0 + 95B OFF)
+    //   Pn ST:x AP:y -- per discovered player, unicast status (0x0a) and
+    //               abs position (0x0b) packets received.  AP > 0 on an
+    //               NXS2 is the decisive "identity accepted" evidence.
+    //==========================================================================
+    void paintPdlDiagnostics(juce::Graphics& g)
+    {
+        if (diagBounds.isEmpty() || diagBounds.getWidth() < 120) return;
+
+        const int mode = proDJLink.getDbKeepaliveMode();
+
+        // Show the identity pair actually on the wire (0x24/0x30 of the 54B
+        // keepalive) -- with the AUTO profile the pair is computed, so the
+        // screenshot must reflect reality, not the combo label.
+        juce::String diag;
+        diag << "ID:" << juce::String::toHexString((int) proDJLink.getLastKeepaliveDev()).toUpperCase()
+             << "/"   << juce::String::toHexString((int) proDJLink.getLastKeepaliveB30()).paddedLeft('0', 2).toUpperCase()
+             << "  95B:" << (mode == ProDJLink::kDbKeepaliveAll ? "ALL"
+                             : mode == ProDJLink::kDbKeepalive3000 ? "3000" : "OFF")
+             << "  TCP12523:" << (int) dbClient.getDbPortInboundCount();
+
+        for (int pn = 1; pn <= ProDJLink::kMaxPlayers; ++pn)
+        {
+            if (!proDJLink.isPlayerDiscovered(pn)) continue;
+            diag << "  |  P" << pn
+                 << " ST:" << (int) proDJLink.getPlayerStatusCount(pn)
+                 << " AP:" << (int) proDJLink.getPlayerAbsPosCount(pn);
+        }
+
+        g.setColour(textMid);
+        g.setFont(juce::Font(juce::FontOptions(11.0f)));
+        g.drawText(diag, diagBounds, juce::Justification::centredRight, false);
     }
 
 private:
@@ -1313,12 +1412,30 @@ private:
     DeckState deckState[4];
     juce::Rectangle<int> deckBounds[4];
     juce::Rectangle<int> mixerBounds;
+    juce::Rectangle<int> diagBounds;   // toolbar remainder for the diagnostics readout
+    int diagRefreshTick = 0;           // throttles the diag repaint to ~2Hz
 
     // Layout state
-    bool layoutHorizontal = false;   // false = 2x2 grid, true = 4x1 horizontal
-    bool showMixer        = true;    // show DJM mixer strip
+    bool layoutHorizontal  = false;  // false = 2x2 grid, true = 4x1 horizontal
+    bool layoutAlternating = false;  // when true, overrides above: 4 decks
+                                     // stacked vertically with full-window-
+                                     // width waveforms.  Trades vertical
+                                     // space for more readable waveforms.
+    bool showMixer         = true;   // show DJM mixer strip
     juce::TextButton   btnLayout;
     juce::ToggleButton btnShowMixer;
+
+    // Updates the layout cycle button's text to reflect the NEXT state
+    // (so the operator sees what a click will do, continuing the original
+    // 2-state convention).  Order: 2x2 -> 4x1 -> ALT -> 2x2.
+    void updateLayoutButtonLabel()
+    {
+        const char* next = "2x2";
+        if (layoutAlternating)         next = "2x2";   // ALT -> 2x2
+        else if (layoutHorizontal)     next = "ALT";   // 4x1 -> ALT
+        else                           next = "4x1";   // 2x2 -> 4x1
+        btnLayout.setButtonText(next);
+    }
 
     // Smoothed VU meter levels (decay-based, updated per timer tick)
     // Indices: 0-5=CH1-CH6, kVuMasterL=MasterL, kVuMasterR=MasterR
@@ -2635,7 +2752,7 @@ public:
                 auto centre = b.getCentre();
                 bool onScreen = false;
                 for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
-                    if (disp.totalArea.contains(centre)) { onScreen = true; break; }
+                    if (disp.logicalBounds.contains(centre.toFloat())) { onScreen = true; break; }
                 if (onScreen)
                     setBounds(b);
             }
@@ -2652,10 +2769,23 @@ public:
         }
     }
 
+    void setLayoutAlternating(bool alternating)
+    {
+        if (auto* c = dynamic_cast<ProDJLinkViewComponent*>(getContentComponent()))
+            c->setLayoutAlternating(alternating);
+    }
+
     bool getLayoutHorizontal() const
     {
         if (auto* c = dynamic_cast<const ProDJLinkViewComponent*>(getContentComponent()))
             return c->getLayoutHorizontal();
+        return false;
+    }
+
+    bool getLayoutAlternating() const
+    {
+        if (auto* c = dynamic_cast<const ProDJLinkViewComponent*>(getContentComponent()))
+            return c->getLayoutAlternating();
         return false;
     }
 

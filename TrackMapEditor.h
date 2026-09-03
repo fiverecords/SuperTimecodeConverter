@@ -268,6 +268,23 @@ public:
                                      juce::dontSendNotification);
     }
 
+    /// Show or hide the Learn "Player:" combo.
+    ///
+    /// The player selector only applies to the ProDJLink source, where the
+    /// user might want to learn the track loaded on any one of up to four
+    /// CDJs.  StageLinQ exposes its current deck through the engine's
+    /// active-track cache directly, and Winamp has no player concept at
+    /// all (one Winamp = one playhead).  For both of those, the combo is
+    /// hidden and `onLearn()` skips the ProDJLink-direct path in favour of
+    /// the `onLearnTrackInfo` callback which reads from the current
+    /// engine's cached track info.
+    void setShowPlayerSelector(bool show)
+    {
+        lblLearnLayer.setVisible(show);
+        cmbLearnLayer.setVisible(show);
+        resized();
+    }
+
     /// Phase 2: set metadata client for enriched Learn data
     void setDbServerClient(DbServerClient* client) { dbClient = client; }
 
@@ -307,8 +324,11 @@ public:
         auto btnRow = area.removeFromTop(28);
         int bw = 64;
         btnLearn.setBounds(btnRow.removeFromLeft(bw));   btnRow.removeFromLeft(4);
-        lblLearnLayer.setBounds(btnRow.removeFromLeft(38));
-        cmbLearnLayer.setBounds(btnRow.removeFromLeft(100));  btnRow.removeFromLeft(8);
+        if (lblLearnLayer.isVisible())
+        {
+            lblLearnLayer.setBounds(btnRow.removeFromLeft(38));
+            cmbLearnLayer.setBounds(btnRow.removeFromLeft(100));  btnRow.removeFromLeft(8);
+        }
         btnAdd.setBounds(btnRow.removeFromLeft(bw));      btnRow.removeFromLeft(4);
         btnDelete.setBounds(btnRow.removeFromLeft(bw));  btnRow.removeFromLeft(4);
         btnClearAll.setBounds(btnRow.removeFromLeft(bw));
@@ -490,6 +510,7 @@ private:
     std::string activeTrackKey;  // artist|title key of currently playing track
     int editingRow = -1;               // -1 = adding new, >= 0 = editing existing
     int learnedDurationSec = 0;        // captured from CDJ during Learn (used for new entries)
+    bool learnRetryInProgress = false; // a Learn click is awaiting late-arriving duration
 
     //--------------------------------------------------------------------------
     // Colours (matching MainComponent)
@@ -1023,11 +1044,24 @@ private:
     //--------------------------------------------------------------------------
     void onLearn()
     {
+        if (learnRetryInProgress) return;  // retry already scheduled
+
         juce::String learnArtist, learnTitle;
         learnedDurationSec = 0;
 
-        // Try ProDJLink first (direct player selection via combo)
-        if (proDJLinkInput && proDJLinkInput->getIsRunning())
+        // Prefer the ProDJLink direct read when (and only when) the player
+        // selector is visible -- that combo is the user's "I want to learn
+        // from CDJ player N" affordance.  When the host has hidden the
+        // selector (current engine source is StageLinQ or Winamp, neither
+        // of which has a meaningful Player combo) we go straight to the
+        // engine-callback fallback instead, otherwise a coincidentally
+        // running shared ProDJLink input would override the user's actual
+        // source and learn the wrong track.
+        const bool useProDJLinkPath = lblLearnLayer.isVisible()
+                                   && proDJLinkInput != nullptr
+                                   && proDJLinkInput->getIsRunning();
+
+        if (useProDJLinkPath)
         {
             int player = cmbLearnLayer.getSelectedId();
             uint32_t cdjId = proDJLinkInput->getTrackID(player);
@@ -1056,7 +1090,8 @@ private:
                     learnedDurationSec = meta.durationSeconds;
             }
         }
-        // Fallback: get track info from the active engine (StageLinQ, etc.)
+        // Fallback: get track info from the active engine (StageLinQ,
+        // Winamp, etc.)
         else if (onLearnTrackInfo)
         {
             auto info = onLearnTrackInfo();
@@ -1072,12 +1107,106 @@ private:
         if (learnTitle.isEmpty())
             return;  // can't learn without any title
 
-        // If entry already exists, open it for editing
-        if (trackMap.contains(learnArtist, learnTitle, learnedDurationSec))
+        // If the source returned duration=0 (the typical case is the first
+        // ~1 s of a freshly loaded MP3 in Winamp / AIMP -- the audio
+        // decoder is still scanning the file for its length), wait a bit
+        // and retry rather than save an entry with no duration.  An entry
+        // without duration matches tracks fuzzily through tier-2 fallback
+        // but its cue-point editor timeline has no scale, so the user
+        // would see a blank waveform with no cursor.  Up to 2.5 s of
+        // background retries usually catches the late-arriving duration.
+        // Only retry on the engine-callback path -- ProDJLink always
+        // returns a duration immediately (it comes from the CDJ status
+        // packet, not from local decoding).
+        if (learnedDurationSec == 0 && !useProDJLinkPath && onLearnTrackInfo)
+        {
+            learnRetryInProgress = true;
+            btnLearn.setEnabled(false);
+            btnLearn.setButtonText("Learning...");
+            scheduleLearnRetry(learnArtist, learnTitle, 0);
+            return;
+        }
+
+        completeLearn(learnArtist, learnTitle, learnedDurationSec);
+    }
+
+    /// Re-poll the engine callback after a short delay to pick up a late-
+    /// arriving duration (Winamp / AIMP VBR decode lag, StageLinQ
+    /// TrackLength state-map late arrival).  Cancels itself if the editor
+    /// is closed in the meantime (SafePointer guard) or if the player has
+    /// moved on to a different track.
+    void scheduleLearnRetry(juce::String artist, juce::String title, int attempt)
+    {
+        constexpr int kMaxAttempts = 10;   // 10 * 250 ms = 2.5 s total
+        constexpr int kDelayMs     = 250;
+
+        if (attempt >= kMaxAttempts)
+        {
+            // Give up and proceed with duration = 0; the entry still works
+            // for matching via the tier-2 fallback (artist + title).
+            completeLearn(artist, title, 0);
+            return;
+        }
+
+        juce::Component::SafePointer<TrackMapEditor> safeThis(this);
+        juce::Timer::callAfterDelay(kDelayMs,
+            [safeThis, artist, title, attempt]()
+            {
+                if (safeThis == nullptr) return;        // editor closed
+                if (! safeThis->learnRetryInProgress) return;  // cancelled
+                if (! safeThis->onLearnTrackInfo)
+                {
+                    safeThis->finishLearnRetry();
+                    return;
+                }
+
+                auto info = safeThis->onLearnTrackInfo();
+                if (info.artist != artist || info.title != title)
+                {
+                    // Player jumped to a different track during the retry
+                    // window -- abort silently rather than learn the wrong
+                    // track.
+                    safeThis->finishLearnRetry();
+                    return;
+                }
+
+                if (info.durationSec > 0)
+                {
+                    safeThis->completeLearn(artist, title, info.durationSec);
+                }
+                else
+                {
+                    safeThis->scheduleLearnRetry(artist, title, attempt + 1);
+                }
+            });
+    }
+
+    /// Restore Learn button to its idle state.  Called when a retry chain
+    /// terminates, either with success (completeLearn does this implicitly)
+    /// or with abort (track changed, callback gone, attempts exhausted
+    /// without resolution).
+    void finishLearnRetry()
+    {
+        learnRetryInProgress = false;
+        btnLearn.setEnabled(true);
+        btnLearn.setButtonText("Learn");
+    }
+
+    /// Commit a learned track: either jump to its existing entry in the
+    /// table or open a fresh form pre-filled with the captured fields.
+    /// Shared between the immediate-Learn and the retry paths so the form
+    /// opens identically regardless of how long the duration took to
+    /// arrive.
+    void completeLearn(juce::String artist, juce::String title, int durationSec)
+    {
+        learnedDurationSec = durationSec;
+        finishLearnRetry();
+
+        if (trackMap.contains(artist, title, durationSec))
         {
             rebuildRows();
             table.updateContent();
-            auto targetKey = TrackMapEntry::makeKey(learnArtist, learnTitle, learnedDurationSec);
+            auto targetKey = TrackMapEntry::makeKey(artist, title, durationSec);
             for (int i = 0; i < (int)rows.size(); ++i)
             {
                 if (rows[(size_t)i]->key() == targetKey)
@@ -1090,7 +1219,7 @@ private:
         }
         else
         {
-            openFormForNew(learnArtist, learnTitle);
+            openFormForNew(artist, title);
         }
     }
 

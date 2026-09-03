@@ -323,6 +323,15 @@ public:
         shouldPlay.store(true,  std::memory_order_release);
         userPaused.store(false, std::memory_order_release);
         if (! hasFileLoaded()) return;             // load still pending; loader will start
+        // If a load is in flight, defer transport.start() to the
+        // onLoadCompleted callback so the audio is started AT the engine's
+        // current playhead instead of from position 0.  Without this guard
+        // play() called from generatorPlay()/activateGenPreset during a
+        // hot-swap would start the previously loaded file from 0, audible
+        // for the load duration, and then the new file would also start
+        // from 0 when attachReaderToTransport runs -- the persistent
+        // cursor/audio desync the operator reported.
+        if (pendingLoad.load(std::memory_order_acquire)) return;
         if (! deviceOpen.load(std::memory_order_relaxed)) return;
         transport.start();
     }
@@ -451,12 +460,32 @@ public:
         else
             thumbnail.setSource(new juce::FileInputSource(file));
 
+        // Mark the player as having a load in flight so subsequent play()
+        // calls (and attachReaderToTransport's auto-start logic) defer
+        // their transport.start() to the onLoadCompleted callback.  This
+        // is what keeps the audio in sync after a hot-swap: starting the
+        // transport eagerly (either via play() before the LoaderThread
+        // runs, or via attachReaderToTransport's auto-start when the load
+        // completes) would always start at position 0, producing the
+        // load-duration desync that pause+play used to fix.  Cleared by
+        // the LoaderThread itself after loadFile / unloadFile returns,
+        // so it covers every load path including the same-file early
+        // return inside loadFile().
+        pendingLoad.store(true, std::memory_order_release);
         loaderThread.request(file, shouldLoop);
     }
 
     //==========================================================================
     juce::AudioThumbnail&       getThumbnail()       { return thumbnail; }
     const juce::AudioThumbnail& getThumbnail() const { return thumbnail; }
+
+    /// Optional callback invoked on the message thread after each successful
+    /// async file load completes.  Set by the owner (TimecodeEngine) once
+    /// during construction; the lambda is expected to capture a
+    /// juce::WeakReference so that a load in flight when the engine is
+    /// destroyed does not produce a use-after-free.  See loadFile() for
+    /// the firing site and the engine's constructor for the wiring.
+    std::function<void()> onLoadCompleted;
 
 private:
     //==========================================================================
@@ -540,6 +569,22 @@ private:
                         owner.unloadFile();
                     else
                         owner.loadFile(file);
+
+                    // Single chokepoint for "load completed (or unloaded)".
+                    // Doing it here, AFTER loadFile / unloadFile returns,
+                    // covers every exit path inside loadFile -- success,
+                    // same-file early return (line 187), unsupported
+                    // format, empty / corrupt file -- so subsequent play()
+                    // / seekSeconds calls behave consistently and the
+                    // onLoadCompleted listener (TimecodeEngine's catch-up
+                    // seek) gets to run regardless of which branch the
+                    // load took inside.  Cleared BEFORE the callAsync so
+                    // play() running inside the callback (via seekSeconds)
+                    // sees pendingLoad == false and is allowed to start
+                    // the transport.
+                    owner.pendingLoad.store(false, std::memory_order_release);
+                    if (owner.onLoadCompleted)
+                        juce::MessageManager::callAsync(owner.onLoadCompleted);
                 }
             }
         }
@@ -583,9 +628,17 @@ private:
         // finished attaching).  Without this, transport.start() from play()
         // would have been a no-op (no source yet) and the user's intent
         // would be lost.
+        //
+        // EXCEPT when an onLoadCompleted listener is wired: in that case
+        // the listener (TimecodeEngine's catch-up seek) is responsible
+        // for starting the transport AT the engine's current playhead,
+        // so auto-starting here at position 0 would re-introduce the
+        // hot-swap desync.  See requestLoad / play() / the LoaderThread's
+        // callAsync for the full sequence.
         if (shouldPlay.load(std::memory_order_acquire)
             && ! userPaused.load(std::memory_order_acquire)
-            && deviceOpen.load(std::memory_order_relaxed))
+            && deviceOpen.load(std::memory_order_relaxed)
+            && ! onLoadCompleted)
         {
             transport.start();
         }
@@ -753,6 +806,13 @@ private:
     // the audio reader thread for tens to hundreds of ms with MP3).
     std::atomic<bool>   fileLoadedAtomic    { false };
     std::atomic<double> fileLengthAtomic    { 0.0 };
+
+    // Set by requestLoad, cleared by LoaderThread after loadFile/unloadFile
+    // returns.  Read by play() and attachReaderToTransport to defer
+    // transport.start() while a load is in flight -- the onLoadCompleted
+    // callback handles the start with the engine's current playhead so the
+    // audio does not race ahead of the cursor during a hot-swap.
+    std::atomic<bool>   pendingLoad         { false };
 
     juce::String currentDeviceName, currentTypeName;
     int    numChannelsAvailable = 0;

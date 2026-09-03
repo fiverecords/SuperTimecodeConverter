@@ -308,6 +308,11 @@ private:
     juce::TextButton btnGenPause  { "PAUSE" };
     juce::TextButton btnGenStop   { "STOP" };
     juce::TextEditor txtGenStartTC;
+    juce::TextEditor txtLtcUserBits;   // LTC OUT: 8-digit hex user-bits entry
+    juce::Label      lblLtcUserBits;
+    juce::ComboBox   cmbLtcUserBitsMode; // LTC OUT: manual / from LTC in / system date
+    juce::Label      lblLtcUserBitsMode;
+    juce::Label      lblLtcInUserBits; // LTC IN: recovered user-bits display
     juce::TextEditor txtGenStopTC;
     juce::Label      lblGenStartTC;
     juce::Label      lblGenStopTC;
@@ -345,6 +350,14 @@ private:
     juce::TextButton btnProDJLinkIn { "PRO DJ LINK" };
     juce::TextButton btnStageLinQIn { "STAGELINQ" };
     juce::TextButton btnHippoIn    { "HIPPONET" };
+    juce::TextButton btnWinampIn   { "WINAMP" };
+
+    // Winamp source expandable panel: read-only status / current track info.
+    // Winamp has no configuration of its own (it auto-attaches to whatever
+    // Winamp / WACUP / winamp.com instance is running), so the expanded
+    // panel shows live state instead of controls.
+    juce::Label      lblWinampInfoHeader;
+    juce::Label      lblWinampInfo;
 
     // --- Output toggles ---
     juce::ToggleButton btnMtcOut    { "MTC OUT" };
@@ -385,6 +398,8 @@ private:
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
+    juce::ComboBox cmbPdlBridgeIdentity;     juce::Label lblPdlBridgeIdentity;
+    juce::ComboBox cmbPdl95bMode;            juce::Label lblPdl95bMode;
     juce::ComboBox cmbStageLinQInterface;    juce::Label lblStageLinQInterface;
 
     // BPM Multiplier buttons (per-player, ProDJLink only)
@@ -444,7 +459,9 @@ private:
     juce::Component::SafePointer<juce::DocumentWindow> genPresetWindow;
     juce::Component::SafePointer<juce::DocumentWindow> genWaveformWindow;
     std::unique_ptr<CuePointEditorWindow> cuePointWindow;
-    std::string cuePointTrackKey;  // key of the entry being edited (for dangling ref safety)
+    std::string  cuePointTrackKey;          // key of the entry being edited (for dangling ref safety)
+    juce::String cuePointEditedArtist;      // entry's artist field, captured at editor open
+    juce::String cuePointEditedTitle;       // entry's title field, captured at editor open
     juce::TextButton btnMixerMapEdit { "Mixer Map" };
     juce::Component::SafePointer<juce::DocumentWindow> mixerMapWindow;
     juce::TextButton btnProDJLinkView { "PDL View" };
@@ -456,6 +473,9 @@ private:
     juce::ComboBox cmbTcnetInterface; juce::Label lblTcnetInterface;
     juce::ComboBox cmbTcnetLayer; juce::Label lblTcnetLayer;
     GainSlider sldTcnetOffset;        juce::Label lblTcnetOffset;
+    // Global TCNet offset (ms): venue-wide latency compensation summed
+    // with each engine's per-layer offset.  See AppSettings::tcnetGlobalOffsetMs.
+    GainSlider sldTcnetGlobalOffset;  juce::Label lblTcnetGlobalOffset;
 
     // Hippotizer output
     juce::ToggleButton btnHippoOut { "HIPPONET OUT" };
@@ -643,6 +663,17 @@ private:
     // Returns the index of another engine that has Link active, or -1 if none.
     int findLinkOwnerOtherThan(int engineIdx) const;
     int getChannelFromCombo(const juce::ComboBox& cmb) const;
+    // Same as getChannelFromCombo, but falls back to the supplied settings
+    // values when the combo is uninitialised (no selection / no items yet).
+    // The startCurrent*Output() helpers run during settings restore BEFORE
+    // populate*Channels() has filled the combo, so reading directly from
+    // the combo at that point yields id=0 and silently routes audio to
+    // stereo, ignoring the user's saved per-channel selection.  This
+    // helper hands back the persisted value in that window; once the
+    // combo is populated it behaves identically to getChannelFromCombo.
+    int getChannelFromComboOrSettings(const juce::ComboBox& cmb,
+                                      int  settingsChannel,
+                                      bool settingsStereo) const;
 
     void updateInputButtonStates();
     void updateFpsButtonStates();
@@ -655,6 +686,12 @@ private:
     void populateGenPresetCombo();
     void activateGenPreset(const juce::String& name);
     void loadGenPresetToFields(const juce::String& name);
+    // Direction: -1 = previous, +1 = next.  Cycles cmbGenPreset and chooses
+    // between browse semantics (idle: just update fields) and hot-swap
+    // semantics (playing: activate immediately, like a CDJ deck-flip).  Used
+    // by both the panel PREV/NEXT buttons and the waveform window's
+    // onPrev / onNext callbacks so all four paths share one definition.
+    void cycleGenPreset(int direction);
     void openGeneratorPresetEditor();
     void openGeneratorWaveformWindow();
     void setupOscInputServer();

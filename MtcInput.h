@@ -200,6 +200,7 @@ public:
             int value = dataByte & 0x0F;
 
             mtcData[index] = value;
+            nibbleMask |= (uint8_t)(1 << index);
 
             if (index == 7)
                 reconstructAndSync();
@@ -234,18 +235,55 @@ public:
                     lastSyncTimecode.frames  = fr;
                     syncTimeMs = juce::Time::getMillisecondCounterHiRes();
                 }
+                // A Full Frame message is an explicit locate: drop the
+                // quarter-frame continuity anchor so the next assembled
+                // sequence is accepted at face value wherever it lands.
+                continuityValid = false;
+                pendingValid    = false;
+                nibbleMask      = 0;
+
                 synced.store(true, std::memory_order_release);
             }
         }
     }
 
 private:
+    /// Linear frame index of a timecode, used only as a continuity metric.
+    /// Deliberately ignores drop-frame skips: at a 29.97DF minute rollover
+    /// this reads as a 4-frame advance instead of 2, which is inside the
+    /// tolerance below.
+    static int64_t linearFrames(const Timecode& t, int maxFrames)
+    {
+        return ((int64_t)t.hours * 3600 + (int64_t)t.minutes * 60
+                + (int64_t)t.seconds) * maxFrames + (int64_t)t.frames;
+    }
+
+    /// Shortest signed distance a - b on the 24h circle, in frames.
+    static int64_t frameDelta(int64_t a, int64_t b, int maxFrames)
+    {
+        const int64_t day = (int64_t)24 * 3600 * maxFrames;
+        int64_t d = ((a - b) % day + day) % day;
+        if (d > day / 2) d -= day;
+        return d;
+    }
+
     void reconstructAndSync()
     {
-        int frames  = mtcData[0] | (mtcData[1] << 4);
-        int seconds = mtcData[2] | (mtcData[3] << 4);
-        int minutes = mtcData[4] | (mtcData[5] << 4);
-        int hours   = mtcData[6] | ((mtcData[7] & 0x01) << 4);
+        // --- Sequence integrity ---
+        // Reconstruct only when all eight nibbles have arrived since the
+        // last reconstruction.  Without this, a dropped or delayed quarter
+        // frame silently mixes stale nibbles into the assembled value.
+        // On failure keep accumulating (do NOT clear): the mask completes
+        // naturally once a full sequence has passed through.
+        if (nibbleMask != 0xFF)
+            return;
+        nibbleMask = 0;
+
+        Timecode assembled;
+        assembled.frames  = mtcData[0] | (mtcData[1] << 4);
+        assembled.seconds = mtcData[2] | (mtcData[3] << 4);
+        assembled.minutes = mtcData[4] | (mtcData[5] << 4);
+        assembled.hours   = mtcData[6] | ((mtcData[7] & 0x01) << 4);
 
         int rateCode = (mtcData[7] >> 1) & 0x03;
 
@@ -253,28 +291,113 @@ private:
             const juce::SpinLock::ScopedLockType lock(tcLock);
             updateDetectedFps(rateCode);
 
-            int maxFrames = frameRateToInt(detectedFps);
+            const int maxFrames = frameRateToInt(detectedFps);
+
+            // Range sanity: a malformed sequence is dropped outright rather
+            // than propagated as a position.
+            if (assembled.frames  >= maxFrames || assembled.frames  < 0
+                || assembled.seconds > 59 || assembled.seconds < 0
+                || assembled.minutes > 59 || assembled.minutes < 0
+                || assembled.hours   > 23 || assembled.hours   < 0)
+            {
+                continuityValid = false;
+                return;
+            }
+
+            // --- Continuity guard (issue #16) ---
+            // The eight quarter frames of one sequence span two frame
+            // periods.  Some generators latch the timecode at the first
+            // quarter frame and send the nibbles of that single value;
+            // others emit each nibble from the live counter.  With the
+            // latter, a sequence that straddles a second boundary carries
+            // its low-order nibbles (frames, seconds -- sent first) from
+            // before the boundary and its high-order nibbles (minutes,
+            // hours) from after it, so the assembled value is a splice of
+            // two different times.
+            //
+            // At 30fps this only happens when the first quarter frame falls
+            // on an ODD frame: 30 is even, so even-aligned sequences pair
+            // as (0,1)(2,3)...(28,29) and never cross a second boundary,
+            // while odd-aligned ones pair as (1,2)...(29,0) and cross once
+            // per second.  Once per minute that crossing is also a minute
+            // rollover, and the splice reads e.g. minutes=01 with
+            // seconds=59 -- roughly a minute out, for one sequence, which
+            // is the reported glitch.  25fps alternates alignment every
+            // second because 25 is odd, so it depends on generator phase.
+            //
+            // Consecutive sequences are two frames apart, so any assembled
+            // value that is not within tolerance of the previous one plus
+            // two frames is treated as suspect and replaced by the
+            // continuity-derived value.  A genuine jump (a locate that
+            // arrives without a Full Frame message) repeats consistently,
+            // so a suspect value confirmed by the next sequence is accepted
+            // -- costing at most one extra sequence of latency on a
+            // quarter-frame-only locate.
+            static constexpr int64_t kToleranceFrames = 4;
+            const int64_t assembledLin = linearFrames(assembled, maxFrames);
+
+            if (continuityValid)
+            {
+                const Timecode expected = advanceTwoFrames(prevAssembled, detectedFps);
+                const int64_t delta = frameDelta(assembledLin,
+                                                 linearFrames(expected, maxFrames),
+                                                 maxFrames);
+
+                if (delta > kToleranceFrames || delta < -kToleranceFrames)
+                {
+                    bool confirmed = false;
+                    if (pendingValid)
+                    {
+                        const Timecode pexp = advanceTwoFrames(pendingAssembled, detectedFps);
+                        const int64_t pdelta = frameDelta(assembledLin,
+                                                          linearFrames(pexp, maxFrames),
+                                                          maxFrames);
+                        confirmed = (pdelta <= kToleranceFrames && pdelta >= -kToleranceFrames);
+                    }
+
+                    if (!confirmed)
+                    {
+                        // Reject this sequence: hold the timeline together
+                        // with the continuity-derived value and remember
+                        // the rejected one in case the next sequence
+                        // confirms it as a real jump.
+                        pendingAssembled = assembled;
+                        pendingValid     = true;
+                        assembled        = expected;
+                    }
+                    else
+                    {
+                        pendingValid = false;
+                    }
+                }
+                else
+                {
+                    pendingValid = false;
+                }
+            }
+
+            prevAssembled   = assembled;
+            continuityValid = true;
 
             // MTC quarter-frame messages describe the timecode from 2 frames
-            // prior (8 QFs x 1/4 frame = 2 frames of latency).  Adding 2 compensates
-            // so the displayed timecode matches the current position.
-            // NOTE: this compensation assumes forward playback.  Reverse or locate
-            // operations may briefly show a +/-4 frame discrepancy until the next
-            // full 8-QF cycle completes.
-            int64_t totalFrames = (int64_t)hours * 3600 * maxFrames
-                                + (int64_t)minutes * 60 * maxFrames
-                                + (int64_t)seconds * maxFrames
-                                + (int64_t)frames
-                                + 2;
-
-            lastSyncTimecode.frames  = (int)(totalFrames % maxFrames);
-            lastSyncTimecode.seconds = (int)((totalFrames / maxFrames) % 60);
-            lastSyncTimecode.minutes = (int)((totalFrames / (maxFrames * 60)) % 60);
-            lastSyncTimecode.hours   = (int)((totalFrames / (maxFrames * 3600)) % 24);
+            // prior (8 QFs x 1/4 frame = 2 frames of latency).  Advancing by
+            // two compensates so the reported position matches the present.
+            // Uses incrementFrame so 29.97 drop-frame skips are honoured --
+            // linear arithmetic here used to emit frames 00/01 of a
+            // non-tenth minute, which do not exist in drop-frame numbering.
+            // NOTE: this compensation assumes forward playback.  Reverse
+            // operations may briefly show a +/-4 frame discrepancy until the
+            // next full 8-QF cycle completes.
+            lastSyncTimecode = advanceTwoFrames(assembled, detectedFps);
 
             syncTimeMs = juce::Time::getMillisecondCounterHiRes();
         }
         synced.store(true, std::memory_order_release);
+    }
+
+    static Timecode advanceTwoFrames(const Timecode& tc, FrameRate fps)
+    {
+        return incrementFrame(incrementFrame(tc, fps), fps);
     }
 
     void updateDetectedFps(int rateCode)
@@ -299,6 +422,11 @@ private:
     {
         for (int i = 0; i < 8; i++)
             mtcData[i] = 0;
+        nibbleMask      = 0;
+        continuityValid = false;
+        pendingValid    = false;
+        prevAssembled    = Timecode();
+        pendingAssembled = Timecode();
         synced.store(false, std::memory_order_relaxed);
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
@@ -316,6 +444,15 @@ private:
 
     // Quarter-frame accumulator -- MIDI-callback-thread-only
     int mtcData[8] = {};
+    uint8_t nibbleMask = 0;          // which pieces arrived since the last reconstruction
+
+    // Quarter-frame continuity state -- MIDI-callback-thread-only.
+    // prevAssembled is the piece-0-time value of the last accepted sequence;
+    // pendingAssembled holds a rejected value awaiting confirmation.
+    Timecode prevAssembled;
+    Timecode pendingAssembled;
+    bool continuityValid = false;
+    bool pendingValid    = false;
 
     // Protected by tcLock (written from MIDI thread, read from UI thread)
     mutable juce::SpinLock tcLock;

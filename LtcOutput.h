@@ -127,6 +127,16 @@ public:
 
     float getPeakLevel() const        { return peakLevel.load(std::memory_order_relaxed); }
 
+    /// LTC user bits (32-bit "binary groups").  Displayed/entered as an
+    /// 8-digit hex value; the most significant digit occupies user group 1.
+    /// Takes effect on the next encoded frame; no reseed needed.
+    void setUserBits(uint32_t bits)   { userBits.store(bits, std::memory_order_relaxed); }
+    /// Binary group flags (bit0=BGF0, bit1=BGF1, bit2=BGF2); see SMPTE
+    /// 12M-1-2008 Table 1.  0 = user-defined data / unspecified clock.
+    void setBinaryGroupFlags(uint8_t f) { binaryGroupFlags.store(f & 0x7, std::memory_order_relaxed); }
+    uint8_t getBinaryGroupFlags() const { return binaryGroupFlags.load(std::memory_order_relaxed); }
+    uint32_t getUserBits() const      { return userBits.load(std::memory_order_relaxed); }
+
 private:
     juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
@@ -147,6 +157,17 @@ private:
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };
     std::atomic<double> pitchMultiplier { 1.0 };
+    // LTC user bits (SMPTE 12M "binary groups"): 32 bits = eight 4-bit
+    // groups carried in every frame alongside the timecode.  Free for the
+    // operator to use however they like (reel/scene/take, date, or -- as
+    // requested in issue #13 -- a value read by other equipment).  Written
+    // from the message thread, read once per frame in packFrame(); the
+    // whole word is one atomic so a frame never carries a torn value.
+    // Default 0 reproduces the previous all-zero user bits exactly.
+    std::atomic<uint32_t> userBits { 0 };
+    // Binary group flags, packed as bit0=BGF0, bit1=BGF1, bit2=BGF2.
+    // Default 0 = user-defined data, unspecified clock (12M-1 sec. 8.4.1).
+    std::atomic<uint8_t> binaryGroupFlags { 0 };
 
     // LTC encoder state -- mostly audio-callback-thread-only.
     // EXCEPTION: needNewFrame and encoderSeeded are also written by reseed()
@@ -235,6 +256,28 @@ private:
 
         std::memset(frameBits, 0, LTC_FRAME_BITS);
 
+        // --- User bits (SMPTE 12M binary groups) ---
+        // 32 bits laid into eight 4-bit groups.  Within each group the bits
+        // are LSB-first (same convention as the BCD digits above).  The
+        // groups are ordered so that the operator's hex value reads
+        // left-to-right: the most significant hex digit lands in binary
+        // group 1 (frame bits 4-7), matching how reel/date user bits are
+        // conventionally displayed and read back.  So userBits 0x12345678
+        // shows as "12345678", digit '1' in the first group.
+        const uint32_t ub = userBits.load(std::memory_order_relaxed);
+        static constexpr int kUserGroupStart[8] =
+            { 4, 12, 20, 28, 36, 44, 52, 60 };
+        for (int g = 0; g < 8; ++g)
+        {
+            const int shift  = (7 - g) * 4;           // group 0 = top nibble
+            const int nibble = (ub >> shift) & 0xF;
+            const int base   = kUserGroupStart[g];
+            frameBits[base + 0] = (nibble >> 0) & 1;
+            frameBits[base + 1] = (nibble >> 1) & 1;
+            frameBits[base + 2] = (nibble >> 2) & 1;
+            frameBits[base + 3] = (nibble >> 3) & 1;
+        }
+
         frameBits[0] = (frameUnits >> 0) & 1;
         frameBits[1] = (frameUnits >> 1) & 1;
         frameBits[2] = (frameUnits >> 2) & 1;
@@ -253,16 +296,6 @@ private:
         frameBits[24] = (secTens >> 0) & 1;
         frameBits[25] = (secTens >> 1) & 1;
         frameBits[26] = (secTens >> 2) & 1;
-
-        // Biphase polarity correction bit 27 (BGF0):
-        // even parity over bits 0-26 so total 1s in bits 0-27 is even.
-        // User bits at positions 4-7, 12-15, 20-23 are within this range
-        // and ARE correctly included in the sum.  User bits group 4 (bits
-        // 28-31) are outside this parity region and do not participate.
-        int parityLow = 0;
-        for (int i = 0; i < 27; i++)
-            parityLow += frameBits[i];
-        frameBits[27] = (parityLow & 1) ? 1 : 0;
 
         frameBits[32] = (minUnits >> 0) & 1;
         frameBits[33] = (minUnits >> 1) & 1;
@@ -286,15 +319,57 @@ private:
         frameBits[72] = 1; frameBits[73] = 1; frameBits[74] = 1; frameBits[75] = 1;
         frameBits[76] = 1; frameBits[77] = 1; frameBits[78] = 0; frameBits[79] = 1;
 
-        // Biphase polarity correction bit 59 (BGF2):
-        // even parity over bits 32-58 so total 1s in bits 32-59 is even.
-        // User bits at positions 36-39, 44-47, 52-55 are within this range
-        // and ARE correctly included in the sum.  User bits group 8 (bits
-        // 60-63) are outside this parity region and do not participate.
-        int parityHigh = 0;
-        for (int i = 32; i < 59; i++)
-            parityHigh += frameBits[i];
-        frameBits[59] = (parityHigh & 1) ? 1 : 0;
+        // --- Binary group flags and biphase polarity correction ---
+        // Per SMPTE 12M-1-2008 Table 3, three of these bit positions MOVE
+        // with the frame rate:
+        //
+        //            30/24-frame     25-frame
+        //   polarity     27              59
+        //   BGF0         43              27
+        //   BGF1         58              58
+        //   BGF2         59              43
+        //
+        // BUG FIXED HERE (v1.9.11-beta22): STC previously wrote a computed
+        // half-word parity into BOTH bit 27 and bit 59.  At 30/24 fps bit 59
+        // is not a parity bit at all -- it is BGF2 -- so roughly half of all
+        // emitted frames carried BGF2=1, BGF1=0, BGF0=0, which per Table 1
+        // declares "the binary groups contain date and time zone data
+        // encoded as described in SMPTE 309M".  STC was therefore telling
+        // 309M-aware receivers to decode its user bits as a date, with the
+        // claim flickering frame by frame according to the timecode value.
+        // At 25 fps the same happened to BGF0 (declaring ISO 8-bit character
+        // data).  Timecode decoding was unaffected -- biphase mark is
+        // polarity insensitive and most gear ignores the BGFs -- but the
+        // signalling was wrong, and it becomes actively harmful now that the
+        // binary groups carry meaningful user data.
+        const bool is25 = (fps == FrameRate::FPS_25);
+        const int bitPolarity = is25 ? 59 : 27;
+        const int bitBGF0     = is25 ? 27 : 43;
+        const int bitBGF1     = 58;
+        const int bitBGF2     = is25 ? 43 : 59;
+
+        // Binary group flags.  Default 0/0/0 = "character set not specified
+        // and unspecified clock time" (12M-1 sec. 8.4.1), under which the 32
+        // user bits "may be assigned in any manner without restriction" --
+        // exactly what STC's user-bits feature provides.  The setter exists
+        // so future work (e.g. real SMPTE ST 309 date encoding, which
+        // requires BGF2=1) can signal correctly.
+        const uint8_t bgf = binaryGroupFlags.load(std::memory_order_relaxed);
+        frameBits[bitBGF0] = (bgf >> 0) & 1;
+        frameBits[bitBGF1] = (bgf >> 1) & 1;
+        frameBits[bitBGF2] = (bgf >> 2) & 1;
+
+        // Biphase mark polarity correction (12M-1 sec. 9.2.3): the bit is set
+        // so the whole 80-bit codeword contains an even number of logical
+        // zeros.  Normative rule: if the number of logical zeros in bits
+        // 0-63, excluding the correction bit itself, is odd, set it to 1.
+        // Must run last -- every other bit in 0..63 has to be final.
+        frameBits[bitPolarity] = 0;
+        int zeros = 0;
+        for (int i = 0; i <= 63; ++i)
+            if (i != bitPolarity && frameBits[i] == 0)
+                ++zeros;
+        frameBits[bitPolarity] = (zeros & 1) ? 1 : 0;
     }
 
     //==============================================================================

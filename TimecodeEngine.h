@@ -15,6 +15,7 @@
 #include "StageLinQInput.h"
 #include "HippotizerInput.h"
 #include "HippotizerOutput.h"
+#include "WinampInput.h"
 #include "DbServerClient.h"
 #include "TriggerOutput.h"
 #include "LinkBridge.h"
@@ -40,7 +41,7 @@ inline constexpr int kMaxEngines = 8;
 class TimecodeEngine
 {
 public:
-    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ, Hippotizer };
+    enum class InputSource { MTC, ArtNet, SystemTime, LTC, ProDJLink, StageLinQ, Hippotizer, Winamp };
 
     //--------------------------------------------------------------------------
     explicit TimecodeEngine(int index, const juce::String& name = {})
@@ -52,6 +53,28 @@ public:
         // Only the primary engine (index 0) gets AudioThru
         if (index == kPrimaryEngineIndex)
             audioThru = std::make_unique<AudioThru>();
+
+        // Re-sync the audio transport to the engine's current playhead
+        // when an async file load completes during playback.  Without
+        // this, attachReaderToTransport() sets transport.setPosition(0)
+        // the moment the source is wired, but the engine has been
+        // ticking forward for the duration of the load -- the audio
+        // plays "late" until the operator pauses+plays.  Captured by
+        // juce::WeakReference so a load completing after this engine
+        // has been destroyed (engines can be removed at runtime) is a
+        // no-op rather than a use-after-free.  Runs on the message
+        // thread (callAsync dispatch), same context that owns genState
+        // and genCurrentMs, so no atomics or locks needed.
+        generatorAudioPlayer.onLoadCompleted =
+            [weak = juce::WeakReference<TimecodeEngine>(this)]()
+            {
+                auto* self = weak.get();
+                if (self == nullptr) return;
+                if (self->genState != GeneratorState::Playing) return;
+                const double audioPosSec = juce::jmax(0.0,
+                    (self->genCurrentMs - self->genStartMs) / 1000.0);
+                self->generatorAudioPlayer.seekSeconds(audioPosSec);
+            };
     }
 
     ~TimecodeEngine()
@@ -71,6 +94,7 @@ public:
         stopArtnetInput();
         stopLtcInput();
         stopHippotizerInput();
+        stopWinampInput();
         stopAudioBpm();
         // ProDJLink is shared -- not stopped per-engine
         // StageLinQ is shared -- not stopped per-engine
@@ -131,6 +155,7 @@ public:
             case InputSource::ProDJLink: stopProDJLinkInput(); break;
             case InputSource::StageLinQ: stopStageLinQInput(); break;
             case InputSource::Hippotizer: stopHippotizerInput(); break;
+            case InputSource::Winamp:     stopWinampInput();     break;
             default: break;
         }
 
@@ -157,8 +182,9 @@ public:
         if (source != InputSource::SystemTime && generatorAudioPlayer.isDeviceOpen())
             generatorAudioPlayer.closeDevice();
 
-        // Reset TrackMap cache when leaving ProDJLink / StageLinQ
-        if (source != InputSource::ProDJLink && source != InputSource::StageLinQ)
+        // Reset TrackMap cache when leaving ProDJLink / StageLinQ / Winamp
+        if (source != InputSource::ProDJLink && source != InputSource::StageLinQ
+            && source != InputSource::Winamp)
         {
             trackMapped = false;
             cachedTrackId = 0;
@@ -221,14 +247,21 @@ public:
     FrameRate getOutputFps() const { return outputFps; }
     Timecode getOutputTimecode() const { return outputTimecode; }
 
-    /// Playhead in ms from CDJ/Denon (for UI cursor / position display).
-    /// Reads directly from ProDJLinkInput or StageLinQInput.
+    /// Playhead in ms from the active input (for UI cursor / position display).
+    /// Reads directly from the corresponding input class for the source.
+    /// Winamp returns getPositionMs() which is already smoothed by the
+    /// poll-thread IIR filter, so no extra work here.
     uint32_t getSmoothedPlayheadMs() const
     {
         if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
         {
             int ep = getEffectivePlayer();
             return (ep >= 1) ? sharedStageLinQ->getPlayheadMs(ep) : 0;
+        }
+        if (activeInput == InputSource::Winamp)
+        {
+            int32_t p = winampInput.getPositionMs();
+            return p > 0 ? (uint32_t)p : 0;
         }
         if (activeInput != InputSource::ProDJLink) return 0;  // non-DJ sources use tcToMs in TCNet
         if (sharedProDJLink == nullptr) return 0;
@@ -238,12 +271,24 @@ public:
     }
 
     /// Play position as 0.0-1.0 ratio (for waveform cursor).
+    /// For Winamp this is position / duration as reported by the player.
+    /// While the duration is still being decoded (very first ~1 s of a
+    /// freshly loaded VBR file) the ratio is held at 0 to avoid jumping
+    /// the cursor to a meaningless value.
     float getSmoothedPlayPositionRatio() const
     {
         if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
         {
             int ep = getEffectivePlayer();
             return (ep >= 1) ? sharedStageLinQ->getPlayPositionRatio(ep) : 0.0f;
+        }
+        if (activeInput == InputSource::Winamp)
+        {
+            int32_t posMs = winampInput.getPositionMs();
+            int32_t durSec = winampInput.getDurationSec();
+            if (durSec <= 0 || posMs <= 0) return 0.0f;
+            float r = (float)posMs / (float)(durSec * 1000);
+            return juce::jlimit(0.0f, 1.0f, r);
         }
         if (activeInput != InputSource::ProDJLink) return 0.0f;
         if (sharedProDJLink == nullptr) return 0.0f;
@@ -271,8 +316,10 @@ public:
     {
         outputFps = fps;
         // ProDJLink has no inherent frame rate (CDJ sends ms, not frames).
-        // The user's fps choice IS the current fps.
-        if (activeInput == InputSource::ProDJLink)
+        // The user's fps choice IS the current fps.  Same applies to Winamp:
+        // the SDK returns position in ms, not frames, so the user's chosen
+        // output fps determines how the position is rendered.
+        if (activeInput == InputSource::ProDJLink || activeInput == InputSource::Winamp)
             currentFps = fps;
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
@@ -303,10 +350,105 @@ public:
     int getMtcOutputOffset() const      { return mtcOutputOffset; }
     int getArtnetOutputOffset() const   { return artnetOutputOffset; }
     int getLtcOutputOffset() const      { return ltcOutputOffset; }
-
     void setMtcOutputOffset(int v)      { mtcOutputOffset = v; }
     void setArtnetOutputOffset(int v)   { artnetOutputOffset = v; }
     void setLtcOutputOffset(int v)      { ltcOutputOffset = v; }
+
+    // LTC user-bits source modes (issue #13 follow-up).
+    static constexpr int kUserBitsManual     = 0;  // fixed operator-entered value
+    static constexpr int kUserBitsFromLtcIn  = 1;  // passthrough from this engine's LTC input
+    static constexpr int kUserBitsSystemDate = 2;  // current date as BCD YYYYMMDD
+
+    /// LTC user bits, set from an operator-entered hex string (up to 8 hex
+    /// digits; blank or unparseable = 0).  Stores the normalised text and,
+    /// in MANUAL mode, pushes the 32-bit value straight to the encoder.
+    /// In the dynamic modes the stored text is kept but the encoder is fed
+    /// by refreshDynamicUserBits() instead.
+    void setLtcUserBitsHex(const juce::String& hex)
+    {
+        ltcUserBitsHex = normaliseUserBitsHex(hex);
+        if (ltcUserBitsMode == kUserBitsManual)
+            ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
+    }
+
+    /// User-bits source mode.  Switching back to MANUAL immediately restores
+    /// the operator's stored value so the field and the wire agree again.
+    void setLtcUserBitsMode(int mode)
+    {
+        ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsSystemDate, mode);
+        if (ltcUserBitsMode == kUserBitsManual)
+            ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
+        lastSystemDateCheckMs = 0.0;   // force a recompute on the next tick
+    }
+    int getLtcUserBitsMode() const { return ltcUserBitsMode; }
+
+    /// The value currently going out on the wire, whatever the mode.
+    uint32_t getEffectiveLtcUserBits() const { return ltcOutput.getUserBits(); }
+
+    /// Current date packed as BCD YYYYMMDD (e.g. 2026-07-24 -> 0x20260724).
+    /// Note this is NOT SMPTE ST 309 (which encodes YYMMDD plus a timezone
+    /// code and requires the Binary Group Flags to be set).  STC leaves the
+    /// BGFs cleared, i.e. "user-defined data", which is what the feature was
+    /// asked for; YYYYMMDD is the convention in common use on show gear.
+    static uint32_t systemDateUserBits()
+    {
+        auto now = juce::Time::getCurrentTime();
+        const int y = now.getYear();          // full year, e.g. 2026
+        const int m = now.getMonth() + 1;     // JUCE months are 0-based
+        const int d = now.getDayOfMonth();
+        auto bcd2 = [](int v) -> uint32_t
+        {
+            v = juce::jlimit(0, 99, v);
+            return (uint32_t)(((v / 10) << 4) | (v % 10));
+        };
+        return (bcd2(y / 100) << 24) | (bcd2(y % 100) << 16)
+             | (bcd2(m)       <<  8) |  bcd2(d);
+    }
+    /// Normalised user-bits hex ("" when zero/unset), for the UI and saving.
+    juce::String getLtcUserBitsHex() const { return ltcUserBitsHex; }
+
+    /// Parse up to 8 hex digits into a 32-bit user-bits word (0 on empty).
+    static uint32_t parseUserBitsHex(const juce::String& hex)
+    {
+        juce::String h = hex.retainCharacters("0123456789abcdefABCDEF");
+        if (h.isEmpty()) return 0;
+        if (h.length() > 8) h = h.getLastCharacters(8);  // low 32 bits win
+        return (uint32_t) h.getHexValue64();
+    }
+    /// Canonical form: hex chars only, upper-case, no leading zeros ("" if 0).
+    static juce::String normaliseUserBitsHex(const juce::String& hex)
+    {
+        uint32_t v = parseUserBitsHex(hex);
+        if (v == 0) return {};
+        return juce::String::toHexString((juce::int64) v).toUpperCase();
+    }
+
+    /// Human-readable rendering of a user-bits word for the UI.
+    /// Always shows the raw 8 hex digits.  User bits are conventionally
+    /// filled with BCD, i.e. one decimal digit per 4-bit group, so when
+    /// every group holds 0-9 the hex string IS the decimal reading -- and
+    /// if it also parses as a plausible YYYYMMDD it is shown as a date.
+    /// (Converting the 32-bit word to a binary decimal integer instead
+    /// would render 0x20260724 as 539300644, which is meaningless for the
+    /// date/reel conventions these bits actually carry.)
+    static juce::String describeUserBits(uint32_t v)
+    {
+        juce::String hex = juce::String::toHexString((juce::int64) v)
+                               .paddedLeft('0', 8).toUpperCase();
+        bool allDecimal = true;
+        for (int g = 0; g < 8; ++g)
+            if (((v >> (g * 4)) & 0xF) > 9) { allDecimal = false; break; }
+        if (!allDecimal || v == 0)
+            return hex;
+
+        const int yyyy = (int) hex.substring(0, 4).getIntValue();
+        const int mm   = (int) hex.substring(4, 6).getIntValue();
+        const int dd   = (int) hex.substring(6, 8).getIntValue();
+        if (yyyy >= 1900 && yyyy <= 2099 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)
+            return hex + "  (" + hex.substring(0, 4) + "-"
+                       + hex.substring(4, 6) + "-" + hex.substring(6, 8) + ")";
+        return hex + "  (dec " + hex.trimCharactersAtStart("0") + ")";
+    }
     void setTcnetOutputOffsetMs(int v)  { tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, v); }
 
     int getTcnetOutputOffsetMs() const  { return tcnetOutputOffsetMs; }
@@ -597,6 +739,30 @@ public:
     void stopHippotizerInput() { hippotizerInput.stop(); }
 
     //==========================================================================
+    // Winamp input (per-engine, Windows-only -- the stub class on macOS makes
+    // these methods harmless no-ops without scattering #ifdefs at every call
+    // site).  Winamp has no IP / interface concept of its own; the input
+    // attaches to whatever local Winamp / WACUP / Winamp Origins window
+    // exists on the desktop the moment start() is called and keeps polling
+    // it until stop().
+    //==========================================================================
+    WinampInput& getWinampInput() { return winampInput; }
+
+    bool startWinampInput()
+    {
+        stopWinampInput();
+        if (winampInput.start())
+        {
+            inputStatusText = "WAITING FOR WINAMP...";
+            return true;
+        }
+        inputStatusText = "FAILED TO START WINAMP INPUT";
+        return false;
+    }
+
+    void stopWinampInput() { winampInput.stop(); }
+
+    //==========================================================================
     // TrackMap -- track-to-timecode-offset mapping
     //==========================================================================
 
@@ -675,6 +841,30 @@ public:
                     }
                 }
 
+                lookupTrackInMap();
+            }
+        }
+        else if (trackMapPtr && activeInput == InputSource::Winamp
+                 && winampInput.getIsRunning() && winampInput.isConnected())
+        {
+            // Winamp parallel of the ProDJLink branch above: the user has
+            // toggled TrackMap on while a track is already loaded, so we
+            // need to refresh the cache from the input and run the lookup
+            // immediately instead of waiting for the next track change.
+            //
+            // Winamp has no numeric track ID, so the key is purely
+            // (artist, title, durationSec) -- which the input has already
+            // captured on the last track-change event in run().
+            juce::String winArtist = winampInput.getArtist();
+            juce::String winTitle  = winampInput.getTitle();
+            int          winDur    = winampInput.getDurationSec();
+
+            if (winTitle.isNotEmpty())
+            {
+                cachedTrackArtist      = winArtist;
+                cachedTrackTitle       = winTitle;
+                cachedTrackDurationSec = winDur;
+                cachedTrackId          = 0;
                 lookupTrackInMap();
             }
         }
@@ -1792,6 +1982,134 @@ public:
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
                 break;
+
+            case InputSource::Winamp:
+                if (winampInput.getIsRunning())
+                {
+                    const bool connected = winampInput.isConnected();
+                    const auto winState = winampInput.getState();
+                    const bool playing  = (winState == WinampInput::State::Playing);
+
+                    if (connected)
+                    {
+                        // Detect track change by comparing artist + title (the
+                        // identity of the track) to the engine's cached
+                        // values.  Duration is treated as METADATA about the
+                        // track, not part of its identity, because Winamp /
+                        // WACUP / AIMP all decode the duration asynchronously
+                        // -- IPC_GETOUTPUTTIME with wparam=1 returns -1 (or 0
+                        // depending on the file type) for up to ~1 s after a
+                        // new track loads, until the audio decoder has
+                        // scanned the file enough to know its length.  If we
+                        // counted that late duration arrival as a track
+                        // change we would run the trigger + cue pipeline a
+                        // SECOND time about a second into the track:
+                        //   - MIDI / OSC / Art-Net DMX triggers would fire
+                        //     twice for one track load,
+                        //   - armedCues would be wiped and rebuilt, so any
+                        //     cue we had already fired in the first second
+                        //     would re-fire,
+                        //   - the second lookupTrackInMap could match a
+                        //     duration-keyed entry with a different offset
+                        //     than the duration=0 fallback match found a
+                        //     second earlier, making the output timecode
+                        //     jump in front of the receiver.
+                        // Instead, only the artist/title diff fires the
+                        // pipeline; the duration is folded into the cache
+                        // silently and the lookup re-runs so any TrackMap
+                        // entry that was keyed on the real duration can
+                        // start matching, without disturbing the triggers
+                        // or cues that already ran.
+                        juce::String winArtist = winampInput.getArtist();
+                        juce::String winTitle  = winampInput.getTitle();
+                        int          winDur    = winampInput.getDurationSec();
+
+                        const bool trackChanged = (winTitle.isNotEmpty()
+                            && (winArtist != cachedTrackArtist
+                             || winTitle  != cachedTrackTitle));
+
+                        const bool durationUpdated = (!trackChanged
+                            && winTitle.isNotEmpty()
+                            && winDur > 0
+                            && winDur != cachedTrackDurationSec);
+
+                        if (trackChanged)
+                        {
+                            cachedTrackArtist      = winArtist;
+                            cachedTrackTitle       = winTitle;
+                            cachedTrackDurationSec = winDur;
+                            cachedTrackId          = 0;  // Winamp has no numeric track ID
+
+                            const auto* entry = lookupTrackInMap();
+                            bpmPlayerOverride = kBpmNoOverride;
+                            lastSentClockBpm  = -1.0f;
+                            lastSentOscBpm    = -1.0f;
+                            fireTrackTrigger(entry);
+                            loadCuePointsForTrack(entry);
+
+                            DBG("TimecodeEngine: Winamp track changed -- "
+                                + cachedTrackArtist + " - " + cachedTrackTitle
+                                + " (" + juce::String(cachedTrackDurationSec) + "s)");
+                        }
+                        else if (durationUpdated)
+                        {
+                            cachedTrackDurationSec = winDur;
+                            // Re-run the lookup quietly so a duration-keyed
+                            // TrackMap entry can start matching.  Do NOT
+                            // call fireTrackTrigger() or
+                            // loadCuePointsForTrack() here -- those happen
+                            // exactly once per real track change above.
+                            lookupTrackInMap();
+                            DBG("TimecodeEngine: Winamp duration arrived late -- "
+                                + cachedTrackTitle + " = "
+                                + juce::String(winDur) + "s");
+                        }
+
+                        // Position -> Timecode.  Winamp returns ms with single-ms
+                        // resolution, polled at 20 Hz; for frame-accurate output
+                        // between polls the upstream MTC/LTC/Art-Net senders run
+                        // at their own configured frame rate against the same
+                        // currentTimecode value, which moves forward by ~50 ms
+                        // every poll.  Audible drift is bounded by the poll
+                        // cadence (one frame at most).
+                        const int32_t posMs = winampInput.getPositionMs();
+                        currentTimecode = wallClockToTimecode((double)posMs, currentFps);
+
+                        // Apply TrackMap offset
+                        if (trackMapEnabled && trackMapped)
+                        {
+                            currentTimecode = applyTimecodeOffset(
+                                currentTimecode, currentFps,
+                                cachedOffH, cachedOffM, cachedOffS, cachedOffF,
+                                currentFps);
+                        }
+
+                        // Fire cue points only during playback; on pause/stop
+                        // we still update the last-seen position so a subsequent
+                        // resume does not retro-fire cues we already crossed.
+                        const uint32_t playheadMs = (uint32_t) juce::jmax(0, (int)posMs);
+                        if (playing)
+                            tickCuePoints(playheadMs);
+                        else
+                            lastCueCheckMs = playheadMs;
+                    }
+
+                    sourceActive = playing;
+
+                    if (statusTextVisible)
+                    {
+                        if (!connected)
+                            inputStatusText = "WAITING FOR WINAMP...";
+                        else if (playing)
+                            inputStatusText = "PLAYING";
+                        else if (winState == WinampInput::State::Paused)
+                            inputStatusText = "PAUSED";
+                        else
+                            inputStatusText = "STOPPED";
+                    }
+                }
+                else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT LISTENING"; }
+                break;
         }
 
         // --- Audio BPM forwarding (non-DJ sources only) ---
@@ -1868,13 +2186,18 @@ public:
         const bool wasStopped = (genState == GeneratorState::Stopped);
         if (wasStopped)
         {
-            genCurrentMs = genStartMs;  // reset to start TC
+            // Standard DAW / Pioneer CDJ loop semantics: when an A/B loop is
+            // armed, pressing Play always starts at loopInMs regardless of
+            // where the playhead was (the loop range defines the play
+            // region).  Without the loop, fall back to genStartMs.
+            const double playFromMs = isGeneratorLoopActive() ? genLoopInMs : genStartMs;
+            genCurrentMs = playFromMs;
             // Sync the cue cursor too: the (prev, now] window for the very
-            // first cue check after play-from-stopped should begin at
-            // startMs, otherwise a leftover lastCueCheckMs from a previous
-            // session could either skip cues or produce a backward-jump
-            // false positive.
-            lastCueCheckMs = (uint32_t) juce::jmax(0.0, genStartMs);
+            // first cue check after play-from-stopped should begin at the
+            // play-from position, otherwise a leftover lastCueCheckMs from
+            // a previous session could either skip cues or produce a
+            // backward-jump false positive.
+            lastCueCheckMs = (uint32_t) juce::jmax(0.0, playFromMs);
         }
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
         genState = GeneratorState::Playing;
@@ -1933,6 +2256,34 @@ public:
 
     /// Set stop timecode in ms from midnight. 0 = no stop (freerun).
     void setGeneratorStopMs(double ms) { genStopMs = juce::jmax(0.0, ms); }
+
+    //==========================================================================
+    // Generator A/B loop (programming aid: repeat a section of the track)
+    //==========================================================================
+
+    /// Set the loop In point.  Caller passes the absolute TC ms (same
+    /// coordinate system as genCurrentMs).  No effect until
+    /// setGeneratorLoopEnabled(true) is also called.
+    void setGeneratorLoopInMs(double ms)  { genLoopInMs  = juce::jmax(0.0, ms); }
+
+    /// Set the loop Out point.  Must be > loop In for the loop to be active.
+    void setGeneratorLoopOutMs(double ms) { genLoopOutMs = juce::jmax(0.0, ms); }
+
+    /// Enable / disable A/B loop.  When enabling and the loaded preset has
+    /// no in/out set yet, the loop has no effect until points are placed.
+    /// When the next Play after enabling fires, position snaps to loopInMs
+    /// (standard DAW behaviour) -- caller does not need to seek manually.
+    void setGeneratorLoopEnabled(bool e)  { genLoopEnabled = e; }
+
+    double getGeneratorLoopInMs()    const { return genLoopInMs;    }
+    double getGeneratorLoopOutMs()   const { return genLoopOutMs;   }
+    bool   getGeneratorLoopEnabled() const { return genLoopEnabled; }
+
+    /// True when a loop is currently in active use (enabled + valid range).
+    bool isGeneratorLoopActive() const
+    {
+        return genLoopEnabled && genLoopOutMs > genLoopInMs;
+    }
 
     /// Load Generator preset cues into the engine's armed-cue list.  Cue
     /// positions are converted from SMPTE TC strings to absolute ms (using
@@ -2094,6 +2445,26 @@ public:
     void setGeneratorAudioFile(const juce::File& file, bool shouldLoop)
     {
         const juce::File f = (file == juce::File() || ! file.existsAsFile()) ? juce::File() : file;
+
+        // On a real file change, clear A/B loop state.  Loop In/Out
+        // are absolute TC ms tied to the previously loaded file's
+        // timeline and are meaningless against a different track;
+        // leaving them armed would either fire a wrap mid-playback
+        // at an arbitrary point or visually mark a loop range that
+        // does not correspond to anything on the new waveform.
+        // Re-loading the SAME file (user re-applies the active
+        // preset, settings restore on launch, OSC re-trigger) is
+        // detected by comparing against the player's current file
+        // and leaves the loop untouched, so the operator does not
+        // have to re-place the markers across no-op reloads.
+        const juce::File prev = generatorAudioPlayer.getCurrentFile();
+        if (f != prev)
+        {
+            genLoopInMs    = 0.0;
+            genLoopOutMs   = 0.0;
+            genLoopEnabled = false;
+        }
+
         // New file (or unload) invalidates the natural-EOF marker -- a
         // click on the timeline of a freshly loaded track should cue,
         // not auto-resume from the previous track's EOF intent.
@@ -2103,7 +2474,15 @@ public:
 
     void clearGeneratorAudioFile()
     {
-        genEndedAtEof = false;
+        // Same rationale as setGeneratorAudioFile on file change:
+        // loop positions are tied to the loaded file, so unloading
+        // also clears the loop.  Without this, the LOOP toggle and
+        // any saved In/Out would carry over to whatever file the
+        // user loads next.
+        genLoopInMs    = 0.0;
+        genLoopOutMs   = 0.0;
+        genLoopEnabled = false;
+        genEndedAtEof  = false;
         generatorAudioPlayer.requestLoad(juce::File(), false);
     }
 
@@ -2154,6 +2533,7 @@ public:
             case InputSource::ProDJLink:  return sharedProDJLink != nullptr && sharedProDJLink->getIsRunning();
             case InputSource::StageLinQ:  return sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning();
             case InputSource::Hippotizer: return hippotizerInput.getIsRunning();
+            case InputSource::Winamp:     return winampInput.getIsRunning();
             default:                      return false;
         }
     }
@@ -2169,6 +2549,7 @@ public:
             case InputSource::ProDJLink:  return "ProDJLink";
             case InputSource::StageLinQ:  return "StageLinQ";
             case InputSource::Hippotizer: return "HippoNet";
+            case InputSource::Winamp:     return "Winamp";
         }
         return "Generator";
     }
@@ -2181,6 +2562,7 @@ public:
         if (s == "ProDJLink") return InputSource::ProDJLink;
         if (s == "StageLinQ") return InputSource::StageLinQ;
         if (s == "HippoNet" || s == "Hippotizer") return InputSource::Hippotizer;
+        if (s == "Winamp") return InputSource::Winamp;
         if (s == "TCNet") return InputSource::ProDJLink;  // legacy migration
         if (s == "Generator" || s == "SystemTime") return InputSource::SystemTime;  // backward compat
         return InputSource::SystemTime;
@@ -2197,6 +2579,7 @@ public:
             case InputSource::ProDJLink:  return "PRO DJ LINK";
             case InputSource::StageLinQ:  return "STAGELINQ";
             case InputSource::Hippotizer: return "HIPPONET";
+            case InputSource::Winamp:     return "WINAMP";
             default:                      return "---";
         }
     }
@@ -2248,6 +2631,20 @@ private:
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
     double genLastTickTime = 0.0;  // hiRes ms for delta calculation
+
+    // A/B loop: when genLoopEnabled and genLoopOutMs > genLoopInMs, the tick
+    // wraps genCurrentMs from loopOutMs to loopInMs.  Pressing Play with loop
+    // enabled snaps position to loopInMs first (standard DAW / CDJ loop).
+    // Set / cleared from the message thread; the tick reads on its own
+    // thread but the writes are simple word stores, so no lock is needed --
+    // worst case the tick observes the previous values for one cycle.
+    // Cleared automatically in setGeneratorAudioFile / clearGeneratorAudioFile
+    // when a different file is loaded, so the loop is effectively
+    // per-track within the engine: switching pistas wipes In/Out/Enabled
+    // since they are absolute ms against the previous file's timeline.
+    double genLoopInMs    = 0.0;
+    double genLoopOutMs   = 0.0;
+    bool   genLoopEnabled = false;
     // Set when the generator stops automatically because the loaded audio
     // file reached EOF (as opposed to a user-initiated stop).  Consumed by
     // setGeneratorPosition() so that a click on the timeline immediately
@@ -2283,6 +2680,33 @@ private:
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
     int ltcOutputOffset    = 0;
+    juce::String ltcUserBitsHex;   // normalised LTC user-bits hex ("" = zero)
+    int ltcUserBitsMode = kUserBitsManual;
+    double lastSystemDateCheckMs = 0.0;   // throttles the date recompute to ~1Hz
+
+    /// Feed the encoder in the dynamic user-bits modes.  Called once per
+    /// output routing tick; cheap and a no-op in MANUAL mode.
+    void refreshDynamicUserBits()
+    {
+        if (ltcUserBitsMode == kUserBitsFromLtcIn)
+        {
+            // Passthrough: mirror whatever the LTC input last decoded.
+            // On signal loss the input keeps its last good value, so the
+            // output HOLDS rather than dropping to zeros -- a receiver
+            // gating on user bits should not see them vanish during a
+            // brief dropout.  Stays 0 if the LTC input never ran.
+            ltcOutput.setUserBits(ltcInput.getUserBits());
+        }
+        else if (ltcUserBitsMode == kUserBitsSystemDate)
+        {
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            if (now - lastSystemDateCheckMs >= 1000.0)
+            {
+                lastSystemDateCheckMs = now;
+                ltcOutput.setUserBits(systemDateUserBits());
+            }
+        }
+    }
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds
 
     // Protocol handlers
@@ -2294,6 +2718,7 @@ private:
     HippotizerOutput hippotizerOutput;
     LtcInput     ltcInput;
     LtcOutput    ltcOutput;
+    WinampInput  winampInput;
     ProDJLinkInput* sharedProDJLink = nullptr;  // shared across engines
     StageLinQInput* sharedStageLinQ = nullptr;  // shared across engines
     DbServerClient* dbClient       = nullptr;  // shared across engines (Phase 2)
@@ -3308,6 +3733,22 @@ private:
             if (delta > 0.0)
                 genCurrentMs += delta;
 
+            // A/B loop: when active and we cross loopOutMs, wrap back to
+            // loopInMs.  Checked BEFORE stop TC and EOF -- if both the stop
+            // TC and the loop Out fall in the same tick, the loop wins (the
+            // user explicitly armed the loop).  We also reseed the cue
+            // cursor so cues inside the loop body re-fire on each
+            // iteration, matching the behaviour of the existing
+            // generatorAudioPlayer.isLooping() full-file loop path.
+            if (genLoopEnabled && genLoopOutMs > genLoopInMs
+                && genCurrentMs >= genLoopOutMs)
+            {
+                genCurrentMs = genLoopInMs;
+                lastCueCheckMs = (uint32_t) juce::jmax(0.0, genLoopInMs);
+                const double audioPosSec = juce::jmax(0.0, (genLoopInMs - genStartMs) / 1000.0);
+                generatorAudioPlayer.seekSeconds(audioPosSec);
+            }
+
             // Auto-stop at stop TC (if set and not zero)
             if (genStopMs > 0.0 && genCurrentMs >= genStopMs)
             {
@@ -3632,6 +4073,10 @@ private:
 
     void routeTimecodeToOutputs()
     {
+        // Keep LTC user bits current for the dynamic modes (passthrough from
+        // the LTC input, system date).  No-op in MANUAL mode.
+        refreshDynamicUserBits();
+
         FrameRate outRate = getEffectiveOutputFps();
         Timecode baseTc = fpsConvertEnabled
                         ? convertTimecodeRate(currentTimecode, currentFps, outRate)
@@ -3740,5 +4185,6 @@ private:
         sThruOut = decayLevel(sThruOut, thruOutLvl);
     }
 
+    JUCE_DECLARE_WEAK_REFERENCEABLE(TimecodeEngine)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TimecodeEngine)
 };

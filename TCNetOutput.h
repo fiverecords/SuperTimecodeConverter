@@ -156,6 +156,16 @@ public:
     bool getIsRunning() const       { return running; }
     int  getSelectedInterface() const { return selectedInterface; }
 
+    // Global TCNet offset (ms), summed with the per-engine offset inside
+    // setLayerFromEngine.  Use case: compensating for venue capture /
+    // encoding chains that add a uniform delay to every engine.  Setting
+    // 0 reproduces v1.9.11-beta6 behaviour exactly.  Both setter and the
+    // read inside setLayerFromEngine run on the message thread (timer
+    // callback + UI callback), so no synchronisation is required; the
+    // field is a plain int matching the per-engine offset's style.
+    void setGlobalOffsetMs(int v) { globalOffsetMs = juce::jlimit(-2000, 2000, v); }
+    int  getGlobalOffsetMs() const { return globalOffsetMs; }
+
     bool start(int interfaceIndex = -1)
     {
         stop();
@@ -236,7 +246,11 @@ public:
         auto& L       = layers[idx];
         L.masterPlayerNum = masterPlayerNum;  // Sync Master value for Metrics
         int64_t baseMs = (int64_t)((playheadMs > 0) ? playheadMs : tcToMs(tc, fps));
-        int64_t adjusted = baseMs + offsetMs;
+        // Engine-side per-layer offset + venue-wide global offset.
+        // Both are signed ms; the sum is clamped into the uint32 wire
+        // range below so negative excursions parked at 0 instead of
+        // wrapping to ~49 days.
+        int64_t adjusted = baseMs + offsetMs + (int64_t)globalOffsetMs;
         uint32_t newMs = (uint32_t)juce::jlimit((int64_t)0, (int64_t)0xFFFFFFFF, adjusted);
 
         // Jog anti-jitter deadband.
@@ -1226,6 +1240,7 @@ private:
     juce::String broadcastIp = "255.255.255.255", bindIp = "0.0.0.0";
     int selectedInterface = -1;
     bool running = false;
+    int globalOffsetMs = 0;  // venue-wide latency comp, see setGlobalOffsetMs
     LayerData layers[kPacketLayers] = {};
     LayerData emptyLayer;
     SlaveNode slaves[kMaxSlaves] = {};

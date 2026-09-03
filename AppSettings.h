@@ -1125,6 +1125,15 @@ struct EngineSettings
     bool   generatorClockMode = true;  // true = wall clock, false = transport
     double generatorStartMs = 0.0;    // start TC in ms from midnight
     double generatorStopMs  = 0.0;    // stop TC in ms (0 = freerun)
+    // Generator A/B loop (in/out points and on/off toggle, programming aid).
+    // When loopEnabled and loopOutMs > loopInMs, the Generator wraps to loopInMs
+    // whenever playback crosses loopOutMs.  Pressing Play with loop enabled
+    // starts at loopInMs regardless of current playhead position (standard
+    // DAW / Pioneer CDJ loop semantics).  Both values are absolute TC ms,
+    // same coordinate system as generatorStartMs / generatorStopMs.
+    double generatorLoopInMs  = 0.0;
+    double generatorLoopOutMs = 0.0;
+    bool   generatorLoopEnabled = false;
     // Generator audio playback (per-engine output device for preset audio files)
     juce::String generatorAudioDevice = "";
     juce::String generatorAudioType   = "";
@@ -1207,6 +1216,13 @@ struct EngineSettings
     int mtcOutputOffset = 0;
     int artnetOutputOffset = 0;
     int ltcOutputOffset = 0;
+    // LTC user bits (SMPTE 12M binary groups), stored as up-to-8-digit hex
+    // text so leading zeros and the operator's exact entry are preserved.
+    // Empty or unparseable -> 0 (all-zero user bits, the prior behaviour).
+    juce::String ltcUserBitsHex;
+    // LTC user-bits source: 0 = manual value, 1 = passthrough from LTC in,
+    // 2 = system date (BCD YYYYMMDD).
+    int ltcUserBitsMode = 0;
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds, -1000 to +1000
 
     // Track change triggers -- destinations
@@ -1231,6 +1247,9 @@ struct EngineSettings
         obj->setProperty("generatorClockMode", generatorClockMode);
         obj->setProperty("generatorStartMs", generatorStartMs);
         obj->setProperty("generatorStopMs", generatorStopMs);
+        obj->setProperty("generatorLoopInMs",  generatorLoopInMs);
+        obj->setProperty("generatorLoopOutMs", generatorLoopOutMs);
+        obj->setProperty("generatorLoopEnabled", generatorLoopEnabled);
         obj->setProperty("generatorAudioDevice",  generatorAudioDevice);
         obj->setProperty("generatorAudioType",    generatorAudioType);
         obj->setProperty("generatorAudioChannel", generatorAudioChannel);
@@ -1301,6 +1320,10 @@ struct EngineSettings
         obj->setProperty("mtcOutputOffset", mtcOutputOffset);
         obj->setProperty("artnetOutputOffset", artnetOutputOffset);
         obj->setProperty("ltcOutputOffset", ltcOutputOffset);
+        if (ltcUserBitsHex.isNotEmpty())
+            obj->setProperty("ltcUserBitsHex", ltcUserBitsHex);
+        if (ltcUserBitsMode != 0)
+            obj->setProperty("ltcUserBitsMode", ltcUserBitsMode);
         obj->setProperty("tcnetOutputOffsetMs", tcnetOutputOffsetMs);
 
         // Track change triggers
@@ -1345,6 +1368,9 @@ struct EngineSettings
         generatorClockMode       = getBool("generatorClockMode", true);
         generatorStartMs         = (double)getInt("generatorStartMs", 0);
         generatorStopMs          = (double)getInt("generatorStopMs", 0);
+        generatorLoopInMs        = (double) obj->getProperty("generatorLoopInMs");
+        generatorLoopOutMs       = (double) obj->getProperty("generatorLoopOutMs");
+        generatorLoopEnabled     = getBool("generatorLoopEnabled", false);
         generatorAudioDevice     = getString("generatorAudioDevice");
         generatorAudioType       = getString("generatorAudioType");
         generatorAudioChannel    = getInt("generatorAudioChannel", 0);
@@ -1431,6 +1457,8 @@ struct EngineSettings
         mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
+        ltcUserBitsHex     = getString("ltcUserBitsHex");
+        ltcUserBitsMode    = juce::jlimit(0, 2, getInt("ltcUserBitsMode", 0));
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         // Track change triggers
@@ -1456,12 +1484,41 @@ struct AppSettings
 
     // Global Pro DJ Link settings (shared connection, not per-engine)
     int  proDJLinkInterface = 0;
+    // Bridge identity profile for the 54B keepalive (beta15, extended beta16).
+    // Three captures of real bridges show three different byte pairs -- the
+    // value is dynamic per session (STC_PRODJLINK_AUDIT.md
+    // sections 3, 7 and 12), so it ships as a user setting for A/B testing:
+    //   0 = F9 profile (0xF9/0x04, Bridge_Original.pcapng / A9 rig) -- default
+    //   1 = C0 profile (0xC0/0x03, 2000nxs2_PDL_bridge.pcapng / NXS2 rig)
+    //   2 = E4 profile (0xE4/0x05, Prueba_prodjlink_bridge.pcapng / A9+3x3000)
+    //   3 = AUTO (0xE4 / b30 = max(network mark, count incl. self) -- experimental)
+    int prodjlinkBridgeIdentity = 0;
+    // 95B dbserver-keepalive scope (v1.9.11-beta15):
+    //   0 = all discovered players (beta14 behaviour) -- default
+    //   1 = CDJ-3000 models only  (v1.9.10 behaviour)
+    //   2 = off                   (reference-bridge behaviour)
+    // The 95B is what triggers the NXS2 TCP-12523 probe storm; the reference
+    // bridge never sends it.  Must only be turned off together with (or
+    // after) the C0 identity, or the v1.9.10 zero-data regression returns.
+    int prodjlink95bMode = 0;
+    // NOTE: the old key "prodjlinkDualIdentity" (beta5-beta14) is no longer
+    // read; the dual CDJ identity was removed in beta15 (see audit sec. 6).
 
     // Global StageLinQ settings (independent interface from ProDJLink)
     int  stageLinQInterface = 0;
 
     // TCNet output (global network interface, enable is per-engine in EngineSettings)
     int  tcnetInterface = -1;    // -1 = all interfaces (broadcast 255.255.255.255)
+    // Venue-wide latency compensation applied to every TCNet layer in
+    // addition to each engine's per-layer offset.  Use case: HDMI / NDI
+    // capture pipelines added between the laptop and the house system
+    // introduce the same delay to every output engine, so dialing it in
+    // once at soundcheck saves having to touch every engine's offset.
+    // Sums with the per-engine TCNet offset just before SMPTE encoding,
+    // so this value of 0 reproduces v1.9.11-beta6 behaviour exactly.
+    // Range -2000..+2000 ms; wider than the per-engine ±1000 ms because
+    // full capture/encode chains can run several hundred ms by themselves.
+    int  tcnetGlobalOffsetMs = 0;
 
     // OSC Input (global listener for generator remote control)
     bool oscInputEnabled = false;
@@ -1480,6 +1537,7 @@ struct AppSettings
 
     // PDL View layout state
     bool pdlViewHorizontal  = false;
+    bool pdlViewAlternating = false;  // 1x4 vertical stack, full-width waveforms
     bool pdlViewShowMixer   = true;
 
     // SLQ View layout state
@@ -1522,8 +1580,11 @@ struct AppSettings
         obj->setProperty("selectedEngine", selectedEngine);
         obj->setProperty("showModeLocked", showModeLocked);
         obj->setProperty("proDJLinkInterface", proDJLinkInterface);
+        obj->setProperty("prodjlinkBridgeIdentity", prodjlinkBridgeIdentity);
+        obj->setProperty("prodjlink95bMode", prodjlink95bMode);
         obj->setProperty("stageLinQInterface", stageLinQInterface);
         obj->setProperty("tcnetInterface", tcnetInterface);
+        obj->setProperty("tcnetGlobalOffsetMs", tcnetGlobalOffsetMs);
         obj->setProperty("oscInputEnabled", oscInputEnabled);
         obj->setProperty("oscInputPort", oscInputPort);
         obj->setProperty("oscInputInterface", oscInputInterface);
@@ -1537,6 +1598,7 @@ struct AppSettings
         if (genPresetBounds.isNotEmpty()) obj->setProperty("genPresetBounds", genPresetBounds);
         if (genWaveformBounds.isNotEmpty()) obj->setProperty("genWaveformBounds", genWaveformBounds);
         obj->setProperty("pdlViewHorizontal", pdlViewHorizontal);
+        obj->setProperty("pdlViewAlternating", pdlViewAlternating);
         obj->setProperty("pdlViewShowMixer",  pdlViewShowMixer);
         obj->setProperty("slqViewHorizontal", slqViewHorizontal);
 
@@ -1591,8 +1653,11 @@ struct AppSettings
                 showModeLocked = v.isVoid() ? false : (bool)v;
             }
             proDJLinkInterface    = getInt("proDJLinkInterface", 0);
+            prodjlinkBridgeIdentity = juce::jlimit(0, 3, getInt("prodjlinkBridgeIdentity", 0));
+            prodjlink95bMode        = juce::jlimit(0, 2, getInt("prodjlink95bMode", 0));
             stageLinQInterface    = getInt("stageLinQInterface", 0);
             tcnetInterface        = getInt("tcnetInterface", -1);
+            tcnetGlobalOffsetMs   = juce::jlimit(-2000, 2000, getInt("tcnetGlobalOffsetMs", 0));
             oscInputEnabled       = getInt("oscInputEnabled", 0) != 0;
             oscInputPort          = juce::jlimit(1, 65535, getInt("oscInputPort", 9800));
             oscInputInterface     = getInt("oscInputInterface", 0);
@@ -1606,6 +1671,7 @@ struct AppSettings
             genPresetBounds = getString("genPresetBounds");
             genWaveformBounds = getString("genWaveformBounds");
             pdlViewHorizontal  = getInt("pdlViewHorizontal", 0) != 0;
+            pdlViewAlternating = getInt("pdlViewAlternating", 0) != 0;
             pdlViewShowMixer   = getInt("pdlViewShowMixer", 1) != 0;
             slqViewHorizontal  = getInt("slqViewHorizontal", 0) != 0;
 
@@ -1671,6 +1737,9 @@ private:
         es.generatorClockMode   = getBool("generatorClockMode", true);
         es.generatorStartMs     = (double)getInt("generatorStartMs", 0);
         es.generatorStopMs      = (double)getInt("generatorStopMs", 0);
+        es.generatorLoopInMs    = (double) obj->getProperty("generatorLoopInMs");
+        es.generatorLoopOutMs   = (double) obj->getProperty("generatorLoopOutMs");
+        es.generatorLoopEnabled = getBool("generatorLoopEnabled", false);
         es.audioInputDevice     = getString("audioInputDevice");
         es.audioInputType       = getString("audioInputType");
         es.audioInputChannel    = juce::jlimit(0, 127, getInt("audioInputChannel", 0));
@@ -1713,6 +1782,8 @@ private:
         es.mtcOutputOffset    = clampOffset(getInt("mtcOutputOffset", 0));
         es.artnetOutputOffset = clampOffset(getInt("artnetOutputOffset", 0));
         es.ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
+        es.ltcUserBitsHex     = getString("ltcUserBitsHex");
+        es.ltcUserBitsMode    = juce::jlimit(0, 2, getInt("ltcUserBitsMode", 0));
         es.tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         engines.clear();

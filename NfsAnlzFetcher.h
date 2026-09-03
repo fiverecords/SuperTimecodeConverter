@@ -226,7 +226,26 @@ private:
     // Constants
     //==========================================================================
     static constexpr int kFHandleSize      = 32;
-    static constexpr int kNfsReadChunk     = 8192;  // NFS v2 max (was 2048 = 4x more round-trips)
+    // NFSv2 READ chunk size.
+    //
+    // NFSv2 allows up to 8192 bytes per READ reply, but a single 8192-byte UDP
+    // datagram crosses the 1500 B Ethernet MTU and is delivered to the player
+    // as ~6 IP fragments that the kernel must reassemble.  On clean wired
+    // networks this works; on busy or multi-NIC topologies, switches that
+    // misroute fragments, autoIP setups with heavy ARP traffic, or older
+    // player firmware revisions, fragment reassembly is unreliable and a
+    // missing fragment kills the whole READ (NFSv2 has no per-fragment retry).
+    //
+    // flesniak's python-prodj-link -- the most field-tested NXS2 reference
+    // we have, explicitly confirmed working against CDJ-2000NXS2 and
+    // DJM-900NXS2 -- uses 1280 bytes per READ, sized so that the full UDP
+    // datagram (1280 NFS payload + ~142 B of NFS/RPC/UDP/IP headers) fits
+    // inside a single 1500 B Ethernet frame and never fragments.  We match
+    // that value here.  The trade-off is ~6.4x more round-trips per ANLZ
+    // file, which is negligible: ANLZ files are 10-40 KB, so the practical
+    // cost is roughly 100-400 ms more per track load, well inside the time
+    // the player itself spends on the same load.
+    static constexpr int kNfsReadChunk     = 1280;
     static constexpr int kRpcTimeoutMs     = 2000;
     static constexpr int kMountProgram     = 100005;
     static constexpr int kMountVersion     = 1;

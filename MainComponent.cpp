@@ -136,6 +136,28 @@ MainComponent::MainComponent()
     { leftContent.addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
     // HippoNet input hidden pending hardware validation (code preserved in HippotizerInput.h)
     btnHippoIn.setVisible(false);
+    // Winamp input: Windows-only (the WinampInput class is a stub on macOS).
+    // The button is added to the layout on every platform so the resized()
+    // logic doesn't have to branch, but on macOS it is hidden so the user
+    // never sees an unusable control.
+    leftContent.addAndMakeVisible(btnWinampIn);
+    btnWinampIn.setClickingTogglesState(false);
+   #if JUCE_WINDOWS
+    btnWinampIn.setVisible(true);
+   #else
+    btnWinampIn.setVisible(false);
+   #endif
+
+    // Winamp expandable panel labels.  Start hidden -- shown only when
+    // Winamp is the active source AND the input config is expanded.
+    leftContent.addAndMakeVisible(lblWinampInfoHeader);
+    leftContent.addAndMakeVisible(lblWinampInfo);
+    lblWinampInfoHeader.setText("WINAMP STATUS:", juce::dontSendNotification);
+    styleLabel(lblWinampInfoHeader);
+    styleLabel(lblWinampInfo);
+    lblWinampInfo.setText("--", juce::dontSendNotification);
+    lblWinampInfoHeader.setVisible(false);
+    lblWinampInfo.setVisible(false);
 
     btnMtcIn.onClick = [this] {
         if (syncing || isShowLocked()) return;
@@ -209,6 +231,13 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (eng.getActiveInput() == SrcType::Hippotizer) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
         else { inputConfigExpanded = true; eng.setInputSource(SrcType::Hippotizer); startCurrentHippotizerInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
+    };
+
+    btnWinampIn.onClick = [this] {
+        if (syncing || isShowLocked()) return;
+        auto& eng = currentEngine();
+        if (eng.getActiveInput() == SrcType::Winamp) { inputConfigExpanded = !inputConfigExpanded; updateDeviceSelectorVisibility(); resized(); }
+        else { inputConfigExpanded = true; eng.setInputSource(SrcType::Winamp); eng.startWinampInput(); updateInputButtonStates(); updateDeviceSelectorVisibility(); resized(); populateFilteredOutputDeviceCombos(); saveSettings(); }
     };
 
     // --- Output toggles ---
@@ -560,24 +589,12 @@ MainComponent::MainComponent()
         leftContent.addAndMakeVisible(btnGenPrev);
         btnGenPrev.setVisible(false);
         btnGenPrev.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
-        btnGenPrev.onClick = [this] {
-            int sel = cmbGenPreset.getSelectedId();
-            int num = cmbGenPreset.getNumItems();
-            if (num == 0) return;
-            int newSel = (sel <= 1) ? num : sel - 1;
-            cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
-        };
+        btnGenPrev.onClick = [this] { cycleGenPreset(-1); };
 
         leftContent.addAndMakeVisible(btnGenNext);
         btnGenNext.setVisible(false);
         btnGenNext.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
-        btnGenNext.onClick = [this] {
-            int sel = cmbGenPreset.getSelectedId();
-            int num = cmbGenPreset.getNumItems();
-            if (num == 0) return;
-            int newSel = (sel >= num) ? 1 : sel + 1;
-            cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
-        };
+        btnGenNext.onClick = [this] { cycleGenPreset(+1); };
 
         leftContent.addAndMakeVisible(btnGenGo);
         btnGenGo.setVisible(false);
@@ -809,6 +826,53 @@ MainComponent::MainComponent()
         }
     };
 
+    // --- ProDJLink bridge identity profile (v1.9.11-beta15) ---
+    // A/B setting for the two-byte keepalive conflict between the two real
+    // bridge captures (see AppSettings + ProDJLinkInput for the rationale).
+    // Changing it restarts the shared PDL connection so peers re-register us
+    // from a clean announce -- flipping identity mid-registration would give
+    // ambiguous results on the very hardware this exists to diagnose.
+    addLabelAndCombo(lblPdlBridgeIdentity, cmbPdlBridgeIdentity, "BRIDGE IDENTITY:");
+    cmbPdlBridgeIdentity.addItem("F9 (A9 CAPTURE)",      1);
+    cmbPdlBridgeIdentity.addItem("C0 (NXS2 CAPTURE)",    2);
+    cmbPdlBridgeIdentity.addItem("E4 (A9+3000 CAPTURE)", 3);
+    cmbPdlBridgeIdentity.addItem("AUTO (COUNT)",         4);
+    cmbPdlBridgeIdentity.setSelectedId(1, juce::dontSendNotification);
+    cmbPdlBridgeIdentity.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        settings.prodjlinkBridgeIdentity = cmbPdlBridgeIdentity.getSelectedId() - 1;
+        if (currentEngine().getActiveInput() == SrcType::ProDJLink)
+        {
+            if (sharedProDJLinkInput.getIsRunning())
+            {
+                DBG("MainComponent: bridge identity profile changed -- restarting PDL");
+                sharedProDJLinkInput.stop();
+                sharedDbClient.stop();
+            }
+            startCurrentProDJLinkInput();
+        }
+        saveSettings();
+    };
+
+    // --- ProDJLink 95B keepalive scope (v1.9.11-beta15) ---
+    // Applied LIVE (no restart): turning the 95B off mid-session while
+    // status keeps flowing is itself one of the diagnostic experiments.
+    addLabelAndCombo(lblPdl95bMode, cmbPdl95bMode, "CDJ 95B KEEPALIVE:");
+    cmbPdl95bMode.addItem("ALL PLAYERS",   1);
+    cmbPdl95bMode.addItem("CDJ-3000 ONLY", 2);
+    cmbPdl95bMode.addItem("OFF",           3);
+    cmbPdl95bMode.setSelectedId(1, juce::dontSendNotification);
+    cmbPdl95bMode.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        settings.prodjlink95bMode = cmbPdl95bMode.getSelectedId() - 1;
+        sharedProDJLinkInput.setDbKeepaliveMode(settings.prodjlink95bMode);
+        saveSettings();
+    };
+
     addLabelAndCombo(lblStageLinQInterface, cmbStageLinQInterface, "STAGELINQ INTERFACE:");
     cmbStageLinQInterface.onChange = [this]
     {
@@ -978,7 +1042,7 @@ MainComponent::MainComponent()
         {
             settings.showModeLocked = true;
             // Close cue editor (config window -- shouldn't be open during show)
-            if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); }
+            if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); cuePointEditedArtist.clear(); cuePointEditedTitle.clear(); }
             updateShowLockVisuals();
             saveSettings();
         }
@@ -1503,6 +1567,10 @@ MainComponent::MainComponent()
     sldThruInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); } };
 
     leftContent.addAndMakeVisible(lblInputStatus); styleLabel(lblInputStatus); lblInputStatus.setColour(juce::Label::textColourId, accentGreen);
+    // LTC IN: recovered user bits (only meaningful when the source is LTC).
+    leftContent.addAndMakeVisible(lblLtcInUserBits); styleLabel(lblLtcInUserBits, 8.0f);
+    lblLtcInUserBits.setText("USER BITS: --", juce::dontSendNotification);
+    lblLtcInUserBits.setVisible(false);
 
     // =====================================================================
     // RIGHT PANEL -- OUTPUT SELECTORS
@@ -1619,6 +1687,39 @@ MainComponent::MainComponent()
     styleLabel(lblTcnetOffset);
     sldTcnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setTcnetOutputOffsetMs((int)sldTcnetOffset.getValue()); saveSettings(); } };
 
+    // Global TCNet offset: same range as per-engine ±1000 ms doubled to
+    // ±2000 ms (full venue capture/encode chains can run hundreds of ms
+    // on their own), summed inside sharedTcnetOutput.setLayerFromEngine
+    // before SMPTE encoding.  Wired to update both settings.tcnetGlobalOffsetMs
+    // and sharedTcnetOutput.setGlobalOffsetMs() so the change is live
+    // immediately and persists across launches.  Show Lock blocks edits
+    // for consistency with the per-engine offset.
+    rightContent.addAndMakeVisible(sldTcnetGlobalOffset);
+    sldTcnetGlobalOffset.setSliderStyle(juce::Slider::LinearHorizontal);
+    sldTcnetGlobalOffset.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 20);
+    sldTcnetGlobalOffset.setRange(-2000.0, 2000.0, 1.0);
+    sldTcnetGlobalOffset.setValue(0.0, juce::dontSendNotification);
+    sldTcnetGlobalOffset.setTextValueSuffix(" ms");
+    sldTcnetGlobalOffset.setDoubleClickReturnValue(true, 0.0);
+    sldTcnetGlobalOffset.setColour(juce::Slider::backgroundColourId, juce::Colour(0xFF1A1D23));
+    sldTcnetGlobalOffset.setColour(juce::Slider::trackColourId, juce::Colour(0xFF37474F));
+    sldTcnetGlobalOffset.setColour(juce::Slider::thumbColourId, juce::Colour(0xFF78909C));
+    sldTcnetGlobalOffset.setColour(juce::Slider::textBoxTextColourId, textBright);
+    sldTcnetGlobalOffset.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xFF1A1D23));
+    sldTcnetGlobalOffset.setColour(juce::Slider::textBoxOutlineColourId, borderCol);
+    rightContent.addAndMakeVisible(lblTcnetGlobalOffset);
+    lblTcnetGlobalOffset.setText("TCNET GLOBAL OFFSET:", juce::dontSendNotification);
+    styleLabel(lblTcnetGlobalOffset);
+    sldTcnetGlobalOffset.onValueChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        const int v = (int) sldTcnetGlobalOffset.getValue();
+        settings.tcnetGlobalOffsetMs = v;
+        sharedTcnetOutput.setGlobalOffsetMs(v);
+        saveSettings();
+    };
+
     // --- Hippotizer output controls ---
     rightContent.addAndMakeVisible(lblHippoDestIp);
     lblHippoDestIp.setText("HIPPONET DEST IP:", juce::dontSendNotification);
@@ -1694,6 +1795,46 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
     sldLtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
+
+    // LTC user bits (SMPTE 12M binary groups).  Issue #13.
+    // Source mode first, then the manual value field.
+    addRightLabelAndCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, "LTC USER BITS:");
+    cmbLtcUserBitsMode.addItem("MANUAL VALUE", 1);
+    cmbLtcUserBitsMode.addItem("FROM LTC IN",  2);
+    cmbLtcUserBitsMode.addItem("SYSTEM DATE",  3);
+    cmbLtcUserBitsMode.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        auto& e = currentEngine();
+        e.setLtcUserBitsMode(cmbLtcUserBitsMode.getSelectedId() - 1);
+        const bool manual = e.getLtcUserBitsMode() == TimecodeEngine::kUserBitsManual;
+        txtLtcUserBits.setReadOnly(!manual);
+        if (manual)
+            txtLtcUserBits.setText(e.getLtcUserBitsHex(), juce::dontSendNotification);
+        saveSettings();
+    };
+
+    rightContent.addAndMakeVisible(lblLtcUserBits);
+    styleLabel(lblLtcUserBits);
+    lblLtcUserBits.setText("LTC USER BITS (HEX):", juce::dontSendNotification);
+    rightContent.addAndMakeVisible(txtLtcUserBits);
+    txtLtcUserBits.setFont(juce::Font(juce::FontOptions(11.0f)));
+    txtLtcUserBits.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xFF222222));
+    txtLtcUserBits.setColour(juce::TextEditor::textColourId, juce::Colours::white);
+    txtLtcUserBits.setJustification(juce::Justification::centred);
+    txtLtcUserBits.setInputRestrictions(8, "0123456789abcdefABCDEF");
+    txtLtcUserBits.setTextToShowWhenEmpty("00000000", juce::Colour(0xFF666666));
+    auto applyUserBits = [this]
+    {
+        if (syncing || isShowLockedRevert()) return;
+        currentEngine().setLtcUserBitsHex(txtLtcUserBits.getText());
+        // Reflect the normalised value back (upper-case, zeros collapsed)
+        txtLtcUserBits.setText(currentEngine().getLtcUserBitsHex(), juce::dontSendNotification);
+        saveSettings();
+    };
+    txtLtcUserBits.onReturnKey  = applyUserBits;
+    txtLtcUserBits.onFocusLost  = applyUserBits;
 
     // AudioThru controls visible for all engines in the panel but only functional for engine 0
     addRightLabelAndCombo(lblThruOutputDevice, cmbThruOutputDevice, "AUDIO THRU OUTPUT DEVICE:");
@@ -1861,6 +2002,7 @@ MainComponent::~MainComponent()
         settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+        settings.pdlViewAlternating = proDJLinkViewWindow->getLayoutAlternating();
         settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
         proDJLinkViewWindow.reset();
     }
@@ -2238,7 +2380,19 @@ void MainComponent::syncUIFromEngine()
     sldMtcOffset.setValue(eng.getMtcOutputOffset(), juce::dontSendNotification);
     sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
     sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
+    cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, 2, eng.getLtcUserBitsMode()) + 1,
+                                     juce::dontSendNotification);
+    {
+        const bool manualUb = eng.getLtcUserBitsMode() == TimecodeEngine::kUserBitsManual;
+        txtLtcUserBits.setReadOnly(!manualUb);
+        txtLtcUserBits.setText(
+            manualUb ? eng.getLtcUserBitsHex()
+                     : TimecodeEngine::normaliseUserBitsHex(
+                           juce::String::toHexString((juce::int64) eng.getEffectiveLtcUserBits())),
+            juce::dontSendNotification);
+    }
     sldTcnetOffset.setValue(eng.getTcnetOutputOffsetMs(), juce::dontSendNotification);
+    sldTcnetGlobalOffset.setValue(settings.tcnetGlobalOffsetMs, juce::dontSendNotification);
 
     // Gains
     if (eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC)
@@ -2358,6 +2512,14 @@ void MainComponent::syncUIFromEngine()
         int pdlIfId = settings.proDJLinkInterface + 1;
         if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
             cmbProDJLinkInterface.setSelectedId(pdlIfId, juce::dontSendNotification);
+
+        // ProDJLink bridge identity + 95B keepalive scope (global)
+        cmbPdlBridgeIdentity.setSelectedId(
+            juce::jlimit(0, 3, settings.prodjlinkBridgeIdentity) + 1,
+            juce::dontSendNotification);
+        cmbPdl95bMode.setSelectedId(
+            juce::jlimit(0, 2, settings.prodjlink95bMode) + 1,
+            juce::dontSendNotification);
 
         // StageLinQ interface (global, independent from ProDJLink)
         int slqIfId = settings.stageLinQInterface + 1;
@@ -2597,6 +2759,15 @@ void MainComponent::startCurrentProDJLinkInput()
         sharedDbClient.stop();
     }
 
+    // Apply the identity/95B settings BEFORE any (re)start.  The 95B mode is
+    // also applied when already running: it is a live send-gate and the
+    // "does status keep flowing once the 95B stops" experiment depends on
+    // being able to flip it mid-session.  Identity changes, in contrast, are
+    // applied here but only take full effect through the restart path (see
+    // the cmbPdlBridgeIdentity onChange, which stops the connection first).
+    sharedProDJLinkInput.setBridgeIdentityProfile(settings.prodjlinkBridgeIdentity);
+    sharedProDJLinkInput.setDbKeepaliveMode(settings.prodjlink95bMode);
+
     // Start shared connection if not already running
     if (!sharedProDJLinkInput.getIsRunning())
     {
@@ -2776,6 +2947,12 @@ void MainComponent::openTrackMapEditor()
         auto info = eng.getActiveTrackInfo();
         editor->setActiveTrack(info.artist, info.title);
     }
+    // Show the Learn "Player:" combo only when the current engine uses a
+    // ProDJLink source.  StageLinQ exposes its loaded track via the engine's
+    // cached track info (read through the onLearnTrackInfo callback below),
+    // and Winamp has no player concept -- in both cases the combo would be
+    // misleading, so we hide it and force onLearn() to use the callback path.
+    editor->setShowPlayerSelector(eng.getActiveInput() == SrcType::ProDJLink);
 
     editor->onChange = [this]
     {
@@ -2790,6 +2967,8 @@ void MainComponent::openTrackMapEditor()
         {
             cuePointWindow.reset();
             cuePointTrackKey.clear();
+            cuePointEditedArtist.clear();
+            cuePointEditedTitle.clear();
         }
 
         settings.trackMap.save();
@@ -2835,7 +3014,7 @@ void MainComponent::openTrackMapEditor()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { win->setBounds(b); break; }
             }
         }
     }
@@ -2861,7 +3040,9 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
     }
 
     cuePointWindow = std::make_unique<CuePointEditorWindow>(*entry);
-    cuePointTrackKey = entry->key();
+    cuePointTrackKey      = entry->key();
+    cuePointEditedArtist  = entry->artist;
+    cuePointEditedTitle   = entry->title;
 
     // Try to find artwork, waveform, and duration for this track
     bool foundMeta = false;
@@ -3058,14 +3239,33 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
         // Only return live playhead if the currently playing track matches
         // the track being edited.  Otherwise return sentinel so the editor
         // hides the red cursor and doesn't interfere with mouse editing.
+        //
+        // The match is on artist + title only, NOT on the full TrackMap
+        // key (which includes duration), because duration is metadata
+        // about the track rather than part of its identity:
+        //   * Winamp / AIMP need a second or so after track load to
+        //     decode the VBR duration -- before that, info.durationSec
+        //     is 0 and a duration-keyed match would always fail for the
+        //     first second of every track.
+        //   * The user might have learned the TrackMap entry from a
+        //     CDJ (rekordbox-derived duration) but be playing the same
+        //     file through Winamp from a slightly differently encoded
+        //     copy.  A few-second duration discrepancy is a normal MP3
+        //     encoding artefact and should not break the cursor link
+        //     when artist + title clearly identify the same song.
+        // The full-key match path remains the primary way the engine's
+        // lookupTrackInMap selects an entry; this looser comparison is
+        // only used to decide whether the editor's UI playhead follows
+        // the live playback.
         auto& eng = currentEngine();
         auto info = eng.getActiveTrackInfo();
-        std::string playingKey;
-        if (info.title.isNotEmpty())
-            playingKey = TrackMapEntry::makeKey(info.artist, info.title, info.durationSec);
+        if (info.title.isEmpty()) return UINT32_MAX;
 
-        if (playingKey.empty() || playingKey != cuePointTrackKey)
-            return UINT32_MAX;  // sentinel: "no matching track"
+        std::string playingNoDur = TrackMapEntry::makeKey(info.artist, info.title, 0);
+        std::string editingNoDur = TrackMapEntry::makeKey(cuePointEditedArtist,
+                                                          cuePointEditedTitle, 0);
+        if (playingNoDur != editingNoDur)
+            return UINT32_MAX;
 
         return eng.getSmoothedPlayheadMs();
     });
@@ -3082,7 +3282,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.totalArea.contains(c)) { cuePointWindow->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { cuePointWindow->setBounds(b); break; }
             }
         }
     }
@@ -3151,7 +3351,7 @@ void MainComponent::openMixerMapEditor()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { win->setBounds(b); break; }
             }
         }
     }
@@ -3181,6 +3381,7 @@ void MainComponent::openProDJLinkView()
 
     // Restore layout state and window bounds
     proDJLinkViewWindow->setLayoutState(settings.pdlViewHorizontal, settings.pdlViewShowMixer);
+    proDJLinkViewWindow->setLayoutAlternating(settings.pdlViewAlternating);
     if (settings.pdlViewBounds.isNotEmpty())
         proDJLinkViewWindow->restoreFromBoundsString(settings.pdlViewBounds);
 
@@ -3203,6 +3404,7 @@ void MainComponent::openProDJLinkView()
         if (proDJLinkViewWindow != nullptr)
         {
             settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+            settings.pdlViewAlternating = proDJLinkViewWindow->getLayoutAlternating();
             settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
             saveSettings();
         }
@@ -3215,6 +3417,7 @@ void MainComponent::openProDJLinkView()
             settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
                                    + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
             settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+            settings.pdlViewAlternating = proDJLinkViewWindow->getLayoutAlternating();
             settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
             saveSettings();
         }
@@ -3361,7 +3564,16 @@ void MainComponent::startCurrentThruOutput()
     if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
     { cmbThruOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedThruOutput(); }
 
-    int outCh = getChannelFromCombo(cmbThruOutputChannel);
+    // Settings fallback for empty-combo case (first launch before populate*).
+    int settingsCh   = 1;
+    bool settingsStereo = true;
+    if (selectedEngine < (int) settings.engines.size())
+    {
+        const auto& es = settings.engines[(size_t) selectedEngine];
+        settingsCh     = es.thruOutputChannel;
+        settingsStereo = es.thruOutputStereo;
+    }
+    int outCh = getChannelFromComboOrSettings(cmbThruOutputChannel, settingsCh, settingsStereo);
     eng.startThruOutput(entry.typeName, entry.deviceName, outCh,
                          getPreferredSampleRate(), getPreferredBufferSize());
 
@@ -3422,7 +3634,19 @@ void MainComponent::startCurrentLtcOutput()
     if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
     { cmbAudioOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioOutput(); }
 
-    int channel = getChannelFromCombo(cmbAudioOutputChannel);
+    // Combo may be empty on first launch (before populateAudioOutputChannels);
+    // fall back to the persisted settings in that window so the user's saved
+    // channel is honoured instead of silently defaulting to stereo.  See
+    // getChannelFromComboOrSettings comment.
+    int settingsCh   = 0;
+    bool settingsStereo = true;
+    if (selectedEngine < (int) settings.engines.size())
+    {
+        const auto& es = settings.engines[(size_t) selectedEngine];
+        settingsCh     = es.audioOutputChannel;
+        settingsStereo = es.audioOutputStereo;
+    }
+    int channel = getChannelFromComboOrSettings(cmbAudioOutputChannel, settingsCh, settingsStereo);
 
     if (eng.startLtcOutput(entry.typeName, entry.deviceName, channel,
                             getPreferredSampleRate(), getPreferredBufferSize()))
@@ -3454,7 +3678,16 @@ void MainComponent::startCurrentGenAudio()
         entry = getSelectedGenAudioOutput();
     }
 
-    int channel = getChannelFromCombo(cmbGenAudioChannel);
+    // Settings fallback for empty-combo case (first launch before populate*).
+    int settingsCh   = 0;
+    bool settingsStereo = true;
+    if (selectedEngine < (int) settings.engines.size())
+    {
+        const auto& es = settings.engines[(size_t) selectedEngine];
+        settingsCh     = es.generatorAudioChannel;
+        settingsStereo = es.generatorAudioStereo;
+    }
+    int channel = getChannelFromComboOrSettings(cmbGenAudioChannel, settingsCh, settingsStereo);
 
     if (eng.startGeneratorAudio(entry.typeName, entry.deviceName, channel,
                                  getGenAudioEffectiveSampleRate(),
@@ -4176,6 +4409,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
+        eng.setLtcUserBitsMode(es.ltcUserBitsMode);
+        eng.setLtcUserBitsHex(es.ltcUserBitsHex);
         eng.setTcnetOutputOffsetMs(es.tcnetOutputOffsetMs);
 
         eng.getLtcInput().setInputGain((float)es.ltcInputGain / 100.0f);
@@ -4200,6 +4435,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         }
         else if (src == SrcType::ProDJLink)
         {
+            sharedProDJLinkInput.setBridgeIdentityProfile(settings.prodjlinkBridgeIdentity);
+            sharedProDJLinkInput.setDbKeepaliveMode(settings.prodjlink95bMode);
             if (!sharedProDJLinkInput.getIsRunning())
             {
                 sharedProDJLinkInput.refreshNetworkInterfaces();
@@ -4228,11 +4465,33 @@ void MainComponent::loadAndApplyNonAudioSettings()
             DBG("MainComponent: HippoNet input disabled, falling back to Generator");
             eng.setInputSource(SrcType::SystemTime);
         }
+        else if (src == SrcType::Winamp)
+        {
+           #if JUCE_WINDOWS
+            // Windows: try to attach to a running Winamp / WACUP instance.
+            // If no Winamp window is found right now the thread will keep
+            // polling and pick it up the moment one appears, so we always
+            // start the input even if Winamp itself is not running yet.
+            eng.startWinampInput();
+           #else
+            // macOS: WinampInput is a stub.  A settings file that was written
+            // on a Windows machine and then opened on a Mac (or vice versa)
+            // could legitimately end up with inputSource="Winamp" on a
+            // platform where the source can never produce data; degrade
+            // gracefully to Generator so the engine has something usable.
+            DBG("MainComponent: Winamp input not available on this platform, falling back to Generator");
+            eng.setInputSource(SrcType::SystemTime);
+           #endif
+        }
 
         // Generator start/stop TC (applies regardless of current source)
         eng.setGeneratorClockMode(es.generatorClockMode);
         eng.setGeneratorStartMs(es.generatorStartMs);
         eng.setGeneratorStopMs(es.generatorStopMs);
+        // Restore A/B loop (programming aid; standard DAW semantics).
+        eng.setGeneratorLoopInMs(es.generatorLoopInMs);
+        eng.setGeneratorLoopOutMs(es.generatorLoopOutMs);
+        eng.setGeneratorLoopEnabled(es.generatorLoopEnabled);
 
         // TrackMap -- wire pointer and restore enabled state
         eng.setTrackMap(&settings.trackMap);
@@ -4325,6 +4584,15 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
     // Start TCNet output if any engine has it enabled
     {
+        // Push the persisted global offset into sharedTcnetOutput before
+        // start(): setLayerFromEngine reads globalOffsetMs every time an
+        // engine feeds a layer, so the very first frame after TCNet comes
+        // up must already see the user's venue offset.  Pushed
+        // unconditionally because start() may also be called later (when
+        // the user enables TCNet in an engine that was off at boot) and
+        // the value should be in place either way.
+        sharedTcnetOutput.setGlobalOffsetMs(settings.tcnetGlobalOffsetMs);
+
         bool anyTcnet = false;
         for (auto& e : engines)
             if (e->isOutputTcnetEnabled()) { anyTcnet = true; break; }
@@ -4517,10 +4785,15 @@ void MainComponent::flushSettings()
         es.generatorClockMode = eng.getGeneratorClockMode();
         es.generatorStartMs = eng.getGeneratorStartMs();
         es.generatorStopMs  = eng.getGeneratorStopMs();
+        es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
+        es.generatorLoopOutMs   = eng.getGeneratorLoopOutMs();
+        es.generatorLoopEnabled = eng.getGeneratorLoopEnabled();
 
         es.mtcOutputOffset = eng.getMtcOutputOffset();
         es.artnetOutputOffset = eng.getArtnetOutputOffset();
         es.ltcOutputOffset = eng.getLtcOutputOffset();
+        es.ltcUserBitsHex = eng.getLtcUserBitsHex();
+        es.ltcUserBitsMode = eng.getLtcUserBitsMode();
         es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
 
         es.ltcInputGain = (int)(eng.getLtcInput().getInputGain() * 100.0f);
@@ -4542,6 +4815,9 @@ void MainComponent::flushSettings()
             es.generatorClockMode = eng.getGeneratorClockMode();
             es.generatorStartMs = eng.getGeneratorStartMs();
             es.generatorStopMs  = eng.getGeneratorStopMs();
+            es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
+            es.generatorLoopOutMs   = eng.getGeneratorLoopOutMs();
+            es.generatorLoopEnabled = eng.getGeneratorLoopEnabled();
             es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
             es.trackMapEnabled = eng.isTrackMapEnabled();
             es.midiClockEnabled = eng.isMidiClockEnabled();
@@ -4739,6 +5015,8 @@ void MainComponent::flushSettings()
     // Pro DJ Link global settings
     settings.proDJLinkInterface = cmbProDJLinkInterface.getSelectedId() - 1;
     if (settings.proDJLinkInterface < 0) settings.proDJLinkInterface = 0;
+    settings.prodjlinkBridgeIdentity = juce::jlimit(0, 3, cmbPdlBridgeIdentity.getSelectedId() - 1);
+    settings.prodjlink95bMode        = juce::jlimit(0, 2, cmbPdl95bMode.getSelectedId() - 1);
 
     // StageLinQ global settings
     settings.stageLinQInterface = cmbStageLinQInterface.getSelectedId() - 1;
@@ -4751,6 +5029,7 @@ void MainComponent::flushSettings()
         settings.pdlViewBounds = juce::String(b.getX()) + " " + juce::String(b.getY())
                                + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         settings.pdlViewHorizontal = proDJLinkViewWindow->getLayoutHorizontal();
+        settings.pdlViewAlternating = proDJLinkViewWindow->getLayoutAlternating();
         settings.pdlViewShowMixer  = proDJLinkViewWindow->getShowMixer();
     }
     if (trackMapWindow != nullptr && trackMapWindow->isVisible())
@@ -5008,6 +5287,19 @@ int MainComponent::getChannelFromCombo(const juce::ComboBox& cmb) const
     return id - 1;
 }
 
+int MainComponent::getChannelFromComboOrSettings(const juce::ComboBox& cmb,
+                                                 int  settingsChannel,
+                                                 bool settingsStereo) const
+{
+    // id == 0 means "no selection" -- typical right after construction
+    // before populate*Channels has added any items.  Anything non-zero
+    // means the combo is populated and reflects the user's choice (or
+    // the populator's default), so honour it via the existing helper.
+    if (cmb.getSelectedId() == 0)
+        return settingsStereo ? -1 : settingsChannel;
+    return getChannelFromCombo(cmb);
+}
+
 //==============================================================================
 // VISIBILITY (updated for collapse + engine)
 //==============================================================================
@@ -5018,9 +5310,18 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showMidiIn   = (input == SrcType::MTC)    && inputConfigExpanded;
     bool showArtnetIn = (input == SrcType::ArtNet)  && inputConfigExpanded;
     bool showHippoIn  = (input == SrcType::Hippotizer) && inputConfigExpanded;
+    bool showWinampIn = (input == SrcType::Winamp) && inputConfigExpanded;
     bool showLtcIn    = (input == SrcType::LTC)     && inputConfigExpanded;
     bool showGenerator = (input == SrcType::SystemTime) && inputConfigExpanded;
     bool showProDJLinkIn = (input == SrcType::ProDJLink || input == SrcType::StageLinQ) && inputConfigExpanded;
+    // TrackMap is also available for Winamp (the input emits artist + title
+    // + duration on track change, which is the same TrackMap key the DJ
+    // sources use), so the TrackMap toggle and editor buttons follow a
+    // wider condition than the ProDJLink/StageLinQ-specific UI (deck views,
+    // mixer map editor) which only make sense for the DJ protocols.
+    bool showTrackMapBtns = (input == SrcType::ProDJLink
+                          || input == SrcType::StageLinQ
+                          || input == SrcType::Winamp) && inputConfigExpanded;
     bool showAudioOut = (eng.isOutputLtcEnabled() || (eng.isPrimary() && eng.isOutputThruEnabled()));
     bool hasInputConfig = true;  // all sources have expandable config now
 
@@ -5031,6 +5332,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbArtnetInputInterface.setVisible(showArtnetIn); lblArtnetInputInterface.setVisible(showArtnetIn);
     cmbHippoInputInterface.setVisible(showHippoIn);   lblHippoInputInterface.setVisible(showHippoIn);
     cmbHippoTcChannel.setVisible(showHippoIn);        lblHippoTcChannel.setVisible(showHippoIn);
+    lblWinampInfoHeader.setVisible(showWinampIn);     lblWinampInfo.setVisible(showWinampIn);
     btnGenClock.setVisible(showGenerator);
     bool showGenTransport = showGenerator && !eng.getGeneratorClockMode();
     btnGenPlay.setVisible(showGenTransport);   btnGenPause.setVisible(showGenTransport);  btnGenStop.setVisible(showGenTransport);
@@ -5057,8 +5359,8 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbOscInputInterface.setVisible(showOscInConfig);  lblOscInputInterface.setVisible(showOscInConfig);
     lblOscInPort.setVisible(showOscInConfig);           txtOscInPort.setVisible(showOscInConfig);
     lblOscInStatus.setVisible(showOscInConfig && lblOscInStatus.getText().isNotEmpty());
-    btnTrackMap.setVisible(showProDJLinkIn);
-    btnTrackMapEdit.setVisible(showProDJLinkIn);
+    btnTrackMap.setVisible(showTrackMapBtns);
+    btnTrackMapEdit.setVisible(showTrackMapBtns);
     btnProDJLinkView.setVisible(showProDJLinkIn && input == SrcType::ProDJLink);
     btnStageLinQView.setVisible(showProDJLinkIn && input == SrcType::StageLinQ);
     btnMixerMapEdit.setVisible(showProDJLinkIn);
@@ -5130,22 +5432,34 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool linkOwnedElsewhere = findLinkOwnerOtherThan(selectedEngine) >= 0;
     lblLinkStatus.setVisible(showBpmOutputs && (btnLink.getToggleState() || linkOwnedElsewhere));
 
-    btnTriggerMidi.setVisible(showProDJLinkIn || showGenerator);
-    cmbTriggerMidiDevice.setVisible((showProDJLinkIn || showGenerator)
+    // Track-change trigger outputs (MIDI, OSC, Art-Net DMX).
+    //
+    // These are populated by TrackMap entries (per-track MIDI note / CC,
+    // OSC address+args, Art-Net DMX channel/value).  They fire whenever
+    // the engine detects a track change, so every source that drives the
+    // TrackMap lookup pipeline needs the destination-config controls --
+    // ProDJLink + StageLinQ (via showProDJLinkIn), Generator (cue points
+    // can fire MIDI/OSC/DMX), and Winamp (per-track triggers on Winamp
+    // track change).  LTC / MTC / ArtNet input do not have a TrackMap
+    // lookup so they don't expose the trigger destination UI.
+    bool showTriggerOutputs = showProDJLinkIn || showGenerator || showWinampIn;
+
+    btnTriggerMidi.setVisible(showTriggerOutputs);
+    cmbTriggerMidiDevice.setVisible(showTriggerOutputs
         && (btnTriggerMidi.getToggleState() || btnMidiClock.getToggleState()
             || btnMidiMixerFwd.getToggleState())
         || (showAudioBpmActive && btnMidiClock.getToggleState()));
-    btnTriggerOsc.setVisible(showProDJLinkIn || showGenerator);
-    btnArtnetTrigger.setVisible(showProDJLinkIn || showGenerator);
+    btnTriggerOsc.setVisible(showTriggerOutputs);
+    btnArtnetTrigger.setVisible(showTriggerOutputs);
     {
-        bool showArtTrig = (showProDJLinkIn || showGenerator) && btnArtnetTrigger.getToggleState();
+        bool showArtTrig = showTriggerOutputs && btnArtnetTrigger.getToggleState();
         cmbArtTrigNet.setVisible(showArtTrig);
         cmbArtTrigSub.setVisible(showArtTrig);
         cmbArtTrigUni.setVisible(showArtTrig);
         lblArtTrigAddr.setVisible(showArtTrig);
     }
     {
-        bool showArtDmxIface = (showProDJLinkIn || showGenerator)
+        bool showArtDmxIface = showTriggerOutputs
             && (btnArtnetMixerFwd.getToggleState() || btnArtnetTrigger.getToggleState());
         cmbArtnetDmxInterface.setVisible(showArtDmxIface);
         lblArtnetDmxInterface.setVisible(showArtDmxIface);
@@ -5153,7 +5467,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showOscConfig = (showProDJLinkIn || showAudioBpmActive)
         && (btnOscFwdBpm.getToggleState() || btnOscMixerFwd.getToggleState());
     bool showOscConfigFull = showOscConfig
-        || ((showProDJLinkIn || showGenerator) && btnTriggerOsc.getToggleState());
+        || (showTriggerOutputs && btnTriggerOsc.getToggleState());
     edOscIp.setVisible(showOscConfigFull);
     edOscPort.setVisible(showOscConfigFull);
 
@@ -5161,6 +5475,8 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showPdlIface = showProDJLinkIn && input == SrcType::ProDJLink;
     bool showSlqIface = showProDJLinkIn && input == SrcType::StageLinQ;
     cmbProDJLinkInterface.setVisible(showPdlIface);  lblProDJLinkInterface.setVisible(showPdlIface);
+    cmbPdlBridgeIdentity.setVisible(showPdlIface);   lblPdlBridgeIdentity.setVisible(showPdlIface);
+    cmbPdl95bMode.setVisible(showPdlIface);          lblPdl95bMode.setVisible(showPdlIface);
     cmbStageLinQInterface.setVisible(showSlqIface);   lblStageLinQInterface.setVisible(showSlqIface);
     cmbProDJLinkPlayer.setVisible(showProDJLinkIn);     lblProDJLinkPlayer.setVisible(showProDJLinkIn);
 
@@ -5224,6 +5540,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     sldThruInputGain.setVisible(showThruInput);     lblThruInputGain.setVisible(showThruInput);
     mtrThruInput.setVisible(showThruInput);
     lblInputStatus.setVisible(true);
+    lblLtcInUserBits.setVisible(showLtcIn);
 
     // FPS Convert: not applicable for ProDJLink/StageLinQ (user selects fps directly)
     bool showFpsConvert = (input != SrcType::ProDJLink && input != SrcType::StageLinQ);
@@ -5280,6 +5597,8 @@ void MainComponent::updateDeviceSelectorVisibility()
     sldLtcOutputGain.setVisible(showLtcConfig);      lblLtcOutputGain.setVisible(showLtcConfig);
     mtrLtcOutput.setVisible(showLtcConfig);
     sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
+    txtLtcUserBits.setVisible(showLtcConfig);          lblLtcUserBits.setVisible(showLtcConfig);
+    cmbLtcUserBitsMode.setVisible(showLtcConfig);      lblLtcUserBitsMode.setVisible(showLtcConfig);
     lblOutputLtcStatus.setVisible(eng.isOutputLtcEnabled());
 
     // AudioThru controls: only visible for primary engine
@@ -5296,6 +5615,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbTcnetInterface.setVisible(showTcnetConfig);  lblTcnetInterface.setVisible(showTcnetConfig);
     cmbTcnetLayer.setVisible(showTcnetConfig);      lblTcnetLayer.setVisible(showTcnetConfig);
     sldTcnetOffset.setVisible(showTcnetConfig);     lblTcnetOffset.setVisible(showTcnetConfig);
+    sldTcnetGlobalOffset.setVisible(showTcnetConfig); lblTcnetGlobalOffset.setVisible(showTcnetConfig);
     if (showTcnetConfig) repopulateTcnetLayerCombo();
 
     // Hippotizer output: disabled in this version (pending hardware validation)
@@ -5322,6 +5642,30 @@ void MainComponent::updateStatusLabels()
     lblInputStatus.setText(eng.getInputStatusText(), juce::dontSendNotification);
     lblInputStatus.setColour(juce::Label::textColourId,
                              eng.isSourceActive() ? getInputColour(eng.getActiveInput()) : textDim);
+
+    // LTC IN user bits: show the recovered value while an LTC source is
+    // active, "--" otherwise.  Cheap enough to update every status tick.
+    if (eng.getActiveInput() == SrcType::LTC)
+    {
+        lblLtcInUserBits.setText(
+            eng.isSourceActive()
+                ? "USER BITS: " + TimecodeEngine::describeUserBits(
+                                      eng.getLtcInput().getUserBits())
+                : "USER BITS: --",
+            juce::dontSendNotification);
+    }
+
+    // In the dynamic user-bits modes the output value is computed, not typed,
+    // so mirror the live value into the (read-only) field.  Skipped while the
+    // field has focus so we never fight the operator mid-edit.
+    if (eng.getLtcUserBitsMode() != TimecodeEngine::kUserBitsManual
+        && txtLtcUserBits.isVisible() && !txtLtcUserBits.hasKeyboardFocus(true))
+    {
+        auto live = juce::String::toHexString((juce::int64) eng.getEffectiveLtcUserBits())
+                        .paddedLeft('0', 8).toUpperCase();
+        if (txtLtcUserBits.getText() != live)
+            txtLtcUserBits.setText(live, juce::dontSendNotification);
+    }
 
     if (eng.isOutputMtcEnabled() && eng.getMtcOutput().getIsRunning())
         lblOutputMtcStatus.setText(eng.getMtcOutput().isPaused() ? "PAUSED" : eng.getMtcOutStatusText(), juce::dontSendNotification);
@@ -5454,6 +5798,71 @@ void MainComponent::updateStatusLabels()
         btnGenStop .setColour(juce::TextButton::buttonColourId,
             state == TimecodeEngine::GeneratorState::Stopped ? juce::Colour(0xFF666666) : defaultCol);
     }
+
+    // Winamp expandable panel info -- only build the string when the panel
+    // is actually visible.  Building it unconditionally would do 60 Hz worth
+    // of juce::String concatenation for every engine even when Winamp is
+    // not the source.
+    if (lblWinampInfo.isVisible())
+    {
+        auto& wi = eng.getWinampInput();
+        juce::String text;
+        juce::Colour col = textDim;
+
+        if (!wi.getIsRunning())
+        {
+            text = "(input not started)";
+        }
+        else if (!wi.isConnected())
+        {
+            text = "Winamp not running";
+        }
+        else
+        {
+            // State prefix
+            const char* statePrefix = "STOPPED";
+            switch (wi.getState())
+            {
+                case WinampInput::State::Playing: statePrefix = "PLAYING"; break;
+                case WinampInput::State::Paused:  statePrefix = "PAUSED";  break;
+                case WinampInput::State::Stopped: statePrefix = "STOPPED"; break;
+            }
+
+            // Track display
+            juce::String artist = wi.getArtist();
+            juce::String title  = wi.getTitle();
+            juce::String track;
+            if (title.isNotEmpty())
+            {
+                if (artist.isNotEmpty())
+                    track = artist + " - " + title;
+                else
+                    track = title;
+            }
+            else
+            {
+                track = "(no track)";
+            }
+
+            // Position MM:SS / MM:SS
+            auto fmt = [](int totalSec) {
+                int m = totalSec / 60;
+                int s = totalSec % 60;
+                return juce::String::formatted("%d:%02d", m, s);
+            };
+            int posSec = wi.getPositionMs() / 1000;
+            int durSec = wi.getDurationSec();
+            juce::String pos = fmt(posSec) + " / " + (durSec > 0 ? fmt(durSec) : juce::String("--:--"));
+
+            text = juce::String(statePrefix) + " | " + track + " | " + pos;
+
+            if (wi.getState() == WinampInput::State::Playing)
+                col = getInputColour(SrcType::Winamp);
+        }
+
+        lblWinampInfo.setText(text, juce::dontSendNotification);
+        lblWinampInfo.setColour(juce::Label::textColourId, col);
+    }
 }
 
 void MainComponent::updateNextCueLabel(TimecodeEngine& eng)
@@ -5549,6 +5958,53 @@ void MainComponent::populateGenPresetCombo()
     int id = 1;
     for (auto& p : presets)
         cmbGenPreset.addItem(p.name, id++);
+}
+
+void MainComponent::cycleGenPreset(int direction)
+{
+    const int num = cmbGenPreset.getNumItems();
+    if (num == 0) return;
+    const int sel = cmbGenPreset.getSelectedId();
+
+    // Compute the new combo index with wrap-around in both directions.
+    // direction < 0 -> previous (wrap to last when at first); else next.
+    int newSel;
+    if (direction < 0)
+        newSel = (sel <= 1) ? num : sel - 1;
+    else
+        newSel = (sel >= num) ? 1 : sel + 1;
+
+    auto& eng = currentEngine();
+    if (eng.isGeneratorAudioPlaying())
+    {
+        // Hot-swap path (CDJ deck-flip semantics).  The combo's
+        // onChange handler routes to loadGenPresetToFields, which
+        // deliberately skips setGeneratorAudioFile while audio is
+        // playing so that browse-in-the-combo does not interrupt
+        // on-air audio.  PREV/NEXT during playback are a different
+        // intent -- the operator IS asking to swap tracks -- so we
+        // sidestep onChange (dontSendNotification on setSelectedId
+        // to keep the combo visually in sync without re-firing it)
+        // and call activateGenPreset directly.  activateGenPreset
+        // does generatorStop -> setGeneratorAudioFile (which clears
+        // any armed loop in the engine because the file changes) ->
+        // generatorPlay, so playback continues against the new
+        // preset's track from its startMs.
+        cmbGenPreset.setSelectedId(newSel, juce::dontSendNotification);
+        const juce::String name = cmbGenPreset.getText();
+        if (name.isNotEmpty())
+            activateGenPreset(name);
+    }
+    else
+    {
+        // Idle: keep browse semantics.  setSelectedId with
+        // sendNotificationSync triggers cmbGenPreset.onChange, which
+        // calls loadGenPresetToFields -- start/stop TC, cuepoints and
+        // (because audio is not playing) the audio file all refresh.
+        // Playback is NOT started; the operator hits GO / PLAY when
+        // ready.
+        cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
+    }
 }
 
 void MainComponent::activateGenPreset(const juce::String& name)
@@ -5864,7 +6320,7 @@ void MainComponent::openGeneratorPresetEditor()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { win->setBounds(b); break; }
             }
         }
     }
@@ -5893,23 +6349,12 @@ void MainComponent::openGeneratorWaveformWindow()
     content->setEngine(&currentEngine());
     content->setLockedFn([this] { return isShowLocked(); });
 
-    // PREV / NEXT route through the same combo the panel uses, so behaviour
-    // (loading the new preset's TC range and refreshing the waveform when
-    // idle) is identical regardless of which UI surface triggered it.
-    content->onPrev = [this] {
-        const int num = cmbGenPreset.getNumItems();
-        if (num == 0) return;
-        const int sel = cmbGenPreset.getSelectedId();
-        const int newSel = (sel <= 1) ? num : sel - 1;
-        cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
-    };
-    content->onNext = [this] {
-        const int num = cmbGenPreset.getNumItems();
-        if (num == 0) return;
-        const int sel = cmbGenPreset.getSelectedId();
-        const int newSel = (sel >= num) ? 1 : sel + 1;
-        cmbGenPreset.setSelectedId(newSel, juce::sendNotificationSync);
-    };
+    // PREV / NEXT route through cycleGenPreset so the panel buttons and
+    // the waveform-window buttons share one implementation -- including
+    // the hot-swap-during-playback behaviour.  See cycleGenPreset for
+    // the browse-vs-swap split.
+    content->onPrev = [this] { cycleGenPreset(-1); };
+    content->onNext = [this] { cycleGenPreset(+1); };
     content->onEdit = [this] {
         // Match the panel's EDIT button: blocked under Show Lock so a
         // distracted operator cannot reshuffle presets mid-show.
@@ -5921,6 +6366,12 @@ void MainComponent::openGeneratorWaveformWindow()
         // dontSendNotification avoids re-firing onValueChange and the
         // engine apply (already done by the window's slider directly).
         sldGenAudioVolume.setValue(v, juce::dontSendNotification);
+        saveSettings();
+    };
+    content->onLoopChanged = [this] {
+        // Loop In/Out/enabled are persisted as part of the engine state.
+        // No mirror UI to update (panel does not show loop controls); the
+        // engine setters were already invoked by the window's buttons.
         saveSettings();
     };
 
@@ -5950,7 +6401,7 @@ void MainComponent::openGeneratorWaveformWindow()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.totalArea.contains(c)) { win->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { win->setBounds(b); break; }
             }
         }
     }
@@ -6237,11 +6688,15 @@ void MainComponent::resized()
     auto layStatus = [](juce::Label& l, juce::Rectangle<int>& panel) {
         l.setBounds(panel.removeFromTop(13)); panel.removeFromTop(4);
     };
+    auto layEditor = [](juce::Label& l, juce::TextEditor& e, juce::Rectangle<int>& panel) {
+        l.setBounds(panel.removeFromTop(14)); panel.removeFromTop(2);
+        e.setBounds(panel.removeFromTop(22)); panel.removeFromTop(3);
+    };
 
     // Input buttons
     auto& eng = currentEngine();
     struct IBI { juce::TextButton* btn; SrcType src; };
-    IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
+    IBI iBtns[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ}, {&btnWinampIn,SrcType::Winamp} };
     for (auto& ib : iBtns) { if (!ib.btn->isVisible()) continue; ib.btn->setBounds(leftPanel.removeFromTop(btnH)); leftPanel.removeFromTop(btnG); }
 
     // Section separator after input source buttons
@@ -6255,6 +6710,16 @@ void MainComponent::resized()
     if (cmbArtnetInputInterface.isVisible()) layCombo(lblArtnetInputInterface, cmbArtnetInputInterface, leftPanel);
     if (cmbHippoInputInterface.isVisible()) layCombo(lblHippoInputInterface, cmbHippoInputInterface, leftPanel);
     if (cmbHippoTcChannel.isVisible()) layCombo(lblHippoTcChannel, cmbHippoTcChannel, leftPanel);
+    if (lblWinampInfo.isVisible())
+    {
+        // Winamp panel: header label (14px) + status / track / position
+        // value label (14px), same vertical rhythm as layCombo so the panel
+        // sits flush with the other source-config panels.
+        lblWinampInfoHeader.setBounds(leftPanel.removeFromTop(14));
+        leftPanel.removeFromTop(2);
+        lblWinampInfo.setBounds(leftPanel.removeFromTop(14));
+        leftPanel.removeFromTop(3);
+    }
 
     // Generator clock toggle + transport + start/stop TC
     if (btnGenClock.isVisible())
@@ -6365,6 +6830,14 @@ void MainComponent::resized()
     {
         layCombo(lblProDJLinkInterface, cmbProDJLinkInterface, leftPanel);
     }
+    if (cmbPdlBridgeIdentity.isVisible())
+    {
+        layCombo(lblPdlBridgeIdentity, cmbPdlBridgeIdentity, leftPanel);
+    }
+    if (cmbPdl95bMode.isVisible())
+    {
+        layCombo(lblPdl95bMode, cmbPdl95bMode, leftPanel);
+    }
     if (cmbStageLinQInterface.isVisible())
     {
         layCombo(lblStageLinQInterface, cmbStageLinQInterface, leftPanel);
@@ -6444,16 +6917,31 @@ void MainComponent::resized()
             lblMixerStatus.setBounds(leftPanel.removeFromTop(13));
             leftPanel.removeFromTop(3);
         }
+    }
 
-        // --- TrackMap ---
-        // --- Action buttons + TrackMap toggle ---
-        if (btnTrackMap.isVisible())
+    // --- TrackMap row (shared by ProDJLink, StageLinQ, and Winamp) ---
+    // Lives outside the cmbProDJLinkPlayer.isVisible() block above because
+    // Winamp does not have a player combo but does use the same TrackMap.
+    // Self-guarded by btnTrackMap.isVisible(), which updateDeviceSelectorVisibility
+    // sets based on showTrackMapBtns = (PDL || StageLinQ || Winamp) && expanded.
+    if (btnTrackMap.isVisible())
+    {
+        leftContent.addSectionSeparator(leftPanel.getY());
+        leftPanel.removeFromTop(4);
+
+        // Row 1: Action buttons.  For ProDJLink and StageLinQ the row
+        // has three columns (TrackMap edit, MixerMap edit, Deck view).
+        // For Winamp only TrackMap edit is visible -- Winamp has no
+        // mixer protocol and no per-deck view -- so we give that one
+        // button the whole row instead of laying it out at a third of
+        // the width with two visually empty columns beside it.
+        auto btnRow = leftPanel.removeFromTop(22);
+        if (eng.getActiveInput() == SrcType::Winamp)
         {
-            leftContent.addSectionSeparator(leftPanel.getY());
-            leftPanel.removeFromTop(4);
-
-            // Row 1: Action buttons (3 equal columns)
-            auto btnRow = leftPanel.removeFromTop(22);
+            btnTrackMapEdit.setBounds(btnRow);
+        }
+        else
+        {
             int thirdW = (btnRow.getWidth() - 8) / 3;
             btnTrackMapEdit.setBounds(btnRow.removeFromLeft(thirdW));
             btnRow.removeFromLeft(4);
@@ -6461,12 +6949,12 @@ void MainComponent::resized()
             btnRow.removeFromLeft(4);
             btnProDJLinkView.setBounds(btnRow);
             btnStageLinQView.setBounds(btnRow);  // same slot, only one is visible
-            leftPanel.removeFromTop(3);
-
-            // Row 2: TrackMap toggle (full width)
-            btnTrackMap.setBounds(leftPanel.removeFromTop(22));
-            leftPanel.removeFromTop(3);
         }
+        leftPanel.removeFromTop(3);
+
+        // Row 2: TrackMap toggle (full width)
+        btnTrackMap.setBounds(leftPanel.removeFromTop(22));
+        leftPanel.removeFromTop(3);
     }
 
     // === Feature sections (shared: work for ProDJLink AND Audio BPM) ===
@@ -6739,6 +7227,8 @@ void MainComponent::resized()
     }
 
     lblInputStatus.setBounds(leftPanel.removeFromTop(14));
+    if (lblLtcInUserBits.isVisible())
+    { leftPanel.removeFromTop(2); lblLtcInUserBits.setBounds(leftPanel.removeFromTop(12)); }
 
     // Set content height for left panel scrolling
     int leftUsedHeight = leftPanel.getY() + 8;
@@ -6808,6 +7298,8 @@ void MainComponent::resized()
             laySlider(lblLtcOutputGain, sldLtcOutputGain, rp);
             if (mtrLtcOutput.isVisible()) layMeter(mtrLtcOutput, rp);
             if (sldLtcOffset.isVisible()) laySlider(lblLtcOffset, sldLtcOffset, rp);
+            if (cmbLtcUserBitsMode.isVisible()) layCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, rp);
+            if (txtLtcUserBits.isVisible()) layEditor(lblLtcUserBits, txtLtcUserBits, rp);
         }
         if (lblOutputLtcStatus.isVisible()) layStatus(lblOutputLtcStatus, rp);
         rp.removeFromTop(2);
@@ -6822,6 +7314,7 @@ void MainComponent::resized()
         if (cmbTcnetInterface.isVisible()) layCombo(lblTcnetInterface, cmbTcnetInterface, rp);
         if (cmbTcnetLayer.isVisible()) layCombo(lblTcnetLayer, cmbTcnetLayer, rp);
         if (sldTcnetOffset.isVisible()) laySlider(lblTcnetOffset, sldTcnetOffset, rp);
+        if (sldTcnetGlobalOffset.isVisible()) laySlider(lblTcnetGlobalOffset, sldTcnetGlobalOffset, rp);
         rp.removeFromTop(2);
     }
 
@@ -7116,6 +7609,7 @@ void MainComponent::timerCallback()
                     case SrcType::ArtNet:     srcTag = 0x30000000u; break;
                     case SrcType::LTC:        srcTag = 0x40000000u; break;
                     case SrcType::Hippotizer: srcTag = 0x50000000u; break;
+                    case SrcType::Winamp:     srcTag = 0x60000000u; break;
                     default: break;
                 }
                 trackIdToSend = srcTag | (uint32_t)(layer + 1);
@@ -7156,6 +7650,7 @@ void MainComponent::timerCallback()
                     case SrcType::ProDJLink:   artist = "Pro DJ Link";      break;
                     case SrcType::StageLinQ:   artist = "StageLinQ";        break;
                     case SrcType::Hippotizer:  artist = "HippoNet";       break;
+                    case SrcType::Winamp:      artist = "Winamp";           break;
                     default:                   artist = "STC";              break;
                 }
                 title = eng.getName();
@@ -8086,6 +8581,66 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
         return true;
     }
 
+    // Generator A/B loop shortcuts: only fire when the Generator transport
+    // is visible (input source = Generator, transport mode = true) and no
+    // text editor has keyboard focus (so typing in a TC field is not
+    // intercepted).  These mirror the DAW / sample editor convention:
+    //   [   set loop In at current playhead
+    //   ]   set loop Out at current playhead
+    //   L   toggle loop on/off
+    // No modifiers required -- these are operational controls, not config.
+    // Routed directly to the engine (rather than triggering buttons in the
+    // waveform window) so the shortcuts work even when that window is
+    // closed.  Validation mirrors what the waveform window's buttons do.
+    if (btnGenPlay.isVisible() && ! key.getModifiers().isAnyModifierKeyDown())
+    {
+        // Skip if a text editor or combo's text edit currently owns focus.
+        if (auto* focused = juce::Component::getCurrentlyFocusedComponent())
+            if (dynamic_cast<juce::TextEditor*>(focused) != nullptr)
+                return false;
+
+        const int code = key.getKeyCode();
+        auto& eng = currentEngine();
+
+        if (code == '[' || code == juce::KeyPress::numberPad0 + 0xDB)
+        {
+            // Loop In is a config-style timestamp-setting gesture; gated
+            // by Show Lock for symmetry with Stop TC editing and the
+            // waveform click-to-seek (silently refused, but the key is
+            // still consumed so it does not propagate to other handlers).
+            if (isShowLocked()) return true;
+            const double here = eng.getGeneratorCurrentMs();
+            const double existingOut = eng.getGeneratorLoopOutMs();
+            if (existingOut > 0.0 && here >= existingOut)
+                return true;  // refuse silently; the visible button shows a dialog
+            eng.setGeneratorLoopInMs(here);
+            saveSettings();
+            return true;
+        }
+        if (code == ']' || code == juce::KeyPress::numberPad0 + 0xDD)
+        {
+            // Symmetric with '[' -- Show Lock gates the Out timestamp too.
+            if (isShowLocked()) return true;
+            const double here = eng.getGeneratorCurrentMs();
+            const double existingIn = eng.getGeneratorLoopInMs();
+            if (here <= existingIn)
+                return true;
+            eng.setGeneratorLoopOutMs(here);
+            saveSettings();
+            return true;
+        }
+        if (code == 'L')
+        {
+            // The LOOP toggle stays ungated: toggling an already-armed
+            // loop on / off is an operational gesture (performance), not
+            // configuration.  Same rationale as the panel's transport
+            // controls remaining active during Show Lock.
+            eng.setGeneratorLoopEnabled(! eng.getGeneratorLoopEnabled());
+            saveSettings();
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -8242,7 +8797,7 @@ void MainComponent::updateInputButtonStates()
     auto& eng = currentEngine();
     auto active = eng.getActiveInput();
     struct I { juce::TextButton* b; SrcType s; };
-    I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ} };
+    I bs[] = { {&btnMtcIn,SrcType::MTC}, {&btnArtnetIn,SrcType::ArtNet}, {&btnHippoIn,SrcType::Hippotizer}, {&btnSysTime,SrcType::SystemTime}, {&btnLtcIn,SrcType::LTC}, {&btnProDJLinkIn,SrcType::ProDJLink}, {&btnStageLinQIn,SrcType::StageLinQ}, {&btnWinampIn,SrcType::Winamp} };
     for (auto& i : bs) styleInputButton(*i.b, active == i.s, getInputColour(i.s));
 
     // Stop shared network inputs when no engine uses them.
@@ -8307,6 +8862,7 @@ juce::Colour MainComponent::getInputColour(SrcType s) const
         case SrcType::ProDJLink:  return juce::Colour(0xFF00AAFF);  // bright blue
         case SrcType::StageLinQ:  return juce::Colour(0xFF00CC66);  // Denon green
         case SrcType::Hippotizer: return juce::Colour(0xFF66BBAA);  // Green Hippo teal
+        case SrcType::Winamp:     return juce::Colour(0xFFFFCC33);  // Winamp classic yellow/gold
         default:                      return textMid;
     }
 }
