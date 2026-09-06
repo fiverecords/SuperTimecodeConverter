@@ -362,9 +362,11 @@ public:
     int getLtcOutputOffset() const      { return ltcOutputOffset; }
     int getLANetTCOutputOffset() const  { return laNetTCOutputOffset; }
 
-    void setMtcOutputOffset(int v)      { mtcOutputOffset = v; }
-    void setArtnetOutputOffset(int v)   { artnetOutputOffset = v; }
-    void setLtcOutputOffset(int v)      { ltcOutputOffset = v; }
+    // Offsets are clamped to the +/-30 frame range the UI and the settings
+    // loader use, so every entry point agrees.
+    void setMtcOutputOffset(int v)      { mtcOutputOffset = juce::jlimit(-30, 30, v); }
+    void setArtnetOutputOffset(int v)   { artnetOutputOffset = juce::jlimit(-30, 30, v); }
+    void setLtcOutputOffset(int v)      { ltcOutputOffset = juce::jlimit(-30, 30, v); }
 
     // LTC user-bits source modes (issue #13 follow-up).
     static constexpr int kUserBitsManual     = 0;  // fixed operator-entered value
@@ -511,7 +513,7 @@ public:
         return hex + "  (dec " + hex.trimCharactersAtStart("0") + ")";
     }
     void setTcnetOutputOffsetMs(int v)  { tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, v); }
-    void setLANetTCOutputOffset(int v)  { laNetTCOutputOffset = v; }
+    void setLANetTCOutputOffset(int v)  { laNetTCOutputOffset = juce::jlimit(-30, 30, v); }
 
     int getTcnetOutputOffsetMs() const  { return tcnetOutputOffsetMs; }
 
@@ -2371,8 +2373,10 @@ public:
         // play session ended at.
         lastCueCheckMs = (uint32_t) juce::jmax(0.0, genStartMs);
         if (activeInput == InputSource::SystemTime)
+        {
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
             setFramePhaseFromPosition(genCurrentMs, currentFps);
+        }
         generatorAudioPlayer.stopAndReset();
     }
 
@@ -2518,8 +2522,10 @@ public:
         genEndedAtEof = false;
 
         if (activeInput == InputSource::SystemTime)
+        {
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
             setFramePhaseFromPosition(genCurrentMs, currentFps);
+        }
 
         const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
         generatorAudioPlayer.seekSeconds(audioPosSec);
@@ -3876,7 +3882,7 @@ private:
                                    + (double)now.getSeconds() * 1000.0
                                    + (double)now.getMilliseconds();
             currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
-                        setFramePhaseFromPosition(msSinceMidnight, currentFps);
+            setFramePhaseFromPosition(msSinceMidnight, currentFps);
             return;
         }
 
@@ -3952,7 +3958,7 @@ private:
         }
         // Stopped and Paused: genCurrentMs stays where it is
         currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
-            setFramePhaseFromPosition(genCurrentMs, currentFps);
+        setFramePhaseFromPosition(genCurrentMs, currentFps);
     }
 
     //==========================================================================

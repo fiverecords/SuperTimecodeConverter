@@ -2192,13 +2192,17 @@ private:
                         DBG("DbServerClient: PCO2 parse returned 0 cues");
                     }
                     else
+                    {
                         DBG("DbServerClient: PCO2 extractBlob failed");
+                    }
                 }
                 else
+                {
                     DBG("DbServerClient: PCO2 response -- ok=" + juce::String((int)resp.ok)
                         + " type=0x" + juce::String::toHexString((int)resp.type)
                         + " args=" + juce::String(resp.argCount)
                         + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+                }
             }
         }
 
@@ -2227,13 +2231,17 @@ private:
                         DBG("DbServerClient: PCOB parse returned 0 cues");
                     }
                     else
+                    {
                         DBG("DbServerClient: PCOB extractBlob failed");
+                    }
                 }
                 else
+                {
                     DBG("DbServerClient: PCOB response -- ok=" + juce::String((int)resp.ok)
                         + " type=0x" + juce::String::toHexString((int)resp.type)
                         + " args=" + juce::String(resp.argCount)
                         + " numArgs[2]=" + juce::String(resp.argCount >= 3 ? (int)resp.numArgs[2] : -1));
+                }
             }
         }
 

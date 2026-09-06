@@ -2956,7 +2956,7 @@ private:
                               const juce::String& interfaceIp = {})
     {
         std::memset(out, 0, 6);
-
+        juce::ignoreUnused(interfaceIp);   // only used in the Windows branch below
 #ifdef _WIN32
         ULONG bufSize = 15000;
         std::vector<uint8_t> buffer(bufSize);

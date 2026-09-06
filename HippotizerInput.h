@@ -389,7 +389,9 @@ private:
                     if (client != nullptr)
                     {
                         DBG("HippoNet: TCP connection accepted on port " + juce::String(listener->getPort()));
-                        tcpClients.push_back({ std::move(client), false });
+                        TcpClient tc;
+                        tc.sock = std::move(client);
+                        tcpClients.push_back(std::move(tc));
                     }
                 }
             }
