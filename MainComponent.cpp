@@ -1893,9 +1893,6 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
     sldLtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
 
-    // Field accepts hex digits in MANUAL, plain text in NAME.
-    applyUserBitsFieldMode(TimecodeEngine::kUserBitsManual);
-
     // LTC user bits (SMPTE 12M binary groups).  Issue #13.
     // Source mode first, then the manual value field.
     addRightLabelAndCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, "LTC USER BITS:");
@@ -1923,14 +1920,15 @@ MainComponent::MainComponent()
 
     rightContent.addAndMakeVisible(lblLtcUserBits);
     styleLabel(lblLtcUserBits);
-    lblLtcUserBits.setText("LTC USER BITS (HEX):", juce::dontSendNotification);
     rightContent.addAndMakeVisible(txtLtcUserBits);
     txtLtcUserBits.setFont(juce::Font(juce::FontOptions(11.0f)));
     txtLtcUserBits.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xFF222222));
     txtLtcUserBits.setColour(juce::TextEditor::textColourId, juce::Colours::white);
     txtLtcUserBits.setJustification(juce::Justification::centred);
-    txtLtcUserBits.setInputRestrictions(8, "0123456789abcdefABCDEF");
-    txtLtcUserBits.setTextToShowWhenEmpty("00000000", juce::Colour(0xFF666666));
+    // The label text, the input restrictions and the placeholder all depend
+    // on the user-bits mode (hex digits vs four characters), so they have a
+    // single owner rather than being set here and overridden later.
+    applyUserBitsFieldMode(TimecodeEngine::kUserBitsManual);
     auto applyUserBits = [this]
     {
         if (syncing || isShowLockedRevert()) return;

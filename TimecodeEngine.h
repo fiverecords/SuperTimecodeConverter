@@ -18,6 +18,7 @@
 #include "HippotizerInput.h"
 #include "HippotizerOutput.h"
 #include "WinampInput.h"
+#include <cmath>
 #include "DbServerClient.h"
 #include "TriggerOutput.h"
 #include "LinkBridge.h"
