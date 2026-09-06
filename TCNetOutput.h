@@ -93,6 +93,7 @@ public:
         uint8_t  tcMinutes     = 0;
         uint8_t  tcSeconds     = 0;
         uint8_t  tcFrames      = 0;
+        uint8_t  smpteMode     = kSmpte30;   // TCNet SMPTE mode of this layer's H:M:S:F block
         uint8_t  onAir         = 0;     // fader position 0-255 (0=off, >=1=on-air)
         uint32_t trackId       = 0;
         uint32_t bpm100        = 0;
@@ -298,18 +299,42 @@ public:
         // ChamSys and similar consoles read the TC H/M/S/F fields (starting
         // at byte 108 for L1) as the advancing timecode; if left at 0 the
         // receiver sees "timecode stopped at 00:00:00:00" and ignores it.
-        int fpsInt = 30;
-        if      (fps == FrameRate::FPS_2398) fpsInt = 24;
-        else if (fps == FrameRate::FPS_24)   fpsInt = 24;
-        else if (fps == FrameRate::FPS_25)   fpsInt = 25;
-        else if (fps == FrameRate::FPS_2997) fpsInt = 30;
-        else if (fps == FrameRate::FPS_30)   fpsInt = 30;
-        uint32_t totalSec = L.currentTimeMs / 1000;
-        uint32_t ms       = L.currentTimeMs % 1000;
-        L.tcHours   = (uint8_t)((totalSec / 3600) % 24);
-        L.tcMinutes = (uint8_t)((totalSec % 3600) / 60);
-        L.tcSeconds = (uint8_t)(totalSec % 60);
-        L.tcFrames  = (uint8_t)((ms * fpsInt) / 1000);
+        // Same conversion as every other output (drop-frame numbering at
+        // 29.97), and the layer's SMPTE mode byte says which rate the frame
+        // field is in -- it used to be fixed at 30 while the frames were
+        // counted at the engine rate, so a console reading the block at
+        // 25 fps saw frame 24 as 0.80 s instead of 0.96 s.
+        const Timecode wire = wallClockToTimecode((double)L.currentTimeMs, fps);
+        L.tcHours   = (uint8_t)wire.hours;
+        L.tcMinutes = (uint8_t)wire.minutes;
+        L.tcSeconds = (uint8_t)wire.seconds;
+        L.tcFrames  = (uint8_t)wire.frames;
+        L.smpteMode = smpteModeFor(fps);
+    }
+
+    /// TCNet SMPTE mode byte for an engine frame rate.  23.976 has no code
+    /// and is sent as 24, like MTC and Art-Net do.
+    static uint8_t smpteModeFor(FrameRate fps)
+    {
+        switch (fps)
+        {
+            case FrameRate::FPS_2398:
+            case FrameRate::FPS_24:   return kSmpte24;
+            case FrameRate::FPS_25:   return kSmpte25;
+            case FrameRate::FPS_2997: return kSmpteDf;
+            case FrameRate::FPS_30:   return kSmpte30;
+            default:                  return kSmpte30;
+        }
+    }
+
+    /// The node-wide SMPTE mode: that of the first active layer, 30 when
+    /// none is (matches what the Bridge sends idle).
+    uint8_t generalSmpteMode() const
+    {
+        for (int i = 0; i < kMaxLayers; ++i)
+            if (layers[i].hasEverBeenActive)
+                return layers[i].smpteMode;
+        return kSmpte30;
     }
 
     void clearLayer(int idx)
@@ -923,9 +948,9 @@ private:
         w32(p + 32, L.trackLenMs);           // Track Length ms
         w32(p + 36, L.currentTimeMs);        // Current Position ms
         w32(p + 40, L.speed);                // Speed (2^20 fixed-point, 1048576=100%)
-        // Byte 45 = SMPTE framerate (30 = 30fps). Bridge observed sending 30 here
-        // in what the spec calls "reserved [44-56]". Apparently not fully reserved.
-        p[45] = kSmpte30;
+        // Byte 45 = SMPTE framerate. Bridge observed sending 30 here in what
+        // the spec calls "reserved [44-56]". Apparently not fully reserved.
+        p[45] = L.smpteMode;
         // [46-56] reserved
         w32(p + 57, L.beatNumber);           // Beat Number
         // [61-111] reserved
@@ -1139,7 +1164,7 @@ private:
             w32(p + 50 + i * 4, L.trackId);
             wstr(p + 172 + i * 16, nm[i], 16);
         }
-        p[83] = kSmpte30;
+        p[83] = generalSmpteMode();
         broadcastSocket->write(broadcastIp, kPortBroadcast, p, 300);
     }
 
@@ -1170,7 +1195,7 @@ private:
             // [1] TC State:   0=Stopped, 1=Running, 2=Force Resync
             // [2..5] HH:MM:SS:FF
             const int tcBase = 106 + i * 6;
-            p[tcBase + 0] = 0;  // defer to general SMPTE mode
+            p[tcBase + 0] = L.hasEverBeenActive ? L.smpteMode : 0;  // 0 = defer to general SMPTE mode
             p[tcBase + 1] = (L.layerState == kStatePlaying) ? 1 : 0;
             p[tcBase + 2] = L.tcHours;
             p[tcBase + 3] = L.tcMinutes;
@@ -1180,7 +1205,7 @@ private:
             p[154 + i] = L.onAir;  // fader position 0-255 (spec V3.3.3+)
         }
         // p[104] is RESERVED per spec; leave at 0.
-        p[105] = kSmpte30;
+        p[105] = generalSmpteMode();
         timeSocket->write(broadcastIp, kPortTime, p, 162);
     }
 
