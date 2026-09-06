@@ -75,4 +75,5 @@ RELEASE_NOTES_*.md
 SESSION_CONTEXT.md
 docs/DESIGN.md
 docs/BENCH.md
+docs/AUDIT.md
 tools/
