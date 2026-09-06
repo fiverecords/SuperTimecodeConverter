@@ -7,6 +7,7 @@
 #include "TimecodeCore.h"
 #include "NetworkUtils.h"
 #include <atomic>
+#include <cstdlib>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -296,17 +297,9 @@ private:
         {
             tc = incrementFrame(encoderTc, fps);
 
-            int maxFrames = frameRateToInt(fps);
-            auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
-                return (int64_t)t.hours * 3600 * maxFrames
-                     + (int64_t)t.minutes * 60 * maxFrames
-                     + (int64_t)t.seconds * maxFrames
-                     + (int64_t)t.frames;
-            };
-            int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
-            int64_t rawDiff = toTotal(pending) - toTotal(tc);
-            int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
-            if (diff > dayFrames / 2) diff = dayFrames - diff;
+            // Distance on the drop-frame-aware frame index (see LtcOutput):
+            // a linear count reads a 59;29 -> 00;02 crossing as three frames.
+            const int64_t diff = std::abs(frameDistance(pending, tc, fps));
             if (diff > 1)
                 tc = pending;
         }

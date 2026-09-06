@@ -6,6 +6,7 @@
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
 #include <atomic>
+#include <cstdlib>
 
 class MtcOutput : public juce::HighResolutionTimer
 {
@@ -244,18 +245,11 @@ private:
                     // Auto-increment by 2 frames (1 QF cycle = 2 frame durations)
                     cycleTimecode = incrementFrame(incrementFrame(cycleTimecode, fps), fps);
 
-                    // Resync if pending differs by more than 2 frames (seek/jump)
-                    int maxFrames = frameRateToInt(fps);
-                    auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
-                        return (int64_t)t.hours * 3600 * maxFrames
-                             + (int64_t)t.minutes * 60 * maxFrames
-                             + (int64_t)t.seconds * maxFrames
-                             + (int64_t)t.frames;
-                    };
-                    int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
-                    int64_t rawDiff = toTotal(pending) - toTotal(cycleTimecode);
-                    int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
-                    if (diff > dayFrames / 2) diff = dayFrames - diff;
+                    // Resync if pending differs by more than 2 frames (seek/jump).
+                    // Distance on the drop-frame-aware frame index: a linear
+                    // count reads a 59;29 -> 00;02 crossing as three frames and
+                    // used to force a spurious resync there.
+                    const int64_t diff = std::abs(frameDistance(pending, cycleTimecode, fps));
                     if (diff > 2)
                         cycleTimecode = pending;
                 }
