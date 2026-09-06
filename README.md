@@ -149,7 +149,7 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 - Per-track timecode offset (HH:MM:SS:FF)
 - Per-track BPM multiplier (/4, /2, 1x, x2, x4) -- applied to MIDI Clock, Ableton Link, and OSC BPM forward
 - Duration-based track identification -- same artist+title with different lengths are treated as separate tracks
-- Learn mode: capture tracks live from any CDJ or Denon deck (auto-captures duration)
+- Learn mode: capture the track currently loaded on any source that reports one — CDJ, Denon deck or Winamp — with the duration captured automatically. If the metadata has not arrived yet, the capture is retried rather than silently doing nothing
 - Auto-fill artist/title from CDJ metadata
 - **Import from rekordbox XML:** import your entire rekordbox collection into the Track Map from an XML export (File → Export Collection in xml format). Artist, title and duration are imported for each track. If the XML contains playlists, STC offers to **apply a playlist order** — reordering the Track Map to match the setlist while preserving all existing cue points, triggers and offsets. Artwork, waveform and cue points populate automatically the first time each track plays on a CDJ.
 - **Clear All:** remove all entries from the Track Map with a single click (with confirmation dialog)
@@ -294,7 +294,7 @@ The internal Generator can play an audio file synchronised with the timecode it 
 - **Per-preset audio file** — each Generator preset stores an absolute path to a WAV / AIFF / FLAC / OGG / MP3 file plus a Loop flag. Activating the preset (GO button or `/stc/N/gen/preset` OSC) loads the file and starts playback at the preset's Start TC. The audio file association is global to the preset, so any engine that activates it loads the same file.
 - **Per-engine output** — each engine has its own audio output device for playback, independent of the LTC output. Stereo (Ch 1+2) or specific mono channel routing.
 - **File channel selection** — choose **Stereo (L+R)**, **Left only**, or **Right only** to handle industry-standard files that carry programme audio on one channel and LTC on the other. The unselected channel is silenced and the audio is centred in the stereo image.
-- **Per-engine sample rate / buffer** — override the global preferred values for the playback device only. Useful for cards that don't share a clock between LTC and music outputs.
+- **Per-engine buffer size** — override the global preferred value for the playback device only. Useful for cards that don't share a clock between LTC and music outputs. The sample rate is shared by every audio device STC opens, in either direction and across all engines.
 - **Volume slider** — linear 0..1.5 (1.0 = unity, with headroom for low-level recordings). Available both in the Generator panel and in the floating waveform window, kept in sync.
 - **Transport sync** — Play / Pause / Stop drive both the timecode and the audio in lockstep. Pause is instant (the audio callback honours a logical-pause flag rather than stopping the transport); resume is gap-free.
 - **Asynchronous file loading** — switching presets never blocks the UI. A dedicated I/O thread loads the new file and attaches it to the transport in the background; rapid navigation across presets is coalesced (only the latest target is loaded). With a 32-entry waveform peak cache, switching back and forth across recently-seen tracks reuses cached peaks instead of re-decoding.
