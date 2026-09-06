@@ -62,3 +62,17 @@ desktop.ini
 # ====================
 libs/
 SDKs/
+
+# ====================
+# Working-tree only -- never published
+# ====================
+# These carry roadmap, internal analysis and session state. Keeping them
+# out of the repo is a standing decision (docs/DESIGN.md D3). They live in
+# the working tree and travel in the project zip, not in git.
+BACKLOG.md
+STC_PRODJLINK_AUDIT.md
+RELEASE_NOTES_*.md
+SESSION_CONTEXT.md
+docs/DESIGN.md
+docs/BENCH.md
+tools/
