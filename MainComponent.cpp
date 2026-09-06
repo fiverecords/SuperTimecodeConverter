@@ -5702,9 +5702,12 @@ void MainComponent::updateDeviceSelectorVisibility()
     bool showTriggerOutputs = showProDJLinkIn || showGenerator || showWinampIn;
 
     btnTriggerMidi.setVisible(showTriggerOutputs);
-    cmbTriggerMidiDevice.setVisible(showTriggerOutputs
-        && (btnTriggerMidi.getToggleState() || btnMidiClock.getToggleState()
-            || btnMidiMixerFwd.getToggleState())
+    // Parenthesised explicitly: this is what the operator precedence already
+    // produced, but Clang warns about mixing && inside || without saying so.
+    cmbTriggerMidiDevice.setVisible(
+        (showTriggerOutputs
+            && (btnTriggerMidi.getToggleState() || btnMidiClock.getToggleState()
+                || btnMidiMixerFwd.getToggleState()))
         || (showAudioBpmActive && btnMidiClock.getToggleState()));
     btnTriggerOsc.setVisible(showTriggerOutputs);
     btnArtnetTrigger.setVisible(showTriggerOutputs);
