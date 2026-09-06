@@ -99,8 +99,41 @@ public:
 
     void setTimecode(const Timecode& tc)
     {
-        packedPendingTc.store(packTimecode(tc.hours, tc.minutes, tc.seconds, tc.frames),
-                              std::memory_order_relaxed);
+        const uint64_t packed = packTimecode(tc.hours, tc.minutes, tc.seconds, tc.frames);
+        packedPendingTc.store(packed, std::memory_order_relaxed);
+    }
+
+    /// Publish where the timecode clock currently sits inside its frame, in
+    /// milliseconds, as measured by the source itself (see the phase section
+    /// in TimecodeEngine).  Called once per engine tick; the encoder uses it
+    /// only when it (re)seeds, to start its frame at the matching position
+    /// instead of at bit 0 of whichever audio buffer arrives first.
+    ///
+    /// Deriving this from the source rather than from the tick matters: the
+    /// engine ticks at 60Hz, which at 30fps is exactly twice the frame rate,
+    /// so simply timing the value change would give a constant-but-arbitrary
+    /// error per session -- precisely the random start-up phase reported in
+    /// issue #15.
+    void setFramePhaseMs(double msIntoFrame)
+    {
+        framePhaseMs.store(msIntoFrame, std::memory_order_relaxed);
+        framePhaseAtMs.store(juce::Time::getMillisecondCounterHiRes(),
+                             std::memory_order_relaxed);
+        haveFramePhase.store(true, std::memory_order_release);
+    }
+
+    /// The output latency compensation actually in force, in milliseconds.
+    /// Set automatically from the device when it opens (see
+    /// audioDeviceAboutToStart); exposed read-only for the status display so
+    /// the applied value is visible without being an operator control.
+    double getLatencyCompensationMs() const { return latencyCompMs.load(std::memory_order_relaxed); }
+
+    /// Output latency the device reports, in milliseconds (0 if unknown).
+    /// Used by the AUTO compensation mode; ASIO drivers are not always
+    /// truthful about this, which is why a manual trim also exists.
+    double getDeviceReportedLatencyMs() const
+    {
+        return deviceLatencyMs.load(std::memory_order_relaxed);
     }
 
     void setFrameRate(FrameRate fps)  { pendingFps.store(fps, std::memory_order_relaxed); }
@@ -155,6 +188,15 @@ private:
     int currentBufferSize = 512;
 
     std::atomic<uint64_t> packedPendingTc { 0 };
+    // Frame-phase alignment (issue #15): see setFramePhaseMs above.
+    // Sub-frame phase published by the engine: how far into the frame the
+    // timecode clock was (framePhaseMs) at the instant it was published
+    // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
+    std::atomic<double> framePhaseMs   { 0.0 };
+    std::atomic<double> framePhaseAtMs { 0.0 };
+    std::atomic<bool>   haveFramePhase { false };
+    std::atomic<double> latencyCompMs { 0.0 };
+    std::atomic<double> deviceLatencyMs { 0.0 };
     std::atomic<FrameRate> pendingFps { FrameRate::FPS_25 };
     std::atomic<bool> paused { false };
     std::atomic<bool> holdOnPause { false };
@@ -400,16 +442,70 @@ private:
                             ? outputChannelData[1] : nullptr;
         const float amplitude = baseAmplitude * outputGain.load(std::memory_order_relaxed);
 
+        // Wall-clock instant of the first sample of this buffer, used by the
+        // phase alignment below.  Taken once per callback, not per sample.
+        const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
+
         float peak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
         {
             if (needNewFrame.load(std::memory_order_relaxed))
             {
+                const bool seeding = !encoderSeeded.load(std::memory_order_relaxed);
+
                 updateSamplesPerBit();
                 packFrame();
                 currentBitIndex = 0;
                 halfCellIndex = 0;
                 samplePositionInHalfBit = 0.0;
+
+                // --- Frame-phase alignment (issue #15) ---
+                // Only on the FIRST frame after a (re)seed.  Previously the
+                // encoder always began a fresh frame at this point, which
+                // anchored the LTC frame boundary to whenever the audio
+                // device happened to start -- giving a phase that was
+                // constant while running but randomly different on every
+                // restart, spread across the whole frame.  Here we instead
+                // start part-way through the frame, at the position matching
+                // how long ago the engine advanced to this frame (plus any
+                // output latency compensation, so the phase is correct at
+                // the connector rather than in the buffer).  The remaining
+                // bits of the current frame go out as a partial codeword,
+                // which decoders simply ignore before locking to the next
+                // full frame.
+                if (seeding && haveFramePhase.load(std::memory_order_acquire)
+                    && samplesPerHalfBit > 0.0)
+                {
+                    const double frameMs = samplesPerHalfBit * LTC_FRAME_BITS * 2.0
+                                           * 1000.0 / currentSampleRate;
+                    if (frameMs > 0.0)
+                    {
+                        // Phase at publication, plus however long ago that
+                        // was, plus the output latency so the alignment holds
+                        // at the connector rather than in the buffer.
+                        double elapsed = framePhaseMs.load(std::memory_order_relaxed)
+                                       + (callbackStartMs
+                                          - framePhaseAtMs.load(std::memory_order_relaxed))
+                                       + latencyCompMs.load(std::memory_order_relaxed);
+                        // Wrap into [0, frameMs): the boundary may be several
+                        // frames old, and compensation can push it negative.
+                        elapsed = std::fmod(elapsed, frameMs);
+                        if (elapsed < 0.0) elapsed += frameMs;
+
+                        const double halfCellsIn = (elapsed / frameMs)
+                                                   * (double)(LTC_FRAME_BITS * 2);
+                        int wholeHalfCells = (int)halfCellsIn;
+                        if (wholeHalfCells < 0) wholeHalfCells = 0;
+                        if (wholeHalfCells > LTC_FRAME_BITS * 2 - 1)
+                            wholeHalfCells = LTC_FRAME_BITS * 2 - 1;
+
+                        currentBitIndex = wholeHalfCells / 2;
+                        halfCellIndex   = wholeHalfCells % 2;
+                        samplePositionInHalfBit =
+                            (halfCellsIn - (double)wholeHalfCells) * samplesPerHalfBit;
+                    }
+                }
+
                 needNewFrame.store(false, std::memory_order_relaxed);
                 // Do NOT invert currentLevel here -- the mandatory start-of-bit
                 // transition for bit 0 was already applied when the previous
@@ -458,6 +554,26 @@ private:
         {
             currentSampleRate = device->getCurrentSampleRate();
             currentBufferSize = device->getCurrentBufferSizeSamples();
+            // Latency the driver claims for its output path, in ms.  Offered
+            // to the UI as the AUTO compensation value; ASIO drivers are
+            // often optimistic here, hence the manual trim alongside it.
+            const int latSamples = device->getOutputLatencyInSamples();
+            const double latMs = currentSampleRate > 0.0
+                                     ? (double)latSamples * 1000.0 / currentSampleRate
+                                     : 0.0;
+            deviceLatencyMs.store(latMs, std::memory_order_relaxed);
+
+            // Apply it automatically.  Without this the LTC leaves the
+            // interface systematically late by the output latency; with it,
+            // the frame phase is right at the connector.  There is no user
+            // control for this on purpose -- it is not something an operator
+            // should have to reason about, and a wrong automatic value is
+            // still closer than no compensation at all.
+            // Clamped to a sane window: a driver reporting an absurd figure
+            // (they sometimes do) must not be able to throw the phase off by
+            // more than it would have been without compensation.
+            latencyCompMs.store(juce::jlimit(0.0, 100.0, latMs),
+                                std::memory_order_relaxed);
             numChannelsAvailable = device->getActiveOutputChannels().countNumberOfSetBits();
         }
         resetEncoder();

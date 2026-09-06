@@ -106,6 +106,17 @@ public:
         return elapsed < kSourceTimeoutMs;
     }
 
+    /// Wall-clock instant (hi-res ms counter) at which the last complete
+    /// timecode was reconstructed.  MTC is a frame-based source, so this is
+    /// the frame boundary as far as the rest of STC is concerned -- and it is
+    /// far more precise than watching the value change from the 60Hz tick.
+    /// 0 if nothing has been decoded yet.
+    double getLastFrameArrivalMs() const
+    {
+        const juce::SpinLock::ScopedLockType lock(tcLock);
+        return syncTimeMs;
+    }
+
     Timecode getCurrentTimecode() const
     {
         if (!synced.load(std::memory_order_acquire))

@@ -436,11 +436,20 @@ MainComponent::MainComponent()
 
     addLabelAndCombo(lblSampleRate, cmbSampleRate, "SAMPLE RATE / BUFFER:");
     populateSampleRateCombo();
-    cmbSampleRate.onChange = [this] { if (!syncing && !isShowLockedRevert()) { restartAllAudioDevices(); saveSettings(); } };
+    cmbSampleRate.onChange = [this] {
+        if (syncing || isShowLockedRevert()) return;
+        cmbSampleRateOut.setSelectedId(cmbSampleRate.getSelectedId(), juce::dontSendNotification);
+        restartAllAudioDevices(); saveSettings();
+    };
 
     addLabelAndCombo(lblBufferSize, cmbBufferSize, "BUFFER SIZE:");
     populateBufferSizeCombo();
-    cmbBufferSize.onChange = [this] { if (!syncing && !isShowLockedRevert()) { restartAllAudioDevices(); saveSettings(); } };
+    populateOutputAudioCombos();
+    cmbBufferSize.onChange = [this] {
+        if (syncing || isShowLockedRevert()) return;
+        cmbBufferSizeOut.setSelectedId(cmbBufferSize.getSelectedId(), juce::dontSendNotification);
+        restartAllAudioDevices(); saveSettings();
+    };
 
     addLabelAndCombo(lblMidiInputDevice, cmbMidiInputDevice, "MIDI INPUT DEVICE:");
     cmbMidiInputDevice.onChange = [this]
@@ -1828,6 +1837,28 @@ MainComponent::MainComponent()
     };
 
     addRightLabelAndCombo(lblAudioOutputChannel, cmbAudioOutputChannel, "LTC CHANNEL:");
+
+    // Sample rate and buffer size for the output device.  These are the same
+    // global values the input panel shows: the audio configuration applies to
+    // every device STC opens, in either direction and across all engines, and
+    // an ASIO driver has a single rate and buffer for the whole interface
+    // anyway.  Mirroring them here makes that visible instead of leaving them
+    // looking like input-only settings (issue #18); the two pairs stay in
+    // step because they read and write the same setting.
+    addRightLabelAndCombo(lblSampleRateOut, cmbSampleRateOut, "SAMPLE RATE:");
+    addRightLabelAndCombo(lblBufferSizeOut, cmbBufferSizeOut, "BUFFER SIZE:");
+    cmbSampleRateOut.setTooltip("Shared by every audio device STC uses, input and output");
+    cmbBufferSizeOut.setTooltip("Shared by every audio device STC uses, input and output");
+    cmbSampleRateOut.onChange = [this] {
+        if (syncing || isShowLockedRevert()) return;
+        cmbSampleRate.setSelectedId(cmbSampleRateOut.getSelectedId(), juce::dontSendNotification);
+        restartAllAudioDevices(); saveSettings();
+    };
+    cmbBufferSizeOut.onChange = [this] {
+        if (syncing || isShowLockedRevert()) return;
+        cmbBufferSize.setSelectedId(cmbBufferSizeOut.getSelectedId(), juce::dontSendNotification);
+        restartAllAudioDevices(); saveSettings();
+    };
     cmbAudioOutputChannel.onChange = [this]
     {
         if (syncing) return;
@@ -1857,22 +1888,31 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
     sldLtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
 
+    // Field accepts hex digits in MANUAL, plain text in NAME.
+    applyUserBitsFieldMode(TimecodeEngine::kUserBitsManual);
+
     // LTC user bits (SMPTE 12M binary groups).  Issue #13.
     // Source mode first, then the manual value field.
     addRightLabelAndCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, "LTC USER BITS:");
     cmbLtcUserBitsMode.addItem("MANUAL VALUE", 1);
     cmbLtcUserBitsMode.addItem("FROM LTC IN",  2);
     cmbLtcUserBitsMode.addItem("SYSTEM DATE",  3);
+    cmbLtcUserBitsMode.addItem("NAME (4 CHAR)", 4);
     cmbLtcUserBitsMode.onChange = [this]
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
         auto& e = currentEngine();
         e.setLtcUserBitsMode(cmbLtcUserBitsMode.getSelectedId() - 1);
-        const bool manual = e.getLtcUserBitsMode() == TimecodeEngine::kUserBitsManual;
-        txtLtcUserBits.setReadOnly(!manual);
+        const int m = e.getLtcUserBitsMode();
+        const bool manual = m == TimecodeEngine::kUserBitsManual;
+        const bool named  = m == TimecodeEngine::kUserBitsName;
+        txtLtcUserBits.setReadOnly(!manual && !named);
+        applyUserBitsFieldMode(m);
         if (manual)
             txtLtcUserBits.setText(e.getLtcUserBitsHex(), juce::dontSendNotification);
+        else if (named)
+            txtLtcUserBits.setText(e.getLtcUserBitsName(), juce::dontSendNotification);
         saveSettings();
     };
 
@@ -1889,9 +1929,18 @@ MainComponent::MainComponent()
     auto applyUserBits = [this]
     {
         if (syncing || isShowLockedRevert()) return;
-        currentEngine().setLtcUserBitsHex(txtLtcUserBits.getText());
-        // Reflect the normalised value back (upper-case, zeros collapsed)
-        txtLtcUserBits.setText(currentEngine().getLtcUserBitsHex(), juce::dontSendNotification);
+        auto& e = currentEngine();
+        if (e.getLtcUserBitsMode() == TimecodeEngine::kUserBitsName)
+        {
+            e.setLtcUserBitsName(txtLtcUserBits.getText());
+            txtLtcUserBits.setText(e.getLtcUserBitsName(), juce::dontSendNotification);
+        }
+        else
+        {
+            e.setLtcUserBitsHex(txtLtcUserBits.getText());
+            // Reflect the normalised value back (upper-case, zeros collapsed)
+            txtLtcUserBits.setText(e.getLtcUserBitsHex(), juce::dontSendNotification);
+        }
         saveSettings();
     };
     txtLtcUserBits.onReturnKey  = applyUserBits;
@@ -2450,13 +2499,19 @@ void MainComponent::syncUIFromEngine()
     cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, 2, eng.getLtcUserBitsMode()) + 1,
                                      juce::dontSendNotification);
     {
-        const bool manualUb = eng.getLtcUserBitsMode() == TimecodeEngine::kUserBitsManual;
-        txtLtcUserBits.setReadOnly(!manualUb);
+        const int ubMode = eng.getLtcUserBitsMode();
+        const bool manualUb = ubMode == TimecodeEngine::kUserBitsManual;
+        const bool namedUb  = ubMode == TimecodeEngine::kUserBitsName;
+        applyUserBitsFieldMode(ubMode);
+        txtLtcUserBits.setReadOnly(!manualUb && !namedUb);
         txtLtcUserBits.setText(
             manualUb ? eng.getLtcUserBitsHex()
+                     : namedUb ? eng.getLtcUserBitsName()
                      : TimecodeEngine::normaliseUserBitsHex(
                            juce::String::toHexString((juce::int64) eng.getEffectiveLtcUserBits())),
             juce::dontSendNotification);
+    }
+    {
     }
     sldTcnetOffset.setValue(eng.getTcnetOutputOffsetMs(), juce::dontSendNotification);
     sldTcnetGlobalOffset.setValue(settings.tcnetGlobalOffsetMs, juce::dontSendNotification);
@@ -4126,6 +4181,21 @@ void MainComponent::populateSampleRateCombo()
     cmbSampleRate.setSelectedId(1, juce::dontSendNotification);
 }
 
+void MainComponent::populateOutputAudioCombos()
+{
+    // Same option lists as the input-panel combos, copied so the two views
+    // cannot drift apart if the source lists ever change.
+    auto copyItems = [](juce::ComboBox& from, juce::ComboBox& to)
+    {
+        to.clear(juce::dontSendNotification);
+        for (int i = 0; i < from.getNumItems(); ++i)
+            to.addItem(from.getItemText(i), from.getItemId(i));
+        to.setSelectedId(from.getSelectedId(), juce::dontSendNotification);
+    };
+    copyItems(cmbSampleRate, cmbSampleRateOut);
+    copyItems(cmbBufferSize, cmbBufferSizeOut);
+}
+
 void MainComponent::populateBufferSizeCombo()
 {
     cmbBufferSize.clear(juce::dontSendNotification);
@@ -4162,6 +4232,23 @@ void MainComponent::populateGenAudioBufferCombo()
     cmbGenAudioBuffer.addItem("1024", 6);
     cmbGenAudioBuffer.addItem("2048", 7);
     cmbGenAudioBuffer.setSelectedId(1, juce::dontSendNotification);
+}
+
+void MainComponent::applyUserBitsFieldMode(int mode)
+{
+    if (mode == TimecodeEngine::kUserBitsName)
+    {
+        // Four ISO characters (SMPTE 12M-1 sec. 8.4.2).
+        txtLtcUserBits.setInputRestrictions(4, {});
+        txtLtcUserBits.setTextToShowWhenEmpty("STC1", juce::Colour(0xFF666666));
+        lblLtcUserBits.setText("LTC USER BITS (NAME):", juce::dontSendNotification);
+    }
+    else
+    {
+        txtLtcUserBits.setInputRestrictions(8, "0123456789abcdefABCDEF");
+        txtLtcUserBits.setTextToShowWhenEmpty("00000000", juce::Colour(0xFF666666));
+        lblLtcUserBits.setText("LTC USER BITS (HEX):", juce::dontSendNotification);
+    }
 }
 
 double MainComponent::getPreferredSampleRate() const
@@ -4556,6 +4643,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setLANetTCOutputOffset(es.laNetTCOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
         eng.setLtcUserBitsMode(es.ltcUserBitsMode);
+        eng.setLtcUserBitsName(es.ltcUserBitsName);
         eng.setLtcUserBitsHex(es.ltcUserBitsHex);
         eng.setTcnetOutputOffsetMs(es.tcnetOutputOffsetMs);
 
@@ -4766,6 +4854,10 @@ void MainComponent::loadAndApplyNonAudioSettings()
     // Global settings
     cmbSampleRate.setSelectedId(sampleRateToComboId(settings.preferredSampleRate), juce::dontSendNotification);
     cmbBufferSize.setSelectedId(bufferSizeToComboId(settings.preferredBufferSize), juce::dontSendNotification);
+    // Mirror AFTER both source combos hold their loaded values -- doing it
+    // before left the output buffer-size combo showing a stale selection.
+    cmbSampleRateOut.setSelectedId(cmbSampleRate.getSelectedId(), juce::dontSendNotification);
+    cmbBufferSizeOut.setSelectedId(cmbBufferSize.getSelectedId(), juce::dontSendNotification);
 
     selectedEngine = juce::jlimit(0, (int)engines.size() - 1, settings.selectedEngine);
     rebuildTabButtons();
@@ -4950,6 +5042,7 @@ void MainComponent::flushSettings()
         es.ltcOutputOffset = eng.getLtcOutputOffset();
         es.ltcUserBitsHex = eng.getLtcUserBitsHex();
         es.ltcUserBitsMode = eng.getLtcUserBitsMode();
+        es.ltcUserBitsName = eng.getLtcUserBitsName();
         es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
 
         es.ltcInputGain = (int)(eng.getLtcInput().getInputGain() * 100.0f);
@@ -5768,6 +5861,8 @@ void MainComponent::updateDeviceSelectorVisibility()
     sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
     txtLtcUserBits.setVisible(showLtcConfig);          lblLtcUserBits.setVisible(showLtcConfig);
     cmbLtcUserBitsMode.setVisible(showLtcConfig);      lblLtcUserBitsMode.setVisible(showLtcConfig);
+    cmbSampleRateOut.setVisible(showLtcConfig);       lblSampleRateOut.setVisible(showLtcConfig);
+    cmbBufferSizeOut.setVisible(showLtcConfig);       lblBufferSizeOut.setVisible(showLtcConfig);
     lblOutputLtcStatus.setVisible(eng.isOutputLtcEnabled());
 
     // AudioThru controls: only visible for primary engine
@@ -5828,6 +5923,7 @@ void MainComponent::updateStatusLabels()
     // so mirror the live value into the (read-only) field.  Skipped while the
     // field has focus so we never fight the operator mid-edit.
     if (eng.getLtcUserBitsMode() != TimecodeEngine::kUserBitsManual
+        && eng.getLtcUserBitsMode() != TimecodeEngine::kUserBitsName
         && txtLtcUserBits.isVisible() && !txtLtcUserBits.hasKeyboardFocus(true))
     {
         auto live = juce::String::toHexString((juce::int64) eng.getEffectiveLtcUserBits())
@@ -7479,6 +7575,8 @@ void MainComponent::resized()
         {
             layCombo(lblAudioOutputDevice, cmbAudioOutputDevice, rp);
             layCombo(lblAudioOutputChannel, cmbAudioOutputChannel, rp);
+            if (cmbSampleRateOut.isVisible()) layCombo(lblSampleRateOut, cmbSampleRateOut, rp);
+            if (cmbBufferSizeOut.isVisible()) layCombo(lblBufferSizeOut, cmbBufferSizeOut, rp);
             laySlider(lblLtcOutputGain, sldLtcOutputGain, rp);
             if (btnLtcHoldOnPause.isVisible()) btnLtcHoldOnPause.setBounds(rp.removeFromTop(btnH));
             if (mtrLtcOutput.isVisible()) layMeter(mtrLtcOutput, rp);

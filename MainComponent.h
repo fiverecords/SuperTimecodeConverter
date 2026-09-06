@@ -312,7 +312,13 @@ private:
     juce::TextEditor txtGenStartTC;
     juce::TextEditor txtLtcUserBits;   // LTC OUT: 8-digit hex user-bits entry
     juce::Label      lblLtcUserBits;
-    juce::ComboBox   cmbLtcUserBitsMode; // LTC OUT: manual / from LTC in / system date
+    // Mirrors of the global audio sample rate / buffer size, shown in the
+    // output panel.  Same underlying setting as the input-panel pair -- the
+    // audio configuration is device-wide, not per direction or per engine --
+    // so changing either updates both.
+    juce::ComboBox   cmbSampleRateOut;   juce::Label lblSampleRateOut;
+    juce::ComboBox   cmbBufferSizeOut;   juce::Label lblBufferSizeOut;
+    juce::ComboBox   cmbLtcUserBitsMode; // LTC OUT: manual / from LTC in / system date / name
     juce::Label      lblLtcUserBitsMode;
     juce::Label      lblLtcInUserBits; // LTC IN: recovered user-bits display
     juce::TextEditor txtGenStopTC;
@@ -623,6 +629,8 @@ private:
     void populateBufferSizeCombo();
     void populateGenAudioSampleRateCombo();
     void populateGenAudioBufferCombo();
+    void applyUserBitsFieldMode(int mode);
+    void populateOutputAudioCombos();
     double getPreferredSampleRate() const;
     int    getPreferredBufferSize() const;
     /// Effective SR/Buffer for the Generator's audio playback device.

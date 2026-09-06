@@ -49,7 +49,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 - **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
-- **LTC Out** — generate LTC audio signal on any audio output device and channel. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops
+- **LTC Out** — generate LTC audio signal on any audio output device and channel, with the frame phase aligned to the timecode clock and compensated for the interface's reported output latency, so the same setup produces the same phase every time it is started. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops
 - **LA-Net Out** — broadcast LaserAnimation Net-Timecode on any network interface
 - **TCNet Out** — broadcast TCNet timecode, playhead, BPM, and beat data (see below)
 - **Audio Thru** — passthrough audio from the LTC input device to a separate output device (Engine 1 only, since it shares the audio device with LTC input)
@@ -323,6 +323,8 @@ Every SMPTE LTC frame carries 32 **user bits** (also called binary groups) along
 - **Manual value** — an 8-digit hexadecimal value you enter
 - **From LTC in** — passthrough of the user bits arriving on the LTC input. If the incoming signal drops out the last received value is held rather than falling back to zeros, so equipment gating on user bits does not lose them during a glitch
 - **System date** — the current date, written as `YYYYMMDD` and updated automatically
+
+- **Name** — four characters, encoded as an eight-bit character set per SMPTE ST 12-1. Defaults to `STC1`, `STC2` and so on per engine if left blank
 
 **On input**, the recovered value is displayed alongside the incoming timecode. User bits are conventionally filled with BCD (one decimal digit per 4-bit group), so the display also shows the decimal reading and a `YYYY-MM-DD` interpretation when the digits form a plausible date.
 

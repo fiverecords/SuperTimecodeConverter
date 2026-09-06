@@ -1228,6 +1228,8 @@ struct EngineSettings
     // LTC user-bits source: 0 = manual value, 1 = passthrough from LTC in,
     // 2 = system date (BCD YYYYMMDD).
     int ltcUserBitsMode = 0;
+    // 4-character label for the NAME user-bits mode ("" = STC<engine>).
+    juce::String ltcUserBitsName;
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds, -1000 to +1000
 
     // Track change triggers -- destinations
@@ -1334,6 +1336,8 @@ struct EngineSettings
             obj->setProperty("ltcUserBitsHex", ltcUserBitsHex);
         if (ltcUserBitsMode != 0)
             obj->setProperty("ltcUserBitsMode", ltcUserBitsMode);
+        if (ltcUserBitsName.isNotEmpty())
+            obj->setProperty("ltcUserBitsName", ltcUserBitsName);
         obj->setProperty("tcnetOutputOffsetMs", tcnetOutputOffsetMs);
 
         // Track change triggers
@@ -1473,7 +1477,8 @@ struct EngineSettings
         laNetTCOutputOffset  = clampOffset(getInt("laNetTCOutputOffset", 0));
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         ltcUserBitsHex     = getString("ltcUserBitsHex");
-        ltcUserBitsMode    = juce::jlimit(0, 2, getInt("ltcUserBitsMode", 0));
+        ltcUserBitsMode    = juce::jlimit(0, 3, getInt("ltcUserBitsMode", 0));
+        ltcUserBitsName    = getString("ltcUserBitsName");
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         // Track change triggers
@@ -1803,7 +1808,8 @@ private:
         es.laNetTCOutputOffset = clampOffset(getInt("laNetTCOutputOffset", 0));
         es.ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         es.ltcUserBitsHex     = getString("ltcUserBitsHex");
-        es.ltcUserBitsMode    = juce::jlimit(0, 2, getInt("ltcUserBitsMode", 0));
+        es.ltcUserBitsMode    = juce::jlimit(0, 3, getInt("ltcUserBitsMode", 0));
+        es.ltcUserBitsName    = getString("ltcUserBitsName");
         es.tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 
         engines.clear();

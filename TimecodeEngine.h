@@ -369,6 +369,38 @@ public:
     static constexpr int kUserBitsManual     = 0;  // fixed operator-entered value
     static constexpr int kUserBitsFromLtcIn  = 1;  // passthrough from this engine's LTC input
     static constexpr int kUserBitsSystemDate = 2;  // current date as BCD YYYYMMDD
+    static constexpr int kUserBitsName       = 3;  // four ISO characters, SMPTE 12M-1 sec. 8.4.2
+
+    /// Pack four characters into the 32-bit user-bits word per SMPTE
+    /// ST 12-1 sec. 8.4.2: four ISO codes, each occupying two binary
+    /// groups.  The FIRST character goes in binary groups 7 and 8, with its
+    /// least significant nibble in group 7 and its most significant nibble
+    /// in group 8; the remaining three characters go in groups 5/6, 3/4 and
+    /// 1/2.  Combined with the group ordering used by the encoder (group 1
+    /// is the most significant hex digit of the displayed word), character
+    /// one therefore lands in the LOW nibbles of the word.
+    /// Seven-bit ISO codes are converted to eight-bit by clearing bit 7,
+    /// as the standard requires.  Short strings are padded with spaces.
+    static uint32_t packNameUserBits(const juce::String& text)
+    {
+        juce::String t = text.substring(0, 4);
+        while (t.length() < 4) t += " ";
+
+        uint32_t word = 0;
+        for (int i = 0; i < 4; ++i)
+        {
+            auto c = (uint32_t)(t[i]) & 0x7Fu;   // force to 8-bit ISO, bit 7 = 0
+            // Character i occupies groups (7,8) for i=0, (5,6) for i=1,
+            // (3,4) for i=2, (1,2) for i=3.  Group g holds hex digit
+            // (8-g) counted from the low end of the word.
+            const int lowGroup = 7 - i * 2;          // 7, 5, 3, 1
+            const int shiftLow  = (8 - lowGroup) * 4; // group 7 -> shift 4
+            const int shiftHigh = (8 - (lowGroup + 1)) * 4;
+            word |= (c & 0x0Fu) << shiftLow;         // LS nibble in lower group
+            word |= ((c >> 4) & 0x0Fu) << shiftHigh; // MS nibble in next group
+        }
+        return word;
+    }
 
     /// LTC user bits, set from an operator-entered hex string (up to 8 hex
     /// digits; blank or unparseable = 0).  Stores the normalised text and,
@@ -384,11 +416,28 @@ public:
 
     /// User-bits source mode.  Switching back to MANUAL immediately restores
     /// the operator's stored value so the field and the wire agree again.
+    /// Four-character label used by the NAME user-bits mode.  Blank falls
+    /// back to STC<engine number>.
+    void setLtcUserBitsName(const juce::String& n)
+    {
+        ltcUserBitsName = n.substring(0, 4);
+        lastSystemDateCheckMs = 0.0;
+    }
+    juce::String getLtcUserBitsName() const { return ltcUserBitsName; }
+
+    /// Output latency compensation currently applied to the LTC encoder, in
+    /// ms.  Derived from the audio device, not a user setting.
+    double getLtcLatencyCompMs() const { return ltcOutput.getLatencyCompensationMs(); }
+
     void setLtcUserBitsMode(int mode)
     {
-        ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsSystemDate, mode);
+        ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsName, mode);
         if (ltcUserBitsMode == kUserBitsManual)
             ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
+        // Only the NAME mode declares a character set; every other mode is
+        // free-form user data, which is BGF 0/0/0 (12M-1 sec. 8.4.1).
+        if (ltcUserBitsMode != kUserBitsName)
+            ltcOutput.setBinaryGroupFlags(0x0);
         lastSystemDateCheckMs = 0.0;   // force a recompute on the next tick
     }
     int getLtcUserBitsMode() const { return ltcUserBitsMode; }
@@ -1218,6 +1267,7 @@ public:
                 if (mtcInput.getIsRunning())
                 {
                     currentTimecode = mtcInput.getCurrentTimecode();
+                    setFramePhaseFromArrival(mtcInput.getLastFrameArrivalMs(), currentFps);
                     bool rx = mtcInput.isReceiving();
                     if (rx)
                     {
@@ -1275,6 +1325,7 @@ public:
                 if (ltcInput.getIsRunning())
                 {
                     currentTimecode = ltcInput.getCurrentTimecode();
+                    setFramePhaseFromArrival(ltcInput.getLastFrameArrivalMs(), currentFps);
                     bool rx = ltcInput.isReceiving();
                     if (rx)
                     {
@@ -2015,6 +2066,7 @@ public:
                     {
                         uint32_t ms = hippotizerInput.getMsSinceMidnight();
                         currentTimecode = wallClockToTimecode((double)ms, currentFps);
+                        setFramePhaseFromPosition((double)ms, currentFps);
                     }
 
                     if (statusTextVisible)
@@ -2141,6 +2193,7 @@ public:
                         // cadence (one frame at most).
                         const int32_t posMs = winampInput.getPositionMs();
                         currentTimecode = wallClockToTimecode((double)posMs, currentFps);
+                        setFramePhaseFromPosition((double)posMs, currentFps);
 
                         // Apply TrackMap offset
                         if (trackMapEnabled && trackMapped)
@@ -2226,7 +2279,17 @@ public:
     juce::String getInputStatusText() const { return inputStatusText; }
     juce::String getMtcOutStatusText() const { return mtcOutStatusText; }
     juce::String getArtnetOutStatusText() const { return artnetOutStatusText; }
-    juce::String getLtcOutStatusText() const { return ltcOutStatusText; }
+    /// LTC output status line.  When the audio device reports an output
+    /// latency, the compensation being applied to the frame phase is shown
+    /// alongside it -- visible for anyone measuring the signal, without
+    /// being a control the operator has to understand or set.
+    juce::String getLtcOutStatusText() const
+    {
+        const double comp = getLtcLatencyCompMs();
+        if (comp > 0.05 && ltcOutStatusText.isNotEmpty())
+            return ltcOutStatusText + " (+" + juce::String(comp, 1) + " ms)";
+        return ltcOutStatusText;
+    }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
     juce::String getHippoOutStatusText() const { return hippoOutStatusText; }
     juce::String getLANetTCOutStatusText() const { return laNetTCOutStatusText; }
@@ -2308,6 +2371,7 @@ public:
         lastCueCheckMs = (uint32_t) juce::jmax(0.0, genStartMs);
         if (activeInput == InputSource::SystemTime)
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+            setFramePhaseFromPosition(genCurrentMs, currentFps);
         generatorAudioPlayer.stopAndReset();
     }
 
@@ -2319,6 +2383,7 @@ public:
         {
             genCurrentMs = genStartMs;
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+            setFramePhaseFromPosition(genCurrentMs, currentFps);
         }
     }
 
@@ -2453,6 +2518,7 @@ public:
 
         if (activeInput == InputSource::SystemTime)
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+            setFramePhaseFromPosition(genCurrentMs, currentFps);
 
         const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
         generatorAudioPlayer.seekSeconds(audioPosSec);
@@ -2755,6 +2821,7 @@ private:
     int laNetTCOutputOffset = 0;
     int ltcOutputOffset    = 0;
     juce::String ltcUserBitsHex;   // normalised LTC user-bits hex ("" = zero)
+    juce::String ltcUserBitsName;  // 4-char label for kUserBitsName ("" = STC<n>)
     int ltcUserBitsMode = kUserBitsManual;
     double lastSystemDateCheckMs = 0.0;   // throttles the date recompute to ~1Hz
 
@@ -2770,6 +2837,17 @@ private:
             // gating on user bits should not see them vanish during a
             // brief dropout.  Stays 0 if the LTC input never ran.
             ltcOutput.setUserBits(ltcInput.getUserBits());
+        }
+        else if (ltcUserBitsMode == kUserBitsName)
+        {
+            // Four-character label.  Defaults to STC<engine number> when the
+            // operator has not typed anything, as suggested in issue #13.
+            juce::String label = ltcUserBitsName;
+            if (label.isEmpty())
+                label = "STC" + juce::String(juce::jlimit(1, 9, engineIndex + 1));
+            ltcOutput.setUserBits(packNameUserBits(label));
+            // BGF0 = 1 signals an eight-bit character set (12M-1 sec. 8.4.2).
+            ltcOutput.setBinaryGroupFlags(0x1);
         }
         else if (ltcUserBitsMode == kUserBitsSystemDate)
         {
@@ -3797,6 +3875,7 @@ private:
                                    + (double)now.getSeconds() * 1000.0
                                    + (double)now.getMilliseconds();
             currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
+                        setFramePhaseFromPosition(msSinceMidnight, currentFps);
             return;
         }
 
@@ -3872,6 +3951,7 @@ private:
         }
         // Stopped and Paused: genCurrentMs stays where it is
         currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
+            setFramePhaseFromPosition(genCurrentMs, currentFps);
     }
 
     //==========================================================================
@@ -4147,11 +4227,63 @@ private:
         return -1;
     }
 
+    //==========================================================================
+    // Sub-frame phase publishing (issue #15)
+    //==========================================================================
+    // tick() runs on the message thread at 60Hz, so simply noticing that the
+    // timecode value changed locates the frame boundary to no better than
+    // 16.7ms -- half a frame at 30fps, and worse still, at 30fps the tick is
+    // exactly twice the frame rate, so the error is a constant that differs
+    // per session rather than noise that could be averaged away.  That is
+    // what made the LTC output phase random on every restart.
+    //
+    // Instead each source publishes where it actually is inside the current
+    // frame, which every source can answer far more precisely than the tick
+    // rate: position-based sources (generator, Pro DJ Link, StageLinQ,
+    // Winamp, system clock) hold a continuous millisecond playhead, and
+    // frame-based sources (MTC, LTC) know the instant the frame arrived.
+    // Sources that can supply neither leave the phase unset and the LTC
+    // encoder keeps its previous free-running behaviour.
+    double framePhaseMs = 0.0;
+    bool   framePhaseValid = false;
+
+    /// Publish the phase from a continuous playhead position in ms.
+    void setFramePhaseFromPosition(double positionMs, FrameRate fps)
+    {
+        const double f = frameRateToDouble(fps);
+        if (f <= 0.0) return;
+        const double frameMs = 1000.0 / f;
+        double p = std::fmod(positionMs, frameMs);
+        if (p < 0.0) p += frameMs;
+        framePhaseMs = p;
+        framePhaseValid = true;
+    }
+
+    /// Publish the phase from the instant the current frame arrived.
+    void setFramePhaseFromArrival(double arrivalMs, FrameRate fps)
+    {
+        if (arrivalMs <= 0.0) return;
+        const double f = frameRateToDouble(fps);
+        if (f <= 0.0) return;
+        const double frameMs = 1000.0 / f;
+        double p = std::fmod(juce::Time::getMillisecondCounterHiRes() - arrivalMs, frameMs);
+        if (p < 0.0) p += frameMs;
+        framePhaseMs = p;
+        framePhaseValid = true;
+    }
+
     void routeTimecodeToOutputs()
     {
         // Keep LTC user bits current for the dynamic modes (passthrough from
         // the LTC input, system date).  No-op in MANUAL mode.
         refreshDynamicUserBits();
+
+        // Hand the encoder the sub-frame phase gathered this tick, so its
+        // frame boundary lands on the timecode frame boundary instead of
+        // wherever the audio device happened to start (issue #15).
+        if (framePhaseValid)
+            ltcOutput.setFramePhaseMs(framePhaseMs);
+        framePhaseValid = false;   // each tick must publish afresh
 
         FrameRate outRate = getEffectiveOutputFps();
         Timecode baseTc = fpsConvertEnabled

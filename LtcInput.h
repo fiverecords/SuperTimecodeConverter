@@ -128,6 +128,14 @@ public:
         return userBitsIn.load(std::memory_order_relaxed);
     }
 
+    /// Wall-clock instant (hi-res ms counter) at which the last good LTC
+    /// frame was decoded -- the frame boundary of the incoming signal.
+    /// 0 if nothing has been decoded yet.
+    double getLastFrameArrivalMs() const
+    {
+        return lastFrameTime.load(std::memory_order_relaxed);
+    }
+
     bool isReceiving() const
     {
         auto now = juce::Time::getMillisecondCounterHiRes();
