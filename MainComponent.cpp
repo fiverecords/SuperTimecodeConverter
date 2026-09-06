@@ -1874,7 +1874,12 @@ MainComponent::MainComponent()
     sldLtcOutputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); } };
 
     rightContent.addAndMakeVisible(btnLtcHoldOnPause);
-    styleOutputToggle(btnLtcHoldOnPause, accentPurple);
+    // A boolean option of the LTC output, not an output in its own right, so
+    // it gets the plain checkbox treatment used by the other option toggles
+    // (ON-AIR ONLY, TRACK MAP) rather than styleOutputToggle, which is
+    // reserved for the protocol outputs themselves.
+    btnLtcHoldOnPause.setColour(juce::ToggleButton::textColourId, textMid);
+    btnLtcHoldOnPause.setColour(juce::ToggleButton::tickColourId, accentPurple);
     btnLtcHoldOnPause.onClick = [this]
     {
         if (syncing) return;
@@ -7578,7 +7583,7 @@ void MainComponent::resized()
             if (cmbSampleRateOut.isVisible()) layCombo(lblSampleRateOut, cmbSampleRateOut, rp);
             if (cmbBufferSizeOut.isVisible()) layCombo(lblBufferSizeOut, cmbBufferSizeOut, rp);
             laySlider(lblLtcOutputGain, sldLtcOutputGain, rp);
-            if (btnLtcHoldOnPause.isVisible()) btnLtcHoldOnPause.setBounds(rp.removeFromTop(btnH));
+            if (btnLtcHoldOnPause.isVisible()) btnLtcHoldOnPause.setBounds(rp.removeFromTop(22));
             if (mtrLtcOutput.isVisible()) layMeter(mtrLtcOutput, rp);
             if (sldLtcOffset.isVisible()) laySlider(lblLtcOffset, sldLtcOffset, rp);
             if (cmbLtcUserBitsMode.isVisible()) layCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, rp);
