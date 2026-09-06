@@ -375,6 +375,11 @@ private:
                     if (replyStat != 0) continue;  // not ACCEPTED
 
                     uint32_t verfLen = xdrRead32(recvBuf + 16);
+                    // Wire length: bound it unsigned before it becomes an offset.
+                    // RFC 5531 caps the verifier at 400 bytes; anything larger is
+                    // not a reply we can use.  (A value >= 2^31 cast to int went
+                    // negative here and read before the buffer.)
+                    if (verfLen > 400) continue;
                     int bodyOffset = 20 + (int)verfLen + 4;  // skip verifier + accept_stat
 
                     if (bodyOffset > bytesRead) continue;
@@ -603,7 +608,8 @@ private:
         if ((int)reply.getSize() < dataLenOff + 4) return {};
 
         uint32_t dataLen = xdrRead32(r + dataLenOff);
-        if ((int)reply.getSize() < dataLenOff + 4 + (int)dataLen) return {};
+        // Unsigned comparison: the wire length must fit in what was received.
+        if (dataLen > (uint32_t)((int)reply.getSize() - dataLenOff - 4)) return {};
 
         return juce::MemoryBlock(r + dataLenOff + 4, dataLen);
     }
@@ -736,7 +742,7 @@ private:
             // Long ASCII: u2(len) + u1(pad) + ASCII[len-4]
             if (offset + 4 > pageSize) return {};
             uint16_t len = readLE16(pageData + offset + 1);
-            if (len < 4 || offset + 3 + (int)(len - 4) > pageSize) return {};
+            if (len < 4 || offset + (int)len > pageSize) return {};   // data is [offset+4, offset+len)
             return juce::String((const char*)(pageData + offset + 4), (size_t)(len - 4));
         }
         else if (kind == 0x90)
@@ -744,7 +750,7 @@ private:
             // Long UTF-16LE: u2(len) + u1(pad) + UTF16LE[len-4 bytes]
             if (offset + 4 > pageSize) return {};
             uint16_t len = readLE16(pageData + offset + 1);
-            if (len < 4 || offset + 3 + (int)(len - 4) > pageSize) return {};
+            if (len < 4 || offset + (int)len > pageSize) return {};   // data is [offset+4, offset+len)
             int numChars = (int)(len - 4) / 2;
             juce::String result;
             for (int i = 0; i < numChars; i++)
@@ -814,8 +820,11 @@ private:
 
         while (maxPages-- > 0)
         {
-            int pageOff = (int)(pageIdx * lenPage);
-            if (pageOff + (int)lenPage > fileSize) break;
+            // pageIdx and lenPage come from the file: multiply in 64 bits so a
+            // corrupt index cannot wrap into a negative offset.
+            const uint64_t pageOff64 = (uint64_t)pageIdx * (uint64_t)lenPage;
+            if (pageOff64 + lenPage > (uint64_t)fileSize) break;
+            int pageOff = (int)pageOff64;
 
             const uint8_t* page = d + pageOff;
 

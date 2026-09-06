@@ -173,10 +173,12 @@ namespace StageLinQ
     //==========================================================================
     inline int readNetworkString(const uint8_t* data, int dataLen, int offset, juce::String& out)
     {
-        if (offset + 4 > dataLen) return -1;
+        if (offset < 0 || offset + 4 > dataLen) return -1;
         uint32_t strLen = readU32BE(data + offset);
         offset += 4;
-        if (offset + (int)strLen > dataLen) return -1;
+        // Bound the wire length in unsigned arithmetic before casting: a
+        // value >= 2^31 cast to int went negative and passed the check.
+        if (strLen > (uint32_t)(dataLen - offset)) return -1;
         out = decodeUTF16BE(data + offset, (int)strLen);
         return offset + (int)strLen;
     }
@@ -2636,11 +2638,13 @@ private:
                     uint32_t numRecords = StageLinQ::readU32BE(block + 12);
 
                     int pos = 16;
-                    // Each player record: beat[8] + totalBeats[8] + bpm[8] = 24 bytes
-                    int playerDataSize = (int)numRecords * 24;
-                    int timelineDataSize = (int)numRecords * 8;
-
-                    if (pos + playerDataSize + timelineDataSize <= (int)blockLen)
+                    // Each player record: beat[8] + totalBeats[8] + bpm[8] = 24 bytes,
+                    // plus one 8-byte timeline entry per record.  numRecords comes
+                    // off the wire: bound it in unsigned arithmetic BEFORE any
+                    // multiplication or cast -- (int)numRecords * 24 overflowed for
+                    // a crafted count and the loop below then read past the buffer.
+                    const uint32_t bytesForRecords = blockLen - 16;   // blockLen >= 16 here
+                    if (numRecords <= bytesForRecords / 32)
                     {
                         std::vector<StageLinQInput::PlayerInfo> players;
                         std::vector<double> timelines;
