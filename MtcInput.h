@@ -144,46 +144,13 @@ public:
         if (elapsed < 0.0)
             return syncTc;
 
-        double fpsDouble = frameRateToDouble(fps);
-        int maxFrames = frameRateToInt(fps);
-        double msPerFrame = 1000.0 / fpsDouble;
+        const double msPerFrame = 1000.0 / frameRateToDouble(fps);
 
-        // Linear interpolation from last sync point.
-        // NOTE: for 29.97 DF, this uses simple frame counting (maxFrames per second)
-        // rather than true DF-aware counting.  The DF correction at the end patches
-        // any landing on skipped frame numbers 0-1.  This is exact for the typical
-        // interpolation range (a few dozen frames between QF syncs), because DF skips
-        // only occur at minute boundaries which are always >1798 frames apart.
-        int extraFrames = (int)(elapsed / msPerFrame);
-
-        int64_t syncTotal = (int64_t)syncTc.hours * 3600 * maxFrames
-                          + (int64_t)syncTc.minutes * 60 * maxFrames
-                          + (int64_t)syncTc.seconds * maxFrames
-                          + (int64_t)syncTc.frames;
-
-        int64_t currentTotal = syncTotal + extraFrames;
-
-        // Wrap at 24h so interpolation across midnight stays valid
-        int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
-        currentTotal = ((currentTotal % dayFrames) + dayFrames) % dayFrames;
-
-        Timecode result;
-        result.frames  = (int)(currentTotal % maxFrames);
-        result.seconds = (int)((currentTotal / maxFrames) % 60);
-        result.minutes = (int)((currentTotal / (maxFrames * 60)) % 60);
-        result.hours   = (int)((currentTotal / (maxFrames * 3600)) % 24);
-
-        // Drop-frame correction: interpolation may land on frames 0/1 at the
-        // start of a non-10th minute -- these frame numbers don't exist in DF
-        if (fps == FrameRate::FPS_2997
-            && result.frames < 2
-            && result.seconds == 0
-            && (result.minutes % 10) != 0)
-        {
-            result.frames = 2;
-        }
-
-        return result;
+        // Interpolate from the last sync point on the drop-frame-aware frame
+        // index, so landing across a 59;29 -> 00;02 crossing yields the next
+        // valid address instead of a patched one.
+        const int64_t extraFrames = (int64_t)(elapsed / msPerFrame);
+        return frameIndexToTimecode(timecodeToFrameIndex(syncTc, fps) + extraFrames, fps);
     }
 
     FrameRate getDetectedFrameRate() const
@@ -236,6 +203,11 @@ public:
                 int rateCode = (hr >> 5) & 0x03;
                 hr &= 0x1F;
 
+                // Same range sanity as the quarter-frame path: a malformed
+                // Full Frame must not become the sync point.
+                if (hr > 23 || mn > 59 || sc > 59 || fr > 29)
+                    return;
+
                 {
                     const juce::SpinLock::ScopedLockType lock(tcLock);
                     updateDetectedFps(rateCode);
@@ -259,25 +231,6 @@ public:
     }
 
 private:
-    /// Linear frame index of a timecode, used only as a continuity metric.
-    /// Deliberately ignores drop-frame skips: at a 29.97DF minute rollover
-    /// this reads as a 4-frame advance instead of 2, which is inside the
-    /// tolerance below.
-    static int64_t linearFrames(const Timecode& t, int maxFrames)
-    {
-        return ((int64_t)t.hours * 3600 + (int64_t)t.minutes * 60
-                + (int64_t)t.seconds) * maxFrames + (int64_t)t.frames;
-    }
-
-    /// Shortest signed distance a - b on the 24h circle, in frames.
-    static int64_t frameDelta(int64_t a, int64_t b, int maxFrames)
-    {
-        const int64_t day = (int64_t)24 * 3600 * maxFrames;
-        int64_t d = ((a - b) % day + day) % day;
-        if (d > day / 2) d -= day;
-        return d;
-    }
-
     void reconstructAndSync()
     {
         // --- Sequence integrity ---
@@ -344,15 +297,14 @@ private:
             // so a suspect value confirmed by the next sequence is accepted
             // -- costing at most one extra sequence of latency on a
             // quarter-frame-only locate.
+            // Distances are measured on the drop-frame-aware frame index, so
+            // a 29.97DF minute rollover reads as the two-frame advance it is.
             static constexpr int64_t kToleranceFrames = 4;
-            const int64_t assembledLin = linearFrames(assembled, maxFrames);
 
             if (continuityValid)
             {
                 const Timecode expected = advanceTwoFrames(prevAssembled, detectedFps);
-                const int64_t delta = frameDelta(assembledLin,
-                                                 linearFrames(expected, maxFrames),
-                                                 maxFrames);
+                const int64_t delta = frameDistance(assembled, expected, detectedFps);
 
                 if (delta > kToleranceFrames || delta < -kToleranceFrames)
                 {
@@ -360,9 +312,7 @@ private:
                     if (pendingValid)
                     {
                         const Timecode pexp = advanceTwoFrames(pendingAssembled, detectedFps);
-                        const int64_t pdelta = frameDelta(assembledLin,
-                                                          linearFrames(pexp, maxFrames),
-                                                          maxFrames);
+                        const int64_t pdelta = frameDistance(assembled, pexp, detectedFps);
                         confirmed = (pdelta <= kToleranceFrames && pdelta >= -kToleranceFrames);
                     }
 
