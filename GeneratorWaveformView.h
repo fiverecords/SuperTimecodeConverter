@@ -4,6 +4,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include <climits>
 #include "GeneratorAudioPlayer.h"
 #include "TimecodeEngine.h"
 #include "TimecodeCore.h"

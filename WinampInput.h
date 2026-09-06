@@ -582,6 +582,11 @@ class WinampInput
 public:
     enum class State { Stopped, Playing, Paused };
 
+    // Explicit: the non-copyable macro below declares a deleted copy
+    // constructor, which suppresses the implicit default one, and
+    // TimecodeEngine holds this as a member.
+    WinampInput() = default;
+
     bool         start()             { return false; }
     void         stop()              {}
     bool         getIsRunning()  const { return false; }
