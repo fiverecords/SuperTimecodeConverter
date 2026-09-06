@@ -1429,6 +1429,12 @@ public:
                     // ALWAYS start from raw playhead to prevent double-offset application.
                     // The offset is applied later and must start from a clean base.
                     currentTimecode = ProDJLink::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
+                    // The millisecond position currentTimecode was derived from,
+                    // kept alongside it so the sub-frame phase published to the
+                    // LTC encoder (D5) is that of the value actually on the wire.
+                    // Truncated exactly like playheadToTimecode's argument, so the
+                    // two cannot disagree at a frame boundary.
+                    double tcSourceMs = (double)rawPlayheadMs;
 
                     if (isNewPacket)
                     {
@@ -1456,6 +1462,7 @@ public:
                             {
                                 currentTimecode = ProDJLink::playheadToTimecode(
                                     (uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                                tcSourceMs = (double)(uint32_t)pdlSnapMs;
                             }
                             pdlSnapMs = (double)rawPlayheadMs;
                             pdlSnapTime = now;
@@ -1476,6 +1483,7 @@ public:
                             // a backward glitch at each 5Hz status packet.
                             currentTimecode = ProDJLink::playheadToTimecode(
                                 (uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                            tcSourceMs = (double)(uint32_t)pdlSnapMs;
                         }
                         // Always refresh speed -- the DJ may have moved the
                         // pitch fader between beats, and the interpolation
@@ -1502,7 +1510,10 @@ public:
                         double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
                         double maxAdvance = hasAbs ? (50.0 * pdlSnapSpeed) : 250.0;
                         if (elapsed <= maxAdvance)
+                        {
                             currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
+                            tcSourceMs = (double)(uint32_t)interpMs;
+                        }
                     }
 
                     // Freeze timecode on end-of-track only.
@@ -1648,7 +1659,15 @@ public:
                             currentTimecode, currentFps,
                             cachedOffH, cachedOffM, cachedOffS, cachedOffF,
                             currentFps);
+                        tcSourceMs += timecodeToMs(Timecode { cachedOffH, cachedOffM, cachedOffS, cachedOffF },
+                                                   currentFps);
                     }
+
+                    // Publish the sub-frame phase of the value on the wire (D5).
+                    // Not while frozen at end-of-track: the value is a snapshot
+                    // and the encoder is paused anyway.
+                    if (!pdlTcFrozen)
+                        setFramePhaseFromPosition(tcSourceMs, currentFps);
 
                     // --- Fire cue point triggers ---
                     // Only fire during actual playback.  Scrub/jog/cue-preview
@@ -1861,6 +1880,9 @@ public:
 
                     // ALWAYS start from raw playhead to prevent double-offset application.
                     currentTimecode = StageLinQ::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
+                    // Millisecond position behind currentTimecode, for the phase
+                    // publication below (see the Pro DJ Link branch).
+                    double tcSourceMs = (double)rawPlayheadMs;
 
                     if (isNewPacket)
                     {
@@ -1875,7 +1897,10 @@ public:
                         double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
                         double maxAdvance = 50.0 * pdlSnapSpeed;
                         if (elapsed <= maxAdvance)
+                        {
                             currentTimecode = StageLinQ::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
+                            tcSourceMs = (double)(uint32_t)interpMs;
+                        }
                     }
 
                     // Feed pitch to LTC output.
@@ -1951,7 +1976,12 @@ public:
                             currentTimecode, currentFps,
                             cachedOffH, cachedOffM, cachedOffS, cachedOffF,
                             currentFps);
+                        tcSourceMs += timecodeToMs(Timecode { cachedOffH, cachedOffM, cachedOffS, cachedOffF },
+                                                   currentFps);
                     }
+
+                    // Publish the sub-frame phase of the value on the wire (D5).
+                    setFramePhaseFromPosition(tcSourceMs, currentFps);
 
                     // --- Fire cue point triggers ---
                     // Same guard as ProDJLink: only during playback.
