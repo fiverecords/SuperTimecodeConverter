@@ -4,6 +4,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "AppSettings.h"   // SafeJsonFile
 #include <vector>
 #include <cstring>
 
@@ -133,15 +134,12 @@ public:
         root->setProperty("params", arr);
 
         juce::var jsonVar(root);
-        getMixerMapFile().replaceWithText(juce::JSON::toString(jsonVar));
+        SafeJsonFile::save(getMixerMapFile(), juce::JSON::toString(jsonVar));
     }
 
     bool load()
     {
-        auto file = getMixerMapFile();
-        if (!file.existsAsFile()) return false;
-
-        auto parsed = juce::JSON::parse(file.loadFileAsString());
+        auto parsed = SafeJsonFile::load(getMixerMapFile());
         auto* obj = parsed.getDynamicObject();
         if (!obj) return false;
 

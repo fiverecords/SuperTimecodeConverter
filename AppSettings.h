@@ -10,6 +10,71 @@
 #include <string>
 
 //==============================================================================
+// SafeJsonFile -- the three persistence rules every STC JSON file follows.
+//
+//  * Save keeps the previous version as "<name>.bak" (one rotation), so a
+//    save that goes wrong, or a change the operator regrets, has a way back.
+//  * Load distinguishes "file is missing" (first run, nothing to say) from
+//    "file exists but does not parse".  In the second case the unreadable
+//    file is moved aside as "<name>.corrupt-<timestamp>" and a message is
+//    left for the UI, instead of being silently replaced by defaults on the
+//    next save -- which is how a whole show configuration used to vanish.
+//  * Writes are atomic (temporary file + rename, via replaceWithText).
+//==============================================================================
+struct SafeJsonFile
+{
+    /// Parse `file`.  Returns an object var on success.  Returns void when the
+    /// file is absent.  When present but unreadable, quarantines it, records
+    /// the problem in `lastLoadProblem`, and returns void.
+    static juce::var load(const juce::File& file)
+    {
+        if (!file.existsAsFile()) return {};
+
+        const juce::String text = file.loadFileAsString();
+        auto parsed = juce::JSON::parse(text);
+        if (parsed.getDynamicObject() != nullptr)
+            return parsed;
+
+        // Not JSON, or not an object.  Keep the bytes -- they may be
+        // recoverable by hand -- and report.
+        const juce::String stamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
+        const juce::File aside = file.getSiblingFile(file.getFileName() + ".corrupt-" + stamp);
+        const bool moved = file.moveFileTo(aside);
+        lastLoadProblem() += file.getFileName() + " could not be read"
+                           + (text.isEmpty() ? " (empty file)" : "")
+                           + (moved ? " and was moved to " + aside.getFileName()
+                                    : " and could not be moved aside")
+                           + ". Defaults are in use";
+        const juce::File bak = backupFor(file);
+        if (bak.existsAsFile())
+            lastLoadProblem() += "; the previous version is " + bak.getFileName();
+        lastLoadProblem() += ".\n";
+        return {};
+    }
+
+    /// Rotate the previous file to .bak, then write atomically.
+    static bool save(const juce::File& file, const juce::String& text)
+    {
+        if (file.existsAsFile())
+            file.copyFileTo(backupFor(file));
+        return file.replaceWithText(text);
+    }
+
+    static juce::File backupFor(const juce::File& file)
+    {
+        return file.getSiblingFile(file.getFileName() + ".bak");
+    }
+
+    /// Accumulated load problems, for the UI to show once at startup.
+    /// Empty when everything loaded (or nothing existed).
+    static juce::String& lastLoadProblem()
+    {
+        static juce::String problem;
+        return problem;
+    }
+};
+
+//==============================================================================
 // TrackMap -- maps tracks (by artist|title) to timecode offsets and triggers
 //==============================================================================
 
@@ -501,15 +566,12 @@ public:
         root->setProperty("tracks", arr);
 
         juce::var jsonVar(root);
-        getTrackMapFile().replaceWithText(juce::JSON::toString(jsonVar));
+        SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(jsonVar));
     }
 
     bool load()
     {
-        auto file = getTrackMapFile();
-        if (!file.existsAsFile()) return false;
-
-        auto parsed = juce::JSON::parse(file.loadFileAsString());
+        auto parsed = SafeJsonFile::load(getTrackMapFile());
         auto* obj = parsed.getDynamicObject();
         if (!obj) return false;
 
@@ -1036,15 +1098,12 @@ public:
 
         root->setProperty("presets", arr);
         juce::var jsonVar(root);
-        getPresetFile().replaceWithText(juce::JSON::toString(jsonVar));
+        SafeJsonFile::save(getPresetFile(), juce::JSON::toString(jsonVar));
     }
 
     bool load()
     {
-        auto file = getPresetFile();
-        if (!file.existsAsFile()) return false;
-
-        auto parsed = juce::JSON::parse(file.loadFileAsString());
+        auto parsed = SafeJsonFile::load(getPresetFile());
         auto* obj = parsed.getDynamicObject();
         if (!obj) return false;
 
@@ -1628,7 +1687,7 @@ struct AppSettings
         obj->setProperty("engines", engineArray);
 
         juce::var jsonVar(obj.release());
-        getSettingsFile().replaceWithText(juce::JSON::toString(jsonVar));
+        SafeJsonFile::save(getSettingsFile(), juce::JSON::toString(jsonVar));
 
         // TrackMap is saved to its own file (trackmap.json)
         trackMap.save();
@@ -1639,10 +1698,7 @@ struct AppSettings
 
     bool load()
     {
-        auto file = getSettingsFile();
-        if (!file.existsAsFile()) return false;
-
-        auto parsed = juce::JSON::parse(file.loadFileAsString());
+        auto parsed = SafeJsonFile::load(getSettingsFile());
         auto* obj = parsed.getDynamicObject();
         if (!obj) return false;
 
@@ -1853,15 +1909,16 @@ public:
         auto mixermapVar = obj->getProperty("mixermap");
         auto presetsVar  = obj->getProperty("generator_presets");
 
-        // Write each section back to its file (only if present in bundle)
+        // Write each section back to its file (only if present in bundle),
+        // keeping the current files as .bak -- a restore replaces the show.
         if (!settingsVar.isVoid())
-            getSettingsFile().replaceWithText(juce::JSON::toString(settingsVar));
+            SafeJsonFile::save(getSettingsFile(), juce::JSON::toString(settingsVar));
         if (!trackmapVar.isVoid())
-            dir.getChildFile("trackmap.json").replaceWithText(juce::JSON::toString(trackmapVar));
+            SafeJsonFile::save(dir.getChildFile("trackmap.json"), juce::JSON::toString(trackmapVar));
         if (!mixermapVar.isVoid())
-            dir.getChildFile("mixermap.json").replaceWithText(juce::JSON::toString(mixermapVar));
+            SafeJsonFile::save(dir.getChildFile("mixermap.json"), juce::JSON::toString(mixermapVar));
         if (!presetsVar.isVoid())
-            dir.getChildFile("generator_presets.json").replaceWithText(juce::JSON::toString(presetsVar));
+            SafeJsonFile::save(dir.getChildFile("generator_presets.json"), juce::JSON::toString(presetsVar));
 
         return true;
     }

@@ -2017,6 +2017,23 @@ MainComponent::MainComponent()
     populateMidiAndNetworkCombos();
     loadAndApplyNonAudioSettings();
 
+    // A settings, TrackMap, mixer map or preset file that exists but could
+    // not be read has been moved aside (SafeJsonFile) and defaults are in
+    // use.  Say so once, now, rather than let the operator find out at the
+    // show that the configuration is gone.
+    if (SafeJsonFile::lastLoadProblem().isNotEmpty())
+    {
+        const juce::String problem = SafeJsonFile::lastLoadProblem();
+        SafeJsonFile::lastLoadProblem().clear();
+        juce::MessageManager::callAsync([problem]
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                "Configuration file could not be read",
+                problem + "\nNothing has been overwritten. The files are in the "
+                "SuperTimecodeConverter folder of your application data directory.");
+        });
+    }
+
     for (auto* cmb : { &cmbAudioInputDevice, &cmbAudioOutputDevice, &cmbThruOutputDevice, &cmbGenAudioDevice })
         cmb->addItem("Scanning...", kPlaceholderItemId);
 
