@@ -287,7 +287,7 @@ private:
         packet[19] = uint8_t(maxFrames);
 
         // endian conversion
-        uint32_t be = ByteOrder::swapIfLittleEndian((int32_t(tc.hours) * 3600 * maxFrames)
+        uint32_t be = juce::ByteOrder::swapIfLittleEndian((int32_t(tc.hours) * 3600 * maxFrames)
                                                     + (int32_t(tc.minutes) * 60 * maxFrames)
                                                     + (int32_t(tc.seconds) * maxFrames)
                                                     + int32_t(tc.frames));

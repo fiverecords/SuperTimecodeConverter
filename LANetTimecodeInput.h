@@ -191,7 +191,7 @@ private:
         const uint32_t* networkData = reinterpret_cast<const uint32_t*>(data);
 
         // message type
-        uint32_t message_type = ByteOrder::swapIfLittleEndian(networkData[0]);
+        uint32_t message_type = juce::ByteOrder::swapIfLittleEndian(networkData[0]);
 
         if (message_type != 1)
         {
@@ -199,14 +199,14 @@ private:
         }
 
         // version parsing
-        uint32_t version = ByteOrder::swapIfLittleEndian(networkData[1]);
+        uint32_t version = juce::ByteOrder::swapIfLittleEndian(networkData[1]);
 
         if (version != 1)
         {
             return;
         }
 
-        uint32_t len = ByteOrder::swapIfLittleEndian(networkData[3]);
+        uint32_t len = juce::ByteOrder::swapIfLittleEndian(networkData[3]);
 
         if (len != 12)
         {
@@ -214,14 +214,14 @@ private:
         }
 
 
-        uint32_t fps = ByteOrder::swapIfLittleEndian(networkData[4]);
+        uint32_t fps = juce::ByteOrder::swapIfLittleEndian(networkData[4]);
 
         if (fps == 0)
         {
             fps = 25;
         }
 
-        uint32_t timestamp = ByteOrder::swapIfLittleEndian(networkData[6]);
+        uint32_t timestamp = juce::ByteOrder::swapIfLittleEndian(networkData[6]);
 
         if (timestamp == 0xffffffff)
         {
