@@ -256,7 +256,11 @@ private:
         samplesPerHalfBit = currentSampleRate / (fps * pitch * LTC_FRAME_BITS * 2.0);
     }
 
-    void packFrame()
+    /// Assemble the next 80-bit codeword.  seedAdvanceFrames is only used on
+    /// the first frame after a (re)seed: the number of whole frames the
+    /// timecode clock has moved since the value in pendingTc was published
+    /// (see the phase alignment in the audio callback).
+    void packFrame(int seedAdvanceFrames = 0)
     {
         FrameRate fps = pendingFps.load(std::memory_order_relaxed);
         Timecode pendingTc = unpackTimecode(packedPendingTc.load(std::memory_order_relaxed));
@@ -264,7 +268,17 @@ private:
         if (!encoderSeeded.load(std::memory_order_relaxed))
         {
             encoderTc = pendingTc;
+            for (int i = 0; i < seedAdvanceFrames; ++i)
+                encoderTc = incrementFrame(encoderTc, fps);
             encoderSeeded.store(true, std::memory_order_relaxed);
+        }
+        else if (paused.load(std::memory_order_relaxed))
+        {
+            // Hold on pause: the engine froze pendingTc at the stop point, and
+            // the signal must carry exactly that value on every frame.  No
+            // auto-increment here -- with it, the resync rule below pulled the
+            // value back every other frame and the output alternated V / V+1.
+            encoderTc = pendingTc;
         }
         else
         {
@@ -272,20 +286,14 @@ private:
             encoderTc = incrementFrame(encoderTc, fps);
 
             // If the UI-provided timecode differs significantly (>1 frame),
-            // re-sync to the UI value (handles seeks, source switches, jumps)
-            int maxFrames = frameRateToInt(fps);
-            auto toTotal = [maxFrames](const Timecode& t) -> int64_t {
-                return (int64_t)t.hours * 3600 * maxFrames
-                     + (int64_t)t.minutes * 60 * maxFrames
-                     + (int64_t)t.seconds * maxFrames
-                     + (int64_t)t.frames;
-            };
-            int64_t dayFrames = (int64_t)24 * 3600 * maxFrames;
-            int64_t rawDiff = toTotal(pendingTc) - toTotal(encoderTc);
-            // Modular distance: shortest path around the 24h wheel
-            int64_t diff = ((rawDiff % dayFrames) + dayFrames) % dayFrames;
-            if (diff > dayFrames / 2) diff = dayFrames - diff;
-            if (diff > 1)
+            // re-sync to the UI value (handles seeks, source switches, jumps).
+            // The distance is measured on the drop-frame-aware frame index:
+            // across a 59;29 -> 00;02 crossing the addresses are one frame
+            // apart although the linear count says three, and a linear
+            // distance here used to force a spurious resync that repeated a
+            // frame at every non-tenth minute.
+            const int64_t diff = frameDistance(pendingTc, encoderTc, fps);
+            if (diff > 1 || diff < -1)
                 encoderTc = pendingTc;
         }
 
@@ -454,10 +462,6 @@ private:
                 const bool seeding = !encoderSeeded.load(std::memory_order_relaxed);
 
                 updateSamplesPerBit();
-                packFrame();
-                currentBitIndex = 0;
-                halfCellIndex = 0;
-                samplePositionInHalfBit = 0.0;
 
                 // --- Frame-phase alignment (issue #15) ---
                 // Only on the FIRST frame after a (re)seed.  Previously the
@@ -473,6 +477,15 @@ private:
                 // bits of the current frame go out as a partial codeword,
                 // which decoders simply ignore before locking to the next
                 // full frame.
+                //
+                // The elapsed time can exceed one frame (phase + age of the
+                // published value + latency): the whole frames it contains
+                // are carried into the seeded value, otherwise the bit
+                // position is right but the value is a frame late -- which
+                // is what happened before, at random depending on the phase
+                // at the instant of seeding.
+                int    seedAdvance = 0;
+                double seedHalfCellsIn = -1.0;
                 if (seeding && haveFramePhase.load(std::memory_order_acquire)
                     && samplesPerHalfBit > 0.0)
                 {
@@ -481,29 +494,40 @@ private:
                     if (frameMs > 0.0)
                     {
                         // Phase at publication, plus however long ago that
-                        // was, plus the output latency so the alignment holds
-                        // at the connector rather than in the buffer.
+                        // was, plus where this sample sits in the buffer,
+                        // plus the output latency so the alignment holds at
+                        // the connector rather than in the buffer.
                         double elapsed = framePhaseMs.load(std::memory_order_relaxed)
                                        + (callbackStartMs
                                           - framePhaseAtMs.load(std::memory_order_relaxed))
+                                       + (double)i * 1000.0 / currentSampleRate
                                        + latencyCompMs.load(std::memory_order_relaxed);
-                        // Wrap into [0, frameMs): the boundary may be several
-                        // frames old, and compensation can push it negative.
-                        elapsed = std::fmod(elapsed, frameMs);
-                        if (elapsed < 0.0) elapsed += frameMs;
-
-                        const double halfCellsIn = (elapsed / frameMs)
-                                                   * (double)(LTC_FRAME_BITS * 2);
-                        int wholeHalfCells = (int)halfCellsIn;
-                        if (wholeHalfCells < 0) wholeHalfCells = 0;
-                        if (wholeHalfCells > LTC_FRAME_BITS * 2 - 1)
-                            wholeHalfCells = LTC_FRAME_BITS * 2 - 1;
-
-                        currentBitIndex = wholeHalfCells / 2;
-                        halfCellIndex   = wholeHalfCells % 2;
-                        samplePositionInHalfBit =
-                            (halfCellsIn - (double)wholeHalfCells) * samplesPerHalfBit;
+                        // Whole frames carry into the value; the remainder
+                        // positions the bit pointer.  Both negative-safe.
+                        double whole = std::floor(elapsed / frameMs);
+                        elapsed -= whole * frameMs;
+                        if (elapsed < 0.0) { elapsed += frameMs; whole -= 1.0; }
+                        seedAdvance = (int) juce::jlimit(0.0, 8.0, whole);
+                        seedHalfCellsIn = (elapsed / frameMs) * (double)(LTC_FRAME_BITS * 2);
                     }
+                }
+
+                packFrame(seedAdvance);
+                currentBitIndex = 0;
+                halfCellIndex = 0;
+                samplePositionInHalfBit = 0.0;
+
+                if (seedHalfCellsIn >= 0.0)
+                {
+                    int wholeHalfCells = (int)seedHalfCellsIn;
+                    if (wholeHalfCells < 0) wholeHalfCells = 0;
+                    if (wholeHalfCells > LTC_FRAME_BITS * 2 - 1)
+                        wholeHalfCells = LTC_FRAME_BITS * 2 - 1;
+
+                    currentBitIndex = wholeHalfCells / 2;
+                    halfCellIndex   = wholeHalfCells % 2;
+                    samplePositionInHalfBit =
+                        (seedHalfCellsIn - (double)wholeHalfCells) * samplesPerHalfBit;
                 }
 
                 needNewFrame.store(false, std::memory_order_relaxed);
