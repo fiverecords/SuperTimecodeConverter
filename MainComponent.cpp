@@ -7913,7 +7913,8 @@ void MainComponent::timerCallback()
                 eng.getTcnetOutputOffsetMs(),
                 beatNumber,
                 masterPlayerNum,
-                trackIdToSend);
+                trackIdToSend,
+                eng.getSourceSpeedRatio());
 
             // Feed track metadata for Resolume unicast.
             // DJ sources: real artist + title from CDJ/Denon.

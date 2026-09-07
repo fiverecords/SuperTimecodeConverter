@@ -241,7 +241,8 @@ public:
                             uint8_t beatInBar, uint32_t bpm100 = 0,
                             int offsetMs = 0, uint32_t beatNumber = 0,
                             uint8_t masterPlayerNum = 0,
-                            uint32_t trackId = 0)
+                            uint32_t trackId = 0,
+                            double speedRatio = 1.0)
     {
         if (idx < 0 || idx >= kMaxLayers) return;
         auto& L       = layers[idx];
@@ -292,7 +293,10 @@ public:
         L.trackId       = (trackId != 0) ? trackId : (uint32_t)(idx + 1);
         L.bpm100        = bpm100;
         L.trackLenMs    = (durationMs > 0) ? durationMs : kDefaultDurationMs;
-        L.speed         = isPlaying ? 1048576u : 0u;  // 2^20 fixed-point = 100%. Bridge sends this range.
+        // 2^20 fixed-point = 100 %; the Bridge sends this range.  Scaled by
+        // the source's pitch so a receiver that extrapolates between packets
+        // runs at the right rate (it was fixed at 100 % under pitch).
+        L.speed         = isPlaying ? (uint32_t) (juce::jlimit(0.0, 4.0, speedRatio) * 1048576.0 + 0.5) : 0u;
 
         // Derive HH:MM:SS:FF from the committed currentTimeMs (post-deadband)
         // so all fields in the Time Packet stay internally consistent.

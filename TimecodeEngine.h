@@ -268,6 +268,16 @@ public:
     /// Reads directly from the corresponding input class for the source.
     /// Winamp returns getPositionMs() which is already smoothed by the
     /// poll-thread IIR filter, so no extra work here.
+    /// Playback speed of the source as a ratio (1.0 = nominal), for
+    /// protocols that carry it (TCNet layer speed).  DJ sources: the PLL's
+    /// pitch; everything else runs at 1.0.  0.0 while frozen or stopped.
+    double getSourceSpeedRatio() const
+    {
+        if (activeInput == InputSource::ProDJLink || activeInput == InputSource::StageLinQ)
+            return (activeInput == InputSource::ProDJLink && pdlTcFrozen) ? 0.0 : pll.pitch;
+        return sourceActive ? 1.0 : 0.0;
+    }
+
     uint32_t getSmoothedPlayheadMs() const
     {
         if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
