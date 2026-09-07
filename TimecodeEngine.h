@@ -188,6 +188,16 @@ public:
         if (source != InputSource::SystemTime && generatorAudioPlayer.isDeviceOpen())
             generatorAudioPlayer.closeDevice();
 
+        // A millisecond source cannot have rate conversion (see
+        // isMillisecondSource): drop it, and render at the user's chosen
+        // output rate, which is the only rate such a source has.
+        if (isMillisecondSource(source))
+        {
+            fpsConvertEnabled = false;
+            currentFps = outputFps;
+            setOutputFrameRate(outputFps);
+        }
+
         // Reset TrackMap cache when leaving ProDJLink / StageLinQ / Winamp
         if (source != InputSource::ProDJLink && source != InputSource::StageLinQ
             && source != InputSource::Winamp)
@@ -311,6 +321,8 @@ public:
 
     void setFpsConvertEnabled(bool enabled)
     {
+        if (enabled && isMillisecondSource(activeInput))
+            enabled = false;   // meaningless for a ms source; never allow the invariant to break
         fpsConvertEnabled = enabled;
         if (!enabled)
         {
@@ -319,14 +331,25 @@ public:
         }
     }
 
+    /// Sources that deliver a millisecond position rather than frames: the
+    /// user's output rate IS their rate, so rate conversion has no meaning
+    /// for them and currentFps must always equal outputFps.  The UI hides
+    /// FPS CONVERT for these; the engine enforces it here regardless of what
+    /// a settings file says (see setInputSource / setFpsConvertEnabled).
+    static bool isMillisecondSource(InputSource src)
+    {
+        return src == InputSource::ProDJLink || src == InputSource::StageLinQ
+            || src == InputSource::Winamp;
+    }
+
     void setOutputFrameRate(FrameRate fps)
     {
         outputFps = fps;
-        // ProDJLink has no inherent frame rate (CDJ sends ms, not frames).
-        // The user's fps choice IS the current fps.  Same applies to Winamp:
-        // the SDK returns position in ms, not frames, so the user's chosen
-        // output fps determines how the position is rendered.
-        if (activeInput == InputSource::ProDJLink || activeInput == InputSource::Winamp)
+        // A millisecond source has no inherent frame rate: the user's fps
+        // choice IS the current fps.  (StageLinQ was missing from this list,
+        // so a stale outputFps could disagree with currentFps and the
+        // timecode was built at one rate and converted as if at the other.)
+        if (isMillisecondSource(activeInput))
             currentFps = fps;
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
@@ -1290,6 +1313,9 @@ public:
                 if (artnetInput.getIsRunning())
                 {
                     currentTimecode = artnetInput.getCurrentTimecode();
+                    // ArtTimeCode goes out once per frame at the sender's frame
+                    // boundary, so the packet's arrival is this frame's start.
+                    setFramePhaseFromArrival(artnetInput.getLastFrameArrivalMs(), currentFps);
                     bool rx = artnetInput.isReceiving();
                     if (rx)
                     {
@@ -1309,6 +1335,7 @@ public:
                 if (laNetTCInput.getIsRunning())
                 {
                     currentTimecode = laNetTCInput.getCurrentTimecode();
+                    setFramePhaseFromArrival(laNetTCInput.getLastFrameArrivalMs(), currentFps);
                     bool rx = laNetTCInput.isReceiving();
                     if (rx)
                     {
@@ -1327,7 +1354,13 @@ public:
             case InputSource::LTC:
                 if (ltcInput.getIsRunning())
                 {
-                    currentTimecode = ltcInput.getCurrentTimecode();
+                    // The decoder delivers a frame when its sync word -- the
+                    // last 16 bits -- has gone by, i.e. at the instant the NEXT
+                    // frame begins on the wire.  The live value is therefore
+                    // the frame after the one decoded, and the arrival instant
+                    // is that frame's start; publishing the decoded value put
+                    // every LTC -> anything conversion one frame late.
+                    currentTimecode = incrementFrame(ltcInput.getCurrentTimecode(), currentFps);
                     setFramePhaseFromArrival(ltcInput.getLastFrameArrivalMs(), currentFps);
                     bool rx = ltcInput.isReceiving();
                     if (rx)
@@ -1817,8 +1850,6 @@ public:
                                  ? pll.actualSpeed
                                  : std::abs(pll.smoothVelocity);
 
-                    bool wasActive = sourceActive;
-
                     // Model-aware playing check.  CDJ-3000 ramp decays speed on
                     // pause, so speed alone is enough.  Everything else needs
                     // the F-flag to discriminate pause-with-frozen-speed from
@@ -1834,10 +1865,8 @@ public:
                                 && !isEOT
                                 && isOnAirGateOpen();
 
-                    // Reseed LTC encoder on pause->active transition
-                    // so it starts a fresh frame instead of continuing a stale one
-                    if (sourceActive && !wasActive)
-                        ltcOutput.reseed();
+                    // (The LTC reseed on pause -> active now happens for every
+                    // source in routeTimecodeToOutputs.)
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
@@ -2081,12 +2110,8 @@ public:
                                  ? pll.actualSpeed
                                  : std::abs(pll.smoothVelocity);
 
-                    bool wasActive = sourceActive;
                     sourceActive = slqRx && slqHasData
                                 && (speed >= PlayheadPLL::kMinEncodingPitch);
-
-                    if (sourceActive && !wasActive)
-                        ltcOutput.reseed();
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "NOT CONNECTED"; }
                 break;
@@ -4333,6 +4358,15 @@ private:
 
         if (sourceActive)
         {
+            // Inactive -> active for ANY source: the LTC encoder was paused
+            // mid-frame with stale bits and its phase alignment is gone, so
+            // it seeds afresh at the published phase.  (Pro DJ Link and
+            // StageLinQ used to do this in their own branches; MTC, LTC,
+            // Art-Net, LA-Net, Hippotizer, Winamp and the generator resumed
+            // unaligned.)
+            if (!wasActive && outputLtcEnabled && ltcOutput.getIsRunning())
+                ltcOutput.reseed();
+
             if (outputMtcEnabled && mtcOutput.getIsRunning())
             {
                 mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));

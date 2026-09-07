@@ -133,6 +133,14 @@ public:
 
     //==============================================================================
     // True if Art-Net TC packets are actively arriving
+    /// Arrival instant of the last valid timecode packet (hi-res ms), which
+    /// the sender emits at its frame boundary -- so it is the start of the
+    /// frame carried in the packet.  0.0 when nothing has arrived.
+    double getLastFrameArrivalMs() const
+    {
+        return lastPacketTime.load(std::memory_order_relaxed);
+    }
+
     bool isReceiving() const
     {
         double lpt = lastPacketTime.load(std::memory_order_relaxed);
