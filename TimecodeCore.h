@@ -237,6 +237,46 @@ inline int64_t frameDistance(const Timecode& a, const Timecode& b, FrameRate fps
 }
 
 //==============================================================================
+// Free-running sender tracking policy.
+//
+// Every sender (LTC, MTC, Art-Net, LA-Net) advances its own value once per
+// frame on its own clock and compares it with the value the engine last
+// published.  The published value lags the truth by up to one engine tick,
+// so a distance of 0 or -1 is "aligned".  When the source runs at a pitch
+// the sender cannot follow (MTC and Art-Net keep their nominal frame rate by
+// design, and any clock drifts) the distance walks away one frame at a
+// time; the policy corrects it one frame at a time too -- a repeated frame
+// when the sender is ahead, a skipped frame when it is behind -- which is
+// what a varispeed source looks like on a fixed-rate protocol and the
+// smallest discontinuity a receiver can see.  Only a distance beyond
+// kTrackingHardResync (a seek the engine did not announce) snaps to the
+// published value.
+//
+// Before this, the senders snapped whenever the distance exceeded one (two
+// for MTC): at -8 % pitch Art-Net went backwards two frames every 0.8 s,
+// MTC three frames every 1.6 s, and a console chasing them treated every
+// snap as a locate.
+//
+// Returns the value to emit given the sender's next nominal value (already
+// advanced by `nominalAdvance` frames from the last emitted one) and the
+// engine's published value.
+//==============================================================================
+static constexpr int64_t kTrackingHardResync = 4;
+
+inline Timecode trackPublishedValue(const Timecode& nominalNext, const Timecode& published,
+                                    int nominalAdvance, FrameRate fps)
+{
+    const int64_t d = frameDistance(published, nominalNext, fps);   // published - next
+    if (d > kTrackingHardResync || d < -kTrackingHardResync)
+        return published;                                            // seek: snap
+    if (d >= 1)
+        return frameIndexToTimecode(timecodeToFrameIndex(nominalNext, fps) + 1, fps);   // behind: skip one
+    if (d <= -2 && nominalAdvance > 0)
+        return frameIndexToTimecode(timecodeToFrameIndex(nominalNext, fps) - 1, fps);   // ahead: repeat one
+    return nominalNext;
+}
+
+//==============================================================================
 // Apply a frame offset (+/-) to a Timecode, wrapping at 24h.  Exact at every
 // rate: the offset is added to the frame index, so a drop-frame minute
 // boundary inside the offset window is counted correctly.  (The previous

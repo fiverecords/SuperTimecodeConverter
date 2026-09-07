@@ -283,10 +283,12 @@ private:
             pending = timecodeToSend;
         }
 
-        // Auto-increment: advance by 1 frame per send.  Compare with
-        // pendingTimecode and only resync on diff > 1 (seek/jump).
-        // Prevents 1-frame backward jitter from interpolation overshoot.
-        // Same architectural pattern as the LTC and MTC encoders.
+        // Auto-increment: advance by 1 frame per send, then the shared
+        // tracking policy (TimecodeCore::trackPublishedValue): a repeated or
+        // skipped frame when the source has drifted by one (pitch, since
+        // Art-Net frames go out at the nominal rate; clock drift), a snap
+        // only on a real seek.  Absorbs the 1-frame backward jitter of the
+        // engine's interpolation like the old rule did, without its jumps.
         Timecode tc;
         if (!artnetSeeded)
         {
@@ -295,13 +297,7 @@ private:
         }
         else
         {
-            tc = incrementFrame(encoderTc, fps);
-
-            // Distance on the drop-frame-aware frame index (see LtcOutput):
-            // a linear count reads a 59;29 -> 00;02 crossing as three frames.
-            const int64_t diff = std::abs(frameDistance(pending, tc, fps));
-            if (diff > 1)
-                tc = pending;
+            tc = trackPublishedValue(incrementFrame(encoderTc, fps), pending, 1, fps);
         }
         encoderTc = tc;
 

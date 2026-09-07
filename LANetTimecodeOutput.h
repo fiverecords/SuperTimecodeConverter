@@ -256,12 +256,8 @@ private:
         }
         else
         {
-            tc = incrementFrame(encoderTc, fps);
-
-            // Distance on the drop-frame-aware frame index (see LtcOutput).
-            const int64_t diff = std::abs(frameDistance(pending, tc, fps));
-            if (diff > 1)
-                tc = pending;
+            // Shared tracking policy (TimecodeCore::trackPublishedValue).
+            tc = trackPublishedValue(incrementFrame(encoderTc, fps), pending, 1, fps);
         }
         encoderTc = tc;
 

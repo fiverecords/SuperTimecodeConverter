@@ -242,16 +242,13 @@ private:
                 }
                 else
                 {
-                    // Auto-increment by 2 frames (1 QF cycle = 2 frame durations)
-                    cycleTimecode = incrementFrame(incrementFrame(cycleTimecode, fps), fps);
-
-                    // Resync if pending differs by more than 2 frames (seek/jump).
-                    // Distance on the drop-frame-aware frame index: a linear
-                    // count reads a 59;29 -> 00;02 crossing as three frames and
-                    // used to force a spurious resync there.
-                    const int64_t diff = std::abs(frameDistance(pending, cycleTimecode, fps));
-                    if (diff > 2)
-                        cycleTimecode = pending;
+                    // Auto-increment by 2 frames (1 QF cycle = 2 frame durations),
+                    // then the shared tracking policy: a cycle of 1 or 3 frames
+                    // when the source has drifted a frame (pitch, clock), a
+                    // snap only on a real seek.  Quarter frames keep their
+                    // nominal rate; scaling them made MA3 lose lock.
+                    cycleTimecode = trackPublishedValue(
+                        incrementFrame(incrementFrame(cycleTimecode, fps), fps), pending, 2, fps);
                 }
             }
 

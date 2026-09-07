@@ -282,19 +282,12 @@ private:
         }
         else
         {
-            // Auto-increment from the last encoded frame
-            encoderTc = incrementFrame(encoderTc, fps);
-
-            // If the UI-provided timecode differs significantly (>1 frame),
-            // re-sync to the UI value (handles seeks, source switches, jumps).
-            // The distance is measured on the drop-frame-aware frame index:
-            // across a 59;29 -> 00;02 crossing the addresses are one frame
-            // apart although the linear count says three, and a linear
-            // distance here used to force a spurious resync that repeated a
-            // frame at every non-tenth minute.
-            const int64_t diff = frameDistance(pendingTc, encoderTc, fps);
-            if (diff > 1 || diff < -1)
-                encoderTc = pendingTc;
+            // Auto-increment from the last encoded frame, then let the shared
+            // tracking policy (TimecodeCore) correct one frame at a time
+            // towards the engine value, or snap on a real seek.  The bit clock
+            // already follows pitch (pitchMultiplier), so here only clock
+            // drift between the audio device and the source shows up.
+            encoderTc = trackPublishedValue(incrementFrame(encoderTc, fps), pendingTc, 1, fps);
         }
 
         int frames  = encoderTc.frames;
