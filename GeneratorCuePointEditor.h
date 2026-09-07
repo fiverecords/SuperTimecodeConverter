@@ -689,35 +689,17 @@ private:
     /// positions -- they're internally consistent, just non-DF-accurate
     /// for the 29.97 case.  If we ever switch to true DF math here, the
     /// engine helper has to switch in lockstep.
+    /// Both delegate to TimecodeCore's shared text conversion (drop-frame
+    /// aware, same arithmetic as the engine display).  fps is the engine's
+    /// rate as a double, as the rest of this editor carries it.
     static double parseTcToMs(const juce::String& tc, double fps)
     {
-        auto parts = juce::StringArray::fromTokens(tc, ":.", "");
-        int h = 0, m = 0, s = 0, f = 0;
-        if (parts.size() >= 1) h = juce::jmax(0, parts[0].getIntValue());
-        if (parts.size() >= 2) m = juce::jmax(0, parts[1].getIntValue());
-        if (parts.size() >= 3) s = juce::jmax(0, parts[2].getIntValue());
-        if (parts.size() >= 4) f = juce::jmax(0, parts[3].getIntValue());
-        if (fps <= 0.0) fps = 30.0;
-        return (h * 3600.0 + m * 60.0 + s + (double) f / fps) * 1000.0;
+        return parseTimecodeTextToMs(tc, frameRateFromDouble(fps));
     }
 
-    /// Convert absolute ms to a SMPTE TC string ("HH:MM:SS:FF") using the
-    /// supplied fps for the frame component.  Inverse of parseTcToMs;
-    /// see that function's note about non-drop-frame counting.
     static juce::String msToTc(double ms, double fps)
     {
-        if (fps <= 0.0) fps = 30.0;
-        ms = juce::jmax(0.0, ms);
-        const double totalSec = ms / 1000.0;
-        const int    h = (int)(totalSec / 3600.0) % 24;
-        const int    m = ((int)(totalSec / 60.0)) % 60;
-        const int    s = ((int)totalSec) % 60;
-        const double frac = totalSec - (double)((int)totalSec);
-        const int    f = juce::jlimit(0, (int)fps - 1, (int)(frac * fps));
-        return juce::String(h).paddedLeft('0', 2) + ":"
-             + juce::String(m).paddedLeft('0', 2) + ":"
-             + juce::String(s).paddedLeft('0', 2) + ":"
-             + juce::String(f).paddedLeft('0', 2);
+        return msToTimecodeText(ms, frameRateFromDouble(fps));
     }
 
     /// Recompute the cue marker positions on the strip.  Each cue's

@@ -423,6 +423,71 @@ inline int fpsToRateCode(FrameRate fps)
 }
 
 //==============================================================================
+// Operator-typed timecode text.  One parser and one formatter for every text
+// field that holds a timecode (generator start/stop, generator cue points,
+// presets), so what the operator types, what the field shows back, and what
+// the engine displays are the same number.  Before this, four private copies
+// of the arithmetic (wall-clock seconds plus frames/fps, no drop-frame, no
+// epsilon) lived in MainComponent, the generator cue editor, the cue point
+// struct and TCNet; at 29.97 they disagreed with the display by up to two
+// frames.
+//
+// Accepted forms: HH:MM:SS:FF, HH:MM:SS.FF, HH:MM:SS;FF, with fewer fields
+// allowed (missing ones read as 0).  Fields are clamped to range.  At 29.97
+// an address in the two numbers a drop-frame minute skips (00 or 01 at second
+// 00 of a non-tenth minute) is moved to 02, the first address that exists.
+//==============================================================================
+inline FrameRate frameRateFromDouble(double fps)
+{
+    if (fps < 23.99) return FrameRate::FPS_2398;
+    if (fps < 24.5)  return FrameRate::FPS_24;
+    if (fps < 27.0)  return FrameRate::FPS_25;
+    if (fps < 29.99) return FrameRate::FPS_2997;
+    return FrameRate::FPS_30;
+}
+
+inline Timecode normaliseDropFrame(Timecode tc, FrameRate fps)
+{
+    if (fps == FrameRate::FPS_2997 && tc.seconds == 0 && tc.frames < 2 && (tc.minutes % 10) != 0)
+        tc.frames = 2;
+    return tc;
+}
+
+inline Timecode parseTimecodeText(const juce::String& text, FrameRate fps)
+{
+    auto parts = juce::StringArray::fromTokens(text, ":.;", "");
+    int v[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4 && i < parts.size(); ++i)
+        v[i] = parts[i].getIntValue();
+
+    Timecode tc;
+    tc.hours   = juce::jlimit(0, 23, v[0]);
+    tc.minutes = juce::jlimit(0, 59, v[1]);
+    tc.seconds = juce::jlimit(0, 59, v[2]);
+    tc.frames  = juce::jlimit(0, frameRateToInt(fps) - 1, v[3]);
+    return normaliseDropFrame(tc, fps);
+}
+
+inline double parseTimecodeTextToMs(const juce::String& text, FrameRate fps)
+{
+    return timecodeToMs(parseTimecodeText(text, fps), fps);
+}
+
+inline juce::String formatTimecodeText(const Timecode& tc, juce::juce_wchar frameSeparator = ':')
+{
+    return juce::String(tc.hours).paddedLeft('0', 2) + ":"
+         + juce::String(tc.minutes).paddedLeft('0', 2) + ":"
+         + juce::String(tc.seconds).paddedLeft('0', 2) + juce::String::charToString(frameSeparator)
+         + juce::String(tc.frames).paddedLeft('0', 2);
+}
+
+inline juce::String msToTimecodeText(double ms, FrameRate fps, juce::juce_wchar frameSeparator = ':')
+{
+    if (ms < 0.0) ms = 0.0;
+    return formatTimecodeText(wallClockToTimecode(ms, fps), frameSeparator);
+}
+
+//==============================================================================
 // Audio device entry with device type information
 //==============================================================================
 struct AudioDeviceEntry

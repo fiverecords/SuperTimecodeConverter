@@ -4,6 +4,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "TimecodeCore.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
@@ -215,15 +216,9 @@ struct GeneratorCuePoint
     /// decide whether a cue should fire.
     uint32_t positionMs(double fps = 30.0) const
     {
-        auto parts = juce::StringArray::fromTokens(positionTC, ":.", "");
-        int h = 0, m = 0, s = 0, f = 0;
-        if (parts.size() >= 1) h = parts[0].getIntValue();
-        if (parts.size() >= 2) m = parts[1].getIntValue();
-        if (parts.size() >= 3) s = parts[2].getIntValue();
-        if (parts.size() >= 4) f = parts[3].getIntValue();
-        if (fps <= 0.0) fps = 30.0;
-        double totalSec = h * 3600.0 + m * 60.0 + s + (double) f / fps;
-        return (uint32_t) juce::jmax(0.0, totalSec * 1000.0);
+        // Shared text conversion (TimecodeCore): drop-frame aware, same
+        // arithmetic as the engine display.
+        return (uint32_t) juce::jmax(0.0, parseTimecodeTextToMs(positionTC, frameRateFromDouble(fps)));
     }
 
     juce::var toVar() const

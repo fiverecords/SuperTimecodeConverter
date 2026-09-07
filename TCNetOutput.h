@@ -1244,16 +1244,8 @@ private:
 
     static uint32_t tcToMs(const Timecode& tc, FrameRate fps)
     {
-        double fms;
-        switch (fps) {
-            case FrameRate::FPS_2398: fms = 1000.0/23.976; break;
-            case FrameRate::FPS_24:   fms = 1000.0/24.0;   break;
-            case FrameRate::FPS_25:   fms = 1000.0/25.0;   break;
-            case FrameRate::FPS_2997: fms = 1000.0/29.97;  break;
-            case FrameRate::FPS_30:   fms = 1000.0/30.0;   break;
-            default:                  fms = 1000.0/30.0;   break;
-        }
-        return (uint32_t)(tc.hours*3600000 + tc.minutes*60000 + tc.seconds*1000 + tc.frames*fms);
+        // Shared conversion (drop-frame aware, exact rates).
+        return (uint32_t) juce::jmax(0.0, timecodeToMs(tc, fps));
     }
 
     // ============================================================

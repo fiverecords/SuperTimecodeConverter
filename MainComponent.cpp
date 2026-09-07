@@ -6192,56 +6192,14 @@ void MainComponent::updateNextCueLabel(TimecodeEngine& eng)
 
 double MainComponent::parseTimecodeToMs(const juce::String& tc, FrameRate fps)
 {
-    // Parse "HH:MM:SS:FF" or "HH:MM:SS.FF" → ms from midnight
-    auto parts = juce::StringArray::fromTokens(tc, ":.", "");
-    int h = 0, m = 0, s = 0, f = 0;
-    if (parts.size() >= 1) h = parts[0].getIntValue();
-    if (parts.size() >= 2) m = parts[1].getIntValue();
-    if (parts.size() >= 3) s = parts[2].getIntValue();
-    if (parts.size() >= 4) f = parts[3].getIntValue();
-
-    double fpsVal = 30.0;
-    switch (fps)
-    {
-        case FrameRate::FPS_2398: fpsVal = 24000.0 / 1001.0; break;
-        case FrameRate::FPS_24:   fpsVal = 24.0; break;
-        case FrameRate::FPS_25:   fpsVal = 25.0; break;
-        case FrameRate::FPS_2997: fpsVal = 30000.0 / 1001.0; break;
-        case FrameRate::FPS_30:   fpsVal = 30.0; break;
-    }
-
-    double ms = (double)h * 3600000.0
-              + (double)m * 60000.0
-              + (double)s * 1000.0
-              + (double)f * (1000.0 / fpsVal);
-    return ms;
+    // One parser for every timecode text field (TimecodeCore): drop-frame
+    // aware, so the value the engine then displays is the value typed.
+    return parseTimecodeTextToMs(tc, fps);
 }
 
 juce::String MainComponent::msToTimecodeString(double ms, FrameRate fps)
 {
-    if (ms < 0.0) ms = 0.0;
-
-    double fpsVal = 30.0;
-    switch (fps)
-    {
-        case FrameRate::FPS_2398: fpsVal = 24000.0 / 1001.0; break;
-        case FrameRate::FPS_24:   fpsVal = 24.0; break;
-        case FrameRate::FPS_25:   fpsVal = 25.0; break;
-        case FrameRate::FPS_2997: fpsVal = 30000.0 / 1001.0; break;
-        case FrameRate::FPS_30:   fpsVal = 30.0; break;
-    }
-
-    int totalSec = (int)(ms / 1000.0);
-    double remainder = ms - (double)totalSec * 1000.0;
-    int h = totalSec / 3600;
-    int m = (totalSec % 3600) / 60;
-    int s = totalSec % 60;
-    int f = (int)(remainder / (1000.0 / fpsVal));
-
-    return juce::String(h).paddedLeft('0', 2) + ":"
-         + juce::String(m).paddedLeft('0', 2) + ":"
-         + juce::String(s).paddedLeft('0', 2) + ":"
-         + juce::String(f).paddedLeft('0', 2);
+    return msToTimecodeText(ms, fps);
 }
 
 void MainComponent::populateGenPresetCombo()
@@ -7851,10 +7809,10 @@ void MainComponent::timerCallback()
                 auto tc  = eng.getOutputTimecode();
                 auto fps = eng.getEffectiveOutputFps();
                 double fms = 1000.0 / 30.0;
-                if      (fps == FrameRate::FPS_2398) fms = 1000.0 / 23.976;
+                if      (fps == FrameRate::FPS_2398) fms = 1000.0 / frameRateToDouble(fps);
                 else if (fps == FrameRate::FPS_24)   fms = 1000.0 / 24.0;
                 else if (fps == FrameRate::FPS_25)   fms = 1000.0 / 25.0;
-                else if (fps == FrameRate::FPS_2997) fms = 1000.0 / 29.97;
+                else if (fps == FrameRate::FPS_2997) fms = 1000.0 / frameRateToDouble(fps);
                 else if (fps == FrameRate::FPS_30)   fms = 1000.0 / 30.0;
                 playheadForBeat = (uint32_t)(tc.hours * 3600000
                                            + tc.minutes * 60000
