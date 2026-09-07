@@ -351,7 +351,13 @@ private:
             // next full 8-QF cycle completes.
             lastSyncTimecode = advanceTwoFrames(assembled, detectedFps);
 
-            syncTimeMs = juce::Time::getMillisecondCounterHiRes();
+            // Piece 7 is sent at the start of the last quarter of the second
+            // frame, so it arrives at N + 1.75 frames; the value N + 2 above
+            // begins a quarter frame later.  The sync instant is that start,
+            // so the phase published to the LTC encoder is not a quarter
+            // frame early.
+            syncTimeMs = juce::Time::getMillisecondCounterHiRes()
+                       + 0.25 * 1000.0 / frameRateToDouble(detectedFps);
         }
         synced.store(true, std::memory_order_release);
     }

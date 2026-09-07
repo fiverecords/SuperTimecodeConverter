@@ -252,6 +252,9 @@ private:
     std::atomic<uint32_t> userBitsIn { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameTime  { 0.0 };
+    double decodeCallbackStartMs = 0.0;   // audio thread only: timestamp base for lastFrameTime
+    int    decodeSamplesRemaining = 0;    // audio thread only: samples after the one being decoded
+    double inputLatencyMs = 0.0;          // set in audioDeviceAboutToStart
 
     // LTC decoder state -- audio-callback-thread-only (no synchronisation needed)
     bool signalHigh = false;
@@ -365,7 +368,17 @@ private:
 
         packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
                              std::memory_order_relaxed);
-        lastFrameTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+        // Arrival instant of the frame end, at sample precision: the
+        // callback runs after the buffer was captured, so the sample being
+        // processed occurred (samples still to process in this buffer)
+        // earlier than the callback start, plus the device's input latency.
+        // Stamping with the callback time put the frame boundary up to a
+        // buffer late and made it jitter by a buffer, which the phase
+        // published to the LTC encoder (D5) inherited.
+        lastFrameTime.store(decodeCallbackStartMs
+                            - (double)(decodeSamplesRemaining) * 1000.0 / currentSampleRate
+                            - inputLatencyMs,
+                            std::memory_order_relaxed);
     }
 
     void onEdgeDetected(int64_t intervalSamples)
@@ -476,8 +489,10 @@ private:
         const float effectiveThreshold = kHysteresisThreshold;
 
         float ltcPeak = 0.0f;
+        decodeCallbackStartMs = juce::Time::getMillisecondCounterHiRes();
         for (int i = 0; i < numSamples; ++i)
         {
+            decodeSamplesRemaining = numSamples - i;
             float sample = data[i] * gain;
             float a = std::abs(sample);
             if (a > ltcPeak) ltcPeak = a;
@@ -519,6 +534,7 @@ private:
             currentSampleRate = device->getCurrentSampleRate();
             currentBufferSize = device->getCurrentBufferSizeSamples();
             numChannelsAvailable = device->getActiveInputChannels().countNumberOfSetBits();
+            inputLatencyMs = (double)device->getInputLatencyInSamples() * 1000.0 / currentSampleRate;
         }
         resetDecoder();
         resetPassthruBuffer();

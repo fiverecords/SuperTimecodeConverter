@@ -297,7 +297,7 @@ private:
         {
             midiOut.store(output, std::memory_order_relaxed);
             setBpm(bpm);
-            accumulator = 0.0;
+            resetClock();
             // Send MIDI Start (0xFA)
             if (output) output->sendMessageNow(juce::MidiMessage(0xFA));
             startTimer(1);
@@ -329,18 +329,35 @@ private:
             auto* out = midiOut.load(std::memory_order_relaxed);
             if (ppms <= 0.0 || !out) return;
 
-            accumulator += ppms;
-            while (accumulator >= 1.0)
+            // Pulses owed = elapsed time x pulses per ms.  Counting callbacks
+            // instead (one pulse-worth per call) made the tempo error equal
+            // the timer's rate error and lost every missed callback; MTC and
+            // Art-Net already use the elapsed-time accumulator.  A gap over
+            // 100 ms (suspended thread) is dropped rather than caught up
+            // with a burst of clocks.
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            if (lastCallbackMs <= 0.0) lastCallbackMs = now;
+            double elapsed = now - lastCallbackMs;
+            lastCallbackMs = now;
+            if (elapsed > 100.0) elapsed = 0.0;
+
+            accumulator += elapsed * ppms;
+            int burst = 0;
+            while (accumulator >= 1.0 && burst < 4)
             {
                 out->sendMessageNow(juce::MidiMessage((uint8_t)0xF8));
                 accumulator -= 1.0;
+                ++burst;
             }
         }
+
+        void resetClock() { accumulator = 0.0; lastCallbackMs = 0.0; }
 
     private:
         std::atomic<juce::MidiOutput*> midiOut { nullptr };
         std::atomic<double> pulsesPerMs { 0.048 };  // default 120 BPM
         double accumulator = 0.0;
+        double lastCallbackMs = 0.0;
     };
 
     MidiClockTimer clockTimer;
