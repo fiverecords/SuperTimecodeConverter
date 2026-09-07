@@ -322,11 +322,11 @@ Every SMPTE LTC frame carries 32 **user bits** (also called binary groups) along
 
 - **Manual value** — an 8-digit hexadecimal value you enter
 - **From LTC in** — passthrough of the user bits arriving on the LTC input. If the incoming signal drops out the last received value is held rather than falling back to zeros, so equipment gating on user bits does not lose them during a glitch
-- **System date** — the current date, written as `YYYYMMDD` and updated automatically
+- **Date (ST 309)** — the current local date and time zone per SMPTE ST 309: `YYMMDD` in groups 1–6, the zone code and daylight-saving flag in groups 7–8, with the binary group flags declaring it, so an ST 309-aware reader shows the date and zone. Updated automatically
 
 - **Name** — four characters, encoded as an eight-bit character set per SMPTE ST 12-1. Defaults to `STC1`, `STC2` and so on per engine if left blank
 
-**On input**, the recovered value is displayed alongside the incoming timecode. User bits are conventionally filled with BCD (one decimal digit per 4-bit group), so the display also shows the decimal reading and a `YYYY-MM-DD` interpretation when the digits form a plausible date.
+**On input**, the recovered value is displayed alongside the incoming timecode. When the incoming binary group flags declare an ST 309 date or an eight-bit character set, the display decodes them (date, zone and DST, or the four characters). Otherwise, since user bits are conventionally filled with BCD (one decimal digit per 4-bit group), it shows the decimal reading and a `YYYY-MM-DD` interpretation when the digits form a plausible date.
 
 User bits are specific to LTC. The Art-Net and TCNet timecode packets have no equivalent field, so the value cannot be carried on those outputs.
 

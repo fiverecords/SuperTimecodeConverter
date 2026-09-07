@@ -1898,7 +1898,7 @@ MainComponent::MainComponent()
     addRightLabelAndCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, "LTC USER BITS:");
     cmbLtcUserBitsMode.addItem("MANUAL VALUE", 1);
     cmbLtcUserBitsMode.addItem("FROM LTC IN",  2);
-    cmbLtcUserBitsMode.addItem("SYSTEM DATE",  3);
+    cmbLtcUserBitsMode.addItem("DATE (ST 309)", 3);
     cmbLtcUserBitsMode.addItem("NAME (4 CHAR)", 4);
     cmbLtcUserBitsMode.onChange = [this]
     {
@@ -2516,7 +2516,8 @@ void MainComponent::syncUIFromEngine()
     sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
     sldLANetTCOffset.setValue(eng.getLANetTCOutputOffset(), juce::dontSendNotification);
     sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
-    cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, 2, eng.getLtcUserBitsMode()) + 1,
+    cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, (int) TimecodeEngine::kUserBitsName,
+                                                  eng.getLtcUserBitsMode()) + 1,
                                      juce::dontSendNotification);
     {
         const int ubMode = eng.getLtcUserBitsMode();
@@ -5937,7 +5938,8 @@ void MainComponent::updateStatusLabels()
         lblLtcInUserBits.setText(
             eng.isSourceActive()
                 ? "USER BITS: " + TimecodeEngine::describeUserBits(
-                                      eng.getLtcInput().getUserBits())
+                                      eng.getLtcInput().getUserBits(),
+                                      eng.getLtcInput().getBinaryGroupFlags())
                 : "USER BITS: --",
             juce::dontSendNotification);
     }

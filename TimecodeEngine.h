@@ -404,7 +404,7 @@ public:
     // LTC user-bits source modes (issue #13 follow-up).
     static constexpr int kUserBitsManual     = 0;  // fixed operator-entered value
     static constexpr int kUserBitsFromLtcIn  = 1;  // passthrough from this engine's LTC input
-    static constexpr int kUserBitsSystemDate = 2;  // current date as BCD YYYYMMDD
+    static constexpr int kUserBitsSystemDate = 2;  // current local date and time zone, SMPTE ST 309
     static constexpr int kUserBitsName       = 3;  // four ISO characters, SMPTE 12M-1 sec. 8.4.2
 
     /// Pack four characters into the 32-bit user-bits word per SMPTE
@@ -470,10 +470,13 @@ public:
         ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsName, mode);
         if (ltcUserBitsMode == kUserBitsManual)
             ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
-        // Only the NAME mode declares a character set; every other mode is
-        // free-form user data, which is BGF 0/0/0 (12M-1 sec. 8.4.1).
-        if (ltcUserBitsMode != kUserBitsName)
-            ltcOutput.setBinaryGroupFlags(0x0);
+        // Binary group flags say what the groups carry (12M-1 sec. 8.4.1):
+        // NAME declares an eight-bit character set (BGF0), DATE declares
+        // ST 309 date and time zone (BGF2, ST 309 Table 3, unspecified clock
+        // reference); the other modes are free-form data, BGF 0/0/0.
+        ltcOutput.setBinaryGroupFlags(ltcUserBitsMode == kUserBitsName       ? 0x1
+                                    : ltcUserBitsMode == kUserBitsSystemDate ? 0x4
+                                    : 0x0);
         lastSystemDateCheckMs = 0.0;   // force a recompute on the next tick
     }
     int getLtcUserBitsMode() const { return ltcUserBitsMode; }
@@ -481,24 +484,89 @@ public:
     /// The value currently going out on the wire, whatever the mode.
     uint32_t getEffectiveLtcUserBits() const { return ltcOutput.getUserBits(); }
 
-    /// Current date packed as BCD YYYYMMDD (e.g. 2026-07-24 -> 0x20260724).
-    /// Note this is NOT SMPTE ST 309 (which encodes YYMMDD plus a timezone
-    /// code and requires the Binary Group Flags to be set).  STC leaves the
-    /// BGFs cleared, i.e. "user-defined data", which is what the feature was
-    /// asked for; YYYYMMDD is the convention in common use on show gear.
+    /// SMPTE ST 309:2012 Table 2 -- time zone code (0-63) for a local offset
+    /// from UTC in minutes, DST already included in the offset.  The code's
+    /// two hex digits read as decimal for whole hours: 00 = UTC, 01-12 =
+    /// UTC-01:00 .. UTC-12:00, 13-25 = UTC+13:00 down to UTC+01:00.  Half
+    /// hours: 0A-0F = -00:30 .. -05:30, 1A-1F = -06:30 .. -11:30, 3F-3A =
+    /// +00:30 .. +05:30, 2F-2A = +06:30 .. +11:30; 32 = +12:45 (Chatham).
+    /// Anything the table has no code for is 39, "unknown".
+    static uint8_t st309TimeZoneCode(int offsetMinutes)
+    {
+        const bool negative = offsetMinutes < 0;
+        const int  absMin   = std::abs(offsetMinutes);
+        const int  hours    = absMin / 60;
+        const int  minutes  = absMin % 60;
+        auto decimalAsHex = [](int n) -> uint8_t { return (uint8_t)(((n / 10) << 4) | (n % 10)); };
+
+        if (minutes == 0)
+        {
+            if (hours == 0) return 0x00;
+            if (negative)  { if (hours <= 12) return decimalAsHex(hours); }
+            else           { if (hours <= 13) return decimalAsHex(26 - hours); }
+        }
+        else if (minutes == 30)
+        {
+            if (negative)  { if (hours <= 5) return (uint8_t)(0x0A + hours);
+                             if (hours <= 11) return (uint8_t)(0x1A + hours - 6); }
+            else           { if (hours <= 5) return (uint8_t)(0x3F - hours);
+                             if (hours <= 11) return (uint8_t)(0x2F - (hours - 6)); }
+        }
+        else if (minutes == 45 && !negative && hours == 12)
+            return 0x32;
+        return 0x39;
+    }
+
+    /// Inverse of st309TimeZoneCode.  Returns false for codes the table
+    /// leaves undefined, deprecated, user-defined or unknown.
+    static bool st309OffsetMinutesForCode(uint8_t code, int& offsetMinutes)
+    {
+        for (int m = -12 * 60; m <= 13 * 60; m += 15)
+            if (st309TimeZoneCode(m) == code && code != 0x39)
+            {
+                offsetMinutes = m;
+                return true;
+            }
+        return false;
+    }
+
+    static juce::String st309ZoneText(uint8_t code)
+    {
+        int m = 0;
+        if (!st309OffsetMinutesForCode(code, m))
+            return code == 0x38 ? "user-defined zone"
+                 : code == 0x39 ? "zone unknown"
+                 : "zone code " + juce::String::toHexString(code).paddedLeft('0', 2).toUpperCase();
+        if (m == 0) return "UTC";
+        const int a = std::abs(m);
+        return "UTC" + juce::String(m < 0 ? "-" : "+")
+             + juce::String(a / 60).paddedLeft('0', 2) + ":" + juce::String(a % 60).paddedLeft('0', 2);
+    }
+
+    /// Current local date and time zone packed per SMPTE ST 309:2012 (Table
+    /// 1 and Table 4): binary groups 1-6 carry the date as YYMMDD with units
+    /// before tens in ascending group order (3 September 2026 = groups 3 0 9
+    /// 0 6 2), group 7 the low four bits of the zone code, group 8 its high
+    /// two bits plus the DST flag (bit 2) and the MJD flag (bit 3, 0 = YYMMDD
+    /// with the time address in local time).  Group 1 is the most
+    /// significant hex digit of the 32-bit word, as everywhere else in STC.
+    /// Emitted with BGF2 = 1 (ST 309 Table 3, unspecified clock reference).
     static uint32_t systemDateUserBits()
     {
-        auto now = juce::Time::getCurrentTime();
-        const int y = now.getYear();          // full year, e.g. 2026
-        const int m = now.getMonth() + 1;     // JUCE months are 0-based
-        const int d = now.getDayOfMonth();
-        auto bcd2 = [](int v) -> uint32_t
-        {
-            v = juce::jlimit(0, 99, v);
-            return (uint32_t)(((v / 10) << 4) | (v % 10));
-        };
-        return (bcd2(y / 100) << 24) | (bcd2(y % 100) << 16)
-             | (bcd2(m)       <<  8) |  bcd2(d);
+        const auto now = juce::Time::getCurrentTime();
+        const int  yy  = juce::jlimit(0, 99, now.getYear() % 100);
+        const int  mm  = now.getMonth() + 1;      // JUCE months are 0-based
+        const int  dd  = now.getDayOfMonth();
+        const uint8_t tz  = st309TimeZoneCode(now.getUTCOffsetSeconds() / 60);
+        const bool    dst = now.isDaylightSavingTime();
+
+        const uint32_t bg1 = (uint32_t)(dd % 10), bg2 = (uint32_t)(dd / 10);
+        const uint32_t bg3 = (uint32_t)(mm % 10), bg4 = (uint32_t)(mm / 10);
+        const uint32_t bg5 = (uint32_t)(yy % 10), bg6 = (uint32_t)(yy / 10);
+        const uint32_t bg7 = (uint32_t)(tz & 0x0F);
+        const uint32_t bg8 = (uint32_t)((tz >> 4) & 0x03) | (dst ? 0x4u : 0u);   // MJD flag 0
+        return (bg1 << 28) | (bg2 << 24) | (bg3 << 20) | (bg4 << 16)
+             | (bg5 << 12) | (bg6 <<  8) | (bg7 <<  4) |  bg8;
     }
     /// Normalised user-bits hex ("" when zero/unset), for the UI and saving.
     juce::String getLtcUserBitsHex() const { return ltcUserBitsHex; }
@@ -527,10 +595,52 @@ public:
     /// (Converting the 32-bit word to a binary decimal integer instead
     /// would render 0x20260724 as 539300644, which is meaningless for the
     /// date/reel conventions these bits actually carry.)
-    static juce::String describeUserBits(uint32_t v)
+    /// Human reading of a user-bits word.  With the binary group flags from
+    /// the decoder it can say what the sender declared: ST 309 date and zone
+    /// (BGF2 = 1, BGF0 = 0), or four eight-bit characters (BGF0 = 1).  With
+    /// no flags it falls back to the BCD heuristics.
+    static juce::String describeUserBits(uint32_t v, uint8_t bgf = 0)
     {
         juce::String hex = juce::String::toHexString((juce::int64) v)
                                .paddedLeft('0', 8).toUpperCase();
+        auto group = [v](int g) -> int { return (int)((v >> ((8 - g) * 4)) & 0xF); };   // g = 1..8
+
+        if ((bgf & 0x5) == 0x4)   // ST 309 (Table 3): BGF2 = 1, BGF0 = 0
+        {
+            const uint8_t tz  = (uint8_t)(group(7) | ((group(8) & 0x3) << 4));
+            const bool    dst = (group(8) & 0x4) != 0;
+            const bool    mjd = (group(8) & 0x8) != 0;
+            juce::String date;
+            if (!mjd)
+            {
+                const int dd = group(2) * 10 + group(1), mm = group(4) * 10 + group(3), yy = group(6) * 10 + group(5);
+                if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)
+                    date = "20" + juce::String(yy).paddedLeft('0', 2) + "-"
+                         + juce::String(mm).paddedLeft('0', 2) + "-" + juce::String(dd).paddedLeft('0', 2);
+            }
+            else
+            {
+                // Six BCD digits, ascending magnitude in groups 1-6 (Table 5).
+                long mjdDays = 0;
+                for (int g = 6; g >= 1; --g) mjdDays = mjdDays * 10 + group(g);
+                date = "MJD " + juce::String((juce::int64) mjdDays) + " = " + civilDateFromMjd(mjdDays) + " UTC,";
+            }
+            if (date.isEmpty()) return hex + "  (ST 309, invalid date)";
+            return hex + "  (" + date + " " + st309ZoneText(tz) + (dst ? " DST" : "") + ")";
+        }
+
+        if ((bgf & 0x1) == 0x1)   // eight-bit character set (12M-1 sec. 8.4.2)
+        {
+            juce::String text;
+            for (int i = 0; i < 4; ++i)
+            {
+                const int lowGroup = 7 - i * 2;                 // same layout as packNameUserBits
+                const int c = group(lowGroup) | (group(lowGroup + 1) << 4);
+                text += (c >= 0x20 && c < 0x7F) ? juce::String::charToString((juce::juce_wchar) c) : juce::String(".");
+            }
+            return hex + "  (\"" + text + "\")";
+        }
+
         bool allDecimal = true;
         for (int g = 0; g < 8; ++g)
             if (((v >> (g * 4)) & 0xF) > 9) { allDecimal = false; break; }
@@ -544,6 +654,24 @@ public:
             return hex + "  (" + hex.substring(0, 4) + "-"
                        + hex.substring(4, 6) + "-" + hex.substring(6, 8) + ")";
         return hex + "  (dec " + hex.trimCharactersAtStart("0") + ")";
+    }
+
+    /// Civil date (YYYY-MM-DD) for a modified Julian date (Fliegel and Van
+    /// Flandern, via JD = MJD + 2400001 for the noon integer day).
+    static juce::String civilDateFromMjd(long mjd)
+    {
+        long l = mjd + 2400001 + 68569;
+        const long n = 4 * l / 146097;
+        l = l - (146097 * n + 3) / 4;
+        const long i = 4000 * (l + 1) / 1461001;
+        l = l - 1461 * i / 4 + 31;
+        const long j = 80 * l / 2447;
+        const long d = l - 2447 * j / 80;
+        l = j / 11;
+        const long m = j + 2 - 12 * l;
+        const long y = 100 * (n - 49) + i + l;
+        return juce::String((juce::int64) y) + "-" + juce::String((juce::int64) m).paddedLeft('0', 2)
+             + "-" + juce::String((juce::int64) d).paddedLeft('0', 2);
     }
     void setTcnetOutputOffsetMs(int v)  { tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, v); }
     void setLANetTCOutputOffset(int v)  { laNetTCOutputOffset = juce::jlimit(-30, 30, v); }
@@ -2938,11 +3066,14 @@ private:
         }
         else if (ltcUserBitsMode == kUserBitsSystemDate)
         {
+            // ST 309 date and zone, re-read once a second so midnight and DST
+            // changes are followed (ST 309 sec. 5.4).
             const double now = juce::Time::getMillisecondCounterHiRes();
             if (now - lastSystemDateCheckMs >= 1000.0)
             {
                 lastSystemDateCheckMs = now;
                 ltcOutput.setUserBits(systemDateUserBits());
+                ltcOutput.setBinaryGroupFlags(0x4);
             }
         }
     }

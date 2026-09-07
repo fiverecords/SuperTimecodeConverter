@@ -136,6 +136,9 @@ public:
         return lastFrameTime.load(std::memory_order_relaxed);
     }
 
+    /// Binary group flags of the last decoded frame (BGF0 in bit 0).
+    uint8_t getBinaryGroupFlags() const { return binaryGroupFlags.load(std::memory_order_relaxed); }
+
     bool isReceiving() const
     {
         auto now = juce::Time::getMillisecondCounterHiRes();
@@ -252,6 +255,7 @@ private:
     std::atomic<uint32_t> userBitsIn { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameTime  { 0.0 };
+    std::atomic<uint8_t> binaryGroupFlags { 0 };   // BGF0 | BGF1<<1 | BGF2<<2 of the last frame
     double decodeCallbackStartMs = 0.0;   // audio thread only: timestamp base for lastFrameTime
     int    decodeSamplesRemaining = 0;    // audio thread only: samples after the one being decoded
     double inputLatencyMs = 0.0;          // set in audioDeviceAboutToStart
@@ -357,6 +361,19 @@ private:
         }
 
         samplesSinceLastSync = 0.0;
+
+        // --- Binary group flags (12M-1 Table 2) ---
+        // BGF1 is bit 58 at every rate; BGF0/BGF2 are bits 43/59 at 24 and
+        // 30 fps and 27/43 at 25 fps.  Reported alongside the user bits so
+        // the reader can decode what the sender declared (ST 309 date, eight-
+        // bit characters).  The rate used is the adopted one.
+        {
+            const bool is25 = (detectedFps.load(std::memory_order_relaxed) == FrameRate::FPS_25);
+            const int  b0 = is25 ? 27 : 43;
+            const int  b2 = is25 ? 43 : 59;
+            const uint8_t bgf = (uint8_t)(((d >> b0) & 1) | (((d >> 58) & 1) << 1) | (((d >> b2) & 1) << 2));
+            binaryGroupFlags.store(bgf, std::memory_order_relaxed);
+        }
 
         // --- User bits (SMPTE 12M binary groups) ---
         // Same layout as the encoder: eight 4-bit groups at bit offsets
