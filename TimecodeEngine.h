@@ -1685,6 +1685,12 @@ public:
                         }
                     }
 
+                    // Track-relative position the cue points are compared
+                    // against: the interpolated one, not the raw packet value
+                    // (a cue used to fire up to a packet interval late, a whole
+                    // beat on the NXS2 beat fallback).
+                    const uint32_t cuePlayheadMs = (uint32_t) tcSourceMs;
+
                     // --- Apply timecode offset ---
                     if (trackMapEnabled && trackMapped)
                     {
@@ -1708,9 +1714,9 @@ public:
                     // DJs preview constantly and spurious MIDI/OSC/ArtNet
                     // triggers during preparation would be disruptive.
                     if (sharedProDJLink->isPlayerPlaying(ep))
-                        tickCuePoints(rawPlayheadMs);
+                        tickCuePoints(cuePlayheadMs, pll.seekDetected);
                     else
-                        lastCueCheckMs = rawPlayheadMs;  // track position so seek detection stays correct
+                        lastCueCheckMs = cuePlayheadMs;  // track position so seek detection stays correct
 
                     bool pdlRx = sharedProDJLink->isReceiving();
                     if (statusTextVisible)
@@ -1998,6 +2004,8 @@ public:
                         }
                     }
 
+                    const uint32_t cuePlayheadMs = (uint32_t) tcSourceMs;   // see the Pro DJ Link branch
+
                     // Apply timecode offset from TrackMap
                     if (trackMapEnabled && trackMapped)
                     {
@@ -2015,9 +2023,9 @@ public:
                     // --- Fire cue point triggers ---
                     // Same guard as ProDJLink: only during playback.
                     if (sharedStageLinQ->isPlayerPlaying(ep))
-                        tickCuePoints(rawPlayheadMs);
+                        tickCuePoints(cuePlayheadMs, pll.seekDetected);
                     else
-                        lastCueCheckMs = rawPlayheadMs;
+                        lastCueCheckMs = cuePlayheadMs;
 
                     bool slqRx = sharedStageLinQ->isReceiving();
                     if (statusTextVisible)
@@ -2267,7 +2275,12 @@ public:
                         // resume does not retro-fire cues we already crossed.
                         const uint32_t playheadMs = (uint32_t) juce::jmax(0, (int)posMs);
                         if (playing)
-                            tickCuePoints(playheadMs);
+                        {
+                            // No PLL here: Winamp's position is continuous
+                            // (50 ms polls, interpolated), so a forward step
+                            // over 500 ms can only be a seek.
+                            tickCuePoints(playheadMs, playheadMs > lastCueCheckMs + 500);
+                        }
                         else
                             lastCueCheckMs = playheadMs;
                     }
@@ -3815,14 +3828,19 @@ private:
     /// Check playhead against armed cue points and fire triggers.
     /// Called from tick() with the current playhead in ms.
     /// Handles forward playback, seek forward, and seek backward.
-    void tickCuePoints(uint32_t playheadMs)
+    /// Fire the cues crossed since the last call.  `sourceSeeked` is the
+    /// source estimator's own verdict (PlayheadPLL::seekDetected): it judges
+    /// a jump against the position it predicted, so a source that only
+    /// reports once per beat (NXS2 fallback: 500 ms at 120 BPM, more below)
+    /// is not mistaken for a seek.  The old rule here -- any forward step
+    /// over 500 ms -- did exactly that, and every cue behind the new
+    /// position was marked fired without firing; below 120 BPM no TrackMap
+    /// cue fired at all on that path.  A backward step is still a seek.
+    void tickCuePoints(uint32_t playheadMs, bool sourceSeeked)
     {
         if (armedCues.empty()) return;
 
-        // Detect seek: playhead jumped backward or jumped forward more than 500ms
-        // beyond what normal playback would produce (60Hz tick = ~17ms advance)
-        bool seekDetected = (playheadMs < lastCueCheckMs)
-                         || (playheadMs > lastCueCheckMs + 500);
+        const bool seekDetected = sourceSeeked || (playheadMs < lastCueCheckMs);
 
         if (seekDetected)
         {
