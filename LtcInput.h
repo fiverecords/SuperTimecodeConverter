@@ -268,6 +268,7 @@ private:
     static constexpr uint16_t LTC_SYNC_WORD = 0xBFFC;
     double samplesSinceLastSync = 0.0;
     int consecutiveGoodFrames = 0;
+    FrameRate candidateFps = FrameRate::FPS_25;   // rate the consecutive count refers to
 
     void resetDecoder()
     {
@@ -336,13 +337,23 @@ private:
             else if (dropFrame)           detected = FrameRate::FPS_2997;
             else                          detected = FrameRate::FPS_30;
 
-            consecutiveGoodFrames++;
+            // The rate is adopted only after three consecutive frames agree
+            // on the SAME classification; before, three good frames of any
+            // rate were enough and the value then followed every single
+            // frame period, so one jittery period flipped the rate.
+            if (detected == candidateFps)
+                consecutiveGoodFrames++;
+            else
+            {
+                candidateFps = detected;
+                consecutiveGoodFrames = 1;
+            }
             if (consecutiveGoodFrames >= 3)
                 detectedFps.store(detected, std::memory_order_relaxed);
         }
         else
         {
-            consecutiveGoodFrames = 1;
+            consecutiveGoodFrames = 0;
         }
 
         samplesSinceLastSync = 0.0;
