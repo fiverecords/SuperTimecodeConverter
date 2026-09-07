@@ -2830,7 +2830,9 @@ private:
     double genStartMs   = 0.0;     // start TC in ms from midnight
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
-    double genLastTickTime = 0.0;  // hiRes ms for delta calculation
+    double genLastTickTime = 0.0;
+    double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
+    double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
 
     // A/B loop: when genLoopEnabled and genLoopOutMs > genLoopInMs, the tick
     // wraps genCurrentMs from loopOutMs to loopInMs.  Pressing Play with loop
@@ -3949,6 +3951,30 @@ private:
             genLastTickTime = now;
             if (delta > 0.0)
                 genCurrentMs += delta;
+
+            // Audio clock discipline.  The timecode above advances on the
+            // system clock; a loaded file plays on the audio device's clock,
+            // and the two differ by tens of ppm -- 70-360 ms an hour between
+            // the sound the audience hears and the LTC the lights and video
+            // chase.  While the file is playing, pull the timecode gently
+            // towards the transport position (audio position = timecode -
+            // start TC, the same relation every seek here uses).  The
+            // transport position moves in audio-block steps, so a slow
+            // first-order pull (tau ~ 0.8 s at 60 Hz) keeps the timecode
+            // smooth.  A discrepancy of a second or more is not drift but a
+            // loop fold, a seek in flight, or a transport stopped at EOF:
+            // leave it to the code that handles those.
+            if (generatorAudioPlayer.hasFileLoaded() && generatorAudioPlayer.isPlaying())
+            {
+                const double audioMs = genStartMs + generatorAudioPlayer.getCurrentPositionSeconds() * 1000.0;
+                // Only follow a clock that is running: a device that has
+                // stalled leaves the position frozen, and following it would
+                // drag the timecode to a halt.
+                if (audioMs != genLastAudioMs) { genLastAudioMs = audioMs; genLastAudioMoveTs = now; }
+                const double err = audioMs - genCurrentMs;
+                if (std::abs(err) < 1000.0 && (now - genLastAudioMoveTs) < 200.0)
+                    genCurrentMs += err * 0.02;
+            }
 
             // A/B loop: when active and we cross loopOutMs, wrap back to
             // loopInMs.  Checked BEFORE stop TC and EOF -- if both the stop
