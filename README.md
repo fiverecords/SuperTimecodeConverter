@@ -332,7 +332,7 @@ User bits are specific to LTC. The Art-Net and TCNet timecode packets have no eq
 
 ### Frame Rate Support
 
-- **23.976 fps** (24000/1001) — cinema and digital cinema workflows
+- **23.976 fps** (24000/1001) — cinema and digital cinema workflows. Counted as the standard specifies: 24 frames per timecode second, so the time address runs 0.1 % slow against real time (3.6 s per hour), like any 23.976 generator. Use it when the content is 23.976; for timecode that must track the wall clock, use 24, 25, 30 or 29.97 drop-frame
 - **24 fps** — film
 - **25 fps** — PAL / EBU broadcast
 - **29.97 fps drop-frame** — NTSC broadcast (SMPTE-compliant DF counting)

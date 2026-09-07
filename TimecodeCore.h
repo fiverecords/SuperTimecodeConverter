@@ -176,7 +176,8 @@ inline Timecode unpackTimecode(uint64_t packed)
 // These helpers convert between the address and the true count, so any
 // arithmetic (offsets, distances, interpolation) can be done on the count and
 // converted back exactly.  For every other rate the index is the plain linear
-// count.  23.976 uses 24 addresses per timecode second like 24 fps.
+// count.  23.976 uses 24 addresses per timecode second like 24 fps; its
+// timecode second is 1.001 real seconds (see wallClockToTimecode).
 //==============================================================================
 inline int64_t framesPerDay(FrameRate fps)
 {
@@ -309,12 +310,23 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         // shared helper so the two never disagree.
         return frameIndexToTimecode(totalFrames, fps);
     }
+    else if (fps == FrameRate::FPS_2398)
+    {
+        // 24/1.001, normative: the time address counts 24 frames per
+        // timecode second and there is no drop-frame variant, so it runs
+        // 0.1 % slow against real time (ST 12-1) -- 3.6 s per hour, like
+        // every 23.976 generator.  (Until 2026-09 STC kept HH:MM:SS on the
+        // wall clock and fitted 24 numbers into each real second, which put
+        // one number too many on the 23.976 carrier every 41.7 s and made a
+        // video server counting clip frames drift 3.6 s per hour from the
+        // audio.  D20.)
+        const double  exactFps    = 24000.0 / 1001.0;
+        const int64_t totalFrames = (int64_t)(msSinceMidnight / 1000.0 * exactFps + 1e-9);
+        return frameIndexToTimecode(totalFrames, fps);
+    }
     else
     {
-        // Non-drop-frame: split into integer seconds + fractional frame.
-        // This correctly handles 23.976fps where 24 frames span slightly
-        // more than 1 wall-clock second (1001/1000 s).  Using a total
-        // frame count with % maxFrames would drift vs second boundaries.
+        // Integer rates: split into integer seconds + fractional frame.
         //
         // Precision note: double has ~15 significant digits.  At 24h
         // (86400s), the fractional part retains ~10 digits of precision --
@@ -347,13 +359,13 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
 //==============================================================================
 inline double timecodeToMs(const Timecode& tc, FrameRate fps)
 {
-    if (fps == FrameRate::FPS_2997)
+    if (fps == FrameRate::FPS_2997 || fps == FrameRate::FPS_2398)
     {
-        // Drop-frame: recover the true frame count from the address (see
-        // timecodeToFrameIndex), then scale by the exact 30000/1001 rate.
-        const int64_t actualFrames = timecodeToFrameIndex(tc, fps);
-        const double exactFps = 30000.0 / 1001.0;
-        return (double)actualFrames / exactFps * 1000.0;
+        // Fractional rates: the frame index (drop-frame aware at 29.97,
+        // linear at 23.976) scaled by the exact 1001-based rate.  This is
+        // the inverse of wallClockToTimecode for both.
+        const int64_t frames = timecodeToFrameIndex(tc, fps);
+        return (double)frames / frameRateToDouble(fps) * 1000.0;
     }
     else
     {
