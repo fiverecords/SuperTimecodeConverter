@@ -6387,136 +6387,146 @@ void MainComponent::setupOscInputServer()
 
     oscInputServer.onMessage = [this](const OscInputServer::Message& msg)
     {
-        // Dispatch on message thread (callback runs on listener thread)
-        juce::MessageManager::callAsync([this, msg]()
+        // Dispatch on message thread (callback runs on listener thread).
+        // The component may be gone by the time the message runs (a packet
+        // arriving during shutdown), so it is reached through a SafePointer.
+        juce::Component::SafePointer<MainComponent> safeThis(this);
+        juce::MessageManager::callAsync([safeThis, msg]()
         {
-            auto addr = msg.address.trimEnd();
-
-            // Parse engine number: /stc/N/gen/... (N = 1-8, required)
-            int targetEngine = -1;
-            juce::String cmd;
-
-            if (addr.startsWith("/stc/") && addr.length() > 6)
-            {
-                auto afterStc = addr.substring(5);  // "N/gen/play"
-                int slashPos = afterStc.indexOf("/");
-                if (slashPos > 0)
-                {
-                    auto numPart = afterStc.substring(0, slashPos);
-                    int n = numPart.getIntValue();
-                    if (n >= 1 && n <= (int)engines.size())
-                    {
-                        targetEngine = n - 1;
-                        cmd = "/stc/" + afterStc.substring(slashPos + 1);  // "/stc/gen/play"
-                    }
-                }
-            }
-
-            if (targetEngine < 0 || targetEngine >= (int)engines.size()) return;
-            auto& eng = *engines[(size_t)targetEngine];
-
-            // --- Generator commands ---
-            if (cmd == "/stc/gen/play")
-            {
-                eng.generatorPlay();
-            }
-            else if (cmd == "/stc/gen/pause")
-            {
-                eng.generatorPause();
-            }
-            else if (cmd == "/stc/gen/jog")
-            {
-                float deltaSec = msg.getFloat(0, 0.0f);
-                if (deltaSec != 0.0f)
-                {
-                    double newMs = eng.getGeneratorCurrentMs() + (double)deltaSec * 1000.0;
-                    eng.setGeneratorPosition(newMs);
-                }
-            }
-            else if (cmd == "/stc/gen/stop")
-            {
-                eng.generatorStop();
-            }
-            else if (cmd == "/stc/gen/clock")
-            {
-                int val = msg.getInt(0, -1);
-                if (val >= 0)
-                {
-                    eng.setGeneratorClockMode(val != 0);
-                    if (targetEngine == selectedEngine)
-                    {
-                        btnGenClock.setToggleState(eng.getGeneratorClockMode(), juce::dontSendNotification);
-                        updateDeviceSelectorVisibility();
-                        resized();
-                    }
-                }
-            }
-            else if (cmd == "/stc/gen/start")
-            {
-                auto tc = msg.getString(0);
-                if (tc.isNotEmpty())
-                {
-                    double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
-                    eng.setGeneratorStartMs(ms);
-                    if (targetEngine == selectedEngine)
-                        txtGenStartTC.setText(tc, false);
-                    saveSettings();
-                }
-            }
-            else if (cmd == "/stc/gen/stoptime")
-            {
-                auto tc = msg.getString(0);
-                if (tc.isNotEmpty())
-                {
-                    double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
-                    eng.setGeneratorStopMs(ms);
-                    if (targetEngine == selectedEngine)
-                        txtGenStopTC.setText(tc, false);
-                    saveSettings();
-                }
-            }
-            else if (cmd == "/stc/gen/preset")
-            {
-                auto name = msg.getString(0);
-                if (name.isNotEmpty())
-                {
-                    auto* preset = settings.generatorPresets.find(name);
-                    if (preset)
-                    {
-                        auto fps = eng.getCurrentFps();
-                        if (eng.getGeneratorClockMode())
-                            eng.setGeneratorClockMode(false);
-                        eng.generatorStop();
-                        eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
-                        eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
-                        // Push cue points into the engine (same as the UI
-                        // applyGeneratorPreset path).  Without this, OSC-
-                        // triggered preset loads would inherit no cues from
-                        // the preset.
-                        eng.setGeneratorCuePoints(preset->cuePoints);
-
-                        // Audio file from the preset (empty path = no audio)
-                        juce::File audioFile = preset->audioFilePath.isNotEmpty()
-                                                 ? juce::File(preset->audioFilePath) : juce::File();
-                        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
-
-                        eng.generatorPlay();
-
-                        // Update UI if this is the selected engine
-                        if (targetEngine == selectedEngine)
-                        {
-                            btnGenClock.setToggleState(false, juce::dontSendNotification);
-                            txtGenStartTC.setText(preset->startTC, false);
-                            txtGenStopTC.setText(preset->stopTC, false);
-                            updateDeviceSelectorVisibility();
-                            resized();
-                        }
-                        saveSettings();
-                    }
-                }
-            }
+            if (safeThis == nullptr) return;
+            auto* self = safeThis.getComponent();
+            self->handleOscMessage(msg);
         });
     };
+}
+
+void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
+{
+    auto addr = msg.address.trimEnd();
+
+    // Parse engine number: /stc/N/gen/... (N = 1-8, required)
+    int targetEngine = -1;
+    juce::String cmd;
+
+    if (addr.startsWith("/stc/") && addr.length() > 6)
+    {
+        auto afterStc = addr.substring(5);  // "N/gen/play"
+        int slashPos = afterStc.indexOf("/");
+        if (slashPos > 0)
+        {
+            auto numPart = afterStc.substring(0, slashPos);
+            int n = numPart.getIntValue();
+            if (n >= 1 && n <= (int)engines.size())
+            {
+                targetEngine = n - 1;
+                cmd = "/stc/" + afterStc.substring(slashPos + 1);  // "/stc/gen/play"
+            }
+        }
+    }
+
+    if (targetEngine < 0 || targetEngine >= (int)engines.size()) return;
+    auto& eng = *engines[(size_t)targetEngine];
+
+    // --- Generator commands ---
+    if (cmd == "/stc/gen/play")
+    {
+        eng.generatorPlay();
+    }
+    else if (cmd == "/stc/gen/pause")
+    {
+        eng.generatorPause();
+    }
+    else if (cmd == "/stc/gen/jog")
+    {
+        float deltaSec = msg.getFloat(0, 0.0f);
+        if (deltaSec != 0.0f)
+        {
+            double newMs = eng.getGeneratorCurrentMs() + (double)deltaSec * 1000.0;
+            eng.setGeneratorPosition(newMs);
+        }
+    }
+    else if (cmd == "/stc/gen/stop")
+    {
+        eng.generatorStop();
+    }
+    else if (cmd == "/stc/gen/clock")
+    {
+        int val = msg.getInt(0, -1);
+        if (val >= 0)
+        {
+            eng.setGeneratorClockMode(val != 0);
+            if (targetEngine == selectedEngine)
+            {
+                btnGenClock.setToggleState(eng.getGeneratorClockMode(), juce::dontSendNotification);
+                updateDeviceSelectorVisibility();
+                resized();
+            }
+        }
+    }
+    else if (cmd == "/stc/gen/start")
+    {
+        auto tc = msg.getString(0);
+        if (tc.isNotEmpty())
+        {
+            double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
+            eng.setGeneratorStartMs(ms);
+            if (targetEngine == selectedEngine)
+                txtGenStartTC.setText(tc, false);
+            saveSettings();
+        }
+    }
+    else if (cmd == "/stc/gen/stoptime")
+    {
+        auto tc = msg.getString(0);
+        if (tc.isNotEmpty())
+        {
+            double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
+            eng.setGeneratorStopMs(ms);
+            if (targetEngine == selectedEngine)
+                txtGenStopTC.setText(tc, false);
+            saveSettings();
+        }
+    }
+    else if (cmd == "/stc/gen/preset")
+    {
+        auto name = msg.getString(0);
+        if (name.isNotEmpty())
+        {
+            auto* preset = settings.generatorPresets.find(name);
+            if (preset)
+            {
+                auto fps = eng.getCurrentFps();
+                if (eng.getGeneratorClockMode())
+                    eng.setGeneratorClockMode(false);
+                eng.generatorStop();
+                eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
+                eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
+                // Push cue points into the engine (same as the UI
+                // applyGeneratorPreset path).  Without this, OSC-
+                // triggered preset loads would inherit no cues from
+                // the preset.
+                eng.setGeneratorCuePoints(preset->cuePoints);
+
+                // Audio file from the preset (empty path = no audio)
+                juce::File audioFile = preset->audioFilePath.isNotEmpty()
+                                         ? juce::File(preset->audioFilePath) : juce::File();
+                eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
+
+                eng.generatorPlay();
+
+                // Update UI if this is the selected engine
+                if (targetEngine == selectedEngine)
+                {
+                    btnGenClock.setToggleState(false, juce::dontSendNotification);
+                    txtGenStartTC.setText(preset->startTC, false);
+                    txtGenStopTC.setText(preset->stopTC, false);
+                    updateDeviceSelectorVisibility();
+                    resized();
+                }
+                saveSettings();
+            }
+        }
+    }
 }
 
 void MainComponent::startOscInput()

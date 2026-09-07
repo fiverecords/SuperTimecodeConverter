@@ -714,6 +714,7 @@ private:
     void openGeneratorPresetEditor();
     void openGeneratorWaveformWindow();
     void setupOscInputServer();
+    void handleOscMessage(const OscInputServer::Message& msg);   // message thread
     void startOscInput();
     void stopOscInput();
 
