@@ -2501,10 +2501,17 @@ public:
     /// being a control the operator has to understand or set.
     juce::String getLtcOutStatusText() const
     {
+        if (ltcOutStatusText.isEmpty()) return ltcOutStatusText;
+        juce::String text = ltcOutStatusText;
         const double comp = getLtcLatencyCompMs();
-        if (comp > 0.05 && ltcOutStatusText.isNotEmpty())
-            return ltcOutStatusText + " (+" + juce::String(comp, 1) + " ms)";
-        return ltcOutStatusText;
+        if (comp > 0.05)
+            text += " (+" + juce::String(comp, 1) + " ms)";
+        // Output holes the device left in the stream (re-aligned each time,
+        // #19): an interface that keeps doing this is worth knowing about.
+        const int gaps = ltcOutput.getOutputGapCount();
+        if (gaps > 0)
+            text += " " + juce::String(gaps) + (gaps == 1 ? " gap" : " gaps");
+        return text;
     }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
     juce::String getHippoOutStatusText() const { return hippoOutStatusText; }

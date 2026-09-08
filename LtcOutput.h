@@ -128,6 +128,12 @@ public:
     /// the applied value is visible without being an operator control.
     double getLatencyCompensationMs() const { return latencyCompMs.load(std::memory_order_relaxed); }
 
+    /// Output gaps seen since start (device ran dry between callbacks; the
+    /// stream is re-aligned each time).  For the status line: an interface
+    /// that keeps doing this is the operator's problem to know about.
+    int    getOutputGapCount() const { return outputGapCount.load(std::memory_order_relaxed); }
+    double getLastGapMs() const      { return lastGapMs.load(std::memory_order_relaxed); }
+
     /// Output latency the device reports, in milliseconds (0 if unknown).
     /// Used by the AUTO compensation mode; ASIO drivers are not always
     /// truthful about this, which is why a manual trim also exists.
@@ -192,6 +198,11 @@ private:
     // Sub-frame phase published by the engine: how far into the frame the
     // timecode clock was (framePhaseMs) at the instant it was published
     // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
+    // Output gap detector (#19): audio thread state and counters for the UI.
+    double lastCallbackMs = 0.0;
+    std::atomic<int>    outputGapCount { 0 };
+    std::atomic<double> lastGapMs      { 0.0 };
+
     std::atomic<double> framePhaseMs   { 0.0 };
     std::atomic<double> framePhaseAtMs { 0.0 };
     std::atomic<bool>   haveFramePhase { false };
@@ -237,6 +248,7 @@ private:
 
     void resetEncoder()
     {
+        lastCallbackMs = 0.0;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -429,6 +441,50 @@ private:
             if (outputChannelData[ch])
                 std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
 
+        // Wall-clock instant of this callback, used by the phase alignment
+        // and by the gap detector below.  Taken once per callback.
+        const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
+
+        // --- Output gap detector (issue #19) ---
+        // A callback that arrives much later than one buffer after the
+        // previous one means the device ran dry in between: it played
+        // silence (or stale data) for the missing time and then resumed our
+        // stream where it left off, so everything after it is late by the
+        // length of the hole.  Seen on a display wake with a USB interface:
+        // one 10.0 ms hole, and the frame phase shifted by exactly 10 ms for
+        // good.  Skipping the same number of samples of our own stream puts
+        // the phase back; the frame in progress loses those samples, which
+        // is one glitchy frame on top of the glitch the hole already was.
+        // The device consumes whole periods, so a hole is a whole number of
+        // them: the correction is quantised to periods, which also keeps
+        // scheduling jitter (well under a period) from being mistaken for a
+        // hole.  Beyond two frames the stall was long enough that the source
+        // has moved on too, and a fresh seed at the published phase is
+        // cleaner than skipping.
+        int skipSamples = 0;
+        {
+            const double expectedMs = (double) numSamples * 1000.0 / currentSampleRate;
+            if (lastCallbackMs > 0.0 && expectedMs > 0.0)
+            {
+                const double gapMs = (callbackStartMs - lastCallbackMs) - expectedMs;
+                if (gapMs > 0.75 * expectedMs)
+                {
+                    const int periods = juce::jmax(1, (int) std::floor(gapMs / expectedMs + 0.5));
+                    outputGapCount.fetch_add(1, std::memory_order_relaxed);
+                    lastGapMs.store(periods * expectedMs, std::memory_order_relaxed);
+                    const double frameMs = samplesPerHalfBit * LTC_FRAME_BITS * 2.0 * 1000.0 / currentSampleRate;
+                    if (frameMs > 0.0 && periods * expectedMs > 2.0 * frameMs)
+                    {
+                        needNewFrame.store(true, std::memory_order_relaxed);
+                        encoderSeeded.store(false, std::memory_order_relaxed);
+                    }
+                    else
+                        skipSamples = periods * numSamples;
+                }
+            }
+            lastCallbackMs = callbackStartMs;
+        }
+
         if (paused.load(std::memory_order_relaxed) && !holdOnPause.load(std::memory_order_relaxed))
             return;
 
@@ -443,13 +499,13 @@ private:
                             ? outputChannelData[1] : nullptr;
         const float amplitude = baseAmplitude * outputGain.load(std::memory_order_relaxed);
 
-        // Wall-clock instant of the first sample of this buffer, used by the
-        // phase alignment below.  Taken once per callback, not per sample.
-        const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
-
         float peak = 0.0f;
-        for (int i = 0; i < numSamples; ++i)
+        // Gap correction: advance the bit stream by the samples the device
+        // did not play, writing nothing.  Same state machine as below, so a
+        // frame boundary crossed while skipping is handled identically.
+        for (int i = -skipSamples; i < numSamples; ++i)
         {
+            const bool skipping = (i < 0);
             if (needNewFrame.load(std::memory_order_relaxed))
             {
                 const bool seeding = !encoderSeeded.load(std::memory_order_relaxed);
@@ -493,7 +549,7 @@ private:
                         double elapsed = framePhaseMs.load(std::memory_order_relaxed)
                                        + (callbackStartMs
                                           - framePhaseAtMs.load(std::memory_order_relaxed))
-                                       + (double)i * 1000.0 / currentSampleRate
+                                       + (double) juce::jmax(0, i) * 1000.0 / currentSampleRate
                                        + latencyCompMs.load(std::memory_order_relaxed);
                         // Whole frames carry into the value; the remainder
                         // positions the bit pointer.  Both negative-safe.
@@ -532,10 +588,13 @@ private:
             }
 
             float sample = currentLevel * amplitude;
-            output[i] = sample;
-            if (output2) output2[i] = sample;
-            float a = std::abs(sample);
-            if (a > peak) peak = a;
+            if (!skipping)
+            {
+                output[i] = sample;
+                if (output2) output2[i] = sample;
+                float a = std::abs(sample);
+                if (a > peak) peak = a;
+            }
             samplePositionInHalfBit += 1.0;
 
             if (samplePositionInHalfBit >= samplesPerHalfBit)
