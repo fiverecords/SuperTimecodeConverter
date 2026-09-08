@@ -320,7 +320,7 @@ Every SMPTE LTC frame carries 32 **user bits** (also called binary groups) along
 
 **On output**, the source is selectable:
 
-- **Manual value** — an 8-digit hexadecimal value you enter
+- **Manual value** — an 8-digit hexadecimal value you enter. The first digit goes into binary group 1 (most significant digit first). SMPTE ST 12 sets no order for free-form hex, and tools differ: readers built on libltc (`ltcdump`) show the same frame with the digits reversed. The date and name modes are addressed by group number as the standards specify, so they read the same everywhere
 - **From LTC in** — passthrough of the user bits arriving on the LTC input. If the incoming signal drops out the last received value is held rather than falling back to zeros, so equipment gating on user bits does not lose them during a glitch
 - **Date (ST 309)** — the current local date and time zone per SMPTE ST 309: `YYMMDD` in groups 1–6, the zone code and daylight-saving flag in groups 7–8, with the binary group flags declaring it, so an ST 309-aware reader shows the date and zone. Updated automatically
 
