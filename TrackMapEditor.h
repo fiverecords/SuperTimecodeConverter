@@ -98,6 +98,33 @@ public:
         btnImport.onClick = [this] { onImport(); };
         btnExport.onClick = [this] { onExport(); };
 
+        // --- Scope selector ---
+        addAndMakeVisible(lblScope);
+        lblScope.setText("Scope:", juce::dontSendNotification);
+        lblScope.setFont(juce::Font(juce::FontOptions(9.0f)));
+        lblScope.setColour(juce::Label::textColourId, textMid);
+        lblScope.setJustificationType(juce::Justification::centredRight);
+
+        addAndMakeVisible(cmbScope);
+        cmbScope.addItem("Global (all engines)", 1);
+        cmbScope.setSelectedId(1, juce::dontSendNotification);
+        cmbScope.setColour(juce::ComboBox::backgroundColourId, bgPanel);
+        cmbScope.setColour(juce::ComboBox::textColourId, textBright);
+        cmbScope.setColour(juce::ComboBox::outlineColourId, borderCol);
+        cmbScope.onChange = [this]
+        {
+            const int id = cmbScope.getSelectedId();
+            const int chosen = (id <= 1) ? -1 : id - 2;
+            if (chosen != scopeEngine && onScopeChange)
+                onScopeChange(chosen);
+        };
+
+        addBtn(btnCopyGlobal, "Copy from global");
+        btnCopyGlobal.setColour(juce::TextButton::buttonColourId, accentGreen.withAlpha(0.25f));
+        btnCopyGlobal.setColour(juce::TextButton::textColourOffId, accentGreen.brighter(0.6f));
+        btnCopyGlobal.setVisible(false);
+        btnCopyGlobal.onClick = [this] { onCopyFromGlobal(); };
+
         // --- Edit form ---
         addAndMakeVisible(formPanel);
         formPanel.setVisible(false);
@@ -242,6 +269,10 @@ public:
     //--------------------------------------------------------------------------
     std::function<void()> onChange;
 
+    /// The user picked another scope in the selector: -1 = global, else the
+    /// engine index.  The owner re-opens the editor on that map.
+    std::function<void(int)> onScopeChange;
+
     /// Called when user clicks the Cues column to open the cue editor for a track.
     /// Receives a mutable pointer to the TrackMapEntry (valid as long as TrackMap is unchanged).
     std::function<void(TrackMapEntry*)> onOpenCueEditor;
@@ -255,6 +286,35 @@ public:
     //--------------------------------------------------------------------------
     // Set the active track ID (for visual highlighting in the table)
     //--------------------------------------------------------------------------
+    /// Configure the scope selector and, for an engine scope, the override
+    /// behaviour.  `engineNames` are the choices after "Global"; `engine` is
+    /// the current scope (-1 = global); `global` is the global map, used in
+    /// override scope for context (offset, notes) and for "Copy from global".
+    void setScope(int engine, const juce::StringArray& engineNames, const TrackMap* global)
+    {
+        scopeEngine = engine;
+        globalMap   = global;
+
+        cmbScope.clear(juce::dontSendNotification);
+        cmbScope.addItem("Global (all engines)", 1);
+        for (int i = 0; i < engineNames.size(); ++i)
+            cmbScope.addItem(engineNames[i] + " overrides", 2 + i);
+        cmbScope.setSelectedId(engine < 0 ? 1 : 2 + engine, juce::dontSendNotification);
+
+        const bool ovr = isOverrideScope();
+        btnCopyGlobal.setVisible(ovr);
+        // A playlist import into an override set would create empty overrides
+        // for every track, silencing the global triggers on this engine.
+        btnImport.setEnabled(!ovr);
+        btnImport.setAlpha(ovr ? 0.35f : 1.0f);
+        lblFormOffset.setText(ovr ? "Offset (global)" : "Offset", juce::dontSendNotification);
+        lblFormNotes.setText(ovr ? "Notes (global)" : "Notes", juce::dontSendNotification);
+        resized();
+        repaint();
+    }
+
+    int getScopeEngine() const { return scopeEngine; }
+
     void setActiveTrack(const juce::String& artist, const juce::String& title)
     {
         auto newKey = TrackMapEntry::makeKey(artist, title);
@@ -334,7 +394,17 @@ public:
         btnClearAll.setBounds(btnRow.removeFromLeft(bw));
 
         btnExport.setBounds(btnRow.removeFromRight(bw));  btnRow.removeFromRight(4);
-        btnImport.setBounds(btnRow.removeFromRight(bw));
+        btnImport.setBounds(btnRow.removeFromRight(bw));  btnRow.removeFromRight(8);
+
+        // Scope selector sits between the two button groups; "Copy from
+        // global" only exists in override scope.
+        if (btnCopyGlobal.isVisible())
+        {
+            btnCopyGlobal.setBounds(btnRow.removeFromRight(120));
+            btnRow.removeFromRight(8);
+        }
+        cmbScope.setBounds(btnRow.removeFromRight(juce::jlimit(120, 200, btnRow.getWidth() - 44)));
+        lblScope.setBounds(btnRow.removeFromRight(44));
 
         area.removeFromTop(6);
 
@@ -503,6 +573,13 @@ private:
     ProDJLinkInput* proDJLinkInput;
     DbServerClient* dbClient = nullptr;  // Phase 2: metadata cache for Learn
 
+    // Scope (see setScope): -1 = the global map, >= 0 = that engine's
+    // override layer.  In override scope `trackMap` IS the override set and
+    // `globalMap` is the global map, read for context and for copying.
+    int scopeEngine = -1;
+    const TrackMap* globalMap = nullptr;
+    bool isOverrideScope() const { return scopeEngine >= 0 && globalMap != nullptr; }
+
     std::vector<const TrackMapEntry*> rows;   // sorted snapshot (ptrs into trackMap) for display
     int  activeSortColumn = ColPlaylistPos;     // default: playlist order
     bool sortForwards     = true;
@@ -538,6 +615,12 @@ private:
     juce::TextButton btnLearn, btnAdd, btnDelete, btnClearAll, btnImport, btnExport;
     juce::Label lblLearnLayer;
     juce::ComboBox cmbLearnLayer;
+
+    // Scope selector (Global / Engine N overrides) and the override-only
+    // "Copy from global" button.
+    juce::Label    lblScope;
+    juce::ComboBox cmbScope;
+    juce::TextButton btnCopyGlobal;
 
     // Edit form
     juce::Component formPanel;
@@ -784,20 +867,69 @@ private:
     //--------------------------------------------------------------------------
     // Form open / close
     //--------------------------------------------------------------------------
-    void openFormForRow(int rowIndex)
+    /// Override scope: identity, offset and notes are the global entry's and
+    /// are not editable here (the engine never reads them from an override).
+    /// Shows the global values for context, read-only.  Global scope: leaves
+    /// the fields editable.
+    void applyScopeToForm(const juce::String& artist, const juce::String& title, int durationSec)
     {
-        if (rowIndex < 0 || rowIndex >= (int)rows.size()) return;
-        jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
-        const auto& entry = *rows[(size_t)rowIndex];
-        editingRow = rowIndex;
+        const bool ovr = isOverrideScope();
+        edFormOffset.setReadOnly(ovr);
+        edFormNotes.setReadOnly(ovr);
+        edFormOffset.setAlpha(ovr ? 0.6f : 1.0f);
+        edFormNotes.setAlpha(ovr ? 0.6f : 1.0f);
+        if (!ovr) return;
 
-        edFormArtist.setText(entry.artist, false);
-        edFormArtist.setReadOnly(true);
-        edFormTitle.setText(entry.title, false);
-        edFormTitle.setReadOnly(true);
-        edFormOffset.setText(entry.timecodeOffset, false);
-        edFormNotes.setText(entry.notes, false);
+        const TrackMapEntry* g = globalEntryFor(artist, title, durationSec);
+        edFormOffset.setText(g ? g->timecodeOffset : juce::String("00:00:00:00"), false);
+        edFormNotes.setText(g ? g->notes : juce::String("(no global entry)"), false);
+    }
 
+    /// Override scope only: start an override from a copy of a global entry.
+    /// Offers the tracks that have a global entry and no override yet, the
+    /// active track first.
+    void onCopyFromGlobal()
+    {
+        if (!isOverrideScope()) return;
+
+        std::vector<const TrackMapEntry*> candidates;
+        for (auto* g : globalMap->getAllSortedPtrs())
+            if (!trackMap.contains(g->artist, g->title, g->durationSec))
+                candidates.push_back(g);
+
+        if (candidates.empty())
+        {
+            lblStatus.setText("Every global track already has an override on this engine", juce::dontSendNotification);
+            return;
+        }
+
+        juce::PopupMenu menu;
+        int id = 1;
+        for (auto* g : candidates)
+        {
+            const bool active = (TrackMapEntry::makeKey(g->artist, g->title) == activeTrackKey);
+            juce::String label = (g->artist.isNotEmpty() ? g->artist + " - " : juce::String()) + g->title;
+            if (active) label = "> " + label + "  (active)";
+            menu.addItem(id++, label);
+        }
+
+        juce::Component::SafePointer<TrackMapEditor> safeThis(this);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&btnCopyGlobal),
+            [safeThis, candidates](int result)
+            {
+                if (safeThis == nullptr || result <= 0 || result > (int)candidates.size()) return;
+                TrackMapEntry copy = *candidates[(size_t)result - 1];
+                safeThis->trackMap.addOrUpdate(copy);
+                safeThis->rebuildRows();
+                safeThis->table.updateContent();
+                safeThis->lblStatus.setText("Override added from global: " + copy.title, juce::dontSendNotification);
+                if (safeThis->onChange) safeThis->onChange();
+            });
+    }
+
+    /// Trigger, DMX and BPM-multiplier fields from an entry.
+    void fillTriggerFields(const TrackMapEntry& entry)
+    {
         // MIDI trigger (independent fields)
         edFormMidiCh.setText(juce::String(entry.midiChannel + 1), false);   // display 1-16
         edFormMidiNote.setText(entry.midiNoteNum >= 0 ? juce::String(entry.midiNoteNum) : "", false);
@@ -822,6 +954,35 @@ private:
             else if (entry.bpmMultiplier == -2) comboId = 5;
             cmbFormBpmMult.setSelectedId(comboId, juce::dontSendNotification);
         }
+    }
+
+    /// Override scope: the global entry for an identity, by the same three
+    /// key steps the engine uses.  Null in global scope or when none exists.
+    const TrackMapEntry* globalEntryFor(const juce::String& artist, const juce::String& title, int durationSec) const
+    {
+        if (!isOverrideScope()) return nullptr;
+        const TrackMapEntry* g = globalMap->find(artist, title, durationSec);
+        if (!g && durationSec > 0) g = globalMap->find(artist, title, 0);
+        if (!g) g = globalMap->findIgnoringDuration(artist, title);
+        return g;
+    }
+
+    void openFormForRow(int rowIndex)
+    {
+        if (rowIndex < 0 || rowIndex >= (int)rows.size()) return;
+        jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
+        const auto& entry = *rows[(size_t)rowIndex];
+        editingRow = rowIndex;
+
+        edFormArtist.setText(entry.artist, false);
+        edFormArtist.setReadOnly(true);
+        edFormTitle.setText(entry.title, false);
+        edFormTitle.setReadOnly(true);
+        edFormOffset.setText(entry.timecodeOffset, false);
+        edFormNotes.setText(entry.notes, false);
+        applyScopeToForm(entry.artist, entry.title, entry.durationSec);
+
+        fillTriggerFields(entry);
 
         btnFormCues.setEnabled(true);  // existing track -- can edit cues
         formPanel.setVisible(true);
@@ -840,6 +1001,7 @@ private:
         edFormTitle.setReadOnly(false);
         edFormOffset.setText("00:00:00:00", false);
         edFormNotes.setText("", false);
+        applyScopeToForm(artist, title, learnedDurationSec);
 
         // MIDI trigger defaults (all disabled)
         edFormMidiCh.setText("1", false);
@@ -858,6 +1020,13 @@ private:
 
         // BPM multiplier default (off)
         cmbFormBpmMult.setSelectedId(1, juce::dontSendNotification);
+
+        // Override scope: a new override starts as a copy of the global
+        // entry's triggers, so the operator changes only what differs (an
+        // override with empty triggers silences the global ones on this
+        // engine, which must be a choice, not a default).
+        if (const auto* g = globalEntryFor(artist, title, learnedDurationSec))
+            fillTriggerFields(*g);
 
         btnFormCues.setEnabled(false);  // new track -- no cues yet
         formPanel.setVisible(true);
@@ -974,6 +1143,18 @@ private:
         {
             // New entry: use duration from Learn (if available)
             entry.durationSec = learnedDurationSec;
+        }
+
+        // Override scope: what the engine reads from an override is triggers,
+        // BPM multiplier and cue points; offset and notes stay the global
+        // entry's.  Store the global values so the table shows them.
+        if (const auto* g = globalEntryFor(entry.artist, entry.title, entry.durationSec))
+        {
+            entry.timecodeOffset = g->timecodeOffset;
+            entry.notes          = g->notes;
+            if (entry.durationSec == 0) entry.durationSec = g->durationSec;
+            if (editingRow < 0 && entry.cuePoints.empty())
+                entry.cuePoints = g->cuePoints;   // new override starts from the global cues
         }
 
         auto savedKey = entry.key();
@@ -1382,7 +1563,6 @@ private:
                 {
                     int before = (int)safeThis->trackMap.size();
                     safeThis->trackMap.applyPlaylistOrder(entries);
-                    safeThis->trackMap.save();
                     // Reset sort to playlist order so the user sees the new
                     // order immediately. setSortColumnId may or may not trigger
                     // sortOrderChanged depending on prior state, so we also
@@ -1391,6 +1571,11 @@ private:
                     safeThis->rebuildRows();
                     safeThis->table.updateContent();
                     safeThis->repaint();
+                    // Persist through the owner (the map may be the global
+                    // file or an engine's settings block) and refresh the
+                    // engines -- this path used to save the file directly and
+                    // left the engines' lookup stale until the next edit.
+                    if (safeThis->onChange) safeThis->onChange();
 
                     int added = (int)safeThis->trackMap.size() - before;
                     int reordered = (int)entries.size() - added;

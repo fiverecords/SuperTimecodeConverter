@@ -655,7 +655,11 @@ private:
     void startCurrentStageLinQInput();
     void startCurrentHippotizerInput();
     void startCurrentLANetTCInput();
-    void openTrackMapEditor();
+    /// scopeEngine < 0 opens the global map; otherwise that engine's
+    /// TrackMap override layer.  The editor's scope selector re-opens it.
+    void openTrackMapEditor(int scopeEngine = -1);
+    void persistTrackMapScope();   // save the map behind the open editor and refresh the engines
+    int  trackMapEditorScope = -1; // scope of the editor in trackMapWindow
     void openCuePointEditor(TrackMapEntry* entry);
     void openMixerMapEditor();
     void openProDJLinkView();

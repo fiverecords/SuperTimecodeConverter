@@ -564,6 +564,31 @@ public:
         SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(jsonVar));
     }
 
+    /// Entries as a JSON array (the "tracks" value of the file format), for
+    /// storing a map somewhere other than trackmap.json -- the per-engine
+    /// override layer keeps one inside the engine's settings block.
+    juce::var toVar() const
+    {
+        juce::Array<juce::var> arr;
+        for (auto& [k, entry] : entries)
+            arr.add(entry.toVar());
+        return arr;
+    }
+
+    void fromVar(const juce::var& v)
+    {
+        entries.clear();
+        if (auto* arr = v.getArray())
+            for (auto& item : *arr)
+            {
+                TrackMapEntry e;
+                e.fromVar(item);
+                if (e.hasValidKey())
+                    entries[e.key()] = e;
+            }
+        ++generation;
+    }
+
     bool load()
     {
         auto parsed = SafeJsonFile::load(getTrackMapFile());
@@ -1186,41 +1211,25 @@ private:
 class TrackMapOverrides
 {
 public:
-    /// An override entry is a full TrackMapEntry; only its trigger, BPM
-    /// multiplier and cue point fields are honoured.  Keeping the whole
-    /// struct means the editor can start an override as a copy of the
-    /// global entry and the operator changes only what differs.
-    std::unordered_map<std::string, TrackMapEntry> entries;
+    /// The override set is a TrackMap in its own right (same entry type,
+    /// same keys, same editor), just never written to trackmap.json: it is
+    /// serialised into the engine's settings block.  Of each entry only the
+    /// triggers, the BPM multiplier and the cue points are honoured
+    /// (`apply`); keeping the whole entry lets the editor start an override
+    /// as a copy of the global one and show the global offset for context.
+    TrackMap map;
 
-    bool empty() const { return entries.empty(); }
-
-    const TrackMapEntry* find(const juce::String& artist, const juce::String& title, int dur = 0) const
-    {
-        auto it = entries.find(TrackMapEntry::makeKey(artist, title, dur));
-        return it == entries.end() ? nullptr : &it->second;
-    }
-
-    const TrackMapEntry* findIgnoringDuration(const juce::String& artist, const juce::String& title) const
-    {
-        const auto base = TrackMapEntry::makeKey(artist, title, 0);
-        for (auto& [k, e] : entries)
-            if (k == base || k.rfind(base + "|", 0) == 0)
-                return &e;
-        return nullptr;
-    }
+    bool empty() const { return map.size() == 0; }
 
     /// Same three-step resolution the engine uses for the global map:
     /// exact key with duration, then without, then ignoring duration.
     const TrackMapEntry* resolve(const juce::String& artist, const juce::String& title, int dur) const
     {
-        const TrackMapEntry* e = find(artist, title, dur);
-        if (!e && dur > 0) e = find(artist, title, 0);
-        if (!e)            e = findIgnoringDuration(artist, title);
+        const TrackMapEntry* e = map.find(artist, title, dur);
+        if (!e && dur > 0) e = map.find(artist, title, 0);
+        if (!e)            e = map.findIgnoringDuration(artist, title);
         return e;
     }
-
-    void upsert(const TrackMapEntry& e)      { entries[e.key()] = e; }
-    void remove(const std::string& key)      { entries.erase(key); }
 
     /// Copy the override fields of `ovr` onto `base` (a copy of the global
     /// entry) and return the effective entry for this engine.
@@ -1241,26 +1250,8 @@ public:
         return e;
     }
 
-    juce::var toVar() const
-    {
-        juce::Array<juce::var> arr;
-        for (auto& [k, e] : entries)
-            arr.add(e.toVar());
-        return arr;
-    }
-
-    void fromVar(const juce::var& v)
-    {
-        entries.clear();
-        if (auto* arr = v.getArray())
-            for (auto& item : *arr)
-            {
-                TrackMapEntry e;
-                e.fromVar(item);
-                if (e.hasValidKey())
-                    entries[e.key()] = e;
-            }
-    }
+    juce::var toVar() const           { return map.toVar(); }
+    void      fromVar(const juce::var& v) { map.fromVar(v); }
 };
 
 struct EngineSettings

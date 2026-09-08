@@ -2248,6 +2248,15 @@ void MainComponent::removeEngine(int index)
     if (settingsDirty)
         flushSettings();
 
+    // A TrackMap editor open on an engine's override layer holds a reference
+    // into that engine; indices shift on removal, so close it.
+    if (trackMapWindow != nullptr && trackMapEditorScope >= 0)
+    {
+        if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); }
+        delete trackMapWindow.getComponent();
+        trackMapEditorScope = -1;
+    }
+
     // Remember if the deleted engine was the primary and had thru enabled,
     // so we can restart AudioThru on the new primary after reindexing.
     bool deletedWasPrimary = engines[(size_t)index]->isPrimary();
@@ -3091,18 +3100,66 @@ void MainComponent::propagateGlobalSettings()
     }
 }
 
-void MainComponent::openTrackMapEditor()
+void MainComponent::persistTrackMapScope()
 {
-    // If already open, bring to front
+    if (trackMapEditorScope < 0)
+    {
+        settings.trackMap.save();
+        for (auto& eng : engines)
+            eng->refreshTrackMapLookup();
+    }
+    else if (trackMapEditorScope < (int) engines.size())
+    {
+        // The override layer lives in the engine and is copied into its
+        // settings block on save.
+        saveSettings();
+        engines[(size_t) trackMapEditorScope]->refreshTrackMapLookup();
+    }
+}
+
+void MainComponent::openTrackMapEditor(int scopeEngine)
+{
+    if (scopeEngine >= (int) engines.size())
+        scopeEngine = -1;
+
+    // If already open on the same scope, bring to front; on another scope,
+    // close and re-open on the requested map.
     if (trackMapWindow != nullptr)
     {
-        trackMapWindow->toFront(true);
-        return;
+        if (scopeEngine == trackMapEditorScope)
+        {
+            trackMapWindow->toFront(true);
+            return;
+        }
+        if (cuePointWindow != nullptr)
+        {
+            cuePointWindow.reset();
+            cuePointTrackKey.clear();
+        }
+        delete trackMapWindow.getComponent();
     }
+    trackMapEditorScope = scopeEngine;
 
     auto& eng = currentEngine();
 
-    auto* editor = new TrackMapEditor(settings.trackMap, &sharedProDJLinkInput);
+    TrackMap& scopedMap = (scopeEngine < 0) ? settings.trackMap
+                                            : engines[(size_t) scopeEngine]->getTrackMapOverrides().map;
+    auto* editor = new TrackMapEditor(scopedMap, &sharedProDJLinkInput);
+    {
+        juce::StringArray names;
+        for (auto& e : engines) names.add(e->getName());
+        editor->setScope(scopeEngine, names, &settings.trackMap);
+    }
+    juce::Component::SafePointer<MainComponent> safeSelf(this);
+    editor->onScopeChange = [safeSelf](int chosen)
+    {
+        // Re-open from the message queue: the request comes from inside the
+        // editor that is about to be deleted.
+        juce::MessageManager::callAsync([safeSelf, chosen]
+        {
+            if (safeSelf != nullptr) safeSelf->openTrackMapEditor(chosen);
+        });
+    };
     editor->setDbServerClient(&sharedDbClient);
     {
         auto info = eng.getActiveTrackInfo();
@@ -3132,9 +3189,7 @@ void MainComponent::openTrackMapEditor()
             cuePointEditedTitle.clear();
         }
 
-        settings.trackMap.save();
-        for (auto& e : engines)
-            e->refreshTrackMapLookup();
+        persistTrackMapScope();
     };
 
     editor->onOpenCueEditor = [this](TrackMapEntry* entry)
@@ -3157,7 +3212,9 @@ void MainComponent::openTrackMapEditor()
         std::function<void()> onClose;
     };
 
-    auto* win = new FloatingWindow("Track Map Editor", juce::Colour(0xFF12141A));
+    auto* win = new FloatingWindow(scopeEngine < 0 ? juce::String("Track Map Editor")
+                                                   : "Track Map Editor - " + engines[(size_t) scopeEngine]->getName() + " overrides",
+                                   juce::Colour(0xFF12141A));
     win->setContentOwned(editor, true);
     win->setUsingNativeTitleBar(false);
     win->setTitleBarHeight(20);
@@ -3383,9 +3440,9 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
 
     cuePointWindow->setOnChange([this]
     {
-        settings.trackMap.save();
-        for (auto& eng : engines)
-            eng->refreshTrackMapLookup();
+        // The entry belongs to the map behind the open TrackMap editor (the
+        // global file or an engine's override layer).
+        persistTrackMapScope();
 
         // Refresh TrackMap editor table if open (cue count column)
         if (trackMapWindow != nullptr)
