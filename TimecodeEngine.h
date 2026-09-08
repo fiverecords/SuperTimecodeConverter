@@ -2982,6 +2982,8 @@ private:
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
     double genLastTickTime = 0.0;
+    double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
+    double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
 
@@ -4089,14 +4091,29 @@ private:
     //--------------------------------------------------------------------------
     void updateGenerator()
     {
-        // Clock mode: read wall clock directly (old SystemTime behavior)
+        // Clock mode: time of day.  The wall clock is read for its VALUE but
+        // advanced with the high-resolution counter: Time::getCurrentTime()
+        // moves in system-timer steps (up to 15.6 ms on Windows), and the
+        // sub-frame phase published to the LTC encoder inherited that
+        // granularity.  The counter is re-anchored to the wall clock only
+        // when the two disagree by more than 50 ms (a clock adjustment,
+        // suspend/resume, the day rollover), so NTP slews are followed
+        // without adding jitter.
         if (genClockMode)
         {
             auto now = juce::Time::getCurrentTime();
-            double msSinceMidnight = (double)now.getHours() * 3600000.0
-                                   + (double)now.getMinutes() * 60000.0
-                                   + (double)now.getSeconds() * 1000.0
-                                   + (double)now.getMilliseconds();
+            const double wallMs = (double)now.getHours() * 3600000.0
+                                + (double)now.getMinutes() * 60000.0
+                                + (double)now.getSeconds() * 1000.0
+                                + (double)now.getMilliseconds();
+            const double hiRes = juce::Time::getMillisecondCounterHiRes();
+            double msSinceMidnight = clockAnchorWallMs + (hiRes - clockAnchorHiResMs);
+            if (clockAnchorHiResMs <= 0.0 || std::abs(msSinceMidnight - wallMs) > 50.0)
+            {
+                clockAnchorWallMs  = wallMs;
+                clockAnchorHiResMs = hiRes;
+                msSinceMidnight    = wallMs;
+            }
             currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
             setFramePhaseFromPosition(msSinceMidnight, currentFps);
             return;
