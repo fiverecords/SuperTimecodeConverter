@@ -1024,6 +1024,13 @@ public:
         }
     }
 
+    /// The per-engine override layer (see TrackMapOverrides).  Owned here so
+    /// it follows the engine through re-indexing; EngineSettings holds a copy
+    /// for persistence.  After editing, call refreshTrackMapLookup().
+    TrackMapOverrides&       getTrackMapOverrides()       { return trackMapOverrides; }
+    const TrackMapOverrides& getTrackMapOverrides() const { return trackMapOverrides; }
+    void setTrackMapOverrides(const TrackMapOverrides& ovr) { trackMapOverrides = ovr; }
+
     void setMixerMap(MixerMap* map)
     {
         mixerMapPtr = map;
@@ -3549,6 +3556,8 @@ private:
 
     // TrackMap state (track-to-offset mapping)
     TrackMap* trackMapPtr       = nullptr;
+    TrackMapOverrides trackMapOverrides;   // this engine's layer over the global map (copied to/from its settings block)
+    TrackMapEntry effectiveEntry;          // global entry with this engine's overrides applied
     MixerMap* mixerMapPtr       = nullptr;
     MixerMap* slqMixerMapPtr    = nullptr;  // Denon StageLinQ mixer map
     bool      trackMapEnabled   = false;
@@ -3880,6 +3889,24 @@ private:
         // enrichment pass).
         if (!entry)
             entry = trackMapPtr->findIgnoringDuration(cachedTrackArtist, cachedTrackTitle);
+
+        // Per-engine override layer: triggers, BPM multiplier and cue points
+        // come from this engine's override when it has one for the track;
+        // identity, offset and notes stay global.  An override without a
+        // global entry still works (offset zero, identity from the key).
+        if (!trackMapOverrides.empty())
+        {
+            if (const auto* ovr = trackMapOverrides.resolve(cachedTrackArtist, cachedTrackTitle,
+                                                            cachedTrackDurationSec))
+            {
+                TrackMapEntry base;
+                if (entry) base = *entry;
+                else { base.artist = cachedTrackArtist; base.title = cachedTrackTitle; base.durationSec = cachedTrackDurationSec; }
+                effectiveEntry = TrackMapOverrides::apply(base, *ovr);
+                entry = &effectiveEntry;
+            }
+        }
+
         if (entry)
         {
             int h, m, s, f;

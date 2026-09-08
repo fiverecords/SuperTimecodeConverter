@@ -1165,6 +1165,104 @@ private:
 //==============================================================================
 // Per-engine settings
 //==============================================================================
+//==============================================================================
+// TrackMapOverrides -- the per-engine layer over the global TrackMap.
+//
+// The global map (trackmap.json) stays the single source of truth for what a
+// track IS: artist, title, duration, timecode offset, notes.  What differs
+// between a lights engine and a video engine chasing the same deck is the
+// show-system-specific part of an entry -- the triggers (MIDI, OSC, Art-Net,
+// BPM multiplier) and the cue points.  An override entry, keyed like a global
+// entry, replaces exactly those fields for one engine; everything else is
+// still read from the global entry.  Lookups check the engine's overrides
+// first and fall back to the global map, so an engine with no overrides
+// behaves as before.
+//
+// Persisted inside the engine's block of settings.json (as "trackMapOverrides"),
+// so it follows the engine through re-indexing and travels in the backup
+// bundle with everything else about that engine.  Overrides are the diff,
+// so the block stays small.
+//==============================================================================
+class TrackMapOverrides
+{
+public:
+    /// An override entry is a full TrackMapEntry; only its trigger, BPM
+    /// multiplier and cue point fields are honoured.  Keeping the whole
+    /// struct means the editor can start an override as a copy of the
+    /// global entry and the operator changes only what differs.
+    std::unordered_map<std::string, TrackMapEntry> entries;
+
+    bool empty() const { return entries.empty(); }
+
+    const TrackMapEntry* find(const juce::String& artist, const juce::String& title, int dur = 0) const
+    {
+        auto it = entries.find(TrackMapEntry::makeKey(artist, title, dur));
+        return it == entries.end() ? nullptr : &it->second;
+    }
+
+    const TrackMapEntry* findIgnoringDuration(const juce::String& artist, const juce::String& title) const
+    {
+        const auto base = TrackMapEntry::makeKey(artist, title, 0);
+        for (auto& [k, e] : entries)
+            if (k == base || k.rfind(base + "|", 0) == 0)
+                return &e;
+        return nullptr;
+    }
+
+    /// Same three-step resolution the engine uses for the global map:
+    /// exact key with duration, then without, then ignoring duration.
+    const TrackMapEntry* resolve(const juce::String& artist, const juce::String& title, int dur) const
+    {
+        const TrackMapEntry* e = find(artist, title, dur);
+        if (!e && dur > 0) e = find(artist, title, 0);
+        if (!e)            e = findIgnoringDuration(artist, title);
+        return e;
+    }
+
+    void upsert(const TrackMapEntry& e)      { entries[e.key()] = e; }
+    void remove(const std::string& key)      { entries.erase(key); }
+
+    /// Copy the override fields of `ovr` onto `base` (a copy of the global
+    /// entry) and return the effective entry for this engine.
+    static TrackMapEntry apply(const TrackMapEntry& base, const TrackMapEntry& ovr)
+    {
+        TrackMapEntry e = base;
+        e.midiChannel   = ovr.midiChannel;
+        e.midiNoteNum   = ovr.midiNoteNum;
+        e.midiNoteVel   = ovr.midiNoteVel;
+        e.midiCCNum     = ovr.midiCCNum;
+        e.midiCCVal     = ovr.midiCCVal;
+        e.oscAddress    = ovr.oscAddress;
+        e.oscArgs       = ovr.oscArgs;
+        e.artnetCh      = ovr.artnetCh;
+        e.artnetVal     = ovr.artnetVal;
+        e.bpmMultiplier = ovr.bpmMultiplier;
+        e.cuePoints     = ovr.cuePoints;
+        return e;
+    }
+
+    juce::var toVar() const
+    {
+        juce::Array<juce::var> arr;
+        for (auto& [k, e] : entries)
+            arr.add(e.toVar());
+        return arr;
+    }
+
+    void fromVar(const juce::var& v)
+    {
+        entries.clear();
+        if (auto* arr = v.getArray())
+            for (auto& item : *arr)
+            {
+                TrackMapEntry e;
+                e.fromVar(item);
+                if (e.hasValidKey())
+                    entries[e.key()] = e;
+            }
+    }
+};
+
 struct EngineSettings
 {
     juce::String engineName = "";   // empty = default "ENGINE N"
@@ -1202,6 +1300,7 @@ struct EngineSettings
     // Pro DJ Link
     int proDJLinkPlayer = 1;
     bool trackMapEnabled = false;
+    TrackMapOverrides trackMapOverrides;   // per-engine layer over the global TrackMap
     bool midiClockEnabled = false;
     juce::String oscBpmAddr = "/composition/tempocontroller/tempo";
     juce::String oscBpmCmd;   // e.g. "Master 3.x at %BPM%" — if set, sends string instead of float
@@ -1323,6 +1422,8 @@ struct EngineSettings
         obj->setProperty("generatorAudioFileChannelMode", generatorAudioFileChannelMode);
         obj->setProperty("proDJLinkPlayer", proDJLinkPlayer);
         obj->setProperty("trackMapEnabled", trackMapEnabled);
+        if (!trackMapOverrides.empty())
+            obj->setProperty("trackMapOverrides", trackMapOverrides.toVar());
         obj->setProperty("midiClockEnabled", midiClockEnabled);
         obj->setProperty("oscBpmAddr", oscBpmAddr);
         obj->setProperty("oscBpmCmd", oscBpmCmd);
@@ -1452,6 +1553,7 @@ struct EngineSettings
         // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER
         proDJLinkPlayer      = juce::jlimit(1, 9, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
+        trackMapOverrides.fromVar(obj->getProperty("trackMapOverrides"));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));
         oscBpmAddr           = getString("oscBpmAddr", getString("tcnetOscBpmAddr", "/composition/tempocontroller/tempo"));
         oscBpmCmd            = getString("oscBpmCmd");

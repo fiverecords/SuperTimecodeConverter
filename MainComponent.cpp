@@ -4753,8 +4753,10 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setGeneratorLoopOutMs(es.generatorLoopOutMs);
         eng.setGeneratorLoopEnabled(es.generatorLoopEnabled);
 
-        // TrackMap -- wire pointer and restore enabled state
+        // TrackMap -- wire pointer and restore enabled state; the per-engine
+        // override layer lives in this engine's settings block.
         eng.setTrackMap(&settings.trackMap);
+        eng.setTrackMapOverrides(es.trackMapOverrides);
         eng.setTrackMapEnabled(es.trackMapEnabled);
 
         // Track change triggers -- restore enable state and connect destinations
@@ -5093,6 +5095,7 @@ void MainComponent::flushSettings()
             es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
             es.laNetTCOutputInterface = cmbLANetTCOutputInterface.getSelectedId() - 1;
             es.trackMapEnabled = eng.isTrackMapEnabled();
+            es.trackMapOverrides = eng.getTrackMapOverrides();
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();
             es.oscBpmAddr       = eng.getOscFwdBpmAddr();
@@ -5249,6 +5252,7 @@ void MainComponent::flushSettings()
             es.generatorAudioFileChannelMode = eng.getGeneratorAudioFileChannelMode();
             // ArtNet interfaces preserved from last save when engine was selected
             es.trackMapEnabled = eng.isTrackMapEnabled();
+            es.trackMapOverrides = eng.getTrackMapOverrides();
             es.midiClockEnabled = eng.isMidiClockEnabled();
             es.oscBpmForward    = eng.isOscForwardEnabled();
             es.oscBpmAddr       = eng.getOscFwdBpmAddr();
