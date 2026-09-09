@@ -129,8 +129,8 @@ public:
     double getLatencyCompensationMs() const { return latencyCompMs.load(std::memory_order_relaxed); }
 
     /// Output gaps seen since start (device ran dry between callbacks; the
-    /// stream is re-aligned each time).  For the status line: an interface
-    /// that keeps doing this is the operator's problem to know about.
+    /// encoder re-seeds at the published phase each time).  For the status
+    /// line: an interface that keeps doing this is worth knowing about.
     int    getOutputGapCount() const { return outputGapCount.load(std::memory_order_relaxed); }
     double getLastGapMs() const      { return lastGapMs.load(std::memory_order_relaxed); }
 
@@ -446,22 +446,18 @@ private:
         const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
 
         // --- Output gap detector (issue #19) ---
-        // A callback that arrives much later than one buffer after the
+        // A callback that arrives much later than one period after the
         // previous one means the device ran dry in between: it played
         // silence (or stale data) for the missing time and then resumed our
         // stream where it left off, so everything after it is late by the
-        // length of the hole.  Seen on a display wake with a USB interface:
-        // one 10.0 ms hole, and the frame phase shifted by exactly 10 ms for
-        // good.  Skipping the same number of samples of our own stream puts
-        // the phase back; the frame in progress loses those samples, which
-        // is one glitchy frame on top of the glitch the hole already was.
-        // The device consumes whole periods, so a hole is a whole number of
-        // them: the correction is quantised to periods, which also keeps
-        // scheduling jitter (well under a period) from being mistaken for a
-        // hole.  Beyond two frames the stall was long enough that the source
-        // has moved on too, and a fresh seed at the published phase is
-        // cleaner than skipping.
-        int skipSamples = 0;
+        // length of the hole.  Seen on a display wake with two USB
+        // interfaces: a 10.0 ms hole on one, a 24.5 ms one on the other --
+        // the hole is the length of the stall, not a whole number of device
+        // periods, so it is not measured and skipped; the encoder re-seeds
+        // at the phase the engine publishes (D5), which is where the frame
+        // boundary should be NOW whatever the hole was.  The frame in
+        // progress is cut short: one glitchy frame on top of the glitch the
+        // hole already was, then the phase is back on the wire.
         {
             const double expectedMs = (double) numSamples * 1000.0 / currentSampleRate;
             if (lastCallbackMs > 0.0 && expectedMs > 0.0)
@@ -469,17 +465,13 @@ private:
                 const double gapMs = (callbackStartMs - lastCallbackMs) - expectedMs;
                 if (gapMs > 0.75 * expectedMs)
                 {
-                    const int periods = juce::jmax(1, (int) std::floor(gapMs / expectedMs + 0.5));
                     outputGapCount.fetch_add(1, std::memory_order_relaxed);
-                    lastGapMs.store(periods * expectedMs, std::memory_order_relaxed);
-                    const double frameMs = samplesPerHalfBit * LTC_FRAME_BITS * 2.0 * 1000.0 / currentSampleRate;
-                    if (frameMs > 0.0 && periods * expectedMs > 2.0 * frameMs)
+                    lastGapMs.store(gapMs, std::memory_order_relaxed);
+                    if (haveFramePhase.load(std::memory_order_acquire))
                     {
                         needNewFrame.store(true, std::memory_order_relaxed);
                         encoderSeeded.store(false, std::memory_order_relaxed);
                     }
-                    else
-                        skipSamples = periods * numSamples;
                 }
             }
             lastCallbackMs = callbackStartMs;
@@ -500,12 +492,8 @@ private:
         const float amplitude = baseAmplitude * outputGain.load(std::memory_order_relaxed);
 
         float peak = 0.0f;
-        // Gap correction: advance the bit stream by the samples the device
-        // did not play, writing nothing.  Same state machine as below, so a
-        // frame boundary crossed while skipping is handled identically.
-        for (int i = -skipSamples; i < numSamples; ++i)
+        for (int i = 0; i < numSamples; ++i)
         {
-            const bool skipping = (i < 0);
             if (needNewFrame.load(std::memory_order_relaxed))
             {
                 const bool seeding = !encoderSeeded.load(std::memory_order_relaxed);
@@ -549,7 +537,7 @@ private:
                         double elapsed = framePhaseMs.load(std::memory_order_relaxed)
                                        + (callbackStartMs
                                           - framePhaseAtMs.load(std::memory_order_relaxed))
-                                       + (double) juce::jmax(0, i) * 1000.0 / currentSampleRate
+                                       + (double) i * 1000.0 / currentSampleRate
                                        + latencyCompMs.load(std::memory_order_relaxed);
                         // Whole frames carry into the value; the remainder
                         // positions the bit pointer.  Both negative-safe.
@@ -588,13 +576,10 @@ private:
             }
 
             float sample = currentLevel * amplitude;
-            if (!skipping)
-            {
-                output[i] = sample;
-                if (output2) output2[i] = sample;
-                float a = std::abs(sample);
-                if (a > peak) peak = a;
-            }
+            output[i] = sample;
+            if (output2) output2[i] = sample;
+            float a = std::abs(sample);
+            if (a > peak) peak = a;
             samplePositionInHalfBit += 1.0;
 
             if (samplePositionInHalfBit >= samplesPerHalfBit)
