@@ -91,20 +91,36 @@ public:
                                    || dev->requestedSampleRate != sampleRate
                                    || dev->requestedBufferSize != bufferSize;
 
-        // Register before opening so a fresh device announces itself to this
-        // client through the fan-out; on a running device, announce directly
-        // (before the client can receive a callback), as JUCE does.
-        dev->fanout.add(client, asInput, !asInput, wantsReconfigure ? nullptr : dev->manager->getCurrentAudioDevice());
-
         if (wantsReconfigure)
         {
+            // Remember what the other clients had, so a request the driver
+            // refuses (a rate it cannot do, a direction it cannot add) costs
+            // only the requester: the device goes back to its previous
+            // configuration for everyone else.
+            const bool         wasOpen = dev->open;
+            const juce::String prevIn = dev->inputName, prevOut = dev->outputName;
+            const double       prevSr = dev->requestedSampleRate;
+            const int          prevBs = dev->requestedBufferSize;
+
             if (! open(*dev, wantIn, wantOut, sampleRate, bufferSize, error))
             {
-                dev->fanout.remove(client, nullptr);
-                if (dev->fanout.empty()) closeAndForget(dev);
+                if (wasOpen && ! dev->fanout.empty())
+                {
+                    juce::String restoreError;
+                    open(*dev, prevIn, prevOut, prevSr, prevBs, restoreError);
+                }
+                if (dev->fanout.empty())
+                    closeAndForget(dev);
                 return nullptr;
             }
         }
+
+        // Register on the running device: announced (audioDeviceAboutToStart)
+        // before it can receive a callback, as JUCE's addAudioCallback does.
+        // Registering after the open also means a re-opened device announces
+        // itself to the existing clients only, and this one never sees a
+        // stop it was not started for.
+        dev->fanout.add(client, asInput, !asInput, dev->manager->getCurrentAudioDevice());
         return dev->manager->getCurrentAudioDevice();
     }
 
@@ -193,8 +209,11 @@ private:
 
         void audioDeviceAboutToStart(juce::AudioIODevice* device) override
         {
+            // Sized once, off the audio thread.  Generous in samples: a driver
+            // that hands over more than its announced buffer (some WASAPI
+            // configurations do) must not be clamped to a short callback.
             scratch.setSize(juce::jmax(1, device->getActiveOutputChannels().countNumberOfSetBits()),
-                            juce::jmax(1, device->getCurrentBufferSizeSamples()), false, false, true);
+                            juce::jmax(4096, device->getCurrentBufferSizeSamples()), false, false, true);
             const juce::ScopedLock sl(lock);
             for (auto& e : entries) e.cb->audioDeviceAboutToStart(device);
         }
