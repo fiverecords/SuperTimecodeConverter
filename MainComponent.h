@@ -659,8 +659,9 @@ private:
     /// scopeEngine < 0 opens the global map; otherwise that engine's
     /// TrackMap override layer.  The editor's scope selector re-opens it.
     void openTrackMapEditor(int scopeEngine = -1);
-    void persistTrackMapScope();   // save the map behind the open editor and refresh the engines
+    void persistTrackMapScope(int scope);   // save the map of that scope (-1 global) and refresh the engines
     int  trackMapEditorScope = -1; // scope of the editor in trackMapWindow
+    int  cuePointEditorScope = -1; // scope the open cue point editor's entry belongs to
     void openCuePointEditor(TrackMapEntry* entry);
     void openMixerMapEditor();
     void openProDJLinkView();

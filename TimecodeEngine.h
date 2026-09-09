@@ -1566,7 +1566,9 @@ public:
                         }
                         if (statusTextVisible)
                             inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
-                                            + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1);
+                                            + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1)
+                                            + " " + describeAudioFormat(ltcInput.getActualSampleRate(),
+                                                                        ltcInput.getActualBufferSize());
                     }
                     else if (statusTextVisible)
                         inputStatusText = "PAUSED - " + ltcInput.getCurrentDeviceName();

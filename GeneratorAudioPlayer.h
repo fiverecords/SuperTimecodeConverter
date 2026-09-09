@@ -93,7 +93,10 @@ public:
         selectedChannel.store(channel, std::memory_order_relaxed);
 
         juce::String err;
-        auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, false, sampleRate, bufferSize, err);
+        // The generator has its own per-engine format combos, so its device
+        // does not follow the global SAMPLE RATE / BUFFER SIZE setting --
+        // unless it shares the interface with a client that does.
+        auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, false, sampleRate, bufferSize, err, false);
         if (device == nullptr) return false;
 
         currentSampleRate    = device->getCurrentSampleRate();

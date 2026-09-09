@@ -61,10 +61,15 @@ public:
     /// reconfiguration: read what you need in audioDeviceAboutToStart, which
     /// is called before this returns when the device is already running), or
     /// nullptr with `error` set.  A client already registered is moved.
+    /// `followsGlobalFormat`: whether this client's device should take part
+    /// in reconfigureAll() (the global SAMPLE RATE / BUFFER SIZE setting).
+    /// The generator player has its own per-engine format combos and passes
+    /// false; a device it shares with a client that follows the global
+    /// setting still follows it.
     juce::AudioIODevice* acquire(juce::AudioIODeviceCallback* client,
                                  const juce::String& typeName, const juce::String& deviceName,
                                  bool asInput, double sampleRate, int bufferSize,
-                                 juce::String& error)
+                                 juce::String& error, bool followsGlobalFormat = true)
     {
         JUCE_ASSERT_MESSAGE_THREAD
         error.clear();
@@ -86,10 +91,21 @@ public:
         const bool needsOutput = !asInput || dev->outputName.isNotEmpty();
         const juce::String wantIn  = needsInput  ? deviceName : juce::String();
         const juce::String wantOut = needsOutput ? deviceName : juce::String();
+
+        // Rate and buffer belong to the device.  The client that opens it
+        // sets them; a client joining an open device adapts to what is
+        // running (its audioDeviceAboutToStart tells it), even if it asked
+        // for something else -- otherwise two components with different
+        // preferences on one interface would restart it at each other on
+        // every start.  A global change goes through reconfigureAll().
+        // Adding a direction (ASIO input to an output-only device) does
+        // reconfigure, as it must.
+        const bool alone = dev->fanout.empty();
+        const double sr = alone ? sampleRate : dev->requestedSampleRate;
+        const int    bs = alone ? bufferSize : dev->requestedBufferSize;
         const bool wantsReconfigure = ! dev->open
                                    || dev->inputName != wantIn || dev->outputName != wantOut
-                                   || dev->requestedSampleRate != sampleRate
-                                   || dev->requestedBufferSize != bufferSize;
+                                   || (alone && (dev->requestedSampleRate != sr || dev->requestedBufferSize != bs));
 
         if (wantsReconfigure)
         {
@@ -102,7 +118,7 @@ public:
             const double       prevSr = dev->requestedSampleRate;
             const int          prevBs = dev->requestedBufferSize;
 
-            if (! open(*dev, wantIn, wantOut, sampleRate, bufferSize, error))
+            if (! open(*dev, wantIn, wantOut, sr, bs, error))
             {
                 if (wasOpen && ! dev->fanout.empty())
                 {
@@ -120,8 +136,29 @@ public:
         // Registering after the open also means a re-opened device announces
         // itself to the existing clients only, and this one never sees a
         // stop it was not started for.
-        dev->fanout.add(client, asInput, !asInput, dev->manager->getCurrentAudioDevice());
+        dev->fanout.add(client, asInput, !asInput, followsGlobalFormat, dev->manager->getCurrentAudioDevice());
         return dev->manager->getCurrentAudioDevice();
+    }
+
+    /// Apply a new preferred rate and buffer to every open device, once
+    /// each (every client sees a stop/start).  This is how the global
+    /// SAMPLE RATE / BUFFER SIZE setting reaches shared devices; a device
+    /// that cannot do the request keeps whatever the driver settled on,
+    /// which the status lines show.
+    void reconfigureAll(double sampleRate, int bufferSize)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+        for (auto& d : devices)
+        {
+            if (! d->open || ! d->fanout.anyFollowsGlobalFormat()) continue;
+            if (d->requestedSampleRate == sampleRate && d->requestedBufferSize == bufferSize) continue;
+            juce::String err;
+            if (! open(*d, d->inputName, d->outputName, sampleRate, bufferSize, err))
+            {
+                juce::String restoreError;
+                open(*d, d->inputName, d->outputName, d->requestedSampleRate, d->requestedBufferSize, restoreError);
+            }
+        }
     }
 
     /// Unregister `client`; the device closes when nobody is left.
@@ -176,14 +213,22 @@ private:
     //==========================================================================
     struct Fanout : public juce::AudioIODeviceCallback
     {
-        struct Entry { juce::AudioIODeviceCallback* cb; bool input; bool output; };
+        struct Entry { juce::AudioIODeviceCallback* cb; bool input; bool output; bool globalFormat; };
 
-        void add(juce::AudioIODeviceCallback* cb, bool input, bool output, juce::AudioIODevice* runningDevice)
+        void add(juce::AudioIODeviceCallback* cb, bool input, bool output, bool globalFormat,
+                 juce::AudioIODevice* runningDevice)
         {
             if (runningDevice != nullptr)
                 cb->audioDeviceAboutToStart(runningDevice);
             const juce::ScopedLock sl(lock);
-            entries.push_back({ cb, input, output });
+            entries.push_back({ cb, input, output, globalFormat });
+        }
+
+        bool anyFollowsGlobalFormat() const
+        {
+            const juce::ScopedLock sl(lock);
+            for (auto& e : entries) if (e.globalFormat) return true;
+            return false;
         }
 
         void remove(juce::AudioIODeviceCallback* cb, juce::AudioIODevice* runningDevice)

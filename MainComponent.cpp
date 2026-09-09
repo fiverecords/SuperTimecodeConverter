@@ -3123,20 +3123,20 @@ void MainComponent::propagateGlobalSettings()
     }
 }
 
-void MainComponent::persistTrackMapScope()
+void MainComponent::persistTrackMapScope(int scope)
 {
-    if (trackMapEditorScope < 0)
+    if (scope < 0)
     {
         settings.trackMap.save();
         for (auto& eng : engines)
             eng->refreshTrackMapLookup();
     }
-    else if (trackMapEditorScope < (int) engines.size())
+    else if (scope < (int) engines.size())
     {
         // The override layer lives in the engine and is copied into its
         // settings block on save.
         saveSettings();
-        engines[(size_t) trackMapEditorScope]->refreshTrackMapLookup();
+        engines[(size_t) scope]->refreshTrackMapLookup();
     }
 }
 
@@ -3154,12 +3154,14 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
             trackMapWindow->toFront(true);
             return;
         }
-        if (cuePointWindow != nullptr)
-        {
-            cuePointWindow.reset();
-            cuePointTrackKey.clear();
-        }
         delete trackMapWindow.getComponent();
+    }
+    // A cue point editor open on an entry of another map would keep a
+    // reference into it; close it rather than let two scopes coexist.
+    if (cuePointWindow != nullptr && cuePointEditorScope != scopeEngine)
+    {
+        cuePointWindow.reset();
+        cuePointTrackKey.clear();
     }
     trackMapEditorScope = scopeEngine;
 
@@ -3195,7 +3197,7 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
     // misleading, so we hide it and force onLearn() to use the callback path.
     editor->setShowPlayerSelector(eng.getActiveInput() == SrcType::ProDJLink);
 
-    editor->onChange = [this]
+    editor->onChange = [this, scopeEngine]
     {
         // Close CuePointEditor FIRST, before save/refresh.
         // TrackMapEditor::onFormSave calls addOrUpdate/remove which can
@@ -3212,7 +3214,7 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
             cuePointEditedTitle.clear();
         }
 
-        persistTrackMapScope();
+        persistTrackMapScope(scopeEngine);
     };
 
     editor->onOpenCueEditor = [this](TrackMapEntry* entry)
@@ -3281,6 +3283,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
     }
 
     cuePointWindow = std::make_unique<CuePointEditorWindow>(*entry);
+    cuePointEditorScope   = trackMapEditorScope;   // the entry belongs to the open TrackMap editor's map
     cuePointTrackKey      = entry->key();
     cuePointEditedArtist  = entry->artist;
     cuePointEditedTitle   = entry->title;
@@ -3463,9 +3466,9 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
 
     cuePointWindow->setOnChange([this]
     {
-        // The entry belongs to the map behind the open TrackMap editor (the
+        // The entry belongs to the map this editor was opened from (the
         // global file or an engine's override layer).
-        persistTrackMapScope();
+        persistTrackMapScope(cuePointEditorScope);
 
         // Refresh TrackMap editor table if open (cue count column)
         if (trackMapWindow != nullptr)
@@ -4394,58 +4397,12 @@ int MainComponent::getGenAudioEffectiveBufferSize() const
 
 void MainComponent::restartAllAudioDevices()
 {
-    double sr = getPreferredSampleRate();
-    int bs = getPreferredBufferSize();
-
-    // Restart LTC input/output for ALL engines
-    for (int i = 0; i < (int)engines.size(); i++)
-    {
-        auto& eng = *engines[(size_t)i];
-
-        if (i == selectedEngine)
-        {
-            // Selected engine: restart via UI combos
-            if (eng.getActiveInput() == SrcType::LTC && eng.getLtcInput().getIsRunning())
-                startCurrentLtcInput();
-            if (eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning())
-                startCurrentLtcOutput();
-        }
-        else
-        {
-            // Non-selected engines: restart using their current device settings
-            if (eng.getActiveInput() == SrcType::LTC && eng.getLtcInput().getIsRunning())
-            {
-                auto devName = eng.getLtcInput().getCurrentDeviceName();
-                auto typeName = eng.getLtcInput().getCurrentTypeName();
-                int ltcCh = eng.getLtcInput().getSelectedChannel();
-                int thruCh = eng.getLtcInput().hasPassthruChannel() ? eng.getLtcInput().getPassthruChannel() : -1;
-                eng.startLtcInput(typeName, devName, ltcCh, thruCh, sr, bs);
-            }
-            if (eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning())
-            {
-                auto devName = eng.getLtcOutput().getCurrentDeviceName();
-                auto typeName = eng.getLtcOutput().getCurrentTypeName();
-                int ch = eng.getLtcOutput().getSelectedChannel();
-                eng.startLtcOutput(typeName, devName, ch, sr, bs);
-            }
-            if (eng.isPrimary() && eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
-            {
-                auto devName = eng.getAudioThru()->getCurrentDeviceName();
-                auto typeName = eng.getAudioThru()->getCurrentTypeName();
-                int ch = eng.getAudioThru()->getSelectedChannel();
-                eng.startThruOutput(typeName, devName, ch, sr, bs);
-            }
-        }
-
-        // Restart Audio BPM on all engines (independent from LTC input)
-        if (eng.isAudioBpmRunning())
-        {
-            auto devName = eng.getAudioBpmInput().getCurrentDeviceName();
-            auto typeName = eng.getAudioBpmInput().getCurrentTypeName();
-            int ch = eng.getAudioBpmInput().getSelectedChannel();
-            eng.startAudioBpm(typeName, devName, ch, sr, bs);
-        }
-    }
+    // The devices are shared (AudioDeviceHub): a rate or buffer change is
+    // applied to each open device once, and every client on it -- LTC in
+    // and out of every engine, Audio Thru, Audio BPM, the generators' audio
+    // -- sees one stop/start.  Restarting the components one by one, as
+    // this used to, would restart a shared device several times.
+    AudioDeviceHub::get().reconfigureAll(getPreferredSampleRate(), getPreferredBufferSize());
     saveSettings();
 }
 
