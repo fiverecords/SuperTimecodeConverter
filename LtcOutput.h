@@ -445,7 +445,11 @@ private:
             if (lastCallbackMs > 0.0 && expectedMs > 0.0)
             {
                 const double gapMs = (callbackStartMs - lastCallbackMs) - expectedMs;
-                if (gapMs > 0.75 * expectedMs)
+                // Three quarters of a period, but never under 4 ms: at 64 or
+                // 128 samples a period is 1-3 ms and ordinary scheduling
+                // jitter would read as holes; a hole that short is a few
+                // percent of a frame and not worth a re-seed anyway.
+                if (gapMs > juce::jmax(4.0, 0.75 * expectedMs))
                 {
                     outputGapCount.fetch_add(1, std::memory_order_relaxed);
                     lastGapMs.store(gapMs, std::memory_order_relaxed);
