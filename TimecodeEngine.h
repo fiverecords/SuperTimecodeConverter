@@ -341,6 +341,17 @@ public:
         }
     }
 
+    /// Two output channel selections clash when they touch the same channel;
+    /// -1 means the stereo pair (channels 0 and 1).
+    static bool channelsOverlap(int a, int b)
+    {
+        auto touches = [](int sel, int ch) { return sel == -1 ? (ch == 0 || ch == 1) : sel == ch; };
+        if (a == -1 && b == -1) return true;
+        if (a == -1) return touches(a, b);
+        if (b == -1) return touches(b, a);
+        return a == b;
+    }
+
     /// Sources that deliver a millisecond position rather than frames: the
     /// user's output rate IS their rate, so rate conversion has no meaning
     /// for them and currentFps must always equal outputFps.  The UI hides
@@ -833,7 +844,8 @@ public:
         if (ltcInput.start(typeName, devName, ltcChannel, thruChannel, sampleRate, bufferSize))
         {
             inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
-                            + " Ch " + juce::String(ltcChannel + 1);
+                            + " Ch " + juce::String(ltcChannel + 1)
+                            + " " + describeAudioFormat(ltcInput.getActualSampleRate(), ltcInput.getActualBufferSize());
             return true;
         }
         inputStatusText = "FAILED TO OPEN AUDIO DEVICE";
@@ -1343,13 +1355,15 @@ public:
         stopLtcOutput();
         if (devName.isEmpty()) { ltcOutStatusText = "NO AUDIO DEVICE AVAILABLE"; return false; }
 
-        // Check for AudioThru device conflict (primary engine only)
+        // Audio Thru on the same interface is fine now (one shared device,
+        // outputs summed); the only conflict is the same output CHANNEL.
         if (audioThru && audioThru->getIsRunning()
             && audioThru->getCurrentDeviceName() == devName
-            && audioThru->getCurrentTypeName() == typeName)
+            && audioThru->getCurrentTypeName() == typeName
+            && channelsOverlap(audioThru->getSelectedChannel(), channel))
         {
             stopThruOutput();
-            thruOutStatusText = "CONFLICT: same device as LTC OUT";
+            thruOutStatusText = "CONFLICT: same channel as LTC OUT";
         }
 
         if (ltcOutput.start(typeName, devName, channel, sampleRate, bufferSize))
@@ -1397,12 +1411,14 @@ public:
 
         if (devName.isEmpty()) { thruOutStatusText = "NO AUDIO DEVICE"; return false; }
 
-        // Check for LTC output device conflict
+        // Same interface as LTC OUT is fine (shared device); the same output
+        // channel is not.
         if (outputLtcEnabled && ltcOutput.getIsRunning()
             && ltcOutput.getCurrentDeviceName() == devName
-            && ltcOutput.getCurrentTypeName() == typeName)
+            && ltcOutput.getCurrentTypeName() == typeName
+            && channelsOverlap(ltcOutput.getSelectedChannel(), channel))
         {
-            thruOutStatusText = "CONFLICT: same device as LTC OUT";
+            thruOutStatusText = "CONFLICT: same channel as LTC OUT";
             return false;
         }
 
@@ -2527,10 +2543,27 @@ public:
     /// latency, the compensation being applied to the frame phase is shown
     /// alongside it -- visible for anyone measuring the signal, without
     /// being a control the operator has to understand or set.
+    /// "48k/512": the sample rate and buffer size the driver actually
+    /// settled on, which is what the operator needs to see when a driver
+    /// ignores the requested values (ASIO interfaces set theirs in their own
+    /// control panel) -- the combos show the request, the status the truth.
+    static juce::String describeAudioFormat(double sampleRate, int bufferSize)
+    {
+        if (sampleRate <= 0.0) return {};
+        juce::String sr = (std::fmod(sampleRate, 1000.0) == 0.0) ? juce::String((int)(sampleRate / 1000.0)) + "k"
+                                                                  : juce::String(sampleRate / 1000.0, 1) + "k";
+        return bufferSize > 0 ? sr + "/" + juce::String(bufferSize) : sr;
+    }
+
     juce::String getLtcOutStatusText() const
     {
         if (ltcOutStatusText.isEmpty()) return ltcOutStatusText;
         juce::String text = ltcOutStatusText;
+        if (ltcOutput.getIsRunning())
+        {
+            const auto fmt = describeAudioFormat(ltcOutput.getActualSampleRate(), ltcOutput.getActualBufferSize());
+            if (fmt.isNotEmpty()) text += " " + fmt;
+        }
         const double comp = getLtcLatencyCompMs();
         if (comp > 0.05)
             text += " (+" + juce::String(comp, 1) + " ms)";

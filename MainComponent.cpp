@@ -2223,6 +2223,11 @@ MainComponent::~MainComponent()
 
     // 10. Now safe to destroy engine objects
     engines.clear();
+
+    // 11. Every audio client has released its device; close the shared
+    // devices and drop their managers while JUCE is still alive, so the
+    // hub's static instance destroys nothing at process exit.
+    AudioDeviceHub::shutdown();
 }
 
 //==============================================================================

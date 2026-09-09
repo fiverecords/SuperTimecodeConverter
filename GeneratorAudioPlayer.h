@@ -4,6 +4,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "AudioDeviceHub.h"
 #include <atomic>
 #include <cstring>
 
@@ -44,13 +45,10 @@ public:
 
     ~GeneratorAudioPlayer() override
     {
-        // Order matters here.  Members are destroyed in reverse declaration
-        // order, which means the std::atomic<> flags (deviceOpen, userPaused,
-        // shouldPlay, fileLoadedAtomic, ...) are torn down BEFORE the
-        // deviceManager.  If the audio device had any callback still in
-        // flight when ~AudioDeviceManager() runs, that callback would read
-        // already-destroyed atomics -- the std::atomic load crash on shutdown
-        // we hunted in v1.9.7/v1.9.8.
+        // Order matters here.  The audio device is shared through the hub,
+        // which may keep calling us until we release; an in-flight callback
+        // reading already-destroyed atomics was the std::atomic load crash
+        // on shutdown we hunted in v1.9.7/v1.9.8.
         //
         // Step 1: latch shuttingDown so any in-flight or imminent audio
         // callback returns immediately without touching other atomics.
@@ -58,22 +56,19 @@ public:
         // sees the flag if it observes the store.
         shuttingDown.store(true, std::memory_order_release);
 
-        // Step 2: closeDevice() calls removeAudioCallback, which JUCE
-        // documents as blocking until any in-flight callback returns.  We
-        // call it explicitly here (rather than relying on the deviceManager
-        // destructor) so the audio thread is provably idle BEFORE we leave
-        // the user-defined destructor body and member destruction begins.
+        // Step 2: closeDevice() releases us from the hub, which blocks until
+        // any in-flight callback returns, so the audio thread is provably
+        // done with us BEFORE we leave the user-defined destructor body and
+        // member destruction begins.
         // The loader thread is stopped first because its tick can call back
         // into transport / reader objects that closeDevice will tear down.
         loaderThread.stop();
         closeDevice();
         unloadFile();
-        // Belt-and-braces: ensure the AudioDeviceManager is fully closed
-        // and has no callbacks attached.  closeDevice already did this for
-        // the case where a device was open, but this also covers the path
-        // where ~GeneratorAudioPlayer runs without ever having opened one.
-        deviceManager.removeAudioCallback(this);
-        deviceManager.closeAudioDevice();
+        // Belt-and-braces: make sure the hub no longer references us, also
+        // on the path where ~GeneratorAudioPlayer runs without ever having
+        // opened a device.
+        AudioDeviceHub::get().release(this);
     }
 
     //==========================================================================
@@ -97,35 +92,9 @@ public:
         currentTypeName   = typeName;
         selectedChannel.store(channel, std::memory_order_relaxed);
 
-        deviceManager.closeAudioDevice();
-        deviceManager.initialise(0, 128, nullptr, false);
-
-        if (typeName.isNotEmpty())
-            deviceManager.setCurrentAudioDeviceType(typeName, false);
-
-        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
-            type->scanForDevices();
-
-        auto setup = deviceManager.getAudioDeviceSetup();
-        setup.outputDeviceName  = devName;
-        setup.inputDeviceName   = "";
-        setup.useDefaultInputChannels  = false;
-        setup.useDefaultOutputChannels = true;
-        if (sampleRate > 0)  setup.sampleRate = sampleRate;
-        if (bufferSize > 0)  setup.bufferSize = bufferSize;
-
-        auto err = deviceManager.setAudioDeviceSetup(setup, true);
-        if (err.isNotEmpty()) return false;
-
-        auto* device = deviceManager.getCurrentAudioDevice();
-        if (!device)
-        {
-            // Setup reported success but the manager has no active device
-            // (rare but observed on some drivers). Close to avoid leaving an
-            // orphan device open with no callback registered.
-            deviceManager.closeAudioDevice();
-            return false;
-        }
+        juce::String err;
+        auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, false, sampleRate, bufferSize, err);
+        if (device == nullptr) return false;
 
         currentSampleRate    = device->getCurrentSampleRate();
         currentBufferSize    = device->getCurrentBufferSizeSamples();
@@ -137,7 +106,6 @@ public:
         // If a file was previously loaded, attach it now that the device SR is known.
         attachReaderToTransport();
 
-        deviceManager.addAudioCallback(this);
         deviceOpen.store(true, std::memory_order_relaxed);
         return true;
     }
@@ -151,8 +119,7 @@ public:
                 const juce::ScopedLock sl(transportLock);
                 transport.setSource(nullptr);
             }
-            deviceManager.removeAudioCallback(this);
-            deviceManager.closeAudioDevice();
+            AudioDeviceHub::get().release(this);   // blocks until any in-flight callback returns
             deviceOpen.store(false, std::memory_order_relaxed);
         }
         if (backgroundThread.isThreadRunning())
@@ -780,7 +747,6 @@ private:
     juce::AudioThumbnailCache thumbnailCache { 32 };  // cache the last 32 files' peaks so navigating presets back-and-forth does not re-decode each time
     juce::AudioThumbnail      thumbnail      { 512, formatManager, thumbnailCache };
     juce::TimeSliceThread     backgroundThread { "STC Generator Audio Reader" };
-    juce::AudioDeviceManager  deviceManager;
 
     juce::CriticalSection                          transportLock;
     std::unique_ptr<juce::AudioFormatReaderSource> currentReaderSource;

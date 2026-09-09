@@ -5,6 +5,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
+#include "AudioDeviceHub.h"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -29,33 +30,12 @@ public:
         currentDeviceName = devName;
         currentTypeName = typeName;
 
-        deviceManager.closeAudioDevice();
-
-        // Register all device types without opening anything
-        deviceManager.initialise(0, 128, nullptr, false);
-
-        // Switch to requested type WITHOUT auto-opening a device (false)
-        if (typeName.isNotEmpty())
-            deviceManager.setCurrentAudioDeviceType(typeName, false);
-
-        // Scan so the device name is recognised
-        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
-            type->scanForDevices();
-
-        // Open the specific device -- this is the ONLY open call
-        auto setup = deviceManager.getAudioDeviceSetup();
-        setup.outputDeviceName  = devName;
-        setup.inputDeviceName   = "";
-        setup.useDefaultInputChannels  = false;
-        setup.useDefaultOutputChannels = true;
-        if (sampleRate > 0)  setup.sampleRate = sampleRate;
-        if (bufferSize > 0)  setup.bufferSize = bufferSize;
-        auto err = deviceManager.setAudioDeviceSetup(setup, true);
-        if (err.isNotEmpty())
-            return false;
-
-        auto* device = deviceManager.getCurrentAudioDevice();
-        if (!device)
+        // Open (or share) the device through the hub for output; the hub
+        // calls audioDeviceAboutToStart() -- sample rate, latency, encoder
+        // reset -- before returning.
+        juce::String err;
+        auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, false, sampleRate, bufferSize, err);
+        if (device == nullptr)
             return false;
 
         numChannelsAvailable = device->getActiveOutputChannels().countNumberOfSetBits();
@@ -73,7 +53,6 @@ public:
 
         resetEncoder();
         peakLevel.store(0.0f, std::memory_order_relaxed);
-        deviceManager.addAudioCallback(this);
         isRunningFlag.store(true, std::memory_order_relaxed);
         return true;
     }
@@ -82,8 +61,7 @@ public:
     {
         if (isRunningFlag.load(std::memory_order_relaxed))
         {
-            deviceManager.removeAudioCallback(this);
-            deviceManager.closeAudioDevice();
+            AudioDeviceHub::get().release(this);
             isRunningFlag.store(false, std::memory_order_relaxed);
         }
     }
@@ -181,7 +159,6 @@ public:
     uint32_t getUserBits() const      { return userBits.load(std::memory_order_relaxed); }
 
 private:
-    juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };

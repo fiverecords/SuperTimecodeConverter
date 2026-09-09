@@ -8,6 +8,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "AudioDeviceHub.h"
 #include <atomic>
 #include <cstring>
 #include <cmath>
@@ -38,27 +39,9 @@ public:
         currentDeviceName = devName;
         currentTypeName   = typeName;
 
-        deviceManager.closeAudioDevice();
-        deviceManager.initialise(128, 0, nullptr, false);
-
-        if (typeName.isNotEmpty())
-            deviceManager.setCurrentAudioDeviceType(typeName, false);
-
-        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
-            type->scanForDevices();
-
-        auto setup = deviceManager.getAudioDeviceSetup();
-        setup.inputDeviceName   = devName;
-        setup.outputDeviceName  = "";
-        setup.useDefaultInputChannels  = true;
-        setup.useDefaultOutputChannels = false;
-        if (sampleRate > 0)  setup.sampleRate = sampleRate;
-        if (bufferSize > 0)  setup.bufferSize = bufferSize;
-        auto err = deviceManager.setAudioDeviceSetup(setup, true);
-        if (err.isNotEmpty()) return false;
-
-        auto* device = deviceManager.getCurrentAudioDevice();
-        if (!device) return false;
+        juce::String err;
+        auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, true, sampleRate, bufferSize, err);
+        if (device == nullptr) return false;
 
         numChannelsAvailable = device->getActiveInputChannels().countNumberOfSetBits();
         {
@@ -103,7 +86,6 @@ public:
         // Apply current smoothing settings to BTT
         setSmoothing(smoothing.load(std::memory_order_relaxed));
 
-        deviceManager.addAudioCallback(this);
         isRunningFlag.store(true, std::memory_order_relaxed);
         return true;
     }
@@ -112,8 +94,7 @@ public:
     {
         if (isRunningFlag.load(std::memory_order_relaxed))
         {
-            deviceManager.removeAudioCallback(this);
-            deviceManager.closeAudioDevice();
+            AudioDeviceHub::get().release(this);
             isRunningFlag.store(false, std::memory_order_relaxed);
         }
         if (bttInstance)
@@ -202,7 +183,6 @@ public:
     static constexpr double kMinConfidence = 0.15;
 
 private:
-    juce::AudioDeviceManager deviceManager;
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
