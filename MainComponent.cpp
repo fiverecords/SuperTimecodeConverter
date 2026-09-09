@@ -3182,7 +3182,21 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
         // editor that is about to be deleted.
         juce::MessageManager::callAsync([safeSelf, chosen]
         {
-            if (safeSelf != nullptr) safeSelf->openTrackMapEditor(chosen);
+            if (safeSelf == nullptr) return;
+            auto* self = safeSelf.getComponent();
+            if (self->isShowLocked())
+            {
+                // Configuration is locked: put the selector back where it was.
+                if (self->trackMapWindow != nullptr)
+                    if (auto* ed = dynamic_cast<TrackMapEditor*>(self->trackMapWindow->getContentComponent()))
+                    {
+                        juce::StringArray names;
+                        for (auto& e : self->engines) names.add(e->getName());
+                        ed->setScope(self->trackMapEditorScope, names, &self->settings.trackMap);
+                    }
+                return;
+            }
+            self->openTrackMapEditor(chosen);
         });
     };
     editor->setDbServerClient(&sharedDbClient);
@@ -4018,7 +4032,11 @@ void MainComponent::startAudioDeviceScan()
     // Create AudioDeviceManager on the message thread -- JUCE 8.x internally
     // registers a MIDI device-change listener that requires JUCE_ASSERT_MESSAGE_THREAD.
     scanThread->tempManager = std::make_unique<juce::AudioDeviceManager>();
-    scanThread->tempManager->initialise(128, 128, nullptr, false);
+    // Zero channels "needed": JUCE then fills in no default device names and
+    // opens nothing.  With 128/128 this manager opened the current type's
+    // default input and output devices at startup and kept them open for
+    // the life of the application, for a scan that only needs the names.
+    scanThread->tempManager->initialise(0, 0, nullptr, false);
     scanThread->startThread();
 }
 

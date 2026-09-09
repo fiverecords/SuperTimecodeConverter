@@ -561,8 +561,15 @@ public:
         root->setProperty("tracks", arr);
 
         juce::var jsonVar(root);
+        if (! persistsToFile) return;   // an override set is persisted by its engine's settings block
         SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(jsonVar));
     }
+
+    /// False for a map that lives somewhere other than trackmap.json (the
+    /// per-engine override layer, stored in the engine's settings block):
+    /// save() then does nothing, so no code path can write an override set
+    /// over the global file.
+    bool persistsToFile = true;
 
     /// Entries as a JSON array (the "tracks" value of the file format), for
     /// storing a map somewhere other than trackmap.json -- the per-engine
@@ -1218,6 +1225,8 @@ public:
     /// (`apply`); keeping the whole entry lets the editor start an override
     /// as a copy of the global one and show the global offset for context.
     TrackMap map;
+
+    TrackMapOverrides() { map.persistsToFile = false; }
 
     bool empty() const { return map.size() == 0; }
 

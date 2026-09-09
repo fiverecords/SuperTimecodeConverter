@@ -303,7 +303,7 @@ private:
                     continue;
                 }
 
-                scratch.clear();
+                scratch.clear(0, scratchLen);   // only the samples in use: the buffer is deliberately oversized
                 float* const* outs = scratch.getArrayOfWritePointers();
                 e.cb->audioDeviceIOCallbackWithContext(ins, numIns, outs, scratchChans, scratchLen, context);
                 for (int ch = 0; ch < scratchChans; ++ch)
