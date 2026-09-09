@@ -1571,7 +1571,9 @@ public:
                                                                         ltcInput.getActualBufferSize());
                     }
                     else if (statusTextVisible)
-                        inputStatusText = "PAUSED - " + ltcInput.getCurrentDeviceName();
+                        inputStatusText = "PAUSED - " + ltcInput.getCurrentDeviceName()
+                                        + " " + describeAudioFormat(ltcInput.getActualSampleRate(),
+                                                                    ltcInput.getActualBufferSize());
                     sourceActive = rx;
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "WAITING FOR DEVICE..."; }
