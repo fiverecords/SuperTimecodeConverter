@@ -378,7 +378,7 @@ private:
         // --- User bits (SMPTE 12M binary groups) ---
         // Same layout as the encoder: eight 4-bit groups at bit offsets
         // 4,12,20,28,36,44,52,60, LSB-first within each group, group 1 as
-        // the most significant hex digit.  Reassembled into a 32-bit word
+        // the LEAST significant hex digit.  Reassembled into a 32-bit word
         // so a value written by an STC output reads back identically.
         // Only stored on good frames (we are past the range check above).
         {
@@ -389,7 +389,7 @@ private:
             {
                 const uint32_t nibble =
                     static_cast<uint32_t>((d >> kUserGroupStart[g]) & 0xF);
-                ub |= nibble << ((7 - g) * 4);
+                ub |= nibble << (g * 4);
             }
             userBitsIn.store(ub, std::memory_order_relaxed);
         }

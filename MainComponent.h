@@ -573,6 +573,7 @@ private:
     juce::ComboBox cmbAudioOutputChannel;    juce::Label lblAudioOutputChannel;
     GainSlider sldLtcOutputGain;             juce::Label lblLtcOutputGain;
     juce::ToggleButton btnLtcHoldOnPause { "HOLD ON PAUSE" };
+    juce::ToggleButton btnLtcUserBitsReverse { "REVERSE DIGIT ORDER" };   // MANUAL user bits only
     LevelMeter mtrLtcOutput;
     juce::ComboBox cmbThruOutputDevice;      juce::Label lblThruOutputDevice;
     juce::ComboBox cmbThruOutputChannel;     juce::Label lblThruOutputChannel;

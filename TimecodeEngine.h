@@ -430,8 +430,8 @@ public:
             // (3,4) for i=2, (1,2) for i=3.  Group g holds hex digit
             // (8-g) counted from the low end of the word.
             const int lowGroup = 7 - i * 2;          // 7, 5, 3, 1
-            const int shiftLow  = (8 - lowGroup) * 4; // group 7 -> shift 4
-            const int shiftHigh = (8 - (lowGroup + 1)) * 4;
+            const int shiftLow  = (lowGroup - 1) * 4; // group g = nibble g-1 of the word
+            const int shiftHigh = lowGroup * 4;
             word |= (c & 0x0Fu) << shiftLow;         // LS nibble in lower group
             word |= ((c >> 4) & 0x0Fu) << shiftHigh; // MS nibble in next group
         }
@@ -446,8 +446,35 @@ public:
     void setLtcUserBitsHex(const juce::String& hex)
     {
         ltcUserBitsHex = normaliseUserBitsHex(hex);
-        if (ltcUserBitsMode == kUserBitsManual)
-            ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
+        pushManualUserBits();
+    }
+
+    /// MANUAL mode only: send the typed digits in the opposite group order,
+    /// for readers that print binary group 1 as the most significant digit
+    /// (the GoPro convention, and STC's own until 2026-09).  ST 12 sets no
+    /// order for free-form hex, so this is the operator matching the reader
+    /// in front of them.  Meaningless in the other modes: DATE and NAME are
+    /// addressed by group number as the standards specify, and FROM LTC IN
+    /// passes the groups through unchanged.
+    void setLtcUserBitsReversed(bool reversed)
+    {
+        ltcUserBitsReversed = reversed;
+        pushManualUserBits();
+    }
+    bool isLtcUserBitsReversed() const { return ltcUserBitsReversed; }
+
+    static uint32_t reverseNibbles(uint32_t v)
+    {
+        uint32_t r = 0;
+        for (int i = 0; i < 8; ++i) r |= ((v >> (i * 4)) & 0xFu) << ((7 - i) * 4);
+        return r;
+    }
+
+    void pushManualUserBits()
+    {
+        if (ltcUserBitsMode != kUserBitsManual) return;
+        const uint32_t v = parseUserBitsHex(ltcUserBitsHex);
+        ltcOutput.setUserBits(ltcUserBitsReversed ? reverseNibbles(v) : v);
     }
 
     /// User-bits source mode.  Switching back to MANUAL immediately restores
@@ -468,8 +495,7 @@ public:
     void setLtcUserBitsMode(int mode)
     {
         ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsName, mode);
-        if (ltcUserBitsMode == kUserBitsManual)
-            ltcOutput.setUserBits(parseUserBitsHex(ltcUserBitsHex));
+        pushManualUserBits();
         // Binary group flags say what the groups carry (12M-1 sec. 8.4.1):
         // NAME declares an eight-bit character set (BGF0), DATE declares
         // ST 309 date and time zone (BGF2, ST 309 Table 3, unspecified clock
@@ -548,8 +574,10 @@ public:
     /// before tens in ascending group order (3 September 2026 = groups 3 0 9
     /// 0 6 2), group 7 the low four bits of the zone code, group 8 its high
     /// two bits plus the DST flag (bit 2) and the MJD flag (bit 3, 0 = YYMMDD
-    /// with the time address in local time).  Group 1 is the most
-    /// significant hex digit of the 32-bit word, as everywhere else in STC.
+    /// with the time address in local time).  Group 1 is the least
+    /// significant hex digit of the 32-bit word, as everywhere else in STC,
+    /// so the word reads "<zone><date>" in hex: 3 September 2026 in Central
+    /// European summer time is 0x64260903.
     /// Emitted with BGF2 = 1 (ST 309 Table 3, unspecified clock reference).
     static uint32_t systemDateUserBits()
     {
@@ -565,8 +593,8 @@ public:
         const uint32_t bg5 = (uint32_t)(yy % 10), bg6 = (uint32_t)(yy / 10);
         const uint32_t bg7 = (uint32_t)(tz & 0x0F);
         const uint32_t bg8 = (uint32_t)((tz >> 4) & 0x03) | (dst ? 0x4u : 0u);   // MJD flag 0
-        return (bg1 << 28) | (bg2 << 24) | (bg3 << 20) | (bg4 << 16)
-             | (bg5 << 12) | (bg6 <<  8) | (bg7 <<  4) |  bg8;
+        return  bg1 | (bg2 << 4) | (bg3 << 8) | (bg4 << 12)
+             | (bg5 << 16) | (bg6 << 20) | (bg7 << 24) | (bg8 << 28);
     }
     /// Normalised user-bits hex ("" when zero/unset), for the UI and saving.
     juce::String getLtcUserBitsHex() const { return ltcUserBitsHex; }
@@ -603,7 +631,7 @@ public:
     {
         juce::String hex = juce::String::toHexString((juce::int64) v)
                                .paddedLeft('0', 8).toUpperCase();
-        auto group = [v](int g) -> int { return (int)((v >> ((8 - g) * 4)) & 0xF); };   // g = 1..8
+        auto group = [v](int g) -> int { return (int)((v >> ((g - 1) * 4)) & 0xF); };   // g = 1..8, BG1 = low nibble
 
         if ((bgf & 0x5) == 0x4)   // ST 309 (Table 3): BGF2 = 1, BGF0 = 0
         {
@@ -3052,6 +3080,7 @@ private:
     int laNetTCOutputOffset = 0;
     int ltcOutputOffset    = 0;
     juce::String ltcUserBitsHex;   // normalised LTC user-bits hex ("" = zero)
+    bool ltcUserBitsReversed = false;   // MANUAL mode: reverse the group order for GoPro-style readers
     juce::String ltcUserBitsName;  // 4-char label for kUserBitsName ("" = STC<n>)
     int ltcUserBitsMode = kUserBitsManual;
     double lastSystemDateCheckMs = 0.0;   // throttles the date recompute to ~1Hz

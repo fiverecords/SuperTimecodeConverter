@@ -1888,6 +1888,21 @@ MainComponent::MainComponent()
         saveSettings();
     };
 
+    // MANUAL user bits only: ST 12 sets no digit order for free-form hex and
+    // readers differ; this lets the operator match the reader in front of
+    // them.  Hidden in the other modes (DATE and NAME are addressed by group
+    // number per the standards; FROM LTC IN passes groups through).
+    rightContent.addAndMakeVisible(btnLtcUserBitsReverse);
+    btnLtcUserBitsReverse.setColour(juce::ToggleButton::textColourId, textMid);
+    btnLtcUserBitsReverse.setColour(juce::ToggleButton::tickColourId, accentPurple);
+    btnLtcUserBitsReverse.onClick = [this]
+    {
+        if (syncing) return;
+        if (isShowLocked()) { btnLtcUserBitsReverse.setToggleState(!btnLtcUserBitsReverse.getToggleState(), juce::dontSendNotification); return; }
+        currentEngine().setLtcUserBitsReversed(btnLtcUserBitsReverse.getToggleState());
+        saveSettings();
+    };
+
     rightContent.addAndMakeVisible(lblOutputLtcStatus); styleLabel(lblOutputLtcStatus); lblOutputLtcStatus.setColour(juce::Label::textColourId, accentPurple);
     rightContent.addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
@@ -1915,6 +1930,8 @@ MainComponent::MainComponent()
             txtLtcUserBits.setText(e.getLtcUserBitsHex(), juce::dontSendNotification);
         else if (named)
             txtLtcUserBits.setText(e.getLtcUserBitsName(), juce::dontSendNotification);
+        btnLtcUserBitsReverse.setVisible(manual && btnLtcHoldOnPause.isVisible());
+        resized();
         saveSettings();
     };
 
@@ -2554,6 +2571,7 @@ void MainComponent::syncUIFromEngine()
     sldThruInputGain.setValue(eng.getLtcInput().getPassthruGain() * 100.0f, juce::dontSendNotification);
     sldLtcOutputGain.setValue(eng.getLtcOutput().getOutputGain() * 100.0f, juce::dontSendNotification);
     btnLtcHoldOnPause.setToggleState(eng.getLtcOutput().getHoldOnPause(), juce::dontSendNotification);
+    btnLtcUserBitsReverse.setToggleState(eng.isLtcUserBitsReversed(), juce::dontSendNotification);
     if (eng.getAudioThru())
         sldThruOutputGain.setValue(eng.getAudioThru()->getOutputGain() * 100.0f, juce::dontSendNotification);
 
@@ -4721,6 +4739,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setLANetTCOutputOffset(es.laNetTCOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
         eng.setLtcUserBitsMode(es.ltcUserBitsMode);
+        eng.setLtcUserBitsReversed(es.ltcUserBitsReversed);
         eng.setLtcUserBitsName(es.ltcUserBitsName);
         eng.setLtcUserBitsHex(es.ltcUserBitsHex);
         eng.setTcnetOutputOffsetMs(es.tcnetOutputOffsetMs);
@@ -5122,6 +5141,7 @@ void MainComponent::flushSettings()
         es.ltcOutputOffset = eng.getLtcOutputOffset();
         es.ltcUserBitsHex = eng.getLtcUserBitsHex();
         es.ltcUserBitsMode = eng.getLtcUserBitsMode();
+        es.ltcUserBitsReversed = eng.isLtcUserBitsReversed();
         es.ltcUserBitsName = eng.getLtcUserBitsName();
         es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
 
@@ -5946,6 +5966,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     sldLtcOffset.setVisible(showLtcConfig);            lblLtcOffset.setVisible(showLtcConfig);
     txtLtcUserBits.setVisible(showLtcConfig);          lblLtcUserBits.setVisible(showLtcConfig);
     cmbLtcUserBitsMode.setVisible(showLtcConfig);      lblLtcUserBitsMode.setVisible(showLtcConfig);
+    btnLtcUserBitsReverse.setVisible(showLtcConfig && eng.getLtcUserBitsMode() == TimecodeEngine::kUserBitsManual);
     cmbSampleRateOut.setVisible(showLtcConfig);       lblSampleRateOut.setVisible(showLtcConfig);
     cmbBufferSizeOut.setVisible(showLtcConfig);       lblBufferSizeOut.setVisible(showLtcConfig);
     lblOutputLtcStatus.setVisible(eng.isOutputLtcEnabled());
@@ -7637,6 +7658,7 @@ void MainComponent::resized()
             if (sldLtcOffset.isVisible()) laySlider(lblLtcOffset, sldLtcOffset, rp);
             if (cmbLtcUserBitsMode.isVisible()) layCombo(lblLtcUserBitsMode, cmbLtcUserBitsMode, rp);
             if (txtLtcUserBits.isVisible()) layEditor(lblLtcUserBits, txtLtcUserBits, rp);
+            if (btnLtcUserBitsReverse.isVisible()) btnLtcUserBitsReverse.setBounds(rp.removeFromTop(22));
         }
         if (lblOutputLtcStatus.isVisible()) layStatus(lblOutputLtcStatus, rp);
         rp.removeFromTop(2);

@@ -1372,6 +1372,7 @@ struct EngineSettings
     // LTC user-bits source: 0 = manual value, 1 = passthrough from LTC in,
     // 2 = system date (BCD YYYYMMDD).
     int ltcUserBitsMode = 0;
+    bool ltcUserBitsReversed = false;   // MANUAL mode: reverse digit order for the reader
     // 4-character label for the NAME user-bits mode ("" = STC<engine>).
     juce::String ltcUserBitsName;
     int tcnetOutputOffsetMs = 0;   // TCNet offset in milliseconds, -1000 to +1000
@@ -1482,6 +1483,8 @@ struct EngineSettings
             obj->setProperty("ltcUserBitsHex", ltcUserBitsHex);
         if (ltcUserBitsMode != 0)
             obj->setProperty("ltcUserBitsMode", ltcUserBitsMode);
+        if (ltcUserBitsReversed)
+            obj->setProperty("ltcUserBitsReversed", true);
         if (ltcUserBitsName.isNotEmpty())
             obj->setProperty("ltcUserBitsName", ltcUserBitsName);
         obj->setProperty("tcnetOutputOffsetMs", tcnetOutputOffsetMs);
@@ -1625,6 +1628,7 @@ struct EngineSettings
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         ltcUserBitsHex     = getString("ltcUserBitsHex");
         ltcUserBitsMode    = juce::jlimit(0, 3, getInt("ltcUserBitsMode", 0));
+        ltcUserBitsReversed = getBool("ltcUserBitsReversed", false);
         ltcUserBitsName    = getString("ltcUserBitsName");
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 

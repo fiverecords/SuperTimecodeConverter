@@ -170,7 +170,8 @@ public:
     float getPeakLevel() const        { return peakLevel.load(std::memory_order_relaxed); }
 
     /// LTC user bits (32-bit "binary groups").  Displayed/entered as an
-    /// 8-digit hex value; the most significant digit occupies user group 1.
+    /// 8-digit hex value; the least significant digit occupies binary group
+    /// 1 and the most significant group 8 (see packFrame).
     /// Takes effect on the next encoded frame; no reseed needed.
     void setUserBits(uint32_t bits)   { userBits.store(bits, std::memory_order_relaxed); }
     /// Binary group flags (bit0=BGF0, bit1=BGF1, bit2=BGF2); see SMPTE
@@ -317,18 +318,22 @@ private:
 
         // --- User bits (SMPTE 12M binary groups) ---
         // 32 bits laid into eight 4-bit groups.  Within each group the bits
-        // are LSB-first (same convention as the BCD digits above).  The
-        // groups are ordered so that the operator's hex value reads
-        // left-to-right: the most significant hex digit lands in binary
-        // group 1 (frame bits 4-7), matching how reel/date user bits are
-        // conventionally displayed and read back.  So userBits 0x12345678
-        // shows as "12345678", digit '1' in the first group.
+        // are LSB-first (same convention as the BCD digits above), and the
+        // groups follow the same habit the standards use when they assign
+        // digits to groups (time address, ST 309 date): binary group 1 holds
+        // the LEAST significant hex digit, group 8 the most significant.
+        // So userBits 0x12345678 puts '8' in group 1 and '1' in group 8, and
+        // a reader that prints the groups as a number -- libltc, Sidus,
+        // Pico-Timecode -- shows "12345678".  (Until 2026-09 STC did the
+        // opposite, the GoPro convention, and those readers showed the value
+        // reversed; the MANUAL mode has a REVERSE DIGIT ORDER option for
+        // readers that still expect it.)
         const uint32_t ub = userBits.load(std::memory_order_relaxed);
         static constexpr int kUserGroupStart[8] =
             { 4, 12, 20, 28, 36, 44, 52, 60 };
         for (int g = 0; g < 8; ++g)
         {
-            const int shift  = (7 - g) * 4;           // group 0 = top nibble
+            const int shift  = g * 4;                 // group 0 (BG1) = low nibble
             const int nibble = (ub >> shift) & 0xF;
             const int base   = kUserGroupStart[g];
             frameBits[base + 0] = (nibble >> 0) & 1;
