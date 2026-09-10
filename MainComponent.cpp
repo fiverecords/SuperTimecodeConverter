@@ -2536,6 +2536,13 @@ void MainComponent::syncUIFromEngine()
     txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false);
     txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
     populateGenPresetCombo();
+    // Show the preset in use (persisted per engine) without re-applying it.
+    for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
+        if (cmbGenPreset.getItemText(i) == eng.getGeneratorPresetName())
+        {
+            cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
+            break;
+        }
 
     // OSC Input (global)
     btnOscIn.setToggleState(oscInputServer.getIsRunning(), juce::dontSendNotification);
@@ -4808,6 +4815,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
         // Generator start/stop TC (applies regardless of current source)
         eng.setGeneratorClockMode(es.generatorClockMode);
+        eng.setGeneratorPresetName(es.generatorPresetName);
         eng.setGeneratorStartMs(es.generatorStartMs);
         eng.setGeneratorStopMs(es.generatorStopMs);
         // Restore A/B loop (programming aid; standard DAW semantics).
@@ -5115,6 +5123,7 @@ void MainComponent::flushSettings()
         es.hippoOutEnabled = eng.isOutputHippoEnabled();
         es.onAirGateEnabled = eng.isOnAirGateEnabled();
         es.generatorClockMode = eng.getGeneratorClockMode();
+        es.generatorPresetName = eng.getGeneratorPresetName();
         es.generatorStartMs = eng.getGeneratorStartMs();
         es.generatorStopMs  = eng.getGeneratorStopMs();
         es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
@@ -5150,6 +5159,8 @@ void MainComponent::flushSettings()
             es.hippotizerDestIp = txtHippoDestIp.getText().trim();
             if (es.hippotizerDestIp.isEmpty()) es.hippotizerDestIp = "255.255.255.255";
             es.generatorClockMode = eng.getGeneratorClockMode();
+            es.generatorPresetName = eng.getGeneratorPresetName();
+        es.generatorPresetName = eng.getGeneratorPresetName();
             es.generatorStartMs = eng.getGeneratorStartMs();
             es.generatorStopMs  = eng.getGeneratorStopMs();
             es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
@@ -6372,6 +6383,7 @@ void MainComponent::loadGenPresetToFields(const juce::String& name)
 
     auto& eng = currentEngine();
     auto fps = eng.getCurrentFps();
+    eng.setGeneratorPresetName(preset->name);   // the preset is the track (TCNet metadata, #20)
 
     // Fill TC editors with normalized values
     juce::String startNorm = msToTimecodeString(parseTimecodeToMs(preset->startTC, fps), fps);

@@ -1276,6 +1276,7 @@ struct EngineSettings
     int laNetTCInputInterface = 0;
     // Generator (internal timecode source)
     bool   generatorClockMode = true;  // true = wall clock, false = transport
+    juce::String generatorPresetName;  // preset in use (empty = fields set by hand); the track title for metadata
     double generatorStartMs = 0.0;    // start TC in ms from midnight
     double generatorStopMs  = 0.0;    // stop TC in ms (0 = freerun)
     // Generator A/B loop (in/out points and on/off toggle, programming aid).
@@ -1407,6 +1408,8 @@ struct EngineSettings
         obj->setProperty("hippotizerTcChannel", hippotizerTcChannel);
         obj->setProperty("laNetTCInputInterface", laNetTCInputInterface);
         obj->setProperty("generatorClockMode", generatorClockMode);
+        if (generatorPresetName.isNotEmpty())
+            obj->setProperty("generatorPresetName", generatorPresetName);
         obj->setProperty("generatorStartMs", generatorStartMs);
         obj->setProperty("generatorStopMs", generatorStopMs);
         obj->setProperty("generatorLoopInMs",  generatorLoopInMs);
@@ -1539,6 +1542,7 @@ struct EngineSettings
         hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
         laNetTCInputInterface    = getInt("laNetTCInputInterface", 0);
         generatorClockMode       = getBool("generatorClockMode", true);
+        generatorPresetName      = getString("generatorPresetName", "");
         generatorStartMs         = (double)getInt("generatorStartMs", 0);
         generatorStopMs          = (double)getInt("generatorStopMs", 0);
         generatorLoopInMs        = (double) obj->getProperty("generatorLoopInMs");
@@ -1913,6 +1917,7 @@ private:
         es.hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
         es.laNetTCInputInterface = getInt("laNetTCInputInterface", 0);
         es.generatorClockMode   = getBool("generatorClockMode", true);
+        es.generatorPresetName  = getString("generatorPresetName", "");
         es.generatorStartMs     = (double)getInt("generatorStartMs", 0);
         es.generatorStopMs      = (double)getInt("generatorStopMs", 0);
         es.generatorLoopInMs    = (double) obj->getProperty("generatorLoopInMs");

@@ -1197,14 +1197,27 @@ public:
         info.durationSec = cachedTrackDurationSec;
         info.mapped  = trackMapped;
 
-        // Generator with a file loaded: the file is the track, so the
-        // outputs that carry metadata (TCNet to Resolume, #20) get its name
-        // instead of "Generator / <engine name>".
-        if (activeInput == InputSource::SystemTime && !genClockMode && generatorAudioPlayer.hasFileLoaded())
+        // Generator: the preset is the track.  Its name is what the operator
+        // called this part of the show, so it is what the outputs that carry
+        // metadata (TCNet to Resolume, #20) should show; the loaded file
+        // supplies the artist (tags or the "Artist - " half of its name) and,
+        // when no preset is selected, the title too.  Clock mode has no
+        // track and keeps "Generator / <engine name>".
+        if (activeInput == InputSource::SystemTime && !genClockMode)
         {
-            info.artist      = generatorAudioPlayer.getTrackArtist();
-            info.title       = generatorAudioPlayer.getTrackTitle();
-            info.durationSec = (int) std::lround(generatorAudioPlayer.getFileLengthSeconds());
+            const bool hasFile = generatorAudioPlayer.hasFileLoaded();
+            if (genPresetName.isNotEmpty())
+            {
+                info.title  = genPresetName;
+                info.artist = hasFile ? generatorAudioPlayer.getTrackArtist() : juce::String();
+            }
+            else if (hasFile)
+            {
+                info.artist = generatorAudioPlayer.getTrackArtist();
+                info.title  = generatorAudioPlayer.getTrackTitle();
+            }
+            if (hasFile)
+                info.durationSec = (int) std::lround(generatorAudioPlayer.getFileLengthSeconds());
         }
         if (trackMapped)
             info.offset = TrackMapEntry::formatTimecodeString(
@@ -2676,6 +2689,12 @@ public:
     }
 
     /// Set start timecode in ms from midnight.
+    /// Name of the generator preset in use (empty when the fields were set
+    /// by hand or no preset is selected).  Reported as the active track's
+    /// title for the outputs that carry metadata.
+    void setGeneratorPresetName(const juce::String& name) { genPresetName = name.trim(); }
+    juce::String getGeneratorPresetName() const           { return genPresetName; }
+
     void setGeneratorStartMs(double ms)
     {
         genStartMs = juce::jmax(0.0, ms);
@@ -3070,6 +3089,7 @@ private:
     double genStartMs   = 0.0;     // start TC in ms from midnight
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
+    juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
     double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
     double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
