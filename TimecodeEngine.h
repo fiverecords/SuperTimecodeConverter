@@ -1196,6 +1196,16 @@ public:
         info.title   = cachedTrackTitle;
         info.durationSec = cachedTrackDurationSec;
         info.mapped  = trackMapped;
+
+        // Generator with a file loaded: the file is the track, so the
+        // outputs that carry metadata (TCNet to Resolume, #20) get its name
+        // instead of "Generator / <engine name>".
+        if (activeInput == InputSource::SystemTime && !genClockMode && generatorAudioPlayer.hasFileLoaded())
+        {
+            info.artist      = generatorAudioPlayer.getTrackArtist();
+            info.title       = generatorAudioPlayer.getTrackTitle();
+            info.durationSec = (int) std::lround(generatorAudioPlayer.getFileLengthSeconds());
+        }
         if (trackMapped)
             info.offset = TrackMapEntry::formatTimecodeString(
                               cachedOffH, cachedOffM, cachedOffS, cachedOffF);

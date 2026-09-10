@@ -28,7 +28,7 @@ public:
     //==============================================================================
     void refreshNetworkInterfaces()
     {
-        availableInterfaces = ::getNetworkInterfaces();
+        availableInterfaces = ::getNetworkInterfaces(true);   // software protocol: localhost too (#20)
     }
 
     juce::StringArray getInterfaceNames() const

@@ -152,7 +152,7 @@ public:
     }
     ~TCNetOutput() override { stop(); }
 
-    void refreshNetworkInterfaces() { availableInterfaces = ::getNetworkInterfaces(); }
+    void refreshNetworkInterfaces() { availableInterfaces = ::getNetworkInterfaces(true); }   // localhost too (#20)
     int  getInterfaceCount() const  { return availableInterfaces.size(); }
     bool getIsRunning() const       { return running; }
     int  getSelectedInterface() const { return selectedInterface; }

@@ -176,6 +176,24 @@ public:
         const double  readerSR     = newReader->sampleRate;
         const int64_t totalSamples = newReader->lengthInSamples;
 
+        // Track identity for the outputs that carry metadata (TCNet, #20).
+        // WAV/AIFF carry LIST INFO tags JUCE exposes (IART / INAM); JUCE's
+        // MP3 and FLAC readers expose no tags.  Otherwise the file name: the
+        // "Artist - Title" convention when present, else the name as title.
+        juce::String tagArtist = newReader->metadataValues.getValue("IART", "").trim();
+        juce::String tagTitle  = newReader->metadataValues.getValue("INAM", "").trim();
+        if (tagTitle.isEmpty())
+        {
+            const juce::String base = file.getFileNameWithoutExtension().trim();
+            if (base.contains(" - "))
+            {
+                if (tagArtist.isEmpty()) tagArtist = base.upToFirstOccurrenceOf(" - ", false, false).trim();
+                tagTitle = base.fromFirstOccurrenceOf(" - ", false, false).trim();
+            }
+            else
+                tagTitle = base;
+        }
+
         if (readerSR <= 0.0 || totalSamples <= 0)
         {
             loadError = "EMPTY OR CORRUPT FILE";
@@ -208,6 +226,8 @@ public:
             oldSource            = std::move(currentReaderSource);
             currentReaderSource  = std::move(newSource);
             currentFile          = file;
+            trackArtist          = tagArtist;
+            trackTitle           = tagTitle;
             sourceFileSampleRate = readerSR;
             fileLengthSeconds    = (readerSR > 0.0) ? (double) totalSamples / readerSR : 0.0;
         }
@@ -246,6 +266,8 @@ public:
             const juce::ScopedLock sl(transportLock);
             oldSource            = std::move(currentReaderSource);
             currentFile          = juce::File();
+            trackArtist.clear();
+            trackTitle.clear();
             sourceFileSampleRate = 0.0;
             fileLengthSeconds    = 0.0;
         }
@@ -267,6 +289,11 @@ public:
         const juce::ScopedLock sl(transportLock);
         return currentFile;
     }
+
+    /// Artist / title of the loaded file (tags, else the file name; see
+    /// loadFile).  Empty when nothing is loaded.
+    juce::String getTrackArtist() const { const juce::ScopedLock sl(transportLock); return trackArtist; }
+    juce::String getTrackTitle()  const { const juce::ScopedLock sl(transportLock); return trackTitle; }
 
     double getFileLengthSeconds() const
     {
@@ -755,6 +782,7 @@ private:
     std::unique_ptr<juce::AudioFormatReaderSource> currentReaderSource;
     juce::AudioTransportSource                     transport;
     juce::File   currentFile;
+    juce::String trackArtist, trackTitle;   // under transportLock
     double       sourceFileSampleRate = 0.0;
     double       fileLengthSeconds    = 0.0;
 

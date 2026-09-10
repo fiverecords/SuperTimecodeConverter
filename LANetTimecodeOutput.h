@@ -38,7 +38,7 @@ public:
     //==============================================================================
     void refreshNetworkInterfaces()
     {
-        availableInterfaces = ::getNetworkInterfaces();
+        availableInterfaces = ::getNetworkInterfaces();   // has its own Localhost entry (see setInterface)
     }
 
     juce::StringArray getInterfaceNames() const

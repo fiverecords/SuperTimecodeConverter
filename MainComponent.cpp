@@ -3238,6 +3238,12 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
 
     editor->onLearnTrackInfo = [this]() -> TrackMapEditor::LearnTrackInfo
     {
+        // The generator reports its loaded file as a track (for TCNet
+        // metadata), but the Track Map does not apply to generator files, so
+        // Learn must not capture them -- an entry would sit there doing
+        // nothing.  See BACKLOG "Track Map for generator files".
+        if (currentEngine().getActiveInput() == SrcType::SystemTime)
+            return {};
         auto info = currentEngine().getActiveTrackInfo();
         return { info.artist, info.title, info.durationSec };
     };
@@ -4456,7 +4462,7 @@ void MainComponent::populateMidiAndNetworkCombos()
     }
 
     // Art-Net interfaces
-    auto nets = getNetworkInterfaces();
+    auto nets = getNetworkInterfaces(true);   // same list the Art-Net / LA-Net components use, localhost last
     cmbArtnetInputInterface.clear(juce::dontSendNotification);
     cmbArtnetOutputInterface.clear(juce::dontSendNotification);
     cmbArtnetDmxInterface.clear(juce::dontSendNotification);

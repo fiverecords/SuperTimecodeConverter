@@ -27,11 +27,30 @@ struct NetworkInterface
 };
 
 //==============================================================================
-// Enumerate active (non-loopback) IPv4 network interfaces
+// Enumerate active IPv4 network interfaces.
+//
+// includeLoopback appends "Localhost (127.0.0.1)" as the LAST entry, so the
+// interface indices stored in settings keep their meaning.  Its "broadcast"
+// address is 127.0.0.1 itself: a sender writing to it reaches every socket
+// on this machine bound to that port (Resolume, a console emulator, another
+// STC), which is what the software protocols -- TCNet, Art-Net, LA-Net,
+// HippoNet, OSC -- need when the receiver runs on the same PC (#20).  The
+// hardware protocols (Pro DJ Link, StageLinQ) do not ask for it.
 //==============================================================================
-inline juce::Array<NetworkInterface> getNetworkInterfaces()
+inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback = false)
 {
     juce::Array<NetworkInterface> interfaces;
+
+    auto appendLoopback = [&]()
+    {
+        if (! includeLoopback) return;
+        NetworkInterface lo;
+        lo.name      = "Localhost (127.0.0.1)";
+        lo.ip        = "127.0.0.1";
+        lo.broadcast = "127.0.0.1";
+        lo.subnet    = "255.0.0.0";
+        interfaces.add(lo);
+    };
 
 #ifdef _WIN32
     ULONG bufSize = 15000;
@@ -54,7 +73,10 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces()
     }
 
     if (result != NO_ERROR || addresses == nullptr)
+    {
+        appendLoopback();
         return interfaces;
+    }
 
     for (auto* adapter = addresses; adapter != nullptr; adapter = adapter->Next)
     {
@@ -99,7 +121,10 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces()
 #else
     struct ifaddrs* ifaddr;
     if (getifaddrs(&ifaddr) == -1)
+    {
+        appendLoopback();
         return interfaces;
+    }
 
     for (auto* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
     {
@@ -140,5 +165,6 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces()
     freeifaddrs(ifaddr);
 #endif
 
+    appendLoopback();
     return interfaces;
 }

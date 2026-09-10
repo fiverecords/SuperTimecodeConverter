@@ -282,7 +282,8 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 **Architecture:**
 - Broadcast: OptIn + Status on port 60000 (1Hz), Time on port 60001 (60Hz)
 - Unicast: automatic slave discovery, Request/Response negotiation, Metrics streaming at 30Hz, Metadata + Artwork on track change
-- Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector
+- Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector. Every interface selector of the software protocols (TCNet, Art-Net, LA-Net, HippoNet, OSC) also offers "Localhost (127.0.0.1)" for a receiver such as Resolume running on the same PC
+- Track metadata for the layer: artist and title from the deck (Pro DJ Link, StageLinQ), or, when the engine plays an audio file, the file's title and artist tags — or its name, split as "Artist - Title" when it follows that convention
 - **Global offset** (-2000 to +2000 ms) applied to every TCNet layer, to compensate for the latency of the receiving system without touching the per-engine frame offsets
 - Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator
 
