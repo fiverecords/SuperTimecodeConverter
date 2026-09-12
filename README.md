@@ -49,7 +49,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 - **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
-- **LTC Out** — generate LTC audio signal on any audio output device and channel, with the frame phase aligned to the timecode clock and compensated for the interface's reported output latency, so the same setup produces the same phase every time it is started. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops
+- **LTC Out** — generate LTC audio signal on any audio output device and channel, with the frame phase aligned to the timecode clock and compensated for the interface's reported output latency, so the same setup produces the same phase every time it is started. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops. If the audio interface leaves a hole in the stream (some USB and FireWire interfaces do when the display wakes), the encoder re-aligns the frame phase afterwards; such gaps are counted in the LTC output status line and logged with their time and size to `ltc_gaps.log` next to `settings.json`
 - **LA-Net Out** — broadcast LaserAnimation Net-Timecode on any network interface
 - **TCNet Out** — broadcast TCNet timecode, playhead, BPM, and beat data (see below)
 - **Audio Thru** — passthrough audio from the LTC input device to a separate output device (Engine 1 only, since it shares the audio device with LTC input)

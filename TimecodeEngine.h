@@ -268,6 +268,30 @@ public:
     /// Reads directly from the corresponding input class for the source.
     /// Winamp returns getPositionMs() which is already smoothed by the
     /// poll-thread IIR filter, so no extra work here.
+    /// LTC output holes (#19) are counted on the audio thread; here, once per
+    /// tick on the message thread, each new one is written to ltc_gaps.log
+    /// next to settings.json: when it happened, on which engine and device,
+    /// how long the callback was late and what the device period was.  A
+    /// logic-analyser capture can then be lined up with STC's own view of
+    /// the event -- @mungewell asked for exactly this.  Nothing is written
+    /// while no gaps occur.
+    void logLtcOutputGaps()
+    {
+        const int gaps = ltcOutput.getOutputGapCount();
+        if (gaps == lastLoggedGapCount) return;
+        lastLoggedGapCount = gaps;
+
+        const auto now = juce::Time::getCurrentTime();
+        juce::String line = now.formatted("%Y-%m-%d %H:%M:%S") + "." + juce::String(now.getMilliseconds()).paddedLeft('0', 3)
+                          + "  " + engineName
+                          + "  " + ltcOutput.getCurrentDeviceName()
+                          + "  gap " + juce::String(ltcOutput.getLastGapMs(), 1) + " ms"
+                          + "  period " + juce::String(ltcOutput.getActualBufferSize() * 1000.0
+                                                       / juce::jmax(1.0, ltcOutput.getActualSampleRate()), 1) + " ms"
+                          + "  total " + juce::String(gaps) + "\n";
+        AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+    }
+
     /// Playback speed of the source as a ratio (1.0 = nominal), for
     /// protocols that carry it (TCNet layer speed).  DJ sources: the PLL's
     /// pitch; everything else runs at 1.0.  0.0 while frozen or stopped.
@@ -1475,6 +1499,8 @@ public:
         // Housekeeping: safely destroy MidiInput devices that were retired
         // by MtcInput::stop().  See MtcInput.h for why this is deferred.
         mtcInput.drainRetiredDevices();
+
+        logLtcOutputGaps();
 
         switch (activeInput)
         {
@@ -3091,6 +3117,7 @@ private:
     double genCurrentMs = 0.0;     // current position in ms
     juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
+    int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
     double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
     double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
