@@ -1295,8 +1295,6 @@ struct EngineSettings
     bool         generatorAudioStereo  = true;
     bool         generatorAudioEnabled = false;
     float        generatorAudioVolume  = 1.0f;   // 0..1.5, 1=unity
-    double       generatorAudioSampleRate = 0.0; // 0 = use global preferred
-    int          generatorAudioBufferSize = 0;   // 0 = use global preferred
     int          generatorAudioFileChannelMode = 0; // 0=Stereo, 1=L only, 2=R only
     // Pro DJ Link
     int proDJLinkPlayer = 1;
@@ -1421,8 +1419,6 @@ struct EngineSettings
         obj->setProperty("generatorAudioStereo",  generatorAudioStereo);
         obj->setProperty("generatorAudioEnabled", generatorAudioEnabled);
         obj->setProperty("generatorAudioVolume",  (double) generatorAudioVolume);
-        obj->setProperty("generatorAudioSampleRate", generatorAudioSampleRate);
-        obj->setProperty("generatorAudioBufferSize", generatorAudioBufferSize);
         obj->setProperty("generatorAudioFileChannelMode", generatorAudioFileChannelMode);
         obj->setProperty("proDJLinkPlayer", proDJLinkPlayer);
         obj->setProperty("trackMapEnabled", trackMapEnabled);
@@ -1554,8 +1550,6 @@ struct EngineSettings
         generatorAudioStereo     = getBool("generatorAudioStereo", true);
         generatorAudioEnabled    = getBool("generatorAudioEnabled", false);
         generatorAudioVolume     = (float) getDouble("generatorAudioVolume", 1.0);
-        generatorAudioSampleRate = getDouble("generatorAudioSampleRate", 0.0);
-        generatorAudioBufferSize = getInt("generatorAudioBufferSize", 0);
         generatorAudioFileChannelMode = getInt("generatorAudioFileChannelMode", 0);
         // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER
         proDJLinkPlayer      = juce::jlimit(1, 9, getInt("proDJLinkPlayer", 1));

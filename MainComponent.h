@@ -336,8 +336,6 @@ private:
     juce::ComboBox   cmbGenAudioDevice;     juce::Label lblGenAudioDevice;
     juce::ComboBox   cmbGenAudioChannel;    juce::Label lblGenAudioChannel;
     juce::ComboBox   cmbGenAudioFileMode;   juce::Label lblGenAudioFileMode;
-    juce::ComboBox   cmbGenAudioSR;         juce::Label lblGenAudioSR;
-    juce::ComboBox   cmbGenAudioBuffer;     juce::Label lblGenAudioBuffer;
     juce::Slider     sldGenAudioVolume;     juce::Label lblGenAudioVolume;
     juce::Label      lblGenAudioStatus;
 
@@ -628,16 +626,12 @@ private:
 
     void populateSampleRateCombo();
     void populateBufferSizeCombo();
-    void populateGenAudioSampleRateCombo();
-    void populateGenAudioBufferCombo();
     void applyUserBitsFieldMode(int mode);
     void populateOutputAudioCombos();
     double getPreferredSampleRate() const;
     int    getPreferredBufferSize() const;
     /// Effective SR/Buffer for the Generator's audio playback device.
     /// Returns the per-engine override if set, otherwise the global preferred.
-    double getGenAudioEffectiveSampleRate() const;
-    int    getGenAudioEffectiveBufferSize() const;
     void   restartAllAudioDevices();
 
     int findFilteredIndex(const juce::Array<int>& filteredIndices,

@@ -723,27 +723,10 @@ MainComponent::MainComponent()
         // Per-engine sample rate / buffer for the audio playback device.
         // Default ("Default") = use the global preferred SR/Buffer; an explicit
         // value overrides only this device.
-        addLabelAndCombo(lblGenAudioSR, cmbGenAudioSR, "SAMPLE RATE:");
-        cmbGenAudioSR.setVisible(false); lblGenAudioSR.setVisible(false);
-        populateGenAudioSampleRateCombo();
-        cmbGenAudioSR.onChange = [this]
-        {
-            if (syncing) return;
-            if (isShowLockedRevert()) return;
-            if (btnGenAudioOut.getToggleState()) startCurrentGenAudio();
-            saveSettings();
-        };
-
-        addLabelAndCombo(lblGenAudioBuffer, cmbGenAudioBuffer, "BUFFER SIZE:");
-        cmbGenAudioBuffer.setVisible(false); lblGenAudioBuffer.setVisible(false);
-        populateGenAudioBufferCombo();
-        cmbGenAudioBuffer.onChange = [this]
-        {
-            if (syncing) return;
-            if (isShowLockedRevert()) return;
-            if (btnGenAudioOut.getToggleState()) startCurrentGenAudio();
-            saveSettings();
-        };
+        // The generator's audio follows the global SAMPLE RATE / BUFFER SIZE
+        // like every other audio component (D7, D23): the interface is one
+        // shared device with one format, and a per-engine format here could
+        // only disagree with what was actually running.
 
         // Volume slider: 0..1.5 linear (1=unity, 1.5=+3.5 dB headroom).
         leftContent.addAndMakeVisible(lblGenAudioVolume);
@@ -2852,28 +2835,10 @@ void MainComponent::syncUIFromEngine()
             cmbGenAudioChannel.setSelectedId(es.generatorAudioChannel + 1, juce::dontSendNotification);
     }
 
-    // Per-engine SR/Buffer/Volume for gen audio playback.
+    // Per-engine volume and file channel mode for gen audio playback.
     if (selectedEngine < (int)settings.engines.size())
     {
         const auto& es = settings.engines[(size_t)selectedEngine];
-        // SR combo: 0=Default, 44100=2, 48000=3, 88200=4, 96000=5
-        int srItem = 1;
-        if (es.generatorAudioSampleRate == 44100) srItem = 2;
-        else if (es.generatorAudioSampleRate == 48000) srItem = 3;
-        else if (es.generatorAudioSampleRate == 88200) srItem = 4;
-        else if (es.generatorAudioSampleRate == 96000) srItem = 5;
-        cmbGenAudioSR.setSelectedId(srItem, juce::dontSendNotification);
-
-        // Buffer combo: 0=Default, 64=2, 128=3, 256=4, 512=5, 1024=6, 2048=7
-        int bsItem = 1;
-        if (es.generatorAudioBufferSize == 64)   bsItem = 2;
-        else if (es.generatorAudioBufferSize == 128)  bsItem = 3;
-        else if (es.generatorAudioBufferSize == 256)  bsItem = 4;
-        else if (es.generatorAudioBufferSize == 512)  bsItem = 5;
-        else if (es.generatorAudioBufferSize == 1024) bsItem = 6;
-        else if (es.generatorAudioBufferSize == 2048) bsItem = 7;
-        cmbGenAudioBuffer.setSelectedId(bsItem, juce::dontSendNotification);
-
         sldGenAudioVolume.setValue(es.generatorAudioVolume, juce::dontSendNotification);
 
         // File channel mode (1=Stereo, 2=L only, 3=R only).
@@ -3971,8 +3936,8 @@ void MainComponent::startCurrentGenAudio()
     int channel = getChannelFromComboOrSettings(cmbGenAudioChannel, settingsCh, settingsStereo);
 
     if (eng.startGeneratorAudio(entry.typeName, entry.deviceName, channel,
-                                 getGenAudioEffectiveSampleRate(),
-                                 getGenAudioEffectiveBufferSize()))
+                                 getPreferredSampleRate(),
+                                 getPreferredBufferSize()))
     {
         populateGenAudioChannels();
 
@@ -4350,30 +4315,6 @@ void MainComponent::populateBufferSizeCombo()
     cmbBufferSize.setSelectedId(1, juce::dontSendNotification);
 }
 
-void MainComponent::populateGenAudioSampleRateCombo()
-{
-    cmbGenAudioSR.clear(juce::dontSendNotification);
-    cmbGenAudioSR.addItem("Default", 1);
-    cmbGenAudioSR.addItem("44100", 2);
-    cmbGenAudioSR.addItem("48000", 3);
-    cmbGenAudioSR.addItem("88200", 4);
-    cmbGenAudioSR.addItem("96000", 5);
-    cmbGenAudioSR.setSelectedId(1, juce::dontSendNotification);
-}
-
-void MainComponent::populateGenAudioBufferCombo()
-{
-    cmbGenAudioBuffer.clear(juce::dontSendNotification);
-    cmbGenAudioBuffer.addItem("Default", 1);
-    cmbGenAudioBuffer.addItem("64",   2);
-    cmbGenAudioBuffer.addItem("128",  3);
-    cmbGenAudioBuffer.addItem("256",  4);
-    cmbGenAudioBuffer.addItem("512",  5);
-    cmbGenAudioBuffer.addItem("1024", 6);
-    cmbGenAudioBuffer.addItem("2048", 7);
-    cmbGenAudioBuffer.setSelectedId(1, juce::dontSendNotification);
-}
-
 void MainComponent::applyUserBitsFieldMode(int mode)
 {
     if (mode == TimecodeEngine::kUserBitsName)
@@ -4409,26 +4350,6 @@ int MainComponent::getPreferredBufferSize() const
         case 5: return 256; case 6: return 512; case 7: return 1024; case 8: return 2048;
         case 9: return 4096; case 10: return 8192;
         default: return 0;
-    }
-}
-
-double MainComponent::getGenAudioEffectiveSampleRate() const
-{
-    switch (cmbGenAudioSR.getSelectedId())
-    {
-        case 2: return 44100; case 3: return 48000;
-        case 4: return 88200; case 5: return 96000;
-        default: return getPreferredSampleRate();    // "Default" -> global
-    }
-}
-
-int MainComponent::getGenAudioEffectiveBufferSize() const
-{
-    switch (cmbGenAudioBuffer.getSelectedId())
-    {
-        case 2: return 64;   case 3: return 128;  case 4: return 256;
-        case 5: return 512;  case 6: return 1024; case 7: return 2048;
-        default: return getPreferredBufferSize();   // "Default" -> global
     }
 }
 
@@ -5053,11 +4974,9 @@ void MainComponent::applyAudioSettings()
         if (es.generatorAudioEnabled)
         {
             int ch = es.generatorAudioStereo ? -1 : es.generatorAudioChannel;
-            // Per-engine SR/Buffer: 0 means "use global preferred".
-            const double sr = (es.generatorAudioSampleRate > 0) ? es.generatorAudioSampleRate
-                                                                : getPreferredSampleRate();
-            const int    bs = (es.generatorAudioBufferSize > 0) ? es.generatorAudioBufferSize
-                                                                : getPreferredBufferSize();
+            // Global format, like every other audio component (D7, D23).
+            const double sr = getPreferredSampleRate();
+            const int    bs = getPreferredBufferSize();
             if (i == selectedEngine)
             {
                 int genIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
@@ -5236,18 +5155,6 @@ void MainComponent::flushSettings()
                 es.generatorAudioChannel = es.generatorAudioStereo ? 0 : (cmbGenAudioChannel.getSelectedId() - 1);
                 es.generatorAudioVolume  = (float) sldGenAudioVolume.getValue();
                 es.generatorAudioFileChannelMode = juce::jlimit(0, 2, cmbGenAudioFileMode.getSelectedId() - 1);
-                // Per-engine SR/Buffer overrides; 0 = "Default" (use global).
-                {
-                    static const double srMap[] = { 0.0, 0.0, 44100, 48000, 88200, 96000 };
-                    static const int    bsMap[] = { 0,    0,   64,    128,   256,   512,  1024, 2048 };
-                    constexpr int srMapN = (int) (sizeof(srMap) / sizeof(srMap[0]));
-                    constexpr int bsMapN = (int) (sizeof(bsMap) / sizeof(bsMap[0]));
-                    const int srSel = cmbGenAudioSR.getSelectedId();
-                    const int bsSel = cmbGenAudioBuffer.getSelectedId();
-                    es.generatorAudioSampleRate = (srSel >= 0 && srSel < srMapN) ? srMap[srSel] : 0.0;
-                    es.generatorAudioBufferSize = (bsSel >= 0 && bsSel < bsMapN) ? bsMap[bsSel] : 0;
-                }
-
                 // Audio BPM device/channel
                 es.audioBpmEnabled = eng.isAudioBpmRunning();
                 if (eng.isAudioBpmRunning())
@@ -5707,8 +5614,6 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbGenAudioDevice.setVisible(showGenAudioConfig);  lblGenAudioDevice.setVisible(showGenAudioConfig);
     cmbGenAudioChannel.setVisible(showGenAudioConfig); lblGenAudioChannel.setVisible(showGenAudioConfig);
     cmbGenAudioFileMode.setVisible(showGenAudioConfig); lblGenAudioFileMode.setVisible(showGenAudioConfig);
-    cmbGenAudioSR.setVisible(showGenAudioConfig);      lblGenAudioSR.setVisible(showGenAudioConfig);
-    cmbGenAudioBuffer.setVisible(showGenAudioConfig);  lblGenAudioBuffer.setVisible(showGenAudioConfig);
     sldGenAudioVolume.setVisible(showGenAudioConfig);  lblGenAudioVolume.setVisible(showGenAudioConfig);
     lblGenAudioStatus.setVisible(showGenAudioConfig);
     miniWaveform.setVisible(showGenAudioConfig);
@@ -7137,11 +7042,6 @@ void MainComponent::resized()
     if (cmbGenAudioFileMode.isVisible())
     {
         layCombo(lblGenAudioFileMode, cmbGenAudioFileMode, leftPanel);
-    }
-    if (cmbGenAudioSR.isVisible())
-    {
-        layCombo(lblGenAudioSR,     cmbGenAudioSR,     leftPanel);
-        layCombo(lblGenAudioBuffer, cmbGenAudioBuffer, leftPanel);
     }
     if (sldGenAudioVolume.isVisible())
     {
