@@ -1640,7 +1640,7 @@ struct EngineSettings
         laNetTCOutputOffset  = clampOffset(getInt("laNetTCOutputOffset", 0));
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         ltcUserBitsHex     = getString("ltcUserBitsHex");
-        ltcUserBitsMode    = juce::jlimit(0, 3, getInt("ltcUserBitsMode", 0));
+        ltcUserBitsMode    = juce::jlimit(0, 4, getInt("ltcUserBitsMode", 0));
         ltcUserBitsReversed = getBool("ltcUserBitsReversed", false);
         ltcUserBitsName    = getString("ltcUserBitsName");
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
@@ -1970,7 +1970,7 @@ private:
         es.laNetTCOutputOffset = clampOffset(getInt("laNetTCOutputOffset", 0));
         es.ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         es.ltcUserBitsHex     = getString("ltcUserBitsHex");
-        es.ltcUserBitsMode    = juce::jlimit(0, 3, getInt("ltcUserBitsMode", 0));
+        es.ltcUserBitsMode    = juce::jlimit(0, 4, getInt("ltcUserBitsMode", 0));
         es.ltcUserBitsName    = getString("ltcUserBitsName");
         es.tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));
 

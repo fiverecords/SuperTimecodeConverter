@@ -106,6 +106,10 @@ public:
     /// the applied value is visible without being an operator control.
     double getLatencyCompensationMs() const { return latencyCompMs.load(std::memory_order_relaxed); }
 
+    /// DEBUG user-bits mode: every group carries the low nibble of the
+    /// callback (buffer) count -- see packFrame.  Off in normal use.
+    void setBufferCounterUserBits(bool on) { bufferCounterUserBits.store(on, std::memory_order_relaxed); }
+
     /// Output gaps seen since start (device ran dry between callbacks; the
     /// encoder re-seeds at the published phase each time).  For the status
     /// line: an interface that keeps doing this is worth knowing about.
@@ -178,6 +182,8 @@ private:
     // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
     // Output gap detector (#19): audio thread state and counters for the UI.
     double lastCallbackMs = 0.0;
+    uint32_t callbackCounter = 0;                       // audio thread only
+    std::atomic<bool> bufferCounterUserBits { false };  // DEBUG user-bits mode
     std::atomic<int>    outputGapCount { 0 };
     std::atomic<double> lastGapMs      { 0.0 };
 
@@ -305,7 +311,15 @@ private:
         // opposite, the GoPro convention, and those readers showed the value
         // reversed; the MANUAL mode has a REVERSE DIGIT ORDER option for
         // readers that still expect it.)
-        const uint32_t ub = userBits.load(std::memory_order_relaxed);
+        // Debug mode (#19): every binary group carries the low four bits of
+        // the count of audio callbacks so far, so a decoded capture shows in
+        // which buffer each frame was packed and where the buffer boundaries
+        // fall.  With buffers of a frame or more, consecutive frames step the
+        // digit; with smaller buffers the digit tells the buffer the frame
+        // STARTED in.
+        uint32_t ub = userBits.load(std::memory_order_relaxed);
+        if (bufferCounterUserBits.load(std::memory_order_relaxed))
+            ub = 0x11111111u * (uint32_t)(callbackCounter & 0xF);
         static constexpr int kUserGroupStart[8] =
             { 4, 12, 20, 28, 36, 44, 52, 60 };
         for (int g = 0; g < 8; ++g)
@@ -426,6 +440,7 @@ private:
         // Wall-clock instant of this callback, used by the phase alignment
         // and by the gap detector below.  Taken once per callback.
         const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
+        ++callbackCounter;
 
         // --- Output gap detector (issue #19) ---
         // A callback that arrives much later than one period after the

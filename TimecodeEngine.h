@@ -441,6 +441,7 @@ public:
     static constexpr int kUserBitsFromLtcIn  = 1;  // passthrough from this engine's LTC input
     static constexpr int kUserBitsSystemDate = 2;  // current local date and time zone, SMPTE ST 309
     static constexpr int kUserBitsName       = 3;  // four ISO characters, SMPTE 12M-1 sec. 8.4.2
+    static constexpr int kUserBitsDebugBuffers = 4; // DEBUG: audio buffer counter in every group (#19)
 
     /// Pack four characters into the 32-bit user-bits word per SMPTE
     /// ST 12-1 sec. 8.4.2: four ISO codes, each occupying two binary
@@ -529,8 +530,9 @@ public:
 
     void setLtcUserBitsMode(int mode)
     {
-        ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsName, mode);
+        ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsDebugBuffers, mode);
         pushManualUserBits();
+        ltcOutput.setBufferCounterUserBits(ltcUserBitsMode == kUserBitsDebugBuffers);
         // Binary group flags say what the groups carry (12M-1 sec. 8.4.1):
         // NAME declares an eight-bit character set (BGF0), DATE declares
         // ST 309 date and time zone (BGF2, ST 309 Table 3, unspecified clock

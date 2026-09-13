@@ -79,7 +79,9 @@ static int bufferSizeToComboId(int bs)
     if (bs <= 256)  return 5;
     if (bs <= 512)  return 6;
     if (bs <= 1024) return 7;
-    return 8;
+    if (bs <= 2048) return 8;
+    if (bs <= 4096) return 9;
+    return 10;
 }
 
 //==============================================================================
@@ -1915,6 +1917,7 @@ MainComponent::MainComponent()
     cmbLtcUserBitsMode.addItem("FROM LTC IN",  2);
     cmbLtcUserBitsMode.addItem("DATE (ST 309)", 3);
     cmbLtcUserBitsMode.addItem("NAME (4 CHAR)", 4);
+    cmbLtcUserBitsMode.addItem("DEBUG: BUFFER COUNTER", 5);   // #19: audio buffer boundaries visible on the wire
     cmbLtcUserBitsMode.onChange = [this]
     {
         if (syncing) return;
@@ -2554,7 +2557,7 @@ void MainComponent::syncUIFromEngine()
     sldArtnetOffset.setValue(eng.getArtnetOutputOffset(), juce::dontSendNotification);
     sldLANetTCOffset.setValue(eng.getLANetTCOutputOffset(), juce::dontSendNotification);
     sldLtcOffset.setValue(eng.getLtcOutputOffset(), juce::dontSendNotification);
-    cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, (int) TimecodeEngine::kUserBitsName,
+    cmbLtcUserBitsMode.setSelectedId(juce::jlimit(0, (int) TimecodeEngine::kUserBitsDebugBuffers,
                                                   eng.getLtcUserBitsMode()) + 1,
                                      juce::dontSendNotification);
     {
@@ -4342,6 +4345,8 @@ void MainComponent::populateBufferSizeCombo()
     cmbBufferSize.addItem("512", 6);
     cmbBufferSize.addItem("1024", 7);
     cmbBufferSize.addItem("2048", 8);
+    cmbBufferSize.addItem("4096", 9);    // beyond the usual: a buffer of a frame or more makes the
+    cmbBufferSize.addItem("8192", 10);   // DEBUG buffer counter step once per frame (#19)
     cmbBufferSize.setSelectedId(1, juce::dontSendNotification);
 }
 
@@ -4402,6 +4407,7 @@ int MainComponent::getPreferredBufferSize() const
     {
         case 2: return 32; case 3: return 64; case 4: return 128;
         case 5: return 256; case 6: return 512; case 7: return 1024; case 8: return 2048;
+        case 9: return 4096; case 10: return 8192;
         default: return 0;
     }
 }
