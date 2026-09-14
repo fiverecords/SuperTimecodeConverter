@@ -155,6 +155,18 @@ public:
         uint32_t rp = passthruReadPos.load(std::memory_order_relaxed);
         uint32_t available = wp - rp;  // works correctly with unsigned wrap-around
 
+        // The producer resets both positions when its device (re)starts
+        // (resetPassthruBuffer); if this consumer runs on another device it
+        // may be mid-read with a stale rp, and "available" then wraps to a
+        // huge count that would replay the whole ring for the next 2^32
+        // samples.  More than the ring can hold is not a state the ring can
+        // be in: resynchronise to the producer and carry on.
+        if (available > RING_SIZE)
+        {
+            rp = wp;
+            available = 0;
+        }
+
         int toRead = (int)juce::jmin((uint32_t)numSamples, available);
 
         // Track underruns: if we can't supply all requested samples, it's an underrun
