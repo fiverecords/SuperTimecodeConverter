@@ -2668,6 +2668,7 @@ public:
             // a previous session could either skip cues or produce a
             // backward-jump false positive.
             lastCueCheckMs = (uint32_t) juce::jmax(0.0, playFromMs);
+            cueCursorInclusive = true;   // a cue exactly at the play-from position fires
         }
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
         genState = GeneratorState::Playing;
@@ -3135,6 +3136,7 @@ private:
     int inputFreewheelMs = (int) kSourceTimeoutMs;   // D10
     juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
+    bool   cueCursorInclusive = false;  // next crossing check includes a cue exactly at lastCueCheckMs
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
     double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
     double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
@@ -4224,21 +4226,30 @@ private:
     ///     prevMs without firing anything.
     void tickCuePointsCrossing(uint32_t playheadMs)
     {
-        if (armedCues.empty()) { lastCueCheckMs = playheadMs; return; }
+        if (armedCues.empty()) { lastCueCheckMs = playheadMs; cueCursorInclusive = false; return; }
 
         const uint32_t prevMs = lastCueCheckMs;
 
         // Backward jump: just take the new mark, don't fire anything.  This
         // covers seek-back, audio loop wrap, and stop->start (which leaves
         // genCurrentMs at startMs, often less than where it was before).
+        // The inclusive flag survives: it belongs to the transport event
+        // that set it, not to this tick.
         if (playheadMs <= prevMs) { lastCueCheckMs = playheadMs; return; }
 
         // Forward advance.  Fire any cue whose position is strictly greater
-        // than where we were and at most where we are now.
+        // than where we were and at most where we are now -- except on the
+        // first tick after the transport started or the loop wrapped, where
+        // the cursor is inclusive so that a cue placed exactly at the start
+        // TC (or at loop In) fires.  "At 00:00:00:00, go" is the obvious way
+        // to ask for something at the top of a cue, and it used to fire
+        // never.
+        const bool inclusive = cueCursorInclusive;
+        cueCursorInclusive = false;
         for (auto& ac : armedCues)
         {
             const uint32_t pos = ac.cue.positionMs;
-            if (pos <= prevMs)     continue;  // already behind; not crossed this tick
+            if (inclusive ? (pos < prevMs) : (pos <= prevMs)) continue;  // already behind
             if (pos >  playheadMs) continue;  // still ahead; not crossed this tick
 
             triggerOutput.fireCuePoint(ac.cue);
@@ -4339,6 +4350,7 @@ private:
             {
                 genCurrentMs = genLoopInMs;
                 lastCueCheckMs = (uint32_t) juce::jmax(0.0, genLoopInMs);
+                cueCursorInclusive = true;   // a cue exactly at loop In fires on every iteration
                 const double audioPosSec = juce::jmax(0.0, (genLoopInMs - genStartMs) / 1000.0);
                 generatorAudioPlayer.seekSeconds(audioPosSec);
             }
