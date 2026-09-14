@@ -181,10 +181,10 @@ private:
     // timecode clock was (framePhaseMs) at the instant it was published
     // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
     // Phase lock (D9), audio thread only except the atomic for the bench.
+    bool valueSnapped = false;    // packFrame saw the tracking policy snap (source seek)
     double lockAdj = 0.0;         // fraction of the bit clock, +/- kLockMaxAdj
     double lockIntegral = 0.0;
     double lockErrFilt = 0.0;
-    double lockLatencyTrimMs = 0.0;   // stream offset the watchdog has found (see lockStep)
     std::atomic<double> lastLockErrorMs { 0.0 };
 
     // Output gap detector (#19): audio thread state and counters for the UI.
@@ -247,7 +247,7 @@ private:
     void resetEncoder()
     {
         lastCallbackMs = 0.0;
-        lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0; lockLatencyTrimMs = 0.0;
+        lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -323,16 +323,17 @@ private:
         // passed p ms ago), in wall time.
         const double eMs = ((p > frameMs * 0.5) ? p - frameMs : p) / pitch;
 
-        // Watchdog on the filtered error: a hole nobody saw.  The stream is
-        // now reaching the connector that much later (or earlier) than the
-        // latency the driver reported, so the measured error is folded into
-        // the latency the alignment uses, and the encoder re-seeds with it.
-        // A plain re-seed would land on the same wrong offset again.  If the
-        // device later catches up, the same watchdog trims it back.
+        // Watchdog on the filtered error: the source's timeline moved under
+        // us without the engine announcing a seek (a clock-mode re-anchor,
+        // an MTC locate the decoder absorbed, a publication hiccup).  A slow
+        // crawl at 200 ppm is the wrong answer to a step; re-seed at the
+        // published phase, which is the truth for a source jump.  (A
+        // DAC-side hole is NOT what this sees: that moves the actual
+        // boundary without touching the encoder's timeline, and nothing
+        // inside STC can measure it -- see D24.)
         lockErrFilt += 0.1 * (eMs - lockErrFilt);
         if (std::abs(lockErrFilt) > kLockReseedMs)
         {
-            lockLatencyTrimMs += lockErrFilt;
             lockErrFilt = 0.0;
             needNewFrame.store(true, std::memory_order_relaxed);
             encoderSeeded.store(false, std::memory_order_relaxed);
@@ -346,15 +347,10 @@ private:
         lastLockErrorMs.store(eMs, std::memory_order_relaxed);
     }
 
-    /// Effective output latency: what the driver reports plus what the lock
-    /// has found the stream to be late by (see the watchdog in lockStep).
-    double effectiveLatencyMs() const { return latencyCompMs.load(std::memory_order_relaxed) + lockLatencyTrimMs; }
-
     /// Last measured phase error at a frame boundary, ms, positive = late.
     /// For the bench.
     double getLockErrorMs() const { return lastLockErrorMs.load(std::memory_order_relaxed); }
     double getLockAdjPpm()  const { return lockAdj * 1e6; }
-    double getLockLatencyTrimMs() const { return lockLatencyTrimMs; }
 
     /// Assemble the next 80-bit codeword.  seedAdvanceFrames is only used on
     /// the first frame after a (re)seed: the number of whole frames the
@@ -385,9 +381,15 @@ private:
             // Auto-increment from the last encoded frame, then let the shared
             // tracking policy (TimecodeCore) correct one frame at a time
             // towards the engine value, or snap on a real seek.  The bit clock
-            // already follows pitch (pitchMultiplier), so here only clock
-            // drift between the audio device and the source shows up.
-            encoderTc = trackPublishedValue(incrementFrame(encoderTc, fps), pendingTc, 1, fps);
+            // already follows pitch (pitchMultiplier) and the phase lock
+            // (D24) holds the phase, so here only what the lock cannot
+            // absorb shows up.  A snap means the source jumped: the phase
+            // has to follow the value, so the boundary is re-seeded too
+            // (see valueSnapped in the callback).
+            const Timecode next = incrementFrame(encoderTc, fps);
+            encoderTc = trackPublishedValue(next, pendingTc, 1, fps);
+            const int64_t moved = frameDistance(encoderTc, next, fps);
+            valueSnapped = (moved > 1 || moved < -1);
         }
 
         int frames  = encoderTc.frames;
@@ -634,7 +636,7 @@ private:
                     // source's boundary relative to the one we are about to
                     // put on the wire?  Recomputes the bit clock if it trims.
                     lockStep(callbackStartMs + (double) i * 1000.0 / currentSampleRate
-                             + effectiveLatencyMs());
+                             + latencyCompMs.load(std::memory_order_relaxed));
                     updateSamplesPerBit();
                     if (! encoderSeeded.load(std::memory_order_relaxed))
                     {
@@ -665,7 +667,7 @@ private:
                                        + ((callbackStartMs
                                            - framePhaseAtMs.load(std::memory_order_relaxed))
                                           + (double) i * 1000.0 / currentSampleRate
-                                          + effectiveLatencyMs()) * pitchNow;
+                                          + latencyCompMs.load(std::memory_order_relaxed)) * pitchNow;
                         // Whole frames carry into the value; the remainder
                         // positions the bit pointer.  Both negative-safe.
                         double whole = std::floor(elapsed / frameMs);
@@ -677,6 +679,17 @@ private:
                 }
 
                 packFrame(seedAdvance);
+                if (valueSnapped)
+                {
+                    // The value just jumped to follow a source seek nobody
+                    // announced: re-seed on this same boundary so the phase
+                    // follows too, instead of crawling there at 200 ppm.
+                    valueSnapped = false;
+                    encoderSeeded.store(false, std::memory_order_relaxed);
+                    needNewFrame.store(true, std::memory_order_relaxed);
+                    --i;        // redo this sample as the seeding boundary
+                    continue;
+                }
                 currentBitIndex = 0;
                 halfCellIndex = 0;
                 // Keep the fractional sample carried over from the last
