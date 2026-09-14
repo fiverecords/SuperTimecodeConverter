@@ -7,6 +7,7 @@
 #include "TimecodeCore.h"
 #include "AudioDeviceHub.h"
 #include <atomic>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -95,8 +96,7 @@ public:
     void setFramePhaseMs(double msIntoFrame)
     {
         framePhaseMs.store(msIntoFrame, std::memory_order_relaxed);
-        framePhaseAtMs.store(juce::Time::getMillisecondCounterHiRes(),
-                             std::memory_order_relaxed);
+        framePhaseAtMs.store(nowMs(), std::memory_order_relaxed);
         haveFramePhase.store(true, std::memory_order_release);
     }
 
@@ -180,6 +180,13 @@ private:
     // Sub-frame phase published by the engine: how far into the frame the
     // timecode clock was (framePhaseMs) at the instant it was published
     // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
+    // Phase lock (D9), audio thread only except the atomic for the bench.
+    double lockAdj = 0.0;         // fraction of the bit clock, +/- kLockMaxAdj
+    double lockIntegral = 0.0;
+    double lockErrFilt = 0.0;
+    double lockLatencyTrimMs = 0.0;   // stream offset the watchdog has found (see lockStep)
+    std::atomic<double> lastLockErrorMs { 0.0 };
+
     // Output gap detector (#19): audio thread state and counters for the UI.
     double lastCallbackMs = 0.0;
     uint32_t callbackCounter = 0;                       // audio thread only
@@ -230,9 +237,17 @@ private:
     Timecode encoderTc;
     std::atomic<bool> encoderSeeded { false };
 
+    /// Wall clock for the phase alignment, the lock and the gap detector.
+    /// Injectable so the encoder can be simulated with a source clock that
+    /// drifts against the sample clock (tools/audit); production uses the
+    /// high-resolution counter.
+    std::function<double()> timeSource;
+    double nowMs() const { return timeSource ? timeSource() : juce::Time::getMillisecondCounterHiRes(); }
+
     void resetEncoder()
     {
         lastCallbackMs = 0.0;
+        lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0; lockLatencyTrimMs = 0.0;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -248,9 +263,98 @@ private:
         double fps = frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
         double pitch = pitchMultiplier.load(std::memory_order_relaxed);
         if (pitch <= 0.0) pitch = 1.0;
-        // Scale bit duration by pitch: faster pitch -> shorter bits -> more frames/sec
-        samplesPerHalfBit = currentSampleRate / (fps * pitch * LTC_FRAME_BITS * 2.0);
+        // Scale bit duration by pitch: faster pitch -> shorter bits -> more
+        // frames/sec.  lockAdj (D9) trims the bit clock by up to +/-200 ppm
+        // to hold the frame phase on the source's clock: positive when the
+        // encoder is late (shorter bits catch up).
+        samplesPerHalfBit = currentSampleRate / (fps * pitch * LTC_FRAME_BITS * 2.0) * (1.0 - lockAdj);
     }
+
+    //==========================================================================
+    // Phase lock (D9).
+    //
+    // The bit stream runs on the audio device's clock; the timecode it
+    // carries runs on the source's (the CPU for the generator, the deck for
+    // Pro DJ Link, the sender for MTC/LTC in).  Seeding aligns the two at one
+    // instant; after that they drift apart at the difference between the
+    // clocks -- 50 ppm is a frame every 11 minutes -- and until now the only
+    // correction was a whole-frame step when the values disagreed, with the
+    // phase sawtoothing through a full frame in between.
+    //
+    // At every frame boundary the encoder now measures where the source's
+    // frame boundary is (the published phase, aged to the instant this
+    // boundary reaches the connector) and trims its bit clock with a slow PI
+    // loop: proportional 0.1/s, integral for the standing clock difference,
+    // +/-200 ppm limit (a receiver's tolerance, and more than any pair of
+    // clocks differs).  Drift is absorbed by the integral, jitter in the
+    // publication (MTC arrivals, deck packets) is filtered by the loop's
+    // ~10 s time constant, and a persistent error of more than
+    // kLockReseedMs -- a hole the interface made without delaying the
+    // callback, which the cadence detector cannot see -- triggers a re-seed
+    // instead of a 50-second crawl.  Everything here runs on the audio
+    // thread, once per frame.
+    //==========================================================================
+    static constexpr double kLockKp          = 0.1;      // per second
+    static constexpr double kLockKi          = 0.0025;   // per second squared (critically damped)
+    static constexpr double kLockMaxAdj      = 200e-6;   // +/- fraction of the bit clock
+    static constexpr double kLockReseedMs    = 4.0;      // filtered error beyond this: re-seed
+
+    /// Called at a frame boundary that is not a seed.  `boundaryConnectorMs`
+    /// is the instant this boundary reaches the connector.
+    void lockStep(double boundaryConnectorMs)
+    {
+        if (! haveFramePhase.load(std::memory_order_acquire)) return;
+        // Hold on pause: the source's phase is frozen while the encoder
+        // free-runs by design; there is nothing to lock to until it resumes.
+        if (paused.load(std::memory_order_relaxed)) return;
+
+        // The published phase is in source (position) time; wall time since
+        // the publication advances it at the source's speed.  The frame is
+        // one source frame.
+        const double fps     = frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
+        const double frameMs = 1000.0 / fps;
+        double pitch = pitchMultiplier.load(std::memory_order_relaxed);
+        if (pitch <= 0.0) pitch = 1.0;
+
+        double p = framePhaseMs.load(std::memory_order_relaxed)
+                 + (boundaryConnectorMs - framePhaseAtMs.load(std::memory_order_relaxed)) * pitch;
+        p = std::fmod(p, frameMs); if (p < 0.0) p += frameMs;
+        // Error, positive when the encoder is late (the source's boundary
+        // passed p ms ago), in wall time.
+        const double eMs = ((p > frameMs * 0.5) ? p - frameMs : p) / pitch;
+
+        // Watchdog on the filtered error: a hole nobody saw.  The stream is
+        // now reaching the connector that much later (or earlier) than the
+        // latency the driver reported, so the measured error is folded into
+        // the latency the alignment uses, and the encoder re-seeds with it.
+        // A plain re-seed would land on the same wrong offset again.  If the
+        // device later catches up, the same watchdog trims it back.
+        lockErrFilt += 0.1 * (eMs - lockErrFilt);
+        if (std::abs(lockErrFilt) > kLockReseedMs)
+        {
+            lockLatencyTrimMs += lockErrFilt;
+            lockErrFilt = 0.0;
+            needNewFrame.store(true, std::memory_order_relaxed);
+            encoderSeeded.store(false, std::memory_order_relaxed);
+            return;
+        }
+
+        const double eS = eMs * 0.001;
+        const double dt = frameMs * 0.001 / pitch;
+        lockIntegral = juce::jlimit(-kLockMaxAdj, kLockMaxAdj, lockIntegral + kLockKi * eS * dt);
+        lockAdj      = juce::jlimit(-kLockMaxAdj, kLockMaxAdj, kLockKp * eS + lockIntegral);
+        lastLockErrorMs.store(eMs, std::memory_order_relaxed);
+    }
+
+    /// Effective output latency: what the driver reports plus what the lock
+    /// has found the stream to be late by (see the watchdog in lockStep).
+    double effectiveLatencyMs() const { return latencyCompMs.load(std::memory_order_relaxed) + lockLatencyTrimMs; }
+
+    /// Last measured phase error at a frame boundary, ms, positive = late.
+    /// For the bench.
+    double getLockErrorMs() const { return lastLockErrorMs.load(std::memory_order_relaxed); }
+    double getLockAdjPpm()  const { return lockAdj * 1e6; }
+    double getLockLatencyTrimMs() const { return lockLatencyTrimMs; }
 
     /// Assemble the next 80-bit codeword.  seedAdvanceFrames is only used on
     /// the first frame after a (re)seed: the number of whole frames the
@@ -439,7 +543,7 @@ private:
 
         // Wall-clock instant of this callback, used by the phase alignment
         // and by the gap detector below.  Taken once per callback.
-        const double callbackStartMs = juce::Time::getMillisecondCounterHiRes();
+        const double callbackStartMs = nowMs();
         ++callbackCounter;
 
         // --- Output gap detector (issue #19) ---
@@ -524,11 +628,33 @@ private:
                 // at the instant of seeding.
                 int    seedAdvance = 0;
                 double seedHalfCellsIn = -1.0;
-                if (seeding && haveFramePhase.load(std::memory_order_acquire)
+                if (! seeding && samplesPerHalfBit > 0.0)
+                {
+                    // Phase lock step at this boundary (D9): where is the
+                    // source's boundary relative to the one we are about to
+                    // put on the wire?  Recomputes the bit clock if it trims.
+                    lockStep(callbackStartMs + (double) i * 1000.0 / currentSampleRate
+                             + effectiveLatencyMs());
+                    updateSamplesPerBit();
+                    if (! encoderSeeded.load(std::memory_order_relaxed))
+                    {
+                        // The watchdog asked for a re-seed: fall through to
+                        // the seeding path on this same boundary.
+                        seedHalfCellsIn = -1.0;
+                    }
+                }
+                const bool seedNow = ! encoderSeeded.load(std::memory_order_relaxed);
+                if (seedNow && haveFramePhase.load(std::memory_order_acquire)
                     && samplesPerHalfBit > 0.0)
                 {
-                    const double frameMs = samplesPerHalfBit * LTC_FRAME_BITS * 2.0
-                                           * 1000.0 / currentSampleRate;
+                    lockErrFilt = 0.0;   // fresh alignment; the integral (clock difference) stays
+                    // One source frame, in source (position) time.  The wall
+                    // time since the publication advances the phase at the
+                    // source's speed (pitch), so the position lands right
+                    // under pitch too.
+                    const double frameMs = 1000.0 / frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
+                    double pitchNow = pitchMultiplier.load(std::memory_order_relaxed);
+                    if (pitchNow <= 0.0) pitchNow = 1.0;
                     if (frameMs > 0.0)
                     {
                         // Phase at publication, plus however long ago that
@@ -536,10 +662,10 @@ private:
                         // plus the output latency so the alignment holds at
                         // the connector rather than in the buffer.
                         double elapsed = framePhaseMs.load(std::memory_order_relaxed)
-                                       + (callbackStartMs
-                                          - framePhaseAtMs.load(std::memory_order_relaxed))
-                                       + (double) i * 1000.0 / currentSampleRate
-                                       + latencyCompMs.load(std::memory_order_relaxed);
+                                       + ((callbackStartMs
+                                           - framePhaseAtMs.load(std::memory_order_relaxed))
+                                          + (double) i * 1000.0 / currentSampleRate
+                                          + effectiveLatencyMs()) * pitchNow;
                         // Whole frames carry into the value; the remainder
                         // positions the bit pointer.  Both negative-safe.
                         double whole = std::floor(elapsed / frameMs);
@@ -553,7 +679,13 @@ private:
                 packFrame(seedAdvance);
                 currentBitIndex = 0;
                 halfCellIndex = 0;
-                samplePositionInHalfBit = 0.0;
+                // Keep the fractional sample carried over from the last
+                // half-cell of the previous frame.  Zeroing it here rounded
+                // every frame up to whole samples, which erased any bit-clock
+                // trim smaller than one sample per frame -- the +/-200 ppm of
+                // the phase lock, and part of the pitch multiplier (1778
+                // samples per frame at +8 % on 25 fps instead of 1777.8).
+                // A seed sets the position explicitly below.
 
                 if (seedHalfCellsIn >= 0.0)
                 {
