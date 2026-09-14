@@ -118,10 +118,19 @@ public:
     /// Binary group flags of the last decoded frame (BGF0 in bit 0).
     uint8_t getBinaryGroupFlags() const { return binaryGroupFlags.load(std::memory_order_relaxed); }
 
+    /// Freewheel (D10): how long after the last frame/packet the source still
+    /// counts as present.  The senders count on their own through it, so a
+    /// short dropout -- a USB stall, a display wake -- never reaches the
+    /// wire; the price is that a real stop takes this long to reach the
+    /// outputs.  The operator sets it (engine setting), default
+    /// kSourceTimeoutMs.
+    void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
+    double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
+
     bool isReceiving() const
     {
         auto now = juce::Time::getMillisecondCounterHiRes();
-        return (now - lastFrameTime.load(std::memory_order_relaxed)) < kSourceTimeoutMs;
+        return (now - lastFrameTime.load(std::memory_order_relaxed)) < timeoutMs.load(std::memory_order_relaxed);
     }
 
     //==============================================================================
@@ -202,6 +211,7 @@ private:
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
     std::atomic<int> selectedChannel { 0 };
     std::atomic<int> passthruChannel { -1 };
     int numChannelsAvailable = 0;

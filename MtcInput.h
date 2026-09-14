@@ -94,6 +94,15 @@ public:
 
     //==============================================================================
     // True if QF messages are actively arriving
+    /// Freewheel (D10): how long after the last frame/packet the source still
+    /// counts as present.  The senders count on their own through it, so a
+    /// short dropout -- a USB stall, a display wake -- never reaches the
+    /// wire; the price is that a real stop takes this long to reach the
+    /// outputs.  The operator sets it (engine setting), default
+    /// kSourceTimeoutMs.
+    void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
+    double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
+
     bool isReceiving() const
     {
         if (!synced.load(std::memory_order_acquire))
@@ -103,7 +112,7 @@ public:
         double elapsed = now - lastQfReceiveTime.load(std::memory_order_relaxed);
 
         // MTC at 24fps sends QF every ~10.4ms, at 30fps ~8.3ms
-        return elapsed < kSourceTimeoutMs;
+        return elapsed < timeoutMs.load(std::memory_order_relaxed);
     }
 
     /// Wall-clock instant (hi-res ms counter) at which the last complete
@@ -408,6 +417,7 @@ private:
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
     std::atomic<bool> isRunningFlag { false };
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
 
     // Quarter-frame accumulator -- MIDI-callback-thread-only
     int mtcData[8] = {};

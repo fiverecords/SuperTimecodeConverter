@@ -191,8 +191,7 @@ public:
                 {
                     int note = juce::jlimit(0, 127, cue.midiNoteNum);
                     int vel  = juce::jlimit(0, 127, cue.midiNoteVel);
-                    midi->sendMessageNow(juce::MidiMessage::noteOn(ch, note, (uint8_t)vel));
-                    midi->sendMessageNow(juce::MidiMessage::noteOff(ch, note));
+                    sendTriggerNote(midi, ch, note, vel);
                 }
                 if (cue.midiCCNum >= 0)
                 {
@@ -371,14 +370,12 @@ private:
 
         int ch = juce::jlimit(0, 15, entry.midiChannel) + 1;  // 1-based for JUCE
 
-        // Note On: fire-and-forget trigger (Note On + immediate Note Off).
-        // Zero-duration notes are standard for lighting/show control triggers.
+        // Note On, Note Off after a short hold (see sendTriggerNote).
         if (entry.midiNoteNum >= 0)
         {
             int note = juce::jlimit(0, 127, entry.midiNoteNum);
             int vel  = juce::jlimit(0, 127, entry.midiNoteVel);
-            midi->sendMessageNow(juce::MidiMessage::noteOn(ch, note, (uint8_t)vel));
-            midi->sendMessageNow(juce::MidiMessage::noteOff(ch, note));
+            sendTriggerNote(midi, ch, note, vel);
         }
 
         // Control Change
@@ -425,6 +422,29 @@ private:
         return sharedMidiOut ? sharedMidiOut : midiOutput.get();
     }
 
+    /// Trigger note: Note On now, Note Off after a short hold.  A zero-length
+    /// note (On immediately followed by Off) is fine for consoles that act on
+    /// the On, but a receiver that needs the note held -- a media server in
+    /// piano mode, a DAW -- gets nothing usable from it, and a "flash" key
+    /// mapped to a note gets a press it can see.  kTriggerNoteHoldMs is
+    /// well above any MIDI interface's latency and well below a musical
+    /// note.  Message thread only (triggers fire from tick()); the Off is
+    /// posted through a WeakReference so a trigger fired just before the
+    /// engine is destroyed does not reach a dead object.
+    static constexpr int kTriggerNoteHoldMs = 100;
+
+    void sendTriggerNote(juce::MidiOutput* midi, int channel1to16, int note, int velocity)
+    {
+        midi->sendMessageNow(juce::MidiMessage::noteOn(channel1to16, note, (uint8_t) velocity));
+        juce::WeakReference<TriggerOutput> weak(this);
+        juce::Timer::callAfterDelay(kTriggerNoteHoldMs, [weak, channel1to16, note]
+        {
+            if (auto* self = weak.get())
+                if (auto* out = self->getActiveMidi())
+                    out->sendMessageNow(juce::MidiMessage::noteOff(channel1to16, note));
+        });
+    }
+
     // OSC
     OscSender oscSender;
     juce::String oscIp = "127.0.0.1";
@@ -433,5 +453,6 @@ private:
 
     std::string lastFiredTrackKey;
 
+    JUCE_DECLARE_WEAK_REFERENCEABLE(TriggerOutput)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TriggerOutput)
 };

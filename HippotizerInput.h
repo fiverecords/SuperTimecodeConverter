@@ -257,6 +257,15 @@ public:
 
     //==============================================================================
     /// True if Hippotizer timecode packets are actively arriving
+    /// Freewheel (D10): how long after the last frame/packet the source still
+    /// counts as present.  The senders count on their own through it, so a
+    /// short dropout -- a USB stall, a display wake -- never reaches the
+    /// wire; the price is that a real stop takes this long to reach the
+    /// outputs.  The operator sets it (engine setting), default
+    /// kSourceTimeoutMs.
+    void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
+    double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
+
     bool isReceiving() const
     {
         double lpt = lastPacketTime.load(std::memory_order_relaxed);
@@ -266,7 +275,7 @@ public:
         double now = juce::Time::getMillisecondCounterHiRes();
         double elapsed = now - lpt;
 
-        return elapsed < kSourceTimeoutMs;
+        return elapsed < timeoutMs.load(std::memory_order_relaxed);
     }
 
     /// Raw milliseconds since midnight from the selected TC channel.
@@ -758,6 +767,7 @@ private:
     int zkUdpPort = 0;
     int selectedInterface = 0;
     std::atomic<bool> isRunningFlag { false };
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
     std::atomic<bool> bindFellBack { false };
 
     juce::Array<NetworkInterface> availableInterfaces;

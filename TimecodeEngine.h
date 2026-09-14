@@ -1899,7 +1899,7 @@ public:
                     if (trackMapDirty && trackMapPtr != nullptr)
                     {
                         trackMapDirty = false;
-                        trackMapPtr->save();
+                        trackMapPtr->saveAsync();   // C8: serialised and written off the tick
                     }
 
                     // Deferred duration pickup: NXS2 doesn't report duration in
@@ -2224,7 +2224,7 @@ public:
                     if (trackMapDirty && trackMapPtr != nullptr)
                     {
                         trackMapDirty = false;
-                        trackMapPtr->save();
+                        trackMapPtr->saveAsync();   // C8: serialised and written off the tick
                     }
 
                     // Deferred duration pickup: TrackLength may arrive after
@@ -2717,6 +2717,21 @@ public:
     }
 
     /// Set start timecode in ms from midnight.
+    /// Freewheel (D10): how long the signal inputs (MTC, LTC, Art-Net,
+    /// LA-Net, HippoNet) keep counting as present after the last frame or
+    /// packet.  Operator's choice per engine; the senders count on their own
+    /// through it, so a dropout shorter than this never reaches the wire.
+    void setInputFreewheelMs(int ms)
+    {
+        inputFreewheelMs = juce::jlimit(50, 5000, ms);
+        mtcInput.setTimeoutMs(inputFreewheelMs);
+        ltcInput.setTimeoutMs(inputFreewheelMs);
+        artnetInput.setTimeoutMs(inputFreewheelMs);
+        laNetTCInput.setTimeoutMs(inputFreewheelMs);
+        hippotizerInput.setTimeoutMs(inputFreewheelMs);
+    }
+    int getInputFreewheelMs() const { return inputFreewheelMs; }
+
     /// Name of the generator preset in use (empty when the fields were set
     /// by hand or no preset is selected).  Reported as the active track's
     /// title for the outputs that carry metadata.
@@ -3117,6 +3132,7 @@ private:
     double genStartMs   = 0.0;     // start TC in ms from midnight
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
+    int inputFreewheelMs = (int) kSourceTimeoutMs;   // D10
     juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log

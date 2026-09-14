@@ -400,6 +400,7 @@ private:
     juce::ComboBox cmbSampleRate;            juce::Label lblSampleRate;
     juce::ComboBox cmbBufferSize;            juce::Label lblBufferSize;
     juce::ComboBox cmbMidiInputDevice;       juce::Label lblMidiInputDevice;
+    juce::ComboBox cmbInputFreewheel;        juce::Label lblInputFreewheel;   // D10, signal inputs
     juce::ComboBox cmbArtnetInputInterface;  juce::Label lblArtnetInputInterface;
     juce::ComboBox cmbHippoInputInterface;  juce::Label lblHippoInputInterface;
     juce::ComboBox cmbHippoTcChannel;      juce::Label lblHippoTcChannel;

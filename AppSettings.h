@@ -549,7 +549,8 @@ public:
     //------------------------------------------------------------------
     // Persistence
     //------------------------------------------------------------------
-    void save() const
+    /// The file's JSON tree, built on the calling thread.
+    juce::var buildFileVar() const
     {
         auto* root = new juce::DynamicObject();
         root->setProperty("version", 2);  // v2 = artist|title keyed
@@ -559,10 +560,63 @@ public:
             arr.add(entry.toVar());
 
         root->setProperty("tracks", arr);
+        return juce::var(root);
+    }
 
-        juce::var jsonVar(root);
+    /// Synchronous save: serialise and write now.  Used for operator edits
+    /// (rare, and a few milliseconds are fine) and at shutdown.
+    void save() const
+    {
         if (! persistsToFile) return;   // an override set is persisted by its engine's settings block
-        SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(jsonVar));
+        SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(buildFileVar()));
+    }
+
+    /// Asynchronous save for the engine's auto-fill (C8): the tree is built
+    /// here, on the message thread, and serialised and written on a
+    /// background thread, so the 60 Hz tick -- which also dispatches cues
+    /// and triggers -- is not held for a JSON write of the whole map.  One
+    /// write in flight at a time; a request that arrives meanwhile is
+    /// honoured with a fresh snapshot once the write has finished.  The
+    /// completion is posted back to the message thread through an alive
+    /// token, so a map destroyed in between is simply not touched.
+    void saveAsync()
+    {
+        if (! persistsToFile) return;
+        if (saveInFlight) { saveAgain = true; return; }
+        if (! aliveToken) aliveToken = std::make_shared<std::atomic<bool>>(true);
+
+        saveInFlight = true;
+        const juce::var snapshot = buildFileVar();
+        const juce::File file = getTrackMapFile();
+        auto token = aliveToken;
+        TrackMap* self = this;
+
+        juce::Thread::launch([snapshot, file, token, self]
+        {
+            SafeJsonFile::save(file, juce::JSON::toString(snapshot));
+            juce::MessageManager::callAsync([token, self]
+            {
+                if (! token->load()) return;
+                self->saveInFlight = false;
+                if (self->saveAgain) { self->saveAgain = false; self->saveAsync(); }
+            });
+        });
+    }
+
+    ~TrackMap()
+    {
+        if (aliveToken) aliveToken->store(false);
+    }
+
+    TrackMap() = default;
+    // Copies (the per-engine override layer copies its map into the settings
+    // block) share the entries but not the async-save state or the token.
+    TrackMap(const TrackMap& other)
+        : persistsToFile(other.persistsToFile), entries(other.entries), generation(other.generation) {}
+    TrackMap& operator=(const TrackMap& other)
+    {
+        if (this != &other) { entries = other.entries; generation = other.generation; persistsToFile = other.persistsToFile; }
+        return *this;
     }
 
     /// False for a map that lives somewhere other than trackmap.json (the
@@ -570,6 +624,11 @@ public:
     /// save() then does nothing, so no code path can write an override set
     /// over the global file.
     bool persistsToFile = true;
+
+    // saveAsync state (message thread only)
+    bool saveInFlight = false;
+    bool saveAgain    = false;
+    std::shared_ptr<std::atomic<bool>> aliveToken;
 
     /// Entries as a JSON array (the "tracks" value of the file format), for
     /// storing a map somewhere other than trackmap.json -- the per-engine
@@ -1380,6 +1439,7 @@ struct EngineSettings
     // LTC user-bits source: 0 = manual value, 1 = passthrough from LTC in,
     // 2 = system date (BCD YYYYMMDD).
     int ltcUserBitsMode = 0;
+    int inputFreewheelMs = 150;   // D10: signal inputs stay "present" this long after the last frame
     bool ltcUserBitsReversed = false;   // MANUAL mode: reverse digit order for the reader
     // 4-character label for the NAME user-bits mode ("" = STC<engine>).
     juce::String ltcUserBitsName;
@@ -1491,6 +1551,8 @@ struct EngineSettings
             obj->setProperty("ltcUserBitsHex", ltcUserBitsHex);
         if (ltcUserBitsMode != 0)
             obj->setProperty("ltcUserBitsMode", ltcUserBitsMode);
+        if (inputFreewheelMs != 150)
+            obj->setProperty("inputFreewheelMs", inputFreewheelMs);
         if (ltcUserBitsReversed)
             obj->setProperty("ltcUserBitsReversed", true);
         if (ltcUserBitsName.isNotEmpty())
@@ -1635,6 +1697,7 @@ struct EngineSettings
         ltcOutputOffset    = clampOffset(getInt("ltcOutputOffset", 0));
         ltcUserBitsHex     = getString("ltcUserBitsHex");
         ltcUserBitsMode    = juce::jlimit(0, 4, getInt("ltcUserBitsMode", 0));
+        inputFreewheelMs   = juce::jlimit(50, 5000, getInt("inputFreewheelMs", 150));
         ltcUserBitsReversed = getBool("ltcUserBitsReversed", false);
         ltcUserBitsName    = getString("ltcUserBitsName");
         tcnetOutputOffsetMs = juce::jlimit(-1000, 1000, getInt("tcnetOutputOffsetMs", 0));

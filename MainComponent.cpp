@@ -454,6 +454,25 @@ MainComponent::MainComponent()
     };
 
     addLabelAndCombo(lblMidiInputDevice, cmbMidiInputDevice, "MIDI INPUT DEVICE:");
+
+    // D10: how long the signal inputs keep counting as present after the
+    // last frame or packet.  The operator's trade-off: a longer window
+    // rides through USB stalls and display wakes without the outputs
+    // noticing; a real stop reaches them that much later.
+    addLabelAndCombo(lblInputFreewheel, cmbInputFreewheel, "FREEWHEEL:");
+    cmbInputFreewheel.addItem("150 ms (default)", 150);
+    cmbInputFreewheel.addItem("250 ms", 250);
+    cmbInputFreewheel.addItem("500 ms", 500);
+    cmbInputFreewheel.addItem("1 s", 1000);
+    cmbInputFreewheel.addItem("2 s", 2000);
+    cmbInputFreewheel.setSelectedId(150, juce::dontSendNotification);
+    cmbInputFreewheel.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        currentEngine().setInputFreewheelMs(cmbInputFreewheel.getSelectedId());
+        saveSettings();
+    };
     cmbMidiInputDevice.onChange = [this]
     {
         if (syncing) return;
@@ -2570,6 +2589,7 @@ void MainComponent::syncUIFromEngine()
     sldLtcOutputGain.setValue(eng.getLtcOutput().getOutputGain() * 100.0f, juce::dontSendNotification);
     btnLtcHoldOnPause.setToggleState(eng.getLtcOutput().getHoldOnPause(), juce::dontSendNotification);
     btnLtcUserBitsReverse.setToggleState(eng.isLtcUserBitsReversed(), juce::dontSendNotification);
+    cmbInputFreewheel.setSelectedId(eng.getInputFreewheelMs(), juce::dontSendNotification);
     if (eng.getAudioThru())
         sldThruOutputGain.setValue(eng.getAudioThru()->getOutputGain() * 100.0f, juce::dontSendNotification);
 
@@ -4659,6 +4679,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setLANetTCOutputOffset(es.laNetTCOutputOffset);
         eng.setLtcOutputOffset(es.ltcOutputOffset);
         eng.setLtcUserBitsMode(es.ltcUserBitsMode);
+        eng.setInputFreewheelMs(es.inputFreewheelMs);
         eng.setLtcUserBitsReversed(es.ltcUserBitsReversed);
         eng.setLtcUserBitsName(es.ltcUserBitsName);
         eng.setLtcUserBitsHex(es.ltcUserBitsHex);
@@ -5061,6 +5082,7 @@ void MainComponent::flushSettings()
         es.ltcOutputOffset = eng.getLtcOutputOffset();
         es.ltcUserBitsHex = eng.getLtcUserBitsHex();
         es.ltcUserBitsMode = eng.getLtcUserBitsMode();
+        es.inputFreewheelMs = eng.getInputFreewheelMs();
         es.ltcUserBitsReversed = eng.isLtcUserBitsReversed();
         es.ltcUserBitsName = eng.getLtcUserBitsName();
         es.tcnetOutputOffsetMs = eng.getTcnetOutputOffsetMs();
@@ -5594,6 +5616,10 @@ void MainComponent::updateDeviceSelectorVisibility()
     updateCollapseButtonText(btnCollapseInput, inputConfigExpanded);
 
     cmbMidiInputDevice.setVisible(showMidiIn);       lblMidiInputDevice.setVisible(showMidiIn);
+    {
+        const bool showFreewheel = (showMidiIn || showArtnetIn || showLANetTCIn || showHippoIn || showLtcIn);
+        cmbInputFreewheel.setVisible(showFreewheel); lblInputFreewheel.setVisible(showFreewheel);
+    }
     cmbArtnetInputInterface.setVisible(showArtnetIn); lblArtnetInputInterface.setVisible(showArtnetIn);
     cmbLANetTCInputInterface.setVisible(showLANetTCIn); lblLANetTCInputInterface.setVisible(showLANetTCIn);
     cmbHippoInputInterface.setVisible(showHippoIn);   lblHippoInputInterface.setVisible(showHippoIn);
@@ -6984,6 +7010,7 @@ void MainComponent::resized()
         leftPanel.removeFromTop(3);
     }
     if (cmbLANetTCInputInterface.isVisible()) layCombo(lblLANetTCInputInterface, cmbLANetTCInputInterface, leftPanel);
+    if (cmbInputFreewheel.isVisible()) layCombo(lblInputFreewheel, cmbInputFreewheel, leftPanel);
 
     // Generator clock toggle + transport + start/stop TC
     if (btnGenClock.isVisible())
