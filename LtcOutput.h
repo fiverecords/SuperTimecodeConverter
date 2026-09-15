@@ -299,6 +299,22 @@ private:
     static constexpr double kLockMaxAdj      = 200e-6;   // +/- fraction of the bit clock
     static constexpr double kLockReseedMs    = 4.0;      // filtered error beyond this: re-seed
 
+    // How long the encoder keeps carrying the source's value forward on its
+    // own when the engine's publication stops arriving (D26).  The engine
+    // ticks at 60 Hz, so a publication older than this by any margin means its
+    // thread is not running -- a display wake on Windows costs a quarter of a
+    // second of it.  A deliberate freeze never gets here: the engine marks the
+    // output paused and republishes every tick, which is the branch above.
+    //
+    // The limit is not precision.  Extrapolating on the interface's clock, a
+    // clock difference of 50 ppm is 50 microseconds of error in a second.  It
+    // is how long the encoder may keep assuming the source is still moving
+    // when nothing has confirmed it.  Past it the value holds, the tracking
+    // repeats frames, and a stalled timecode on the wire is the visible sign
+    // that the application is not running -- which is the failure worth
+    // seeing.
+    static constexpr double kPublicationGraceMs = 1000.0;
+
     /// Called at a frame boundary that is not a seed.  `boundaryConnectorMs`
     /// is the instant this boundary reaches the connector.
     void lockStep(double boundaryConnectorMs)
@@ -683,14 +699,17 @@ private:
                         elapsed -= whole * frameMs;
                         if (elapsed < 0.0) { elapsed += frameMs; whole -= 1.0; }
                         // A stale or absurd publication must not be able to
-                        // throw the value forward: the source can only be
-                        // ahead by what this buffer and the output latency
-                        // hold, plus a margin for the engine's tick.  The
-                        // fixed ceiling of 8 frames this replaces was itself
-                        // short of an 8192-sample buffer at 30 fps.
+                        // throw the value forward without limit.  What the
+                        // source can legitimately have moved is what this
+                        // buffer and the output latency hold -- plus, while
+                        // the engine's publication is not arriving at all,
+                        // whatever grace D26 allows for carrying it forward.
+                        // The fixed ceiling of 8 frames this replaces was
+                        // itself short of an 8192-sample buffer at 30 fps.
                         const double maxAhead =
                             std::floor((((double) numSamples * 1000.0 / currentSampleRate)
-                                        + latencyCompMs.load(std::memory_order_relaxed)) / frameMs) + 2.0;
+                                        + latencyCompMs.load(std::memory_order_relaxed)
+                                        + kPublicationGraceMs) / frameMs) + 2.0;
                         // The seed positions the bit pointer at the leading
                         // edge, so it wants floor().  The tracking wants a
                         // reference the shared policy can read with the band
