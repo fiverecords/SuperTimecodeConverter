@@ -356,7 +356,11 @@ private:
     /// the first frame after a (re)seed: the number of whole frames the
     /// timecode clock has moved since the value in pendingTc was published
     /// (see the phase alignment in the audio callback).
-    void packFrame(int seedAdvanceFrames = 0)
+    /// publishedAheadFrames is that same count for THIS frame, seed or not:
+    /// the frame being packed is the one that reaches the connector that many
+    /// source frames after the publication, and the tracking below has to age
+    /// the published value by it (issue #21).
+    void packFrame(int seedAdvanceFrames = 0, int publishedAheadFrames = 0)
     {
         FrameRate fps = pendingFps.load(std::memory_order_relaxed);
         Timecode pendingTc = unpackTimecode(packedPendingTc.load(std::memory_order_relaxed));
@@ -386,8 +390,21 @@ private:
             // absorb shows up.  A snap means the source jumped: the phase
             // has to follow the value, so the boundary is re-seeded too
             // (see valueSnapped in the callback).
+            // Compare like with like.  pendingTc is the source's value at
+            // the instant the engine published it; this frame carries the
+            // value for the instant it reaches the connector,
+            // publishedAheadFrames source frames later.  Comparing the two
+            // directly made every frame after the first one in a buffer look
+            // like the sender running ahead: with a buffer longer than a
+            // frame the policy repeated a frame at the end of each buffer and
+            // skipped one at the start of the next, which is issue #21.  The
+            // count is taken where the shared policy expects its reference to
+            // sit (see the audio callback); the policy itself is untouched,
+            // and so are the senders that do not age anything.
+            const Timecode publishedAtConnector =
+                offsetTimecode(pendingTc, publishedAheadFrames, fps);
             const Timecode next = incrementFrame(encoderTc, fps);
-            encoderTc = trackPublishedValue(next, pendingTc, 1, fps);
+            encoderTc = trackPublishedValue(next, publishedAtConnector, 1, fps);
             const int64_t moved = frameDistance(encoderTc, next, fps);
             valueSnapped = (moved > 1 || moved < -1);
         }
@@ -630,13 +647,81 @@ private:
                 // at the instant of seeding.
                 int    seedAdvance = 0;
                 double seedHalfCellsIn = -1.0;
+
+                // The instant this frame reaches the connector: this
+                // callback, plus where this sample sits in the buffer, plus
+                // the output latency.  The lock, the seed and the value the
+                // source will be showing are all measured against it, because
+                // that is when this frame is heard -- not now.
+                const double connectorMs = callbackStartMs
+                                         + (double) i * 1000.0 / currentSampleRate
+                                         + latencyCompMs.load(std::memory_order_relaxed);
+
+                // Whole source frames from the publication of pendingTc to
+                // that instant, and where inside its frame the source will be
+                // then.  The seed uses both; the tracking in packFrame uses
+                // the count (issue #21).
+                const double frameMs = 1000.0 / frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
+                int    aheadFrames      = 0;   // to the leading edge: the seed
+                int    aheadValueFrames = 0;   // to mid-frame: the value tracking
+                double aheadRemainderMs = 0.0;
+                bool   haveAhead        = false;
+                {
+                    double pitchNow = pitchMultiplier.load(std::memory_order_relaxed);
+                    if (pitchNow <= 0.0) pitchNow = 1.0;
+                    if (frameMs > 0.0 && haveFramePhase.load(std::memory_order_acquire))
+                    {
+                        // Phase at publication, aged to the connector at the
+                        // source's speed, so the position lands right under
+                        // pitch too.
+                        double elapsed = framePhaseMs.load(std::memory_order_relaxed)
+                                       + (connectorMs - framePhaseAtMs.load(std::memory_order_relaxed)) * pitchNow;
+                        const double elapsedRaw = elapsed;
+                        // Whole frames carry into the value; the remainder
+                        // positions the bit pointer.  Both negative-safe.
+                        double whole = std::floor(elapsed / frameMs);
+                        elapsed -= whole * frameMs;
+                        if (elapsed < 0.0) { elapsed += frameMs; whole -= 1.0; }
+                        // A stale or absurd publication must not be able to
+                        // throw the value forward: the source can only be
+                        // ahead by what this buffer and the output latency
+                        // hold, plus a margin for the engine's tick.  The
+                        // fixed ceiling of 8 frames this replaces was itself
+                        // short of an 8192-sample buffer at 30 fps.
+                        const double maxAhead =
+                            std::floor((((double) numSamples * 1000.0 / currentSampleRate)
+                                        + latencyCompMs.load(std::memory_order_relaxed)) / frameMs) + 2.0;
+                        // The seed positions the bit pointer at the leading
+                        // edge, so it wants floor().  The tracking wants a
+                        // reference the shared policy can read with the band
+                        // it already has: "aligned" there is 0 or -1, because
+                        // every other sender compares a value published up to
+                        // a tick ago against the frame it is emitting -- half
+                        // a frame of lag, by construction.  Aging to the
+                        // leading edge would hand it a reference centred on
+                        // zero instead, and the first frame of drift would
+                        // read as being behind.  Taking the count half a frame
+                        // further back puts it back on that centre AND moves
+                        // its own rounding boundary to the middle of the frame
+                        // being emitted, which is the point furthest from this
+                        // boundary: once the lock has put the source's
+                        // boundary on top of ours, a count taken at the edge
+                        // flickers between k-1 and k on nothing but rounding,
+                        // and each flicker costs a skipped or repeated frame.
+                        aheadFrames      = (int) juce::jlimit(0.0, maxAhead, whole);
+                        aheadValueFrames = (int) juce::jlimit(0.0, maxAhead,
+                                                              std::floor(elapsedRaw / frameMs - 0.5));
+                        aheadRemainderMs = elapsed;
+                        haveAhead        = true;
+                    }
+                }
+
                 if (! seeding && samplesPerHalfBit > 0.0)
                 {
                     // Phase lock step at this boundary (D9): where is the
                     // source's boundary relative to the one we are about to
                     // put on the wire?  Recomputes the bit clock if it trims.
-                    lockStep(callbackStartMs + (double) i * 1000.0 / currentSampleRate
-                             + latencyCompMs.load(std::memory_order_relaxed));
+                    lockStep(connectorMs);
                     updateSamplesPerBit();
                     if (! encoderSeeded.load(std::memory_order_relaxed))
                     {
@@ -646,39 +731,14 @@ private:
                     }
                 }
                 const bool seedNow = ! encoderSeeded.load(std::memory_order_relaxed);
-                if (seedNow && haveFramePhase.load(std::memory_order_acquire)
-                    && samplesPerHalfBit > 0.0)
+                if (seedNow && haveAhead && samplesPerHalfBit > 0.0)
                 {
                     lockErrFilt = 0.0;   // fresh alignment; the integral (clock difference) stays
-                    // One source frame, in source (position) time.  The wall
-                    // time since the publication advances the phase at the
-                    // source's speed (pitch), so the position lands right
-                    // under pitch too.
-                    const double frameMs = 1000.0 / frameRateToDouble(pendingFps.load(std::memory_order_relaxed));
-                    double pitchNow = pitchMultiplier.load(std::memory_order_relaxed);
-                    if (pitchNow <= 0.0) pitchNow = 1.0;
-                    if (frameMs > 0.0)
-                    {
-                        // Phase at publication, plus however long ago that
-                        // was, plus where this sample sits in the buffer,
-                        // plus the output latency so the alignment holds at
-                        // the connector rather than in the buffer.
-                        double elapsed = framePhaseMs.load(std::memory_order_relaxed)
-                                       + ((callbackStartMs
-                                           - framePhaseAtMs.load(std::memory_order_relaxed))
-                                          + (double) i * 1000.0 / currentSampleRate
-                                          + latencyCompMs.load(std::memory_order_relaxed)) * pitchNow;
-                        // Whole frames carry into the value; the remainder
-                        // positions the bit pointer.  Both negative-safe.
-                        double whole = std::floor(elapsed / frameMs);
-                        elapsed -= whole * frameMs;
-                        if (elapsed < 0.0) { elapsed += frameMs; whole -= 1.0; }
-                        seedAdvance = (int) juce::jlimit(0.0, 8.0, whole);
-                        seedHalfCellsIn = (elapsed / frameMs) * (double)(LTC_FRAME_BITS * 2);
-                    }
+                    seedAdvance     = aheadFrames;
+                    seedHalfCellsIn = (aheadRemainderMs / frameMs) * (double)(LTC_FRAME_BITS * 2);
                 }
 
-                packFrame(seedAdvance);
+                packFrame(seedAdvance, aheadValueFrames);
                 if (valueSnapped)
                 {
                     // The value just jumped to follow a source seek nobody

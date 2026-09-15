@@ -4699,13 +4699,27 @@ private:
     bool   framePhaseValid = false;
 
     /// Publish the phase from a continuous playhead position in ms.
+    ///
+    /// The phase and the value handed to the encoder have to come out of the
+    /// same quantisation of the same playhead.  A plain fmod does not: at a
+    /// position sitting on a frame boundary the value rounds up through the
+    /// epsilon that TimecodeCore uses against exactly this truncation, while
+    /// the fmod returns a hair under a whole frame -- the pair then says
+    /// "frame N, and almost a frame into it", which is frame N+1.  The
+    /// encoder reads it as one frame of catching up to do and skips a frame
+    /// on the wire.  Taking the remainder off the same epsilon-corrected
+    /// frame index leaves the phase at zero on the boundary, where it
+    /// belongs.
     void setFramePhaseFromPosition(double positionMs, FrameRate fps)
     {
         const double f = frameRateToDouble(fps);
         if (f <= 0.0) return;
         const double frameMs = 1000.0 / f;
-        double p = std::fmod(positionMs, frameMs);
-        if (p < 0.0) p += frameMs;
+        const double frames  = positionMs / frameMs;
+        const double idx     = std::floor(frames + 1e-9);
+        double p = (frames - idx) * frameMs;
+        if (p < 0.0) p = 0.0;
+        if (p >= frameMs) p = 0.0;
         framePhaseMs = p;
         framePhaseValid = true;
     }
