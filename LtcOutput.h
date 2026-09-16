@@ -185,6 +185,7 @@ private:
     double lockAdj = 0.0;         // fraction of the bit clock, +/- kLockMaxAdj
     double lockIntegral = 0.0;
     double lockErrFilt = 0.0;
+    bool   lockSlewing = false;   // absorbing a step the PI cannot reach (D27)
     std::atomic<double> lastLockErrorMs { 0.0 };
 
     // Output gap detector (#19): audio thread state and counters for the UI.
@@ -247,7 +248,7 @@ private:
     void resetEncoder()
     {
         lastCallbackMs = 0.0;
-        lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0;
+        lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0; lockSlewing = false;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -289,15 +290,29 @@ private:
     // clocks differs).  Drift is absorbed by the integral, jitter in the
     // publication (MTC arrivals, deck packets) is filtered by the loop's
     // ~10 s time constant, and a persistent error of more than
-    // kLockReseedMs -- a hole the interface made without delaying the
-    // callback, which the cadence detector cannot see -- triggers a re-seed
-    // instead of a 50-second crawl.  Everything here runs on the audio
-    // thread, once per frame.
+    // kLockSlewEnterMs -- a hole the interface made without delaying the
+    // callback, which the cadence detector cannot see -- is absorbed by
+    // running the bit clock fast or slow until it is gone (D27), rather than
+    // by a 50-second crawl at 200 ppm or by jumping.  Everything here runs on
+    // the audio thread, once per frame.
     //==========================================================================
     static constexpr double kLockKp          = 0.1;      // per second
     static constexpr double kLockKi          = 0.0025;   // per second squared (critically damped)
     static constexpr double kLockMaxAdj      = 200e-6;   // +/- fraction of the bit clock
-    static constexpr double kLockReseedMs    = 4.0;      // filtered error beyond this: re-seed
+
+    // Slew, not jump (D27).  A phase error this loop cannot absorb at 200 ppm
+    // used to re-seed, and a seed starts the codeword part-way through by
+    // design (issue #15), so it costs one frame no decoder can read -- which
+    // is what @mungewell's captures show as a short unreadable stretch with
+    // the buffer counter running straight through it.  Nothing about a phase
+    // error requires breaking the frame: running the bit clock fast or slow
+    // moves the boundary just as well and every frame stays whole.  A source
+    // that genuinely jumped still re-seeds, through the value snapping, which
+    // is a different path.
+    static constexpr double kLockSlewEnterMs = 4.0;        // filtered error beyond this: slew
+    static constexpr double kLockSlewExitMs  = 0.5;        // back under this: hand it to the PI
+    static constexpr double kLockSlewMaxAdj  = 20000e-6;   // 2 %, varispeed territory for any reader
+    static constexpr double kLockSlewMs      = 1000.0;     // clear the error in about a second
 
     // How long the encoder keeps carrying the source's value forward on its
     // own when the engine's publication stops arriving (D26).  The engine
@@ -339,20 +354,28 @@ private:
         // passed p ms ago), in wall time.
         const double eMs = ((p > frameMs * 0.5) ? p - frameMs : p) / pitch;
 
-        // Watchdog on the filtered error: the source's timeline moved under
-        // us without the engine announcing a seek (a clock-mode re-anchor,
-        // an MTC locate the decoder absorbed, a publication hiccup).  A slow
-        // crawl at 200 ppm is the wrong answer to a step; re-seed at the
-        // published phase, which is the truth for a source jump.  (A
-        // DAC-side hole is NOT what this sees: that moves the actual
-        // boundary without touching the encoder's timeline, and nothing
-        // inside STC can measure it -- see D24.)
+        // The source's timeline moved under us without the engine announcing
+        // a seek (a clock-mode re-anchor, an MTC locate the decoder absorbed,
+        // a publication hiccup).  A slow crawl at 200 ppm is the wrong answer
+        // to a step, but so is a jump: absorb it by running the bit clock at
+        // whatever rate clears it in about a second, and every frame on the
+        // wire stays whole while it happens.  (A DAC-side hole is NOT what
+        // this sees: that moves the actual boundary without touching the
+        // encoder's timeline, and nothing inside STC can measure it -- D24.)
         lockErrFilt += 0.1 * (eMs - lockErrFilt);
-        if (std::abs(lockErrFilt) > kLockReseedMs)
+
+        const double absErr = std::abs(lockErrFilt);
+        if (absErr > kLockSlewEnterMs)      lockSlewing = true;
+        else if (absErr < kLockSlewExitMs)  lockSlewing = false;
+
+        if (lockSlewing)
         {
-            lockErrFilt = 0.0;
-            needNewFrame.store(true, std::memory_order_relaxed);
-            encoderSeeded.store(false, std::memory_order_relaxed);
+            const double rate = juce::jlimit(kLockMaxAdj, kLockSlewMaxAdj, absErr / kLockSlewMs);
+            lockAdj = (lockErrFilt > 0.0) ? rate : -rate;   // positive = late = shorter bits
+            // The integral holds its standing value: it carries the clock
+            // difference between this interface and the source, which the
+            // step did not change.
+            lastLockErrorMs.store(eMs, std::memory_order_relaxed);
             return;
         }
 
