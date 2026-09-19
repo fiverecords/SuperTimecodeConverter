@@ -128,14 +128,31 @@ public:
 
     Timecode getCurrentTimecode() const
     {
+        double phaseIgnored = 0.0;
+        return getCurrentTimecode(juce::Time::getMillisecondCounterHiRes(), phaseIgnored);
+    }
+
+    /// The live value at `nowMs`, and how far into that frame the source is
+    /// (`phaseMsOut`, 0 .. one frame).  Both come from ONE elapsed against ONE
+    /// sync point, read under one lock -- that is the whole point of this
+    /// overload (D29, issue #22).
+    ///
+    /// The sync point is dated a quarter frame into the future on purpose
+    /// (piece 7 arrives at N + 1.75 frames; the value N + 2 begins a quarter
+    /// frame later), so for the first 10 ms after every sequence `elapsed` is
+    /// NEGATIVE.  The old code returned the sync value outright for a negative
+    /// elapsed, while the engine took the phase with an fmod and wrapped the
+    /// negative remainder up by a frame: value N + 2, phase 30 ms, when the
+    /// truth was N + 1 at 30 ms.  A pair one frame high for a quarter frame
+    /// out of every two, sampled by a 60 Hz tick more often than not, and the
+    /// LTC encoder's tracking let one through now and then as a skipped frame
+    /// with a repeat to come back.  floor() on the same number gives N + 1 at
+    /// 30 ms, which is where the stream is.
+    Timecode getCurrentTimecode(double nowMs, double& phaseMsOut) const
+    {
+        phaseMsOut = 0.0;
         if (!synced.load(std::memory_order_acquire))
             return Timecode();
-
-        if (!isReceiving())
-        {
-            const juce::SpinLock::ScopedLockType lock(tcLock);
-            return lastSyncTimecode; // Frozen
-        }
 
         Timecode syncTc;
         double syncMs;
@@ -147,19 +164,20 @@ public:
             fps = detectedFps;
         }
 
-        double now = juce::Time::getMillisecondCounterHiRes();
-        double elapsed = now - syncMs;
-
-        if (elapsed < 0.0)
-            return syncTc;
+        if (!isReceiving())
+            return syncTc;   // frozen: the last value, no phase to speak of
 
         const double msPerFrame = 1000.0 / frameRateToDouble(fps);
+        const double elapsed = nowMs - syncMs;
 
         // Interpolate from the last sync point on the drop-frame-aware frame
         // index, so landing across a 59;29 -> 00;02 crossing yields the next
-        // valid address instead of a patched one.
-        const int64_t extraFrames = (int64_t)(elapsed / msPerFrame);
-        return frameIndexToTimecode(timecodeToFrameIndex(syncTc, fps) + extraFrames, fps);
+        // valid address instead of a patched one.  floor(), not truncation:
+        // a negative elapsed is the frame BEFORE the sync value, part-way
+        // through, and the remainder must say so.
+        const double whole = std::floor(elapsed / msPerFrame);
+        phaseMsOut = elapsed - whole * msPerFrame;
+        return frameIndexToTimecode(timecodeToFrameIndex(syncTc, fps) + (int64_t) whole, fps);
     }
 
     FrameRate getDetectedFrameRate() const

@@ -1532,8 +1532,18 @@ public:
             case InputSource::MTC:
                 if (mtcInput.getIsRunning())
                 {
-                    currentTimecode = mtcInput.getCurrentTimecode();
-                    setFramePhaseFromArrival(mtcInput.getLastFrameArrivalMs(), currentFps);
+                    // Value and phase from one clock reading and one sync
+                    // point (D29): two separate getters took two clock
+                    // readings against a sync instant that is dated a
+                    // quarter frame ahead, and disagreed by a frame for the
+                    // first 10 ms after every sequence.
+                    {
+                        double phase = 0.0;
+                        currentTimecode = mtcInput.getCurrentTimecode(
+                            juce::Time::getMillisecondCounterHiRes(), phase);
+                        framePhaseMs = phase;
+                        framePhaseValid = true;
+                    }
                     bool rx = mtcInput.isReceiving();
                     if (rx)
                     {
