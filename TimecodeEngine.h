@@ -277,19 +277,50 @@ public:
     /// while no gaps occur.
     void logLtcOutputGaps()
     {
-        const int gaps = ltcOutput.getOutputGapCount();
-        if (gaps == lastLoggedGapCount) return;
-        lastLoggedGapCount = gaps;
+        const auto stamp = [] {
+            const auto now = juce::Time::getCurrentTime();
+            return now.formatted("%Y-%m-%d %H:%M:%S") + "." + juce::String(now.getMilliseconds()).paddedLeft('0', 3);
+        };
 
-        const auto now = juce::Time::getCurrentTime();
-        juce::String line = now.formatted("%Y-%m-%d %H:%M:%S") + "." + juce::String(now.getMilliseconds()).paddedLeft('0', 3)
-                          + "  " + engineName
-                          + "  " + ltcOutput.getCurrentDeviceName()
-                          + "  gap " + juce::String(ltcOutput.getLastGapMs(), 1) + " ms"
-                          + "  period " + juce::String(ltcOutput.getActualBufferSize() * 1000.0
-                                                       / juce::jmax(1.0, ltcOutput.getActualSampleRate()), 1) + " ms"
-                          + "  total " + juce::String(gaps) + "\n";
-        AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+        const int gaps = ltcOutput.getOutputGapCount();
+        if (gaps != lastLoggedGapCount)
+        {
+            lastLoggedGapCount = gaps;
+            juce::String line = stamp()
+                              + "  " + engineName
+                              + "  " + ltcOutput.getCurrentDeviceName()
+                              + "  gap " + juce::String(ltcOutput.getLastGapMs(), 1) + " ms"
+                              + "  period " + juce::String(ltcOutput.getActualBufferSize() * 1000.0
+                                                           / juce::jmax(1.0, ltcOutput.getActualSampleRate()), 1) + " ms"
+                              + (ltcOutput.getLastGapReseeded() ? "  hole, re-seeded" : "  late, absorbed")
+                              + "  total " + juce::String(gaps) + "\n";
+            AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+        }
+
+        // Value corrections and re-seeds (D30), same file, so a capture of a
+        // skipped or repeated frame can be lined up with STC's own view.
+        const int events = ltcOutput.getTrackEventCount();
+        if (events != lastLoggedTrackCount)
+        {
+            lastLoggedTrackCount = events;
+            const char* what = "?";
+            switch (ltcOutput.getLastTrackKind())
+            {
+                case 1: what = "ahead: repeated a frame"; break;
+                case 2: what = "behind: skipped a frame"; break;
+                case 3: what = "seek: snapped"; break;
+                case 4: what = "re-seed after hole"; break;
+                case 5: what = "re-seed after snap"; break;
+            }
+            juce::String line = stamp()
+                              + "  " + engineName
+                              + "  track " + what
+                              + "  d " + juce::String((int) ltcOutput.getLastTrackD())
+                              + "  next " + ltcOutput.getLastTrackNext().toString()
+                              + "  ref " + ltcOutput.getLastTrackRef().toString()
+                              + "  total " + juce::String(events) + "\n";
+            AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+        }
     }
 
     /// Playback speed of the source as a ratio (1.0 = nominal), for
@@ -3148,6 +3179,7 @@ private:
     double genLastTickTime = 0.0;
     bool   cueCursorInclusive = false;  // next crossing check includes a cue exactly at lastCueCheckMs
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
+    int    lastLoggedTrackCount = 0;    // LTC value corrections already written there (D30)
     double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
     double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)

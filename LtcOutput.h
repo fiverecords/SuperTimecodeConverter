@@ -115,6 +115,20 @@ public:
     /// line: an interface that keeps doing this is worth knowing about.
     int    getOutputGapCount() const { return outputGapCount.load(std::memory_order_relaxed); }
     double getLastGapMs() const      { return lastGapMs.load(std::memory_order_relaxed); }
+    bool   getLastGapReseeded() const { return lastGapReseeded.load(std::memory_order_relaxed); }
+
+    /// Every value correction and re-seed the encoder makes, counted on the
+    /// audio thread so the engine can write each one to ltc_gaps.log next
+    /// to the holes (D30): a logic-analyser capture of a skipped or repeated
+    /// frame can then be lined up with what STC saw at that instant.
+    /// kind: 1 the encoder was ahead (a frame repeated), 2 behind (a frame
+    /// skipped), 3 a seek (snapped), 4 re-seeded after a hole, 5 re-seeded
+    /// after a snap.
+    int      getTrackEventCount() const { return trackEventCount.load(std::memory_order_relaxed); }
+    int      getLastTrackKind() const   { return lastTrackKind.load(std::memory_order_relaxed); }
+    int64_t  getLastTrackD() const      { return lastTrackD.load(std::memory_order_relaxed); }
+    Timecode getLastTrackNext() const   { return unpackTimecode(lastTrackNext.load(std::memory_order_relaxed)); }
+    Timecode getLastTrackRef() const    { return unpackTimecode(lastTrackRef.load(std::memory_order_relaxed)); }
 
     /// Output latency the device reports, in milliseconds (0 if unknown).
     /// Used by the AUTO compensation mode; ASIO drivers are not always
@@ -186,6 +200,8 @@ private:
     double lockIntegral = 0.0;
     double lockErrFilt = 0.0;
     bool   lockSlewing = false;   // absorbing a step the PI cannot reach (D27)
+    int     trackOffFrames = 0;   // boundaries in a row the reference has disagreed (D30)
+    int64_t trackOffD      = -1;  // the disagreement being counted
     std::atomic<double> lastLockErrorMs { 0.0 };
 
     // Output gap detector (#19): audio thread state and counters for the UI.
@@ -194,6 +210,21 @@ private:
     std::atomic<bool> bufferCounterUserBits { false };  // DEBUG user-bits mode
     std::atomic<int>    outputGapCount { 0 };
     std::atomic<double> lastGapMs      { 0.0 };
+    std::atomic<bool>   lastGapReseeded { false };
+    std::atomic<int>      trackEventCount { 0 };
+    std::atomic<int>      lastTrackKind   { 0 };
+    std::atomic<int64_t>  lastTrackD      { 0 };
+    std::atomic<uint64_t> lastTrackNext   { 0 };
+    std::atomic<uint64_t> lastTrackRef    { 0 };
+
+    void noteTrackEvent(int kind, int64_t d, const Timecode& next, const Timecode& ref)
+    {
+        lastTrackKind.store(kind, std::memory_order_relaxed);
+        lastTrackD.store(d, std::memory_order_relaxed);
+        lastTrackNext.store(packTimecode(next.hours, next.minutes, next.seconds, next.frames), std::memory_order_relaxed);
+        lastTrackRef.store(packTimecode(ref.hours, ref.minutes, ref.seconds, ref.frames), std::memory_order_relaxed);
+        trackEventCount.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::atomic<double> framePhaseMs   { 0.0 };
     std::atomic<double> framePhaseAtMs { 0.0 };
@@ -249,6 +280,7 @@ private:
     {
         lastCallbackMs = 0.0;
         lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0; lockSlewing = false;
+        trackOffFrames = 0; trackOffD = -1;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -309,6 +341,13 @@ private:
     // moves the boundary just as well and every frame stays whole.  A source
     // that genuinely jumped still re-seeds, through the value snapping, which
     // is a different path.
+    // Persistence gate on value corrections (D30): how many boundaries in a
+    // row the reference has to disagree with the encoder before the shared
+    // policy is consulted.  An engine tick is a fraction of a frame, so a
+    // reference that is wrong for one tick can never get here; a real offset
+    // is corrected within this many frames.
+    static constexpr int kTrackPersistFrames = 3;
+
     static constexpr double kLockSlewEnterMs = 4.0;        // filtered error beyond this: slew
     static constexpr double kLockSlewExitMs  = 0.5;        // back under this: hand it to the PI
     static constexpr double kLockSlewMaxAdj  = 20000e-6;   // 2 %, varispeed territory for any reader
@@ -443,7 +482,40 @@ private:
             const Timecode publishedAtConnector =
                 offsetTimecode(pendingTc, publishedAheadFrames, fps);
             const Timecode next = incrementFrame(encoderTc, fps);
-            encoderTc = trackPublishedValue(next, publishedAtConnector, 1, fps);
+            const int64_t d = frameDistance(publishedAtConnector, next, fps);   // reference - next
+
+            // Persistence gate (D30).  The reference is a fresh measurement at
+            // every boundary, and a wrong one for a single engine tick used
+            // to cost a frame on the wire: the shared policy corrects at
+            // once.  So it is only consulted when the same disagreement has
+            // stood for kTrackPersistFrames boundaries in a row.  A blip
+            // lasts one tick and never reaches that; a real offset is fixed
+            // within it.  A seek (past the hard-resync distance) still snaps
+            // at once -- waiting would be wrong for a real jump.
+            //
+            // And no dead band.  The reference sits half a frame back (see
+            // the callback), so the exact state is d == -1.  The policy
+            // treats 0 as aligned too, which for THIS reference means the
+            // wire running one frame behind the source indefinitely -- which
+            // is what a repeat left behind until something else happened to
+            // push it forward.  A persistent 0 is handed to the policy with
+            // the reference one frame up, so it reads as behind and skips.
+            const bool seek = (d > kTrackingHardResync || d < -kTrackingHardResync);
+            if (d == -1) { trackOffFrames = 0; trackOffD = -1; }
+            else if (d == trackOffD) ++trackOffFrames;
+            else { trackOffD = d; trackOffFrames = 1; }
+
+            if (seek || trackOffFrames >= kTrackPersistFrames)
+            {
+                const Timecode ref = (d == 0) ? incrementFrame(publishedAtConnector, fps)
+                                              : publishedAtConnector;
+                encoderTc = trackPublishedValue(next, ref, 1, fps);
+                trackOffFrames = 0; trackOffD = -1;
+                noteTrackEvent(seek ? 3 : (d > -1 ? 2 : 1), d, next, publishedAtConnector);
+            }
+            else
+                encoderTc = next;
+
             const int64_t moved = frameDistance(encoderTc, next, fps);
             valueSnapped = (moved > 1 || moved < -1);
         }
@@ -622,18 +694,33 @@ private:
             if (lastCallbackMs > 0.0 && expectedMs > 0.0)
             {
                 const double gapMs = (callbackStartMs - lastCallbackMs) - expectedMs;
-                // Three quarters of a period, but never under 4 ms: at 64 or
-                // 128 samples a period is 1-3 ms and ordinary scheduling
-                // jitter would read as holes; a hole that short is a few
-                // percent of a frame and not worth a re-seed anyway.
+                // Logged from three quarters of a period, never under 4 ms:
+                // at 64 or 128 samples a period is 1-3 ms and ordinary
+                // scheduling jitter would read as holes.
                 if (gapMs > juce::jmax(4.0, 0.75 * expectedMs))
                 {
                     outputGapCount.fetch_add(1, std::memory_order_relaxed);
                     lastGapMs.store(gapMs, std::memory_order_relaxed);
-                    if (haveFramePhase.load(std::memory_order_acquire))
+
+                    // Re-seeded only for a hole (D30).  A double-buffered
+                    // driver has one period of slack, so a callback less
+                    // than a period late did not starve the DAC: the
+                    // samples on the wire are still contiguous, and a
+                    // re-seed would be the only thing to break them -- it
+                    // starts the codeword part-way through.  And a hole
+                    // under half a frame is one the lock slews out with
+                    // every frame whole (D27); only a longer one is worth
+                    // an instant re-alignment.  At a MOTU's 512-sample
+                    // period the old three-quarter threshold was 8 ms,
+                    // which Windows scheduling reaches on its own.
+                    const double frameMsNow = 1000.0 / juce::jmax(1.0, frameRateToDouble(pendingFps.load(std::memory_order_relaxed)));
+                    const bool hole = gapMs > juce::jmax(expectedMs, 0.5 * frameMsNow);
+                    lastGapReseeded.store(hole, std::memory_order_relaxed);
+                    if (hole && haveFramePhase.load(std::memory_order_acquire))
                     {
                         needNewFrame.store(true, std::memory_order_relaxed);
                         encoderSeeded.store(false, std::memory_order_relaxed);
+                        noteTrackEvent(4, (int64_t) gapMs, encoderTc, encoderTc);
                     }
                 }
             }
@@ -751,7 +838,15 @@ private:
                         // flickers between k-1 and k on nothing but rounding,
                         // and each flicker costs a skipped or repeated frame.
                         aheadFrames      = (int) juce::jlimit(0.0, maxAhead, whole);
-                        aheadValueFrames = (int) juce::jlimit(0.0, maxAhead,
+                        // -1 is legitimate here and must not be clamped away:
+                        // with a small buffer and no latency the connector is
+                        // a fraction of a frame ahead of the publication, and
+                        // half a frame back from that is the frame BEFORE the
+                        // published one.  Clamped to 0 the reference sat a
+                        // frame high in exactly that case, the aligned state
+                        // read as d == 0 instead of -1, and the dead band the
+                        // policy used to have was the only thing hiding it.
+                        aheadValueFrames = (int) juce::jlimit(-1.0, maxAhead,
                                                               std::floor(elapsedRaw / frameMs - 0.5));
                         aheadRemainderMs = elapsed;
                         haveAhead        = true;
@@ -783,6 +878,7 @@ private:
                 packFrame(seedAdvance, aheadValueFrames);
                 if (valueSnapped)
                 {
+                    noteTrackEvent(5, 0, encoderTc, encoderTc);
                     // The value just jumped to follow a source seek nobody
                     // announced: re-seed on this same boundary so the phase
                     // follows too, instead of crawling there at 200 ppm.
