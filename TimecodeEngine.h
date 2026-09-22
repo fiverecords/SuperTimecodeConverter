@@ -233,6 +233,7 @@ public:
         {
             sourceActive = genClockMode;  // clock mode: always active; transport mode: wait for Play
             genLastTickTime = juce::Time::getMillisecondCounterHiRes();  // prevent time jump
+            clockFollower.reset();        // clock mode starts exactly on the wall clock
         }
     }
 
@@ -2957,6 +2958,7 @@ public:
     {
         if (useSystemClock && !genClockMode)
             generatorStop();  // stop transport when switching to clock mode
+        if (useSystemClock && ! genClockMode) clockFollower.reset();
         genClockMode = useSystemClock;
     }
     bool getGeneratorClockMode() const { return genClockMode; }
@@ -3180,8 +3182,7 @@ private:
     bool   cueCursorInclusive = false;  // next crossing check includes a cue exactly at lastCueCheckMs
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
     int    lastLoggedTrackCount = 0;    // LTC value corrections already written there (D30)
-    double clockAnchorWallMs  = 0.0;    // clock mode: wall clock at the anchor (ms since midnight)
-    double clockAnchorHiResMs = 0.0;    // clock mode: hi-res counter at the anchor (0 = not anchored)
+    WallClockFollower clockFollower;    // clock mode: time of day, followed rather than jumped to (D31)
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
 
@@ -4319,14 +4320,16 @@ private:
     //--------------------------------------------------------------------------
     void updateGenerator()
     {
-        // Clock mode: time of day.  The wall clock is read for its VALUE but
-        // advanced with the high-resolution counter: Time::getCurrentTime()
-        // moves in system-timer steps (up to 15.6 ms on Windows), and the
-        // sub-frame phase published to the LTC encoder inherited that
-        // granularity.  The counter is re-anchored to the wall clock only
-        // when the two disagree by more than 50 ms (a clock adjustment,
-        // suspend/resume, the day rollover), so NTP slews are followed
-        // without adding jitter.
+        // Clock mode: time of day.  The wall clock says WHAT time it is but
+        // moves in system-timer steps (up to 15.6 ms on Windows); the
+        // high-resolution counter is smooth but is a different oscillator,
+        // tens of ppm away.  This used to run on the counter and re-anchor to
+        // the wall clock whenever they disagreed by 50 ms -- a 50 ms jump on
+        // every output, a skipped frame at 25 fps, every time the two drifted
+        // that far apart (@mungewell: every 46 minutes).  The follower pulls
+        // towards the wall clock continuously instead, and only jumps for a
+        // disagreement of more than a second: the clock being set, a resume,
+        // midnight (D31).
         if (genClockMode)
         {
             auto now = juce::Time::getCurrentTime();
@@ -4334,14 +4337,8 @@ private:
                                 + (double)now.getMinutes() * 60000.0
                                 + (double)now.getSeconds() * 1000.0
                                 + (double)now.getMilliseconds();
-            const double hiRes = juce::Time::getMillisecondCounterHiRes();
-            double msSinceMidnight = clockAnchorWallMs + (hiRes - clockAnchorHiResMs);
-            if (clockAnchorHiResMs <= 0.0 || std::abs(msSinceMidnight - wallMs) > 50.0)
-            {
-                clockAnchorWallMs  = wallMs;
-                clockAnchorHiResMs = hiRes;
-                msSinceMidnight    = wallMs;
-            }
+            const double msSinceMidnight =
+                clockFollower.update(wallMs, juce::Time::getMillisecondCounterHiRes());
             currentTimecode = wallClockToTimecode(msSinceMidnight, currentFps);
             setFramePhaseFromPosition(msSinceMidnight, currentFps);
             return;

@@ -543,3 +543,57 @@ struct AudioDeviceEntry
         return prefix.isEmpty() ? deviceName : (prefix + ": " + deviceName);
     }
 };
+
+//==============================================================================
+// Time of day, followed rather than jumped to (D31)
+//
+// The Generator's clock mode shows the time of day.  The wall clock is the
+// truth for WHAT time it is, but it moves in system-timer steps (up to
+// 15.6 ms on Windows) and would put that granularity into the frame phase;
+// the high-resolution counter is smooth but is a different oscillator, and
+// the two drift apart by tens of ppm.  The previous design ran on the counter
+// and re-anchored to the wall clock whenever they disagreed by 50 ms -- a
+// 50 ms jump, more than a frame at 25 fps, every time the two clocks drifted
+// that far apart: @mungewell's skip every 46 minutes, on every output.
+//
+// This advances on the counter and pulls gently towards the wall clock every
+// tick, so the drift is followed continuously instead of in steps.  The pull
+// also averages the wall clock's quantisation away.  Only a disagreement of
+// more than a second -- the clock being set, a resume from sleep, midnight --
+// is treated as a real jump and followed at once.
+//
+// Pure and header-only so the harness can drive the same code the engine
+// runs (tools/audit/ltc_clockmode_sim.cpp).
+//==============================================================================
+struct WallClockFollower
+{
+    // Fraction of the disagreement taken out per engine tick.  At 60 Hz that
+    // is a time constant of about 3.3 s: a 15 ppm drift leaves a standing lag
+    // of 0.05 ms, and the wall clock's 15.6 ms steps come through as about
+    // 0.2 ms of noise, which the LTC phase lock filters anyway.
+    static constexpr double kPullPerTick = 0.005;
+    static constexpr double kJumpMs      = 1000.0;
+
+    double update(double wallMs, double hiResMs)
+    {
+        if (lastHiResMs < 0.0)
+        {
+            posMs = wallMs;
+            lastHiResMs = hiResMs;
+            return posMs;
+        }
+        posMs += hiResMs - lastHiResMs;
+        lastHiResMs = hiResMs;
+
+        const double err = wallMs - posMs;
+        if (std::abs(err) > kJumpMs) posMs = wallMs;      // set, resume, midnight
+        else                         posMs += err * kPullPerTick;
+        return posMs;
+    }
+
+    void reset() { lastHiResMs = -1.0; }
+
+private:
+    double posMs       = 0.0;
+    double lastHiResMs = -1.0;
+};
