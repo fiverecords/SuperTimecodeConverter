@@ -41,7 +41,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
 - **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net, HippoNet), how long the source still counts as present after the last frame or packet: 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
-- **Generator** — internal timecode generator with two modes: **Clock** (reads system wall clock for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. Supports an **A/B loop**: set the loop in and out points at the current position and arm the LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
+- **Generator** — internal timecode generator with two modes: **Clock** (follows the system wall clock continuously, for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. Supports an **A/B loop**: set the loop in and out points at the current position and arm the LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
 - **LA-Net (LaserAnimation Net-Timecode)** — receive Net-Timecode over the network from LaserAnimation systems (configurable interface)
 - **Winamp / WACUP** *(Windows only)* — follow playback position from a running Winamp or WACUP instance. The input attaches automatically as soon as a Winamp window appears, so it can be selected before the player is launched. On macOS and Linux this source falls back to the Generator.
 - **HippoNet** *(coming soon)* — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009. *Currently disabled pending hardware validation.*
@@ -353,6 +353,7 @@ User bits are specific to LTC. The Art-Net and TCNet timecode packets have no eq
 
 ### Synchronization
 
+- **LTC bit-clock phase lock** — the LTC output aligns its frame boundaries with the source and holds them there by trimming its bit clock, rather than by jumping. A correction of a few milliseconds is absorbed over a second or two with every frame left whole and every frame number intact
 - **Output frame offsets** — independent offset per output (MTC, Art-Net, LTC) from -30 to +30 frames, to compensate for device latency or synchronization differences
 - **TCNet output offset** — independent offset in milliseconds (-1000 to +1000 ms) for the TCNet output, separate from the frame-based offsets used by MTC/Art-Net/LTC
 
@@ -366,12 +367,13 @@ Operational controls remain active while locked: output enable/disable (for emer
 
 - **Stereo or mono output:** configurable per output (LTC Out and Audio Thru)
 - **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS; ALSA on Linux)
-- **Configurable sample rate and buffer size**
+- **Configurable sample rate and buffer size** — buffer sizes up to 8192 samples, for interfaces or machines that need the headroom
 - **ASIO support** for low-latency professional audio interfaces (Windows)
 - **Cross-engine device conflict detection** — device selectors show which devices are in use by other engines with colour-coded indicators (cyan for current engine, amber for other engines)
 - **Check for updates** — manually check for new versions from the title bar, with automatic check on startup
 - **Refresh Devices** — scan for newly connected interfaces without losing existing configuration
 - **Collapsible UI panels** to reduce clutter and focus on active sections
+- **LTC output log** — `ltc_gaps.log`, next to the settings file, records every interruption the LTC output sees and every correction it makes: how late a callback was, whether it was absorbed or was a real hole, and each frame repeated, skipped or re-aligned with the frame it was about to send and the position it was comparing against. Written for diagnosing sync problems against a scope or decoder capture
 - **Persistent settings** — all configuration saved automatically per engine and restored on launch
 - **Dark theme UI** with a clean, professional look
 
