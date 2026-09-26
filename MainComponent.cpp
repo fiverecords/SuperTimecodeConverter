@@ -1650,6 +1650,13 @@ MainComponent::MainComponent()
                 else
                     applyTriggerSettings();  // reopen trigger on its own device
             }
+            else
+            {
+                // Refused -- another engine streams MTC on that port (D32) --
+                // or failed to open.  The trigger output may have given up its
+                // own port above: let it take it back.
+                applyTriggerSettings();
+            }
             populateMidiAndNetworkCombos();
             saveSettings();
         }
@@ -3849,8 +3856,9 @@ void MainComponent::startCurrentMtcOutput()
     auto& trig = eng.getTriggerOutput();
     int sel = cmbMidiOutputDevice.getSelectedId() - 1;
 
-    // If TriggerOutput has its OWN handle open on the same device,
-    // release it before MtcOutput opens -- Windows forbids two handles.
+    // If TriggerOutput has its OWN port open on the same device, release it
+    // before MtcOutput opens.  Historical: the two were separate JUCE handles
+    // until D32; MidiOutputHub now gives both the same port.
     if (trig.hasOwnMidiOpen() && sel >= 0)
     {
         eng.getMtcOutput().refreshDeviceList();
@@ -3872,6 +3880,13 @@ void MainComponent::startCurrentMtcOutput()
             trig.setSharedMidiOutput(eng.getMtcOutput().getMidiOutputPtr());
         else
             trig.setSharedMidiOutput(nullptr);
+    }
+    else
+    {
+        // Refused -- another engine streams MTC on that port (D32) -- or
+        // failed to open: the trigger output takes back the port it may have
+        // released above.
+        applyTriggerSettings();
     }
 }
 
@@ -4833,12 +4848,14 @@ void MainComponent::loadAndApplyNonAudioSettings()
         {
             int idx = findDeviceByName(cmbMidiOutputDevice, es.midiOutputDevice);
 
-            // Release TriggerOutput's own handle if it matches the MTC device --
-            // Windows forbids two handles to the same MIDI port.
+            // Release TriggerOutput's own port if it matches the MTC device.
+            // Historical: separate JUCE handles until D32; the hub now shares one port.
+            bool releasedTriggerPort = false;
             if (eng.getTriggerOutput().hasOwnMidiOpen()
                 && es.triggerMidiDevice == es.midiOutputDevice)
             {
                 eng.getTriggerOutput().releaseOwnMidi();
+                releasedTriggerPort = true;
             }
 
             eng.startMtcOutput(idx);
@@ -4849,6 +4866,13 @@ void MainComponent::loadAndApplyNonAudioSettings()
             {
                 eng.getTriggerOutput().setSharedMidiOutput(
                     eng.getMtcOutput().getMidiOutputPtr());
+            }
+            else if (releasedTriggerPort && !eng.getMtcOutput().getIsRunning())
+            {
+                // Refused -- an engine restored earlier already streams MTC on
+                // that port (D32) -- or failed to open: give the trigger output
+                // back the port opened for it above.
+                eng.getTriggerOutput().startMidiByName(es.triggerMidiDevice);
             }
         }
         if (es.artnetOutEnabled)

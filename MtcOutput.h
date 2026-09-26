@@ -5,6 +5,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "TimecodeCore.h"
+#include "MidiOutputHub.h"
 #include <atomic>
 #include <cstdlib>
 
@@ -42,16 +43,33 @@ public:
     }
 
     //==============================================================================
+    /// Name shown to another engine whose MTC is refused on this port
+    /// ("IN USE BY <name>").  Message thread; kept current on rename.
+    void setOwnerName(const juce::String& name) { ownerName = name; }
+
+    /// After a failed start(): the name of the sender already streaming MTC on
+    /// that port, or empty if the device simply could not be opened.
+    const juce::String& getBlockedBy() const { return blockedBy; }
+
+    //==============================================================================
     bool start(int deviceIndex)
     {
         stop();
+        blockedBy.clear();
 
         if (deviceIndex < 0 || deviceIndex >= availableDevices.size())
             return false;
 
-        midiOutput = juce::MidiOutput::openDevice(availableDevices[deviceIndex].identifier);
+        // One port per device for the whole application (MidiOutputHub, D32).
+        // MTC has no channel: a second MTC stream in the same cable cannot be
+        // received, so the port refuses it and names the stream it carries.
+        auto p = MidiOutputHub::get().acquire(availableDevices[deviceIndex]);
+        if (p != nullptr && !p->claimMtc(this, [this] { return ownerName; }, blockedBy))
+            p = nullptr;   // releases our reference; the other stream is untouched
 
-        if (midiOutput != nullptr)
+        port = std::move(p);
+
+        if (port != nullptr)
         {
             currentDeviceIndex = deviceIndex;
             isRunningFlag.store(true, std::memory_order_relaxed);
@@ -74,8 +92,12 @@ public:
 
     void stop()
     {
-        stopTimer();
-        midiOutput = nullptr;
+        stopTimer();   // blocks until an in-flight callback returns
+        if (port != nullptr)
+        {
+            port->releaseMtc(this);
+            port = nullptr;   // the device closes when its last sender lets go
+        }
 
         isRunningFlag.store(false, std::memory_order_relaxed);
         paused.store(false, std::memory_order_relaxed);
@@ -84,10 +106,12 @@ public:
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
 
-    /// Raw pointer to the open MidiOutput device (for sharing with TriggerOutput).
-    /// Returns nullptr if not running.  Thread-safe: juce::MidiOutput::sendMessageNow()
-    /// uses an internal CriticalSection.
-    juce::MidiOutput* getMidiOutputPtr() const { return midiOutput.get(); }
+    /// The port this output streams on (for TriggerOutput to share), or nullptr
+    /// if not running.  The holder keeps the port open for as long as it holds
+    /// it.  Sends go through Port::send, which serialises every thread on the
+    /// port: juce::MidiOutput::sendMessageNow itself is NOT thread-safe
+    /// (JUCE 8.0.11 onwards; see MidiOutputHub.h).
+    MidiOutputHub::PortPtr getMidiOutputPtr() const { return port; }
 
     //==============================================================================
     // Called from UI thread - thread-safe via SpinLock
@@ -158,7 +182,7 @@ public:
     //==============================================================================
     void sendFullFrame()
     {
-        if (midiOutput == nullptr)
+        if (port == nullptr)
             return;
 
         Timecode tc;
@@ -187,7 +211,7 @@ public:
             0xF7
         };
 
-        midiOutput->sendMessageNow(juce::MidiMessage(sysex, sizeof(sysex)));
+        port->send(juce::MidiMessage(sysex, sizeof(sysex)));
     }
 
 private:
@@ -195,7 +219,7 @@ private:
     // Runs on HighResolutionTimer thread (~1ms precision)
     void hiResTimerCallback() override
     {
-        if (midiOutput == nullptr
+        if (port == nullptr
             || paused.load(std::memory_order_relaxed))
         {
             stopTimer();   // Don't spin at 1000Hz when there's nothing to send
@@ -295,7 +319,7 @@ private:
         }
 
         uint8_t dataByte = (uint8_t)((index << 4) | (value & 0x0F));
-        midiOutput->sendMessageNow(juce::MidiMessage(0xF1, (int)dataByte));
+        port->send(juce::MidiMessage(0xF1, (int)dataByte));
     }
 
     void updateTimerRate()
@@ -307,7 +331,11 @@ private:
     }
 
     //==============================================================================
-    std::unique_ptr<juce::MidiOutput> midiOutput;
+    // Set in start()/stop() on the message thread, always with the timer
+    // stopped; the timer thread only reads it while it runs.
+    MidiOutputHub::PortPtr port;
+    juce::String ownerName;     // message thread
+    juce::String blockedBy;     // message thread
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
     std::atomic<bool> isRunningFlag { false };

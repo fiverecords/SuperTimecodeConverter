@@ -53,6 +53,10 @@ public:
     {
         std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
 
+        // Named in "IN USE BY <name>" when another engine's MTC is refused on
+        // the port this engine streams on (D32).
+        mtcOutput.setOwnerName(engineName);
+
         // Only the primary engine (index 0) gets AudioThru
         if (index == kPrimaryEngineIndex)
             audioThru = std::make_unique<AudioThru>();
@@ -110,7 +114,7 @@ public:
     //==========================================================================
     int getIndex() const { return engineIndex; }
     juce::String getName() const { return engineName; }
-    void setName(const juce::String& name) { engineName = name; }
+    void setName(const juce::String& name) { engineName = name; mtcOutput.setOwnerName(name); }
     bool isPrimary() const { return engineIndex == kPrimaryEngineIndex; }
 
     // Called after engine deletion to fix indices so isPrimary() stays correct
@@ -1392,7 +1396,11 @@ public:
             mtcOutStatusText = "TX: " + mtcOutput.getCurrentDeviceName();
             return true;
         }
-        mtcOutStatusText = (deviceIndex < 0) ? "NO MIDI DEVICE" : "FAILED TO OPEN";
+        // One MTC stream per MIDI port (D32): a port already carrying another
+        // engine's MTC refuses this one and names it.
+        mtcOutStatusText = (deviceIndex < 0) ? "NO MIDI DEVICE"
+                         : mtcOutput.getBlockedBy().isNotEmpty() ? "IN USE BY " + mtcOutput.getBlockedBy()
+                         : "FAILED TO OPEN";
         return false;
     }
 

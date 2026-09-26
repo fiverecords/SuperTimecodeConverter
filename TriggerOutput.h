@@ -7,6 +7,7 @@
 #include <atomic>
 #include "OscSender.h"
 #include "AppSettings.h"
+#include "MidiOutputHub.h"
 
 //==============================================================================
 // TriggerOutput -- Dispatches MIDI and OSC messages on track changes.
@@ -54,8 +55,10 @@ public:
         if (deviceIndex < 0 || deviceIndex >= (int)midiDevices.size())
             return false;
 
-        midiOutput = juce::MidiOutput::openDevice(midiDevices[deviceIndex].identifier);
-        if (midiOutput)
+        // The same port object as the MTC output when both name one device
+        // (MidiOutputHub, D32), so the two never race on it.
+        ownPort = MidiOutputHub::get().acquire(midiDevices[deviceIndex]);
+        if (ownPort)
         {
             currentMidiDeviceName = midiDevices[deviceIndex].name;
             return true;
@@ -73,46 +76,53 @@ public:
     void stopMidi()
     {
         clockTimer.stop();
-        sharedMidiOut = nullptr;   // release borrowed pointer (not owned)
-        midiOutput.reset();        // close own device if open
+        sharedPort = nullptr;      // drop the MTC output's port
+        ownPort = nullptr;         // and our own; a port closes with its last sender
         currentMidiDeviceName.clear();
     }
 
     bool isMidiOpen() const { return getActiveMidi() != nullptr; }
-    bool hasOwnMidiOpen() const { return midiOutput != nullptr; }
+    bool hasOwnMidiOpen() const { return ownPort != nullptr; }
     juce::String getCurrentMidiDeviceName() const { return currentMidiDeviceName; }
 
     //--------------------------------------------------------------------------
-    // Shared MIDI output -- allows TriggerOutput to piggyback on MtcOutput's
-    // open device handle when both target the same MIDI port.
-    // juce::MidiOutput::sendMessageNow() is thread-safe (internal CriticalSection).
+    // Shared MIDI output -- the trigger output uses the MTC output's port when
+    // both target the same MIDI device.  Every send goes through
+    // MidiOutputHub::Port::send, which serialises all threads on the port;
+    // juce::MidiOutput::sendMessageNow on its own is NOT thread-safe (JUCE
+    // 8.0.11 onwards, see MidiOutputHub.h).
     //--------------------------------------------------------------------------
 
-    /// Set an external MidiOutput to use instead of (or alongside) our own.
-    /// Pass nullptr to clear and fall back to own device.
-    void setSharedMidiOutput(juce::MidiOutput* shared)
+    /// Use the MTC output's port instead of (or alongside) our own.  Pass
+    /// nullptr to clear and fall back to our own device.  A running MIDI clock
+    /// moves to a new shared port; when the shared port is cleared the clock
+    /// keeps its own reference, so the port stays open under it until the
+    /// clock is moved or stopped (it used to keep a raw pointer to an object
+    /// the MTC output then deleted).
+    void setSharedMidiOutput(MidiOutputHub::PortPtr shared)
     {
-        sharedMidiOut = shared;
+        sharedPort = shared;
         // If sharing and clock is running, redirect it to the shared output
         if (shared && clockTimer.isTimerRunning())
-            clockTimer.updateOutput(shared);
+            clockTimer.updateOutput(std::move(shared));
     }
 
-    /// Close our OWN MidiOutput handle (if open) without affecting the shared pointer.
-    /// Used before MtcOutput opens the same device to avoid double-open conflict.
+    /// Drop our OWN port (if open) without affecting the shared one.  Used
+    /// before MtcOutput opens the same device -- a double open conflicted
+    /// before D32; MidiOutputHub now hands both the same port.
     void releaseOwnMidi()
     {
-        if (midiOutput)
+        if (ownPort)
         {
             // If clock was using our own output, redirect to shared (if available)
             if (clockTimer.isTimerRunning())
             {
-                if (sharedMidiOut)
-                    clockTimer.updateOutput(sharedMidiOut);
+                if (sharedPort)
+                    clockTimer.updateOutput(sharedPort);
                 else
                     clockTimer.stop();
             }
-            midiOutput.reset();
+            ownPort = nullptr;
         }
     }
 
@@ -162,8 +172,9 @@ public:
     /// global enable flags.
     ///
     /// NOTE: This method is called from TimecodeEngine::tick() which runs on the
-    /// JUCE message thread (60Hz timer callback).  sendMessageNow() is synchronous
-    /// and may briefly block (~microseconds on healthy drivers).  For Note On +
+    /// JUCE message thread (60Hz timer callback).  Port::send is synchronous
+    /// and may briefly block (~microseconds on healthy drivers, or up to a few
+    /// ms if another thread is sending a SysEx on the same port).  For Note On +
     /// Note Off back-to-back, two synchronous calls are made.  This is acceptable
     /// for show control trigger use cases but could cause a UI stutter if a MIDI
     /// driver is exceptionally slow.
@@ -197,7 +208,7 @@ public:
                 {
                     int cc  = juce::jlimit(0, 127, cue.midiCCNum);
                     int val = juce::jlimit(0, 127, cue.midiCCVal);
-                    midi->sendMessageNow(juce::MidiMessage::controllerEvent(ch, cc, val));
+                    midi->send(juce::MidiMessage::controllerEvent(ch, cc, val));
                 }
             }
         }
@@ -225,7 +236,7 @@ public:
             juce::jlimit(1, 16, channel),
             juce::jlimit(0, 127, cc),
             juce::jlimit(0, 127, value));
-        midi->sendMessageNow(msg);
+        midi->send(msg);
     }
 
     /// Send a MIDI Note On message for continuous fader control.
@@ -241,7 +252,7 @@ public:
             juce::jlimit(1, 16, channel),
             juce::jlimit(0, 127, note),
             (uint8_t)juce::jlimit(0, 127, velocity));
-        midi->sendMessageNow(msg);
+        midi->send(msg);
     }
 
     /// Send a raw OSC message with a single float value.
@@ -265,9 +276,9 @@ public:
 
     void startMidiClock(double bpm)
     {
-        auto* midi = getActiveMidi();
-        if (!midi) return;
-        clockTimer.start(bpm, midi);
+        auto port = sharedPort ? sharedPort : ownPort;
+        if (!port) return;
+        clockTimer.start(bpm, std::move(port));
     }
 
     void stopMidiClock()
@@ -286,19 +297,26 @@ private:
     //--------------------------------------------------------------------------
     // MIDI Clock timer -- 1ms resolution, fractional accumulator
     //--------------------------------------------------------------------------
+    // The clock holds its own reference to its port, under portLock: the
+    // timer callback sends while holding it, and start/stop/updateOutput swap
+    // the port under it on the message thread and let the old one go outside
+    // it -- so a port is never closed under a pulse, and the last reference is
+    // always dropped on the message thread.  stopTimer() is never called with
+    // portLock held (it waits for the callback, which takes it).
     class MidiClockTimer : public juce::HighResolutionTimer
     {
     public:
         MidiClockTimer() = default;
         ~MidiClockTimer() override { stopTimer(); }
 
-        void start(double bpm, juce::MidiOutput* output)
+        void start(double bpm, MidiOutputHub::PortPtr output)
         {
-            midiOut.store(output, std::memory_order_relaxed);
+            stopTimer();   // a restart must not reset the accumulator under a running callback
+            auto previous = swapPort(output);
             setBpm(bpm);
             resetClock();
             // Send MIDI Start (0xFA)
-            if (output) output->sendMessageNow(juce::MidiMessage(0xFA));
+            if (output) output->send(juce::MidiMessage(0xFA));
             startTimer(1);
         }
 
@@ -306,9 +324,8 @@ private:
         {
             stopTimer();
             // Send MIDI Stop (0xFC)
-            auto* out = midiOut.load(std::memory_order_relaxed);
-            if (out) out->sendMessageNow(juce::MidiMessage(0xFC));
-            midiOut.store(nullptr, std::memory_order_relaxed);
+            auto previous = swapPort(nullptr);
+            if (previous) previous->send(juce::MidiMessage(0xFC));
         }
 
         void setBpm(double bpm)
@@ -317,16 +334,15 @@ private:
                 pulsesPerMs.store(bpm * 24.0 / 60000.0, std::memory_order_relaxed);
         }
 
-        /// Redirect clock output to a different MidiOutput (e.g. when switching
-        /// from own device to shared MtcOutput device).  Now truly thread-safe
-        /// via atomic store -- timer thread reads via atomic load.
-        void updateOutput(juce::MidiOutput* newOut) { midiOut.store(newOut, std::memory_order_relaxed); }
+        /// Redirect clock output to a different port (e.g. when switching from
+        /// own device to the shared MtcOutput port).  Message thread.
+        void updateOutput(MidiOutputHub::PortPtr newOut) { swapPort(std::move(newOut)); }
 
         void hiResTimerCallback() override
         {
             double ppms = pulsesPerMs.load(std::memory_order_relaxed);
-            auto* out = midiOut.load(std::memory_order_relaxed);
-            if (ppms <= 0.0 || !out) return;
+            const juce::ScopedLock sl(portLock);
+            if (ppms <= 0.0 || port == nullptr) return;
 
             // Pulses owed = elapsed time x pulses per ms.  Counting callbacks
             // instead (one pulse-worth per call) made the tempo error equal
@@ -344,7 +360,7 @@ private:
             int burst = 0;
             while (accumulator >= 1.0 && burst < 4)
             {
-                out->sendMessageNow(juce::MidiMessage((uint8_t)0xF8));
+                port->send(juce::MidiMessage((uint8_t)0xF8));
                 accumulator -= 1.0;
                 ++burst;
             }
@@ -353,7 +369,17 @@ private:
         void resetClock() { accumulator = 0.0; lastCallbackMs = 0.0; }
 
     private:
-        std::atomic<juce::MidiOutput*> midiOut { nullptr };
+        /// Install `next`, return the port it replaces (to be released by the
+        /// caller, outside the lock).
+        MidiOutputHub::PortPtr swapPort(MidiOutputHub::PortPtr next)
+        {
+            const juce::ScopedLock sl(portLock);
+            std::swap(port, next);
+            return next;
+        }
+
+        juce::CriticalSection portLock;
+        MidiOutputHub::PortPtr port;   // under portLock
         std::atomic<double> pulsesPerMs { 0.048 };  // default 120 BPM
         double accumulator = 0.0;
         double lastCallbackMs = 0.0;
@@ -383,7 +409,7 @@ private:
         {
             int cc  = juce::jlimit(0, 127, entry.midiCCNum);
             int val = juce::jlimit(0, 127, entry.midiCCVal);
-            midi->sendMessageNow(juce::MidiMessage::controllerEvent(ch, cc, val));
+            midi->send(juce::MidiMessage::controllerEvent(ch, cc, val));
         }
     }
 
@@ -409,17 +435,17 @@ private:
     //--------------------------------------------------------------------------
     // Members
     //--------------------------------------------------------------------------
-    // MIDI
-    std::unique_ptr<juce::MidiOutput> midiOutput;     // own device (when not sharing)
-    juce::MidiOutput* sharedMidiOut = nullptr;         // borrowed from MtcOutput (not owned)
+    // MIDI -- both message thread only (the clock keeps its own reference)
+    MidiOutputHub::PortPtr ownPort;       // own device (when not sharing)
+    MidiOutputHub::PortPtr sharedPort;    // the MtcOutput's port, when on the same device
     juce::Array<juce::MidiDeviceInfo> midiDevices;
     juce::String currentMidiDeviceName;
     bool midiEnabled = false;
 
-    /// Returns the active MidiOutput: shared if set, else own.
-    juce::MidiOutput* getActiveMidi() const
+    /// Returns the active port: shared if set, else own.  Message thread.
+    MidiOutputHub::Port* getActiveMidi() const
     {
-        return sharedMidiOut ? sharedMidiOut : midiOutput.get();
+        return sharedPort ? sharedPort.get() : ownPort.get();
     }
 
     /// Trigger note: Note On now, Note Off after a short hold.  A zero-length
@@ -433,15 +459,15 @@ private:
     /// engine is destroyed does not reach a dead object.
     static constexpr int kTriggerNoteHoldMs = 100;
 
-    void sendTriggerNote(juce::MidiOutput* midi, int channel1to16, int note, int velocity)
+    void sendTriggerNote(MidiOutputHub::Port* midi, int channel1to16, int note, int velocity)
     {
-        midi->sendMessageNow(juce::MidiMessage::noteOn(channel1to16, note, (uint8_t) velocity));
+        midi->send(juce::MidiMessage::noteOn(channel1to16, note, (uint8_t) velocity));
         juce::WeakReference<TriggerOutput> weak(this);
         juce::Timer::callAfterDelay(kTriggerNoteHoldMs, [weak, channel1to16, note]
         {
             if (auto* self = weak.get())
                 if (auto* out = self->getActiveMidi())
-                    out->sendMessageNow(juce::MidiMessage::noteOff(channel1to16, note));
+                    out->send(juce::MidiMessage::noteOff(channel1to16, note));
         });
     }
 

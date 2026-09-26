@@ -49,7 +49,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 ### Outputs (enable any combination per engine)
 
-- **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages)
+- **MTC Out** — transmit MIDI Time Code (Quarter Frame + Full Frame messages); one MTC stream per MIDI port (see Shared MIDI Output)
 - **Art-Net Out** — broadcast ArtTimeCode packets on any network interface
 - **LTC Out** — generate LTC audio signal on any audio output device and channel, with the frame phase aligned to the timecode clock, compensated for the interface's reported output latency and held there by a phase lock on the bit clock (up to ±200 ppm), so the same setup produces the same phase every time it is started and keeps it as the interface's clock and the source's drift apart. Supports **user bits** (see below) and an optional **Hold on Pause** mode that keeps the LTC carrier running while the source is paused, for receivers that drop sync when the signal stops. If the audio interface leaves a hole in the stream (some USB and FireWire interfaces do when the display wakes), the encoder re-aligns the frame phase afterwards; such gaps are counted in the LTC output status line and logged with their time and size to `ltc_gaps.log` next to `settings.json`
 - **LA-Net Out** — broadcast LaserAnimation Net-Timecode on any network interface
@@ -316,7 +316,9 @@ A visual companion to the Generator audio playback: a waveform view of the loade
 
 ### Shared MIDI Output
 
-When MTC output and MIDI triggers/clock/mixer forward target the same MIDI port, STC automatically shares the connection. No configuration needed — both features work simultaneously on a single port, even on Windows where MIDI ports allow only one handle at a time.
+Each MIDI port is opened once and shared by everything that sends to it — MTC output, MIDI triggers, MIDI clock and mixer forward, from any engine — with the messages going out one at a time. No configuration needed.
+
+One port carries one MTC stream. MTC has no channels, so two MTC streams in one cable cannot be received: if an engine's MTC output is set to a port that already carries another engine's MTC, it does not start, and its status reads **IN USE BY** followed by the other engine's name. Triggers, clock and mixer forward can still share that port.
 
 ### LTC User Bits
 
