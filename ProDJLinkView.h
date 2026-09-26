@@ -632,8 +632,11 @@ public:
                 {
                     // Choose dbserver query identity.
                     // CDJ-3000: accepts player 5 (VCDJ). NXS2: requires 1-4.
+                    // Keyed on the CDJ-3000 format of 0x0b, not on absolute
+                    // position alone, which an NXS2 streams too (AUDIT A20;
+                    // same rule as TimecodeEngine::requestDbMetadata).
                     int dbCtx;
-                    if (proDJLink.playerHasAbsolutePosition((int)srcPlayer))
+                    if (proDJLink.playerSends3000Position((int)srcPlayer))
                     {
                         dbCtx = proDJLink.getVCDJPlayerNumber();
                         if (dbCtx == (int)srcPlayer)

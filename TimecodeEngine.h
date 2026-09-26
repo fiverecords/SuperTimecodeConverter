@@ -4029,9 +4029,12 @@ private:
         // CDJ-3000: accepts player 5 (our VCDJ number) — use it directly.
         // NXS2/older: rejects player 5, requires 1-4 that's present on the
         // network.  Use suggestDbPlayerNumber() to find a valid candidate.
+        // Keyed on the CDJ-3000 FORMAT of 0x0b: an NXS2 that streams its own
+        // 0x0b format has absolute position too, and used to be asked as
+        // player 5 because of it (AUDIT A20).
         int dbCtx;
-        bool srcHasAbsPos = sharedProDJLink->playerHasAbsolutePosition((int)srcPlayer);
-        if (srcHasAbsPos)
+        bool srcIs3000 = sharedProDJLink->playerSends3000Position((int)srcPlayer);
+        if (srcIs3000)
         {
             dbCtx = sharedProDJLink->getVCDJPlayerNumber();
             // Safety: if VCDJ coincidentally matches source, pick another

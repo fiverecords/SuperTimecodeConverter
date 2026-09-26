@@ -30,7 +30,7 @@
 //   - Absolute Position from CDJ-3000         (port 50001, type 0x0b)
 //   - CDJ status: track ID, play state, pitch (port 50002)
 //   - DJM on-air broadcast                    (port 50001, type 0x03)
-//   - DJM on-air unicast                      (type 0x29, handled on both 50001 & 50002)
+//   - Mixer status                            (type 0x29, counted only -- no channel flags)
 //   - DJM mixer fader data                    (type 0x39, handled on both 50001 & 50002)
 //   - Timecode derived from playhead position in ms
 //
@@ -115,7 +115,7 @@ namespace ProDJLink
     // Status packet types (byte 10)
     static constexpr uint8_t kStatusTypeCDJ    = 0x0a;
     static constexpr uint8_t kStatusTypeMixer  = 0x39;  // DJM fader status (unicast, bridge-triggered)
-    static constexpr uint8_t kStatusTypeDJM    = 0x29;  // DJM channel on-air status (unicast, bridge-triggered)
+    static constexpr uint8_t kStatusTypeDJM    = 0x29;  // Mixer status (no channel flags; see handleDJMStatusPacket)
     static constexpr uint8_t kStatusTypeVU     = 0x58;  // DJM VU meter data (unicast, 524B, port 50001)
 
     // Play states (from status packet, bytes 120-123)
@@ -283,9 +283,16 @@ struct ProDJLinkPlayerState
     std::atomic<uint32_t> trackLenSec  { 0 };    // track length (seconds)
     std::atomic<bool>     hasAbsolutePosition { false };    // CDJ-3000: native ms playhead
     std::atomic<bool>     hasBeatDerivedPosition { false }; // NXS2: computed from beatCount+BPM
+    // Set by the CDJ-3000-format 0x0b only (player-numbered, with track
+    // length and BPM).  hasAbsolutePosition is also set by the NXS2-format
+    // 0x0b, which carries a position and nothing else, so it cannot say
+    // where the BPM comes from or which dbserver identity the player takes
+    // (AUDIT A16, A20).
+    std::atomic<bool>     absPosIs3000Format { false };
 
     // From beat packets
-    std::atomic<uint32_t> bpmRaw       { 0 };    // BPM x 100 (from beat) or x10 (from abs pos)
+    std::atomic<uint32_t> bpmRaw       { 0 };    // track BPM x100 (beat/status) or effective
+                                                    // BPM x10 (CDJ-3000 0x0b, absPosIs3000Format)
     std::atomic<uint32_t> pitchRaw     { 0x100000 }; // fader pitch multiplier raw (offset 140)
     std::atomic<uint32_t> actualSpeedRaw { 0 };   // real playback speed raw (offset 152)
                                                     // Includes motor ramp -- 0 when stopped,
@@ -350,6 +357,7 @@ struct ProDJLinkPlayerState
         trackLenSec.store(0, std::memory_order_relaxed);
         hasAbsolutePosition.store(false, std::memory_order_relaxed);
         hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
+        absPosIs3000Format.store(false, std::memory_order_relaxed);
         bpmRaw.store(0, std::memory_order_relaxed);
         pitchRaw.store(0x100000, std::memory_order_relaxed);
         actualSpeedRaw.store(0, std::memory_order_relaxed);
@@ -864,19 +872,28 @@ public:
         return info;
     }
 
-    /// BPM for a player (0.0 if unknown)
+    /// BPM as the player shows it (0.0 if unknown): the track's tempo times
+    /// the pitch in effect, sync included -- what MIDI clock, Link, OSC and
+    /// TCNet send.
+    ///
+    /// The CDJ-3000's 0x0b carries it ready-made, x10.  Status and beat
+    /// packets carry the TRACK tempo x100, to be multiplied by Pitch1
+    /// (dysentery vcdj.adoc; beat-link's effective tempo is the same
+    /// product).  Without that multiplication every non-3000 player sent the
+    /// track tempo whatever the pitch fader said (AUDIT A15, @Joren2087's
+    /// report on the NXS2); dividing by 10 whenever hasAbsolutePosition was
+    /// set also froze an NXS2 streaming 0x0b at ten times its tempo (A16).
     double getBPM(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0.0;
         const auto& p = players[idx];
-        if (p.hasAbsolutePosition.load(std::memory_order_relaxed))
-        {
-            // Abs position: BPM x 10
-            return double(p.bpmRaw.load(std::memory_order_relaxed)) / 10.0;
-        }
-        // Beat/status packets: BPM x 100
-        return double(p.bpmRaw.load(std::memory_order_relaxed)) / 100.0;
+        const uint32_t raw = p.bpmRaw.load(std::memory_order_relaxed);
+        if (p.absPosIs3000Format.load(std::memory_order_relaxed))
+            return double(raw) / 10.0;
+        if (raw == 0 || raw == 0xFFFF) return 0.0;   // no track, or tempo unknown
+        return double(raw) / 100.0
+             * ProDJLink::pitchFromStatus(p.pitchRaw.load(std::memory_order_relaxed));
     }
 
     /// Fader pitch multiplier (1.0 = 0%, from status offset 140)
@@ -1289,12 +1306,20 @@ public:
         return players[idx].loadedPlayer.load(std::memory_order_relaxed);
     }
 
-    /// Does this player support absolute position? (CDJ-3000 only)
+    /// Does this player stream absolute position (0x0b, either format)?
     bool playerHasAbsolutePosition(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
         return players[idx].hasAbsolutePosition.load(std::memory_order_relaxed);
+    }
+
+    /// Does this player stream the CDJ-3000 format of 0x0b?  (Not the NXS2's.)
+    bool playerSends3000Position(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].absPosIs3000Format.load(std::memory_order_relaxed);
     }
 
     /// Does this player use beat-derived position? (NXS2 / older models)
@@ -1373,7 +1398,8 @@ public:
         return (excludePlayer != 4) ? 4 : 3;
     }
 
-    /// Is the given player on-air? (from CDJ status flags or DJM 0x29 packets)
+    /// Is the given player on-air?  From the mixer's 0x03 broadcast, or from the
+    /// CDJ's own status flag while no mixer has reported for 5 s.
     bool isPlayerOnAir(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1552,8 +1578,9 @@ private:
             }
 
             // --- Send bridge subscribe (0x57) to all known DJMs ---
-            // This triggers the DJM to send type-0x39 mixer fader packets and
-            // type-0x29 channel on-air status packets.
+            // This starts the DJM's VU stream (0x58); fader packets (0x39)
+            // come with an accepted bridge identity alone
+            // (STC_PRODJLINK_AUDIT.md 12.2).
             //
             // IMPORTANT: The first subscribe must be DELAYED after the first
             // keepalive broadcast.  The DJM-900NXS2 needs time to register the
@@ -1625,7 +1652,7 @@ private:
             // Keepalive (port 50000) -- ~1Hz per player
             if (keepaliveSock && keepaliveSock->waitUntilReady(true, 0))
             {
-                uint8_t buf[256];
+                uint8_t buf[2048];   // AUDIT C20: no datagram on these ports is cut short
                 int n = keepaliveSock->read(buf, sizeof(buf), false, sender, port);
                 if (n > 0)
                     handleKeepalivePacket(buf, n, sender);
@@ -1637,7 +1664,7 @@ private:
             {
                 while (beatDrained < 20 && beatSock->waitUntilReady(true, 0))
                 {
-                    uint8_t buf[600];
+                    uint8_t buf[2048];
                     int n = beatSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
                         handleBeatPacket(buf, n, sender);
@@ -1651,7 +1678,7 @@ private:
             {
                 while (statusDrained < 10 && statusSock->waitUntilReady(true, 0))
                 {
-                    uint8_t buf[1200];
+                    uint8_t buf[4096];   // CDJ-3000 pushes of 2.5 kB exist (0x3d)
                     int n = statusSock->read(buf, sizeof(buf), false, sender, port);
                     if (n > 0)
                         handleStatusPacket(buf, n, sender);
@@ -1777,55 +1804,52 @@ private:
         // The TCP listener on port 12523 in DbServerClient (answers
         // "no dbserver here", port = 0) stays as a belt-and-braces
         // mitigation regardless of mode.  See dbPortListenerLoop().
+        for (const auto& ip : dbKeepaliveTargets())
+            sendDbServerKeepalive(ip);
+    }
+
+    /// Where the 95 B goes this tick: one address per physical box (an
+    /// XDJ-XZ exposes players 1+2 on one IP), filtered by dbKeepaliveMode,
+    /// and never a real player on our own 95 B number: before AUDIT A18 a
+    /// real player 5 was never discovered from its keepalives, so it never
+    /// received our claim to its number, and it must not start now (the
+    /// reference bridge sends no 95 B at all -- D33).  Network thread only:
+    /// model[] and ipStr are written by this thread at discovery.
+    juce::StringArray dbKeepaliveTargets() const
+    {
+        juce::StringArray ips;
         const int mode = dbKeepaliveMode.load(std::memory_order_acquire);
         if (mode == ProDJLink::kDbKeepaliveOff)
-            return;
+            return ips;
 
-        // Multi-deck units expose several player numbers on one IP
-        // (XDJ-XZ: players 1+2, one box) -- send each physical box ONE 95B
-        // per tick, not one per deck.
-        const char* sentIps[ProDJLink::kMaxPlayers] = {};
-        int numSent = 0;
         for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
         {
             if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
-
-            // 3000-only mode: model[] is written once by this same network
-            // thread when the player is first registered, so reading it
-            // here is race-free.
+            if (players[i].playerNumber.load(std::memory_order_relaxed)
+                    == uint8_t(vCDJPlayerNumber))
+                continue;
             if (mode == ProDJLink::kDbKeepalive3000
                 && std::strstr(players[i].model, "3000") == nullptr)
                 continue;
-
-            bool dup = false;
-            for (int k = 0; k < numSent; ++k)
-                if (std::strncmp(sentIps[k], players[i].ipStr, 15) == 0) { dup = true; break; }
-            if (dup) continue;
-
-            juce::String ip(players[i].ipStr);
-            if (ip.isNotEmpty())
-            {
-                sendDbServerKeepalive(ip);
-                sentIps[numSent++] = players[i].ipStr;
-            }
+            const juce::String ip(players[i].ipStr);
+            if (ip.isNotEmpty() && !ips.contains(ip))
+                ips.add(ip);
         }
+        return ips;
     }
 
     // Bridge keepalive (0x06) -- 54B BROADCAST
-    // Standard bridge format: variant=0x01, player=0xC1,
-    // class=0x00, flags=0x05, last=0x20. DJM activates faders on seeing this.
+    // The official bridge's format: 0x20=0x01, 0x21=0x01, device number at
+    // 0x24 and 0x30 per the identity profile (see sendBridgeKeepalive),
+    // 0x34=0x05, 0x35=0x20.  DJM activates faders on seeing this.
     //
     // CRITICAL: This must be BROADCAST, not unicast to the DJM.
     // The bridge broadcasts this and the DJM discovers it via
     // standard keepalive broadcast monitoring on port 50000. Sending as
-    // unicast does not register in the DJM's device table.
-    //
-    // macOS fix: ALSO send as unicast to each known DJM IP.
-    // Some macOS network stacks/NIC drivers have subtle issues with broadcast
-    // UDP delivery (checksum offloading, interface routing, firewall interaction)
-    // that can cause the DJM to never see the broadcast keepalive even though it
-    // reaches the wire. Unicasting a copy ensures the DJM sees our bridge identity.
-    // The DJM receives the same player=0xC1 identity both ways -- no conflict.
+    // unicast does not register in the DJM's device table.  (An earlier
+    // macOS workaround also unicast a copy to each DJM; it was removed --
+    // the reference bridge only broadcasts, see the note at the end of
+    // sendBridgeKeepalive.)
     /// Count of PDL devices currently visible on the wire: discovered CDJ
     /// players + registered DJMs.  Used by the AUTO identity profile
     /// (b30 = this + 1 for ourselves).  Rekordbox instances are not tracked
@@ -1979,46 +2003,50 @@ private:
 
     // DJM on-air broadcast handler (type 0x03, port 50001)
     //
-    // The DJM broadcasts this on port 50001 regardless of bridge presence.
-    // Contains per-channel on-air flags (simpler than 0x29 unicast).
-    // Format (45 bytes, from capture):
-    //   [10]    0x03 (type)
-    //   [33]    player_number (0x21 = DJM)
-    //   [35]    0x09 (payload length?)
-    //   [36]    ch1 on-air (0x01=on, 0x00=off)
-    //   [37]    ch2 on-air
-    //   [38]    ch3 on-air
-    //   [39]    ch4 on-air
+    // The mixer (and the XDJ-XZ) broadcasts this on port 50001, bridge or no
+    // bridge.  It is the mixer's own report of which channels are audible,
+    // and the only on-air source STC takes from a mixer: 0x29 is the mixer
+    // STATUS packet and carries no channel flags (AUDIT A13).
+    // Layout (dysentery mixer_integration.adoc; beat-link
+    // BeatFinder.getAudibleChannels, which reads it the same way):
+    //   [0x20]        subtype: 0x00 four channels (45 B), 0x03 six channels
+    //                 (53 B, DJM-V10 -- from @AhnHEL's captures)
+    //   [0x21]        the mixer's device number (0x21)
+    //   [0x24..0x27]  F1..F4  (0x00 off air, 0x01 on air)
+    //   [0x28..0x2c]  zero
+    //   [0x2d..0x2e]  F5, F6 -- six-channel packet only (AUDIT A14; this
+    //                 used to read 0x28/0x29, which are always zero)
     //==========================================================================
     void handleOnAirBroadcast(const uint8_t* data, int len)
     {
-        if (len < 40) return;
+        if (len < 0x28) return;   // F1..F4 must be present
 
-        // On-air flags at bytes 36-41 (4-ch DJMs use 36-39, V10 may use 36-41)
         bool chOnAir[6] = { false };
-        int numCh = juce::jmin(6, len - 36);  // how many channel flags fit
-        for (int i = 0; i < numCh; ++i)
-            chOnAir[i] = (data[36 + i] != 0x00);
-
-        // Update player on-air state (only if we don't have 0x29 unicast data,
-        // which is more reliable since it's DJM->bridge specific)
-        if (pktCountDJMStatus.load(std::memory_order_relaxed) == 0)
+        for (int ch = 0; ch < 4; ++ch)
+            chOnAir[ch] = (data[0x24 + ch] != 0x00);
+        if (len >= 0x35)          // six-channel packet (beat-link's test)
         {
-            for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
-            {
-                if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
-                uint8_t pn = players[i].playerNumber.load(std::memory_order_relaxed);
-                if (pn < 1 || pn > 6) continue;
-                players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
-            }
-            // Mark that we have a DJM-sourced on-air signal so the CDJ
-            // self-reported flag is suppressed in the status handler.
-            djmOnAirLastMs.store(juce::Time::getMillisecondCounter(),
-                                  std::memory_order_relaxed);
+            chOnAir[4] = (data[0x2d] != 0x00);
+            chOnAir[5] = (data[0x2e] != 0x00);
         }
+        // A four-channel mixer has no channel 5 or 6: players on those
+        // numbers read off air, as the mixer reports them to the CDJs.
 
-        DBG("ProDJLink: 0x03 on-air broadcast ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
-            << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]);
+        for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
+        {
+            if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
+            uint8_t pn = players[i].playerNumber.load(std::memory_order_relaxed);
+            if (pn < 1 || pn > 6) continue;
+            players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
+        }
+        // Mark that we have a DJM-sourced on-air signal so the CDJ
+        // self-reported flag is suppressed in the status handler.
+        djmOnAirLastMs.store(juce::Time::getMillisecondCounter(),
+                              std::memory_order_relaxed);
+
+        DBG("ProDJLink: 0x03 on-air ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
+            << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]
+            << " ch5=" << (int)chOnAir[4] << " ch6=" << (int)chOnAir[5]);
     }
 
     /// Register a DJM IP + model for bridge subscription.
@@ -2137,12 +2165,12 @@ private:
         // A full beat-link-style implementation would respond with a
         // DEVICE_NUMBER_IN_USE (type 0x08) packet to defend our assigned
         // number.  That emission path is intentionally not implemented yet
-        // -- it needs hardware validation that we do not have, and STC's
-        // own identities (player 5 on the 95 B keepalive, 0xC1 / 0xF9 on
-        // the 54 B bridge keepalive) do not collide with any legal CDJ
-        // number (1-6), so in practice a collision would require another
-        // bridge on the network or a misconfigured device.  For now we
-        // surface the event in the log so operators can see it.
+        // -- it needs hardware validation that we do not have.  The 54 B
+        // bridge identities (0xC0 / 0xE4 / 0xF9) are outside the player
+        // range; player 5, the 95 B's number, is NOT: CDJ-3000s use 5 and 6
+        // (AUDIT A18), which is why the 95 B is never sent to a real
+        // player 5.  For now we surface the event in the log so operators
+        // can see it.
         if (type == ProDJLink::kKeepAliveTypeClaimStage1
             || type == ProDJLink::kKeepAliveTypeClaimStage2
             || type == ProDJLink::kKeepAliveTypeClaimStage3
@@ -2220,9 +2248,12 @@ private:
 
         // Identity-collision diagnostic: another peer keepalive-advertising
         // one of our bridge identities means a second STC instance or a real
-        // bridge is on the network.  Surface it in the log; do not fight it.
+        // bridge is on the network; player 5 from another address is a real
+        // CDJ-3000 on the number the 95 B claims.  Surface it in the log; do
+        // not fight it.
         if (pn != 0
-            && (pn == uint8_t(vCDJPlayerNumber) || pn == 0xC0 || pn == 0xC1 || pn == 0xF9)
+            && (pn == uint8_t(vCDJPlayerNumber)
+                || pn == 0xC0 || pn == 0xC1 || pn == 0xE4 || pn == 0xF9)
             && sender != bindIp)
         {
 #if JUCE_DEBUG
@@ -2233,10 +2264,16 @@ private:
 #endif
         }
 
+        // Our own broadcast keepalive loops back to us: recognise it by its
+        // source address.  A number cannot say "self": 5, the number in the
+        // 95 B, is a legal player (CDJ-3000s use 5 and 6), and ignoring it
+        // hid a real player 5 for good (AUDIT A18).  The bridge identities
+        // are ignored too -- ours seen from another address, or another
+        // bridge's.
         if (pn == 0
-            || pn == uint8_t(vCDJPlayerNumber)
-            || pn == 0xC0 || pn == 0xC1 || pn == 0xF9)
-            return;  // ignore self + bridge identities
+            || sender == bindIp
+            || pn == 0xC0 || pn == 0xC1 || pn == 0xE4 || pn == 0xF9)
+            return;
 
         // Detect DJM mixers: device_type=0x02 AND player_number >= 0x21.
         // (CDJs also use device_type=0x02 but have player_number 1-6;
@@ -2326,17 +2363,16 @@ private:
             return;
         }
 
-        // DJM channel on-air status (0x29) -- sent by DJM unicast after the extended
-        // 95-byte bridge keepalive with Pioneer identification fields is accepted.
-        // Not player-addressed; route directly to the DJM status handler.
+        // Mixer status (0x29) -- documented on port 50002; counted if it ever
+        // shows up here.  Carries no channel flags (handleDJMStatusPacket).
         if (type == ProDJLink::kStatusTypeDJM)
         {
             handleDJMStatusPacket(data, len);
             return;
         }
 
-        // DJM on-air broadcast (0x03) -- DJM broadcasts this on port 50001 always.
-        // Contains per-channel on-air flags. Used as fallback when 0x29 is unavailable.
+        // DJM on-air broadcast (0x03) -- the mixer broadcasts this on port 50001
+        // always.  Per-channel on-air flags: the mixer's on-air source.
         if (type == ProDJLink::kBeatTypeMixer)
         {
             handleOnAirBroadcast(data, len);
@@ -2350,6 +2386,15 @@ private:
             handleVuMeterPacket(data, len);
             return;
         }
+
+        // Absolute position is exactly 60 bytes in both known formats
+        // (dysentery: len_r 0x18; beat-link accepts no other length).  The
+        // CDJ-3000 also unicasts a 68-byte 0x0b of telemetry, with no
+        // playhead in it, to peers that announce 05/20 at keepalive bytes
+        // 0x34/0x35 -- Stagehand, the bridge, and so STC (dysentery
+        // stagehand.adoc).  Read as position it would be garbage (AUDIT C18).
+        if (type == ProDJLink::kBeatTypeAbsPosition && len != 60)
+            return;
 
         // --- 0x0b Absolute Position: two wire formats share this type/size ---
         //
@@ -2509,6 +2554,7 @@ private:
                 p.pitchRaw.store(statusPitch, std::memory_order_relaxed);
             }
             p.hasAbsolutePosition.store(true, std::memory_order_relaxed);
+            p.absPosIs3000Format.store(true, std::memory_order_relaxed);
 
             double absNow = juce::Time::getMillisecondCounterHiRes();
             p.absPositionTs.store(absNow, std::memory_order_relaxed);
@@ -2551,12 +2597,18 @@ private:
             uint16_t bpm   = ProDJLink::readU16BE(data + 90);
             uint8_t  beat  = data[92];
 
-            // Only update from beat packets if we don't have abs position
-            if (!p.hasAbsolutePosition.load(std::memory_order_relaxed))
+            // Pitch and track BPM from beat packets, unless the CDJ-3000's 0x0b
+            // supplies the BPM (x10, already effective).  The NXS2's 0x0b has
+            // no BPM, so it must not stop these updates (AUDIT A16).
+            if (!p.absPosIs3000Format.load(std::memory_order_relaxed))
             {
                 p.pitchRaw.store(pitch, std::memory_order_relaxed);
                 p.bpmRaw.store(bpm, std::memory_order_relaxed);
+            }
 
+            // Position from beats only while no absolute position flows.
+            if (!p.hasAbsolutePosition.load(std::memory_order_relaxed))
+            {
                 // --- NXS2 beat-derived position advancement (FALLBACK) ---
                 // Beat packets arrive at the exact moment of each beat (~2Hz at 120BPM).
                 // While no abs position flows (identity not yet accepted by the
@@ -2578,10 +2630,13 @@ private:
                         p.beatCount.store(bc, std::memory_order_relaxed);
                         double bpmReal = double(bpm) / 100.0;
                         double msPerBeat = 60000.0 / bpmReal;
-                        uint32_t derivedMs = uint32_t(double(bc) * msPerBeat);
-                        p.playheadMs.store(derivedMs, std::memory_order_relaxed);
-                        p.absPositionTs.store(juce::Time::getMillisecondCounterHiRes(),
-                                              std::memory_order_relaxed);
+                        const double derived = double(bc) * msPerBeat;
+                        if (derived < 4294967295.0)   // never convert out of range (UB)
+                        {
+                            p.playheadMs.store(uint32_t(derived), std::memory_order_relaxed);
+                            p.absPositionTs.store(juce::Time::getMillisecondCounterHiRes(),
+                                                  std::memory_order_relaxed);
+                        }
                     }
                 }
             }
@@ -2720,7 +2775,7 @@ private:
             // The CDJ's own on-air bit (0x08) is gated by its UTILITY -> "On
             // Air Display" setting -- when the DJ disables that, the bit goes
             // to 0 even when the channel is genuinely on-air at the mixer.
-            // The DJM's own report (0x03 broadcast or 0x29 unicast) is the
+            // The DJM's own report (the 0x03 broadcast) is the
             // authoritative source.  If we've heard from the DJM in the last
             // 5 seconds we trust it exclusively and skip writing isOnAir from
             // the CDJ status, otherwise the two writers race and the flag
@@ -2734,8 +2789,9 @@ private:
             p.isPlaying.store((flags & 0x40) != 0, std::memory_order_relaxed);
         }
 
-        // BPM (only use if no abs position, to avoid source confusion)
-        if (len > 147 && !p.hasAbsolutePosition.load(std::memory_order_relaxed))
+        // Track BPM x100, unless the CDJ-3000's 0x0b supplies the BPM (x10,
+        // effective).  The NXS2's 0x0b has no BPM (AUDIT A16).
+        if (len > 147 && !p.absPosIs3000Format.load(std::memory_order_relaxed))
         {
             uint16_t bpm = ProDJLink::readU16BE(data + 146);
             if (bpm != 0xFFFF)
@@ -2765,6 +2821,14 @@ private:
         if (len > 166)
         {
             uint32_t bc = ProDJLink::readU32BE(data + 160);
+            // ffffffff means "no beat information": no rekordbox-analysed
+            // track, a track still loading, or a pre-nexus player (dysentery
+            // vcdj.adoc; beat-link's getBeatNumber returns -1 for it).  Taken
+            // as a beat number it turned into a position of 600-900 hours at
+            // every track load on the July 2026 nexus captures, through an
+            // out-of-range conversion (AUDIT A17).  Treat it as "no beat".
+            if (bc == 0xFFFFFFFFu)
+                bc = 0;
 
             // --- Beat-derived playhead (FALLBACK while no abs position flows) ---
             // Historically documented as "NXS2 and older players don't send
@@ -2800,11 +2864,11 @@ private:
                 {
                     p.beatCount.store(bc, std::memory_order_relaxed);
                     uint16_t bpm = ProDJLink::readU16BE(data + 146);  // BPM x 100
-                    if (bpm > 0 && bpm != 0xFFFF)
+                    const double derived = (bpm > 0 && bpm != 0xFFFF)
+                        ? double(bc) * (60000.0 / (double(bpm) / 100.0)) : -1.0;
+                    if (derived >= 0.0 && derived < 4294967295.0)   // never convert out of range (UB)
                     {
-                        double bpmReal = double(bpm) / 100.0;
-                        double msPerBeat = 60000.0 / bpmReal;
-                        uint32_t derivedMs = uint32_t(double(bc) * msPerBeat);
+                        const uint32_t derivedMs = uint32_t(derived);
 
                         p.playheadMs.store(derivedMs, std::memory_order_relaxed);
                         p.absPositionTs.store(juce::Time::getMillisecondCounterHiRes(),
@@ -2815,7 +2879,8 @@ private:
             }
             else
             {
-                // CDJ-3000 or no beat count yet: store unconditionally
+                // CDJ-3000, or no beat (0, or ffffffff above): store as is, so
+                // a beat count from the previous track cannot outlive it.
                 p.beatCount.store(bc, std::memory_order_relaxed);
             }
 
@@ -3025,8 +3090,10 @@ private:
             if (ifa->ifa_addr->sa_family != AF_LINK) continue;
 
             juce::String name(ifa->ifa_name);
-            // Match interface name (e.g. "en0") against the NetworkUtils name
-            if (!name.containsIgnoreCase(ifaceName) && !ifaceName.containsIgnoreCase(name))
+            // Exact BSD name (e.g. "en0"), as NetworkUtils reports it.  A
+            // substring test matched "en1" for a USB/Thunderbolt adapter named
+            // en10-en19 and put en1's MAC in our keepalives (AUDIT A19).
+            if (name != ifaceName)
                 continue;
 
             auto* sdl = reinterpret_cast<struct sockaddr_dl*>(ifa->ifa_addr);
@@ -3381,58 +3448,28 @@ private:
     }
 
     //==========================================================================
-    // DJM channel on-air status handler (type 0x29)
+    // Mixer status handler (type 0x29, port 50002)
     //
-    // Delivered unicast by the DJM once the extended 95-byte bridge keepalive
-    // (with "PIONEER DJ CORP" / "PRODJLINK BRIDGE" identification fields) has
-    // been accepted. Contains per-channel on-air flags indicating which channels
-    // are currently faded up.
+    // The mixer's counterpart of the CDJ status packet (dysentery vcdj.adoc,
+    // "Mixer Status Packets"): 56 bytes; [0x27] status flag F (0xf0 tempo
+    // master, 0xd0 not); [0x28..0x2b] pitch, always +0 %; [0x2e..0x2f] BPM
+    // x100, valid only while an analysed track plays; [0x36] master
+    // handoff; [0x37] beat within bar.  rekordbox sends the same packet with
+    // subtype 0x01.  Matches dysentery's to-virtual.pcapng (DJM-2000nexus)
+    // byte for byte.
     //
-    // Offset map (to be confirmed from live captures once 0x29 delivery is active;
-    // offsets below are derived from protocol analysis):
-    //   [0x24]  Channel count (uint8, typically 4)
-    //   [0x27]  Channel 1 on-air flag (0x00=off-air, 0xff=on-air)
-    //   [0x2b]  Channel 2 on-air flag
-    //   [0x2f]  Channel 3 on-air flag
-    //   [0x33]  Channel 4 on-air flag
-    //
-    // Note: CDJ status packets (port 50002, offset 136, bit 3) carry the same
-    // per-player on-air flag from the player's perspective. The 0x29 packet
-    // mirrors this from the mixer side and also covers non-CDJ inputs.
-    // When both sources are available the 0x29 value takes precedence here
-    // because the mixer has authoritative knowledge of fader position.
+    // There are NO per-channel on-air flags in it.  This handler used to read
+    // channels 1-6 from 0x27/0x2b/0x2f/0x33/0x37/0x3b -- the status flag, a
+    // pitch byte, the low byte of the BPM, a zero, the beat counter -- and the
+    // first 0x29 also silenced the real source, the 0x03 broadcast (AUDIT
+    // A13, replayed on the capture: player 2 on air at the mixer, off air in
+    // STC after 33 of 33 packets).  Nothing in STC needs these fields yet, so
+    // the packet is only counted.
     //==========================================================================
     void handleDJMStatusPacket(const uint8_t* data, int len)
     {
-        // Per-channel on-air flags at 4-byte stride starting at 0x27
-        // CH1=0x27, CH2=0x2b, CH3=0x2f, CH4=0x33, CH5=0x37, CH6=0x3b
-        static constexpr int kOnAirOffsets[6] = { 0x27, 0x2b, 0x2f, 0x33, 0x37, 0x3b };
-
-        bool chOnAir[6] = { false };
-        for (int ch = 0; ch < 6; ++ch)
-        {
-            if (kOnAirOffsets[ch] < len)
-                chOnAir[ch] = (data[kOnAirOffsets[ch]] != 0x00);
-        }
-
-        // Propagate on-air state to matching player slots.
-        // Channel number == player number for standard setups.
-        for (int i = 0; i < ProDJLink::kMaxPlayers; ++i)
-        {
-            if (!players[i].discovered.load(std::memory_order_relaxed)) continue;
-            uint8_t pn = players[i].playerNumber.load(std::memory_order_relaxed);
-            if (pn < 1 || pn > 6) continue;
-            players[i].isOnAir.store(chOnAir[pn - 1], std::memory_order_relaxed);
-        }
-
+        juce::ignoreUnused(data, len);
         pktCountDJMStatus.fetch_add(1, std::memory_order_relaxed);
-        // Mark that we have a DJM-sourced on-air signal so the CDJ
-        // self-reported flag is suppressed in the status handler.
-        djmOnAirLastMs.store(juce::Time::getMillisecondCounter(),
-                              std::memory_order_relaxed);
-
-        DBG("ProDJLink: 0x29 on-air ch1=" << (int)chOnAir[0] << " ch2=" << (int)chOnAir[1]
-            << " ch3=" << (int)chOnAir[2] << " ch4=" << (int)chOnAir[3]);
     }
 
     // Player state array -- indexed 0-5 for players 1-6
@@ -3495,9 +3532,9 @@ private:
     std::atomic<uint32_t> pktCountAbsPos     { 0 };
     std::atomic<uint32_t> pktCountStatus     { 0 };
     std::atomic<uint32_t> pktCountMixer      { 0 };
-    std::atomic<uint32_t> pktCountDJMStatus  { 0 };  // type 0x29 packets received
+    std::atomic<uint32_t> pktCountDJMStatus  { 0 };  // type 0x29 (mixer status) packets received
     // Timestamp (juce::Time::getMillisecondCounter) of the most recent on-air
-    // update from a DJM-sourced packet (0x03 broadcast OR 0x29 unicast).
+    // update from the mixer (the 0x03 broadcast).
     // The CDJ status (0x0a) also reports an on-air bit, but that bit reflects
     // the CDJ's "On Air Display" setting in its own UTILITY menu -- when the
     // user switches that off, the CDJ's bit goes to 0 even though the channel
