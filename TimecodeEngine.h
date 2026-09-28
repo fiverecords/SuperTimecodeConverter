@@ -784,6 +784,13 @@ public:
     bool isOnAirGateEnabled() const     { return onAirGateEnabled; }
     void setOnAirGateEnabled(bool e)    { onAirGateEnabled = e; }
 
+    // ON AIR on StageLinQ, OFF AIR AT (D34): the level at or below which a
+    // deck counts as quiet -- 0 SILENCE (default), 1 -80 dB, 2 -60 dB,
+    // 3 -40 dB (StageLinQ::onAirQuietLevel).  Pro DJ Link has no level:
+    // the DJM decides on-air there.
+    int  getOnAirQuietStep() const      { return onAirQuietStep; }
+    void setOnAirQuietStep(int step)    { onAirQuietStep = juce::jlimit(0, 3, step); }
+
     /// Returns true if the on-air gate allows the engine to be active.
     /// If the gate is disabled, always returns true. Otherwise consults the
     /// CDJ's on-air flag -- this reflects the DJM mixer's full gating logic
@@ -2184,7 +2191,12 @@ public:
                         if (statusTextVisible)
                         {
                             if (isXfMode())
-                                inputStatusText = juce::String(autoModeLabel()) + ": NO DECK ON SIDE";
+                                // A PRIME 4+ never sends the crossfader
+                                // assignment (#23), so XF cannot know sides.
+                                inputStatusText = juce::String(autoModeLabel())
+                                    + ((sharedStageLinQ->hasMixerData() && !sharedStageLinQ->hasChannelAssignment())
+                                           ? ": DEVICE SENDS NO SIDES - USE ON AIR"
+                                           : ": NO DECK ON SIDE");
                             else if (isOnAirMode())
                                 inputStatusText = juce::String(autoModeLabel()) + ": NO DECK ON AIR";
                             else
@@ -3240,6 +3252,7 @@ private:
     // mixer's own gating logic (fader + cross-fader + EQ + mute), so no
     // threshold or channel selection is needed.
     bool onAirGateEnabled = false;
+    int  onAirQuietStep = 0;      // OFF AIR AT, StageLinQ ON AIR (D34): 0 = SILENCE
 
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
@@ -3439,9 +3452,10 @@ private:
     }
 
     /// Resolve XF-A/XF-B for StageLinQ.  Same sticky logic as ProDJLink.
-    /// Uses derived on-air status (fader + crossfader + channel assignment).
-    /// Channel assignment values assumed 0=THRU, 1=A, 2=B -- awaiting
-    /// hardware confirmation.
+    /// On air from isDeckOnAir (ExternalMixerVolume above silence when the
+    /// device sends it).  Sides from /Mixer/ChannelAssignmentN, values
+    /// assumed 0=THRU, 1=A, 2=B -- which a PRIME 4+ never sends (#23 second
+    /// capture), so on that unit XF finds no deck and the status says why.
     void resolveXfPlayerStageLinQ()
     {
         if (!sharedStageLinQ || !sharedStageLinQ->hasMixerData())
@@ -3506,7 +3520,8 @@ private:
 
     /// Resolve which deck to follow in ON AIR mode (D34), for Pro DJ Link
     /// (players 1-6, on air from the DJM, loudest by channel fader) and for
-    /// StageLinQ (decks 1-4, on air and loudest by ExternalMixerVolume).  The
+    /// StageLinQ (decks 1-4, on air above the OFF AIR AT level and loudest
+    /// by ExternalMixerVolume).  The
     /// rule itself is OnAirFollow::pick: the current deck until it goes quiet
     /// or stops, then the loudest one playing on air, else stay.
     void resolveOnAirPlayer()
@@ -3525,9 +3540,10 @@ private:
         {
             static_assert(StageLinQ::kMaxDecks <= ProDJLink::kMaxPlayers, "candidate array size");
             count = StageLinQ::kMaxDecks;
+            const double quiet = StageLinQ::onAirQuietLevel(onAirQuietStep);
             for (int d = 1; d <= count; ++d)
                 candidates[d - 1] = { sharedStageLinQ->isPlayerPlaying(d),
-                                      sharedStageLinQ->getOnAirLevel(d) };
+                                      sharedStageLinQ->getOnAirLevel(d, quiet) };
         }
 
         const int next = OnAirFollow::pick(resolvedXfPlayer, candidates, count);

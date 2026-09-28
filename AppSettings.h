@@ -1389,6 +1389,9 @@ struct EngineSettings
 
     // On-air gate: engine only active when CDJ is flagged on-air by the DJM
     bool onAirGateEnabled = false;
+    // ON AIR on StageLinQ, OFF AIR AT (D34): 0 = SILENCE, 1 = -80 dB,
+    // 2 = -60 dB, 3 = -40 dB
+    int onAirQuiet = 0;
     juce::String midiOutputDevice = "";
     int artnetOutputInterface = 0;
     int laNetTCOutputInterface = 0;
@@ -1510,6 +1513,8 @@ struct EngineSettings
         obj->setProperty("tcnetLayer", tcnetLayer);
         if (onAirGateEnabled)
             obj->setProperty("onAirGateEnabled", onAirGateEnabled);
+        if (onAirQuiet != 0)
+            obj->setProperty("onAirQuiet", onAirQuiet);
         obj->setProperty("hippoOutEnabled", hippoOutEnabled);
         obj->setProperty("hippotizerDestIp", hippotizerDestIp);
         obj->setProperty("midiOutputDevice", midiOutputDevice);
@@ -1655,6 +1660,7 @@ struct EngineSettings
         tcnetOutEnabled      = getBool("tcnetOutEnabled", false);
         tcnetLayer           = juce::jlimit(0, 3, getInt("tcnetLayer", 0));
         onAirGateEnabled     = getBool("onAirGateEnabled", false);
+        onAirQuiet           = juce::jlimit(0, 3, getInt("onAirQuiet", 0));
         hippoOutEnabled      = getBool("hippoOutEnabled", false);
         hippotizerDestIp     = getString("hippotizerDestIp", "255.255.255.255");
         midiOutputDevice     = getString("midiOutputDevice");

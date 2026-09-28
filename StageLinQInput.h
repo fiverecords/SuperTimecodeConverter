@@ -117,13 +117,18 @@ namespace StageLinQ
     static constexpr double kExtendedPositionScale = 1.27;
     static constexpr double kPositionOverrange     = 1.01;
 
-    // /Engine/DeckN/ExternalMixerVolume at or below this is off air (-60 dB).
-    // On a PRIME 4+ it is the deck's level after the channel fader AND the
-    // crossfader (#23 capture): 0 with the fader down, 0 with the crossfader
-    // cutting the deck's side, 1 with the fader up and the crossfader on its
-    // side, about 0.53 each with the crossfader in the middle.  -60 dB is
-    // the fader in roughly the bottom sixth of its travel there.
-    static constexpr double kOnAirMinVolume = 0.001;
+    // /Engine/DeckN/ExternalMixerVolume is the deck's level after the channel
+    // fader AND the crossfader (#23 captures, PRIME 4+): 0 with the fader
+    // down, 0 with the crossfader cutting the deck's side, 1 with the fader
+    // up and the crossfader on its side, about half each near the centre.
+    // A deck is off air at or below the level the engine's OFF AIR AT
+    // setting names (D34): SILENCE (the default) is exactly 0, which the
+    // PRIME 4+ sends with the fader in the bottom 1-4 % of its travel or the
+    // crossfader in the last 3-6 %; -80, -60 and -40 dB go off air earlier
+    // (-60 dB, beta1's fixed value, around 13-20 % of the fader and 10-15 %
+    // from the crossfader's end).
+    static constexpr double kOnAirQuietLevels[4] = { 0.0, 1.0e-4, 1.0e-3, 1.0e-2 };
+    inline double onAirQuietLevel(int step) { return kOnAirQuietLevels[juce::jlimit(0, 3, step)]; }
 
     // Playback speed from BeatInfo (see StageLinQInput::handleBeatInfo):
     // an estimate older than this is not used, and a pair of messages that
@@ -704,18 +709,21 @@ struct StageLinQDeckState
     std::atomic<bool>     isPlaying { false };     // from /Engine/DeckN/Play
     std::atomic<int>      playState { 0 };         // from /Engine/DeckN/PlayState
     std::atomic<double>   currentBPM { 0.0 };      // from /Engine/DeckN/CurrentBPM
-    // /Engine/DeckN/Speed was taken for the playback rate.  It is not, on
-    // Engine OS 5.0.4: a PRIME 4+ sent 0.0085 for a synced deck playing at
-    // 0.803x, and nothing when a deck paused (#23 capture).  The rate comes
-    // from BeatInfo now (beatSpeed below); this is only the fallback for a
-    // device that sends no BeatInfo.
+    // /Engine/DeckN/Speed was taken for the playback rate.  It is the pitch
+    // fader's position, 0 to 1 with 0.5 at 0 % (#23 captures, PRIME 4+ on
+    // Engine OS 5.0.4, range +/-20 %): 0.4853 at -0.59 %, 0.5000 at 0, and
+    // 0.0085 for a deck synced to -19.66 %.  It does not change on pause.
+    // The rate comes from BeatInfo (beatSpeed below); without BeatInfo,
+    // from SpeedState and Play (getActualSpeedAt).  Speed is kept as sent.
     std::atomic<double>   speed { 0.0 };           // from /Engine/DeckN/Speed (see above)
     std::atomic<bool>     speedReceived { false };  // true once Speed path has sent at least one value
-    // The six below are stored but drive nothing (SyncMode reaches the SLQ
-    // View's deck state, which does not draw it).  On the PRIME 4+
-    // SpeedState is the pitch in percent (-19.66 at 0.803x), and
-    // SpeedNeutral / SpeedOffsetUp are {"state": bool}, read here as 0.
-    std::atomic<int>      speedState { 0 };        // from /Engine/DeckN/SpeedState
+    // SpeedState is the pitch in percent (-19.66 at 0.803x, -0.59 at
+    // 0.9941): the fallback rate.  The five after it are stored but drive
+    // nothing (SyncMode reaches the SLQ View's deck state, which does not
+    // draw it); on the PRIME 4+ SpeedRange is {"string":"20"} and
+    // SpeedNeutral / SpeedOffsetUp are {"state": bool}, all read here as 0.
+    std::atomic<double>   speedState { 0.0 };      // from /Engine/DeckN/SpeedState (percent)
+    std::atomic<bool>     speedStateReceived { false };
     std::atomic<double>   speedNeutral { 1.0 };    // from SpeedNeutral
     std::atomic<double>   speedRange { 0.08 };     // from SpeedRange (+/-8% default)
     std::atomic<double>   speedOffsetUp { 0.0 };   // from SpeedOffsetUp
@@ -785,7 +793,8 @@ struct StageLinQDeckState
         currentBPM.store(0.0);
         speed.store(0.0);
         speedReceived.store(false);
-        speedState.store(0);
+        speedState.store(0.0);
+        speedStateReceived.store(false);
         speedNeutral.store(1.0);
         speedRange.store(0.08);
         speedOffsetUp.store(0.0);
@@ -845,6 +854,7 @@ struct StageLinQMixerState
     std::atomic<int>    numChannels { 0 };            // from /Mixer/NumberOfChannels
     std::atomic<double> positionScale { 1.0 };       // full scale of faders and crossfader (kExtendedPositionScale)
     std::atomic<bool>   valuesReceived { false };    // any fader, crossfader or ExternalMixerVolume value
+    std::atomic<bool>   assignmentReceived { false }; // any /Mixer/ChannelAssignmentN (never, from a PRIME 4+)
 
     // Deck ring LED colors (from /Client/Preferences/Profile/Application/PlayerColorN)
     // Index 0-3 = deck 1-4.  Each has base, A (layer A), B (layer B) variants.
@@ -862,6 +872,7 @@ struct StageLinQMixerState
         numChannels.store(0);
         positionScale.store(1.0);
         valuesReceived.store(false);
+        assignmentReceived.store(false);
         for (auto& c : playerColor)  c.store(0);
         for (auto& c : playerColorA) c.store(0);
         for (auto& c : playerColorB) c.store(0);
@@ -1071,23 +1082,19 @@ public:
         if (measuredAt > 0.0 && (nowMs - measuredAt) < StageLinQ::kBeatSpeedMaxAgeMs)
             return decks[idx].beatSpeed.load(std::memory_order_relaxed);
 
-        // No BeatInfo: the pre-#23 behaviour, unchanged -- Speed as sent,
-        // which is not the rate on Engine OS 5.x (see the deck state).
-        double spd = decks[idx].speed.load(std::memory_order_relaxed);
-        // Fall back to 1.0 ONLY if the Speed path has NEVER sent a value.
-        // Some firmware versions may not emit Speed at all (chrisle/StageLinq
-        // doesn't even subscribe to it).  Without the fallback, the PLL gets
-        // 0 velocity forever and timecode interpolation stops.
-        //
-        // Previously this checked isPlaying instead of speedReceived, which
-        // caused a race: if Speed=0.0 (pause) arrived before Play=false
-        // (two different StateMap paths, order not guaranteed), the fallback
-        // returned 1.0 -- telling the PLL we're at full speed when actually
-        // stopped.  Using speedReceived avoids this: once Speed has sent any
-        // value (including 0.0 for pause), we trust it.
-        if (spd == 0.0 && !decks[idx].speedReceived.load(std::memory_order_relaxed))
-            return 1.0;
-        return spd;
+        // No BeatInfo (none yet, or it stalled).  Speed is the pitch fader's
+        // position, not a rate (see the deck state), and it does not drop on
+        // pause, so it is not used: a deck that is not playing is at 0, a
+        // playing one at 1 + SpeedState / 100 -- 0.9941 and 0.8034 for the
+        // two decks of the #23 captures, what BeatInfo measured for them --
+        // or 1.0 from a device that sends no SpeedState.  (Before, Speed was
+        // returned as the rate: 0.49 for a PRIME 4+ deck at -0.59 %, and a
+        // paused deck never read 0.)
+        if (!decks[idx].isPlaying.load(std::memory_order_relaxed))
+            return 0.0;
+        if (decks[idx].speedStateReceived.load(std::memory_order_acquire))
+            return 1.0 + decks[idx].speedState.load(std::memory_order_relaxed) / 100.0;
+        return 1.0;
     }
 
     uint32_t getTrackLengthSec(int deckNum) const
@@ -1309,7 +1316,8 @@ public:
 
     /// Crossfader assignment for a channel.
     /// Values assumed to be: 0=THRU, 1=A, 2=B (same as Pioneer DJM).
-    /// Not yet confirmed with real hardware -- awaiting community testing.
+    /// Not confirmed on any hardware: a PRIME 4+ never sends it (#23 second
+    /// capture -- STC subscribes, nothing comes; hasChannelAssignment()).
     int getChannelAssignment(int channel) const
     {
         int idx = channel - 1;
@@ -1317,14 +1325,22 @@ public:
         return decks[idx].channelAssignment.load(std::memory_order_relaxed);
     }
 
+    /// Has the device ever sent a channel's crossfader assignment?  XF-A /
+    /// XF-B cannot tell sides without it.
+    bool hasChannelAssignment() const
+    {
+        return mixerState.assignmentReceived.load(std::memory_order_relaxed);
+    }
+
     /// Is the deck heard on the mixer's output?
     ///
     /// From the deck's ExternalMixerVolume when the device sends it: that is
     /// the mixer's own answer, after channel fader and crossfader, with the
-    /// crossfader assignment the DJ actually set (#23 capture, PRIME 4+).
-    /// Otherwise derived from the fader, the crossfader and the channel's
-    /// assumed assignment (0=THRU, 1=A, 2=B), as before.
-    bool isDeckOnAir(int deckNum) const
+    /// crossfader assignment the DJ actually set (#23 captures, PRIME 4+) --
+    /// on air above `quietLevel` (StageLinQ::onAirQuietLevel; 0 = anything
+    /// but silence).  Otherwise derived from the fader, the crossfader and
+    /// the channel's assumed assignment (0=THRU, 1=A, 2=B), as before.
+    bool isDeckOnAir(int deckNum, double quietLevel = 0.0) const
     {
         static constexpr double kFaderThreshold = 0.02;  // ~2% above zero
         static constexpr double kXfCutThreshold = 0.02;  // crossfader fully to opposite side
@@ -1333,7 +1349,7 @@ public:
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return false;
 
         if (decks[idx].externalVolumeReceived.load(std::memory_order_acquire))
-            return decks[idx].externalVolume.load(std::memory_order_relaxed) > StageLinQ::kOnAirMinVolume;
+            return decks[idx].externalVolume.load(std::memory_order_relaxed) > quietLevel;
 
         double fader = getFaderPosition(deckNum);
         if (fader < kFaderThreshold) return false;  // fader down = not on-air
@@ -1350,10 +1366,11 @@ public:
 
     /// ON AIR follow (D34): how loud the deck is among the decks on air --
     /// its ExternalMixerVolume when the device sends it, otherwise its
-    /// channel fader.  Negative when isDeckOnAir() says it is not on air.
-    double getOnAirLevel(int deckNum) const
+    /// channel fader.  Negative when isDeckOnAir(deckNum, quietLevel) says
+    /// it is not on air.
+    double getOnAirLevel(int deckNum, double quietLevel = 0.0) const
     {
-        if (!isDeckOnAir(deckNum)) return -1.0;
+        if (!isDeckOnAir(deckNum, quietLevel)) return -1.0;
         const int idx = deckNum - 1;
         if (decks[idx].externalVolumeReceived.load(std::memory_order_acquire))
             return decks[idx].externalVolume.load(std::memory_order_relaxed);
@@ -1867,7 +1884,8 @@ private:
             }
             else if (sub == "SpeedState")
             {
-                dk.speedState.store(value.asInt(), std::memory_order_relaxed);
+                dk.speedState.store(value.asDouble(), std::memory_order_relaxed);
+                dk.speedStateReceived.store(true, std::memory_order_release);
             }
             else if (sub == "Track/ArtistName")
             {
@@ -2056,7 +2074,10 @@ private:
             // /Mixer/ChannelAssignment1 -> channel 1 is assigned to deck N
             int ch = path[24] - '0';
             if (ch >= 1 && ch <= StageLinQ::kMaxMixerChannels)
+            {
                 decks[ch - 1].channelAssignment.store(value.asInt(), std::memory_order_relaxed);
+                mixerState.assignmentReceived.store(true, std::memory_order_relaxed);
+            }
         }
         else if (path == "/Mixer/NumberOfChannels")
         {

@@ -113,7 +113,7 @@ Both settings take effect on the next connection. A mixer decides whether to acc
 
 STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving deck state, track metadata, mixer fader positions, and beat information in real time.
 
-**Note:** This implementation is based on open-source protocol references. One network capture of a real unit has been checked against it so far -- a PRIME 4+ on Engine OS 5.0.4, from a user (#23) -- which fixed the playback speed of synced decks, the fader ranges and the on-air reading; the rest is still unconfirmed on Denon hardware. If you have access to Denon Prime equipment, please try it and report results on [GitHub](https://github.com/fiverecords/SuperTimecodeConverter/issues).
+**Note:** This implementation is based on open-source protocol references. Two network captures of a real unit have been checked against it so far -- a PRIME 4+ on Engine OS 5.0.4, from a user (#23) -- which fixed the playback speed, the fader ranges and the on-air reading, and showed what that unit does not report (the crossfader assignment); the rest is still unconfirmed on Denon hardware. If you have access to Denon Prime equipment, please try it and report results on [GitHub](https://github.com/fiverecords/SuperTimecodeConverter/issues).
 
 **Supported hardware:** SC5000, SC6000, SC6000M, LC6000, Prime 4, Prime 2, Prime Go, X1800, X1850. Other StageLinQ-compatible hardware should work but has not been verified yet -- please report any issues on GitHub.
 
@@ -123,7 +123,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 - Track metadata: artist, title, duration, loaded state
 - Channel fader positions and crossfader position (0-1.27 on the PRIME 4+, scaled to the full travel)
 - Per-deck mixer level after fader and crossfader (ExternalMixerVolume), used as the deck's on-air state
-- Deck selection per engine: DECK 1-4, XF-A / XF-B, or ON AIR (follows the deck you are hearing; see Pro DJ Link above)
+- Deck selection per engine: DECK 1-4, XF-A / XF-B, or ON AIR (follows the deck you are hearing; see Pro DJ Link above). With ON AIR, **OFF AIR AT** sets when a deck counts as quiet: SILENCE (default: fader all the way down or the crossfader at the far end), -80 dB, -60 dB or -40 dB
 
 **Beat information (via BeatInfo service):**
 - Real-time beat position, total beats, and BPM per deck
@@ -145,7 +145,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 
 **Known limitations:**
 - No DJM-style mixer parameter mapping (Denon mixers expose basic fader data only via StateMap)
-- XF-A/XF-B crossfader auto-follow is preliminary -- channel assignment values (0=THRU, 1=A, 2=B) assumed from Pioneer convention; the one PRIME 4+ capture available could not confirm them. ON AIR does not depend on them
+- XF-A/XF-B crossfader auto-follow needs the unit to report each channel's crossfader assignment. The PRIME 4+ does not (captured), so there XF-A / XF-B find no deck and say so -- use ON AIR, which does not depend on it. Other Denon units unconfirmed; the values are assumed 0=THRU, 1=A, 2=B, from Pioneer convention
 
 ### Track Map
 

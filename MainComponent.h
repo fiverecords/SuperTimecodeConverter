@@ -408,6 +408,7 @@ private:
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
+    juce::ComboBox cmbOnAirQuiet;            juce::Label lblOnAirQuiet;       // D34, StageLinQ ON AIR
     juce::ComboBox cmbPdlBridgeIdentity;     juce::Label lblPdlBridgeIdentity;
     juce::ComboBox cmbPdl95bMode;            juce::Label lblPdl95bMode;
     juce::ComboBox cmbStageLinQInterface;    juce::Label lblStageLinQInterface;
@@ -699,6 +700,7 @@ private:
     void updateFpsButtonStates();
     void updateOutputFpsButtonStates();
     void updateDeviceSelectorVisibility();
+    void updateOnAirQuietVisibility();   // OFF AIR AT: StageLinQ with ON AIR selected (D34)
     void updateStatusLabels();
     void updateNextCueLabel(TimecodeEngine& eng);
     static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);

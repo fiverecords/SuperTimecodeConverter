@@ -955,8 +955,29 @@ MainComponent::MainComponent()
                 lblProDJLinkMetadata.setText("", juce::dontSendNotification);
                 lblNextCue.setText("", juce::dontSendNotification);
             }
+            updateOnAirQuietVisibility();
+            resized();
             saveSettings();
         }
+    };
+
+    // OFF AIR AT: when a deck counts as quiet for ON AIR on StageLinQ (D34).
+    // Pro DJ Link has no level to compare -- the DJM decides on-air -- so it
+    // only shows with StageLinQ and ON AIR selected.
+    addLabelAndCombo(lblOnAirQuiet, cmbOnAirQuiet, "OFF AIR AT:");
+    cmbOnAirQuiet.addItem("SILENCE", 1);
+    cmbOnAirQuiet.addItem("-80 dB", 2);
+    cmbOnAirQuiet.addItem("-60 dB", 3);
+    cmbOnAirQuiet.addItem("-40 dB", 4);
+    cmbOnAirQuiet.setSelectedId(1, juce::dontSendNotification);
+    cmbOnAirQuiet.setVisible(false);
+    lblOnAirQuiet.setVisible(false);
+    cmbOnAirQuiet.onChange = [this]
+    {
+        if (syncing) return;
+        if (isShowLockedRevert()) return;
+        currentEngine().setOnAirQuietStep(cmbOnAirQuiet.getSelectedId() - 1);
+        saveSettings();
     };
 
     leftContent.addAndMakeVisible(lblProDJLinkMetadata);
@@ -2543,6 +2564,7 @@ void MainComponent::syncUIFromEngine()
 
     // On-air gate
     btnOnAirGate.setToggleState(eng.isOnAirGateEnabled(), juce::dontSendNotification);
+    cmbOnAirQuiet.setSelectedId(eng.getOnAirQuietStep() + 1, juce::dontSendNotification);
 
     // Generator TC fields
     btnGenClock.setToggleState(eng.getGeneratorClockMode(), juce::dontSendNotification);
@@ -4689,6 +4711,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setTcnetLayer(es.tcnetLayer);
         eng.setOutputHippoEnabled(es.hippoOutEnabled);
         eng.setOnAirGateEnabled(es.onAirGateEnabled);
+        eng.setOnAirQuietStep(es.onAirQuiet);
 
         eng.setMtcOutputOffset(es.mtcOutputOffset);
         eng.setArtnetOutputOffset(es.artnetOutputOffset);
@@ -5093,6 +5116,7 @@ void MainComponent::flushSettings()
         es.tcnetLayer = eng.getTcnetLayer();
         es.hippoOutEnabled = eng.isOutputHippoEnabled();
         es.onAirGateEnabled = eng.isOnAirGateEnabled();
+        es.onAirQuiet = eng.getOnAirQuietStep();
         es.generatorClockMode = eng.getGeneratorClockMode();
         es.generatorPresetName = eng.getGeneratorPresetName();
         es.generatorStartMs = eng.getGeneratorStartMs();
@@ -5614,6 +5638,17 @@ int MainComponent::getChannelFromComboOrSettings(const juce::ComboBox& cmb,
 //==============================================================================
 // VISIBILITY (updated for collapse + engine)
 //==============================================================================
+void MainComponent::updateOnAirQuietVisibility()
+{
+    // OFF AIR AT is StageLinQ's alone (Pro DJ Link's on-air comes from the
+    // DJM as a flag, with no level), and only means something with ON AIR.
+    const bool show = cmbProDJLinkPlayer.isVisible()
+                   && currentEngine().getActiveInput() == SrcType::StageLinQ
+                   && cmbProDJLinkPlayer.getSelectedId() == 10;
+    cmbOnAirQuiet.setVisible(show);
+    lblOnAirQuiet.setVisible(show);
+}
+
 void MainComponent::updateDeviceSelectorVisibility()
 {
     auto& eng = currentEngine();
@@ -5831,6 +5866,7 @@ void MainComponent::updateDeviceSelectorVisibility()
         }
         cmbProDJLinkPlayer.setSelectedId(prevId, juce::dontSendNotification);
     }
+    updateOnAirQuietVisibility();
     lblProDJLinkMetadata.setVisible(showProDJLinkIn);
     lblNextCue.setVisible(showProDJLinkIn);
     lblProDJLinkTrackInfo.setVisible(showProDJLinkIn);
@@ -7162,6 +7198,10 @@ void MainComponent::resized()
     if (cmbProDJLinkPlayer.isVisible())
     {
         layCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, leftPanel);
+
+        // OFF AIR AT (StageLinQ, ON AIR selected; D34)
+        if (cmbOnAirQuiet.isVisible())
+            layCombo(lblOnAirQuiet, cmbOnAirQuiet, leftPanel);
 
         // ON-AIR ONLY toggle (gate engine output by DJM on-air flag)
         if (btnOnAirGate.isVisible())
