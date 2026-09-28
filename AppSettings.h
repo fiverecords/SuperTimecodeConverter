@@ -1613,8 +1613,8 @@ struct EngineSettings
         generatorAudioEnabled    = getBool("generatorAudioEnabled", false);
         generatorAudioVolume     = (float) getDouble("generatorAudioVolume", 1.0);
         generatorAudioFileChannelMode = getInt("generatorAudioFileChannelMode", 0);
-        // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER
-        proDJLinkPlayer      = juce::jlimit(1, 9, getInt("proDJLinkPlayer", 1));
+        // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER, 10 = ON AIR
+        proDJLinkPlayer      = juce::jlimit(1, 10, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
         trackMapOverrides.fromVar(obj->getProperty("trackMapOverrides"));
         midiClockEnabled     = getBool("midiClockEnabled", getBool("tcnetMidiClock", false));

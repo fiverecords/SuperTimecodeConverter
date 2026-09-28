@@ -23,6 +23,12 @@
 // engineering work cited above.  No Denon hardware was available during
 // development.  Extensive logging is included for Wireshark-assisted
 // debugging when hardware becomes available.
+//
+// One field capture has been read since: a PRIME 4+ on Engine OS 5.0.4,
+// from issue #23 (replayed by tools/audit/slq_capture_replay.cpp).  It set
+// the playback speed (from BeatInfo, not /Engine/DeckN/Speed), the 0 - 1.27
+// range of its faders and crossfader, and ExternalMixerVolume as the on-air
+// signal.  Everything else here is still unconfirmed on Denon hardware.
 
 #pragma once
 #include <JuceHeader.h>
@@ -30,6 +36,7 @@
 #include "NetworkUtils.h"
 #include <atomic>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -99,6 +106,31 @@ namespace StageLinQ
 
     // Maximum mixer channels
     static constexpr int kMaxMixerChannels = 4;
+
+    // Mixer positions.  A PRIME 4+ on Engine OS 5.0.4 reports its channel
+    // faders and crossfader as 0 - 1.27, not 0 - 1 (#23 capture: top of
+    // travel 1.2699999809, crossfader near the centre 0.56 - 0.60).  STC
+    // keeps 1.0 as full scale until a position above kPositionOverrange
+    // arrives, then uses 1.27 -- or the highest position seen, should a
+    // device go further still.  The margin keeps a device whose top is a
+    // float rounding of 1.0 at full scale 1.0.
+    static constexpr double kExtendedPositionScale = 1.27;
+    static constexpr double kPositionOverrange     = 1.01;
+
+    // /Engine/DeckN/ExternalMixerVolume at or below this is off air (-60 dB).
+    // On a PRIME 4+ it is the deck's level after the channel fader AND the
+    // crossfader (#23 capture): 0 with the fader down, 0 with the crossfader
+    // cutting the deck's side, 1 with the fader up and the crossfader on its
+    // side, about 0.53 each with the crossfader in the middle.  -60 dB is
+    // the fader in roughly the bottom sixth of its travel there.
+    static constexpr double kOnAirMinVolume = 0.001;
+
+    // Playback speed from BeatInfo (see StageLinQInput::handleBeatInfo):
+    // an estimate older than this is not used, and a pair of messages that
+    // gives more than this speed is a jump (cue, hot cue, track load), not
+    // playback.
+    static constexpr double kBeatSpeedMaxAgeMs  = 500.0;
+    static constexpr double kMaxPlausibleSpeed  = 4.0;
 
     //==========================================================================
     // Big-endian byte helpers
@@ -608,6 +640,56 @@ namespace StageLinQ
     {
         return wallClockToTimecode(double(playheadMs), fps);
     }
+
+    //==========================================================================
+    // Playback speed of one deck from consecutive BeatInfo messages.
+    //
+    // Each BeatInfo message carries the device's clock in nanoseconds
+    // (chrisle/StageLinq's protocol notes; in the #23 capture it advanced
+    // 76.0376 s while the capture's own clock advanced 76.0327 s) and every
+    // deck's position in samples.  The speed is the position's advance in
+    // seconds of track over the clock's advance.  On a PRIME 4+ the messages
+    // come every 35 ms of device clock and the estimate scatters by 0.3 %
+    // (1 sd) around the true rate, so it is used as it comes, unsmoothed:
+    // 0.994 and 1.000 for the two unsynced decks of the capture, 0.803 for
+    // the synced one, 0 while paused, and the ramp as SYNC pulls a deck in.
+    //
+    // A pair more than 0.5 s apart, less than 1 ms apart, or giving more
+    // than kMaxPlausibleSpeed is not a measurement: the first two are a
+    // stalled stream or a clock in other units, the last a jump in position
+    // (cue, hot cue, track load).  Those return false and the caller keeps
+    // the last estimate.
+    //==========================================================================
+    struct BeatSpeedTracker
+    {
+        uint64_t lastClock    = 0;      // device clock of the previous message (ns)
+        double   lastTimeline = 0.0;    // this deck's position then (samples)
+        bool     haveLast     = false;
+
+        void reset() { *this = BeatSpeedTracker{}; }
+
+        bool update(uint64_t clock, double timeline, double sampleRate, double& speedOut)
+        {
+            bool measured = false;
+            if (haveLast && clock > lastClock && sampleRate > 0.0 && std::isfinite(timeline))
+            {
+                const double dtSec = double(clock - lastClock) * 1.0e-9;
+                if (dtSec >= 0.001 && dtSec <= 0.5)
+                {
+                    const double speed = (timeline - lastTimeline) / sampleRate / dtSec;
+                    if (std::isfinite(speed) && std::abs(speed) < kMaxPlausibleSpeed)
+                    {
+                        speedOut = speed;
+                        measured = true;
+                    }
+                }
+            }
+            lastClock    = clock;
+            lastTimeline = timeline;
+            haveLast     = std::isfinite(timeline);
+            return measured;
+        }
+    };
 }
 
 //==============================================================================
@@ -622,14 +704,23 @@ struct StageLinQDeckState
     std::atomic<bool>     isPlaying { false };     // from /Engine/DeckN/Play
     std::atomic<int>      playState { 0 };         // from /Engine/DeckN/PlayState
     std::atomic<double>   currentBPM { 0.0 };      // from /Engine/DeckN/CurrentBPM
-    std::atomic<double>   speed { 0.0 };           // from /Engine/DeckN/Speed (pitch multiplier)
+    // /Engine/DeckN/Speed was taken for the playback rate.  It is not, on
+    // Engine OS 5.0.4: a PRIME 4+ sent 0.0085 for a synced deck playing at
+    // 0.803x, and nothing when a deck paused (#23 capture).  The rate comes
+    // from BeatInfo now (beatSpeed below); this is only the fallback for a
+    // device that sends no BeatInfo.
+    std::atomic<double>   speed { 0.0 };           // from /Engine/DeckN/Speed (see above)
     std::atomic<bool>     speedReceived { false };  // true once Speed path has sent at least one value
+    // The six below are stored but drive nothing (SyncMode reaches the SLQ
+    // View's deck state, which does not draw it).  On the PRIME 4+
+    // SpeedState is the pitch in percent (-19.66 at 0.803x), and
+    // SpeedNeutral / SpeedOffsetUp are {"state": bool}, read here as 0.
     std::atomic<int>      speedState { 0 };        // from /Engine/DeckN/SpeedState
-    std::atomic<double>   speedNeutral { 1.0 };    // from SpeedNeutral (pitch at 0%)
+    std::atomic<double>   speedNeutral { 1.0 };    // from SpeedNeutral
     std::atomic<double>   speedRange { 0.08 };     // from SpeedRange (+/-8% default)
-    std::atomic<double>   speedOffsetUp { 0.0 };   // from SpeedOffsetUp (pitch bend)
-    std::atomic<double>   speedOffsetDown { 0.0 }; // from SpeedOffsetDown (pitch bend)
-    std::atomic<int>      syncMode { 0 };          // from SyncMode
+    std::atomic<double>   speedOffsetUp { 0.0 };   // from SpeedOffsetUp
+    std::atomic<double>   speedOffsetDown { 0.0 }; // from SpeedOffsetDown
+    std::atomic<int>      syncMode { 0 };          // from SyncMode ({"string":"BeatOrBarSync"} on the PRIME 4+, read as 0)
     std::atomic<bool>     scratchWheelTouch { false }; // from ExternalScratchWheelTouch
     std::atomic<int>      padsView { 0 };          // from Pads/View
     std::atomic<bool>     bleep { false };         // from Track/Bleep (reverse mode)
@@ -665,9 +756,14 @@ struct StageLinQDeckState
     std::atomic<double>   beatInfoBPM { 0.0 };         // BPM from BeatInfo
     std::atomic<double>   beatInfoTimeline { 0.0 };    // current sample position
 
+    // Playback speed measured from BeatInfo (StageLinQ::BeatSpeedTracker)
+    std::atomic<double>   beatSpeed { 0.0 };         // 1.0 = normal, 0 = paused
+    std::atomic<double>   beatSpeedTime { 0.0 };     // hiRes ms of the last measurement, 0 = none
+
     // Mixer (per-channel)
-    std::atomic<double>   faderPosition { 0.0 };   // from /Mixer/CH{N}faderPosition (0-1)
-    std::atomic<double>   externalVolume { 0.0 };   // from ExternalMixerVolume
+    std::atomic<double>   faderPosition { 0.0 };   // from /Mixer/CH{N}faderPosition, as sent (0-1, or 0-1.27 on a PRIME 4+)
+    std::atomic<double>   externalVolume { 0.0 };   // from ExternalMixerVolume: level after fader and crossfader, 0-1
+    std::atomic<bool>     externalVolumeReceived { false };
     std::atomic<bool>     isMaster { false };        // from /Client/DeckN/DeckIsMaster
     std::atomic<int>      channelAssignment { 0 };   // from /Mixer/ChannelAssignment{N} (deck->channel map)
 
@@ -726,8 +822,11 @@ struct StageLinQDeckState
         beatInfoTotalBeats.store(0.0);
         beatInfoBPM.store(0.0);
         beatInfoTimeline.store(0.0);
+        beatSpeed.store(0.0);
+        beatSpeedTime.store(0.0);
         faderPosition.store(0.0);
         externalVolume.store(0.0);
+        externalVolumeReceived.store(false);
         isMaster.store(false);
         channelAssignment.store(0);
         lastUpdateTime.store(0.0);
@@ -741,9 +840,11 @@ struct StageLinQDeckState
 //==============================================================================
 struct StageLinQMixerState
 {
-    std::atomic<double> crossfaderPosition { 0.0 };  // 0=left, 0.5=center, 1=right
+    std::atomic<double> crossfaderPosition { 0.0 };  // as sent: 0=left, 1 (or 1.27) = right
     std::atomic<double> masterBPM { 0.0 };           // from /Engine/Master/MasterTempo
     std::atomic<int>    numChannels { 0 };            // from /Mixer/NumberOfChannels
+    std::atomic<double> positionScale { 1.0 };       // full scale of faders and crossfader (kExtendedPositionScale)
+    std::atomic<bool>   valuesReceived { false };    // any fader, crossfader or ExternalMixerVolume value
 
     // Deck ring LED colors (from /Client/Preferences/Profile/Application/PlayerColorN)
     // Index 0-3 = deck 1-4.  Each has base, A (layer A), B (layer B) variants.
@@ -751,6 +852,20 @@ struct StageLinQMixerState
     std::atomic<int>    playerColor[4]  = {};    // PlayerColor1-4
     std::atomic<int>    playerColorA[4] = {};    // PlayerColor1A-4A
     std::atomic<int>    playerColorB[4] = {};    // PlayerColor1B-4B
+
+    // Cleared with the decks on start/stop, so a scale or a crossfader learned
+    // from one device does not carry over to the next session.
+    void reset()
+    {
+        crossfaderPosition.store(0.0);
+        masterBPM.store(0.0);
+        numChannels.store(0);
+        positionScale.store(1.0);
+        valuesReceived.store(false);
+        for (auto& c : playerColor)  c.store(0);
+        for (auto& c : playerColorA) c.store(0);
+        for (auto& c : playerColorB) c.store(0);
+    }
 };
 
 //==============================================================================
@@ -839,8 +954,10 @@ public:
         bindIp = iface.ip;
         selectedInterface = idx;
 
-        // Reset all decks
+        // Reset all decks and the mixer
         for (auto& d : decks) d.reset();
+        mixerState.reset();
+        resetBeatSpeedTrackers();
 
         // Clear discovered devices
         {
@@ -882,6 +999,8 @@ public:
         stopThread(3000);
 
         for (auto& d : decks) d.reset();
+        mixerState.reset();
+        resetBeatSpeedTrackers();
 
         DBG("StageLinQ: Stopped");
     }
@@ -931,10 +1050,29 @@ public:
         return decks[idx].currentBPM.load(std::memory_order_relaxed);
     }
 
+    /// Playback speed: 1.0 = normal, 0 = stopped.  Drives the engine's PLL,
+    /// its interpolation and its source-active test, like the CDJ's actual
+    /// speed does for Pro DJ Link.
     double getActualSpeed(int deckNum) const
+    {
+        return getActualSpeedAt(deckNum, juce::Time::getMillisecondCounterHiRes());
+    }
+
+    double getActualSpeedAt(int deckNum, double nowMs) const
     {
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0.0;
+
+        // The rate measured from BeatInfo, while it is being measured.  A
+        // PRIME 4+ streams BeatInfo for every deck all the time, paused or
+        // not, so on that hardware this is the answer whenever STC has a
+        // position at all (the position comes from the same messages).
+        const double measuredAt = decks[idx].beatSpeedTime.load(std::memory_order_acquire);
+        if (measuredAt > 0.0 && (nowMs - measuredAt) < StageLinQ::kBeatSpeedMaxAgeMs)
+            return decks[idx].beatSpeed.load(std::memory_order_relaxed);
+
+        // No BeatInfo: the pre-#23 behaviour, unchanged -- Speed as sent,
+        // which is not the rate on Engine OS 5.x (see the deck state).
         double spd = decks[idx].speed.load(std::memory_order_relaxed);
         // Fall back to 1.0 ONLY if the Speed path has NEVER sent a value.
         // Some firmware versions may not emit Speed at all (chrisle/StageLinq
@@ -1129,9 +1267,10 @@ public:
         return "Denon";
     }
 
+    /// Crossfader, 0 = left end ... 1 = right end of its travel.
     double getCrossfaderPosition() const
     {
-        return mixerState.crossfaderPosition.load(std::memory_order_relaxed);
+        return normalisePosition(mixerState.crossfaderPosition.load(std::memory_order_relaxed));
     }
 
     double getMasterBPM() const
@@ -1152,11 +1291,20 @@ public:
         return decks[idx].isMaster.load(std::memory_order_relaxed);
     }
 
+    /// Channel fader, 0 = closed ... 1 = top of its travel.
     double getFaderPosition(int channel) const
     {
         int idx = channel - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0.0;
-        return decks[idx].faderPosition.load(std::memory_order_relaxed);
+        return normalisePosition(decks[idx].faderPosition.load(std::memory_order_relaxed));
+    }
+
+    /// A fader or crossfader value as sent, over the full scale learned so
+    /// far (StageLinQ::kExtendedPositionScale), clamped to 0-1.
+    double normalisePosition(double raw) const
+    {
+        const double scale = mixerState.positionScale.load(std::memory_order_relaxed);
+        return juce::jlimit(0.0, 1.0, raw / (scale > 0.0 ? scale : 1.0));
     }
 
     /// Crossfader assignment for a channel.
@@ -1169,8 +1317,13 @@ public:
         return decks[idx].channelAssignment.load(std::memory_order_relaxed);
     }
 
-    /// Derive on-air status from fader + crossfader + channel assignment.
-    /// A deck is "on-air" when its fader is up AND it's not cut by crossfader.
+    /// Is the deck heard on the mixer's output?
+    ///
+    /// From the deck's ExternalMixerVolume when the device sends it: that is
+    /// the mixer's own answer, after channel fader and crossfader, with the
+    /// crossfader assignment the DJ actually set (#23 capture, PRIME 4+).
+    /// Otherwise derived from the fader, the crossfader and the channel's
+    /// assumed assignment (0=THRU, 1=A, 2=B), as before.
     bool isDeckOnAir(int deckNum) const
     {
         static constexpr double kFaderThreshold = 0.02;  // ~2% above zero
@@ -1179,11 +1332,14 @@ public:
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return false;
 
-        double fader = decks[idx].faderPosition.load(std::memory_order_relaxed);
+        if (decks[idx].externalVolumeReceived.load(std::memory_order_acquire))
+            return decks[idx].externalVolume.load(std::memory_order_relaxed) > StageLinQ::kOnAirMinVolume;
+
+        double fader = getFaderPosition(deckNum);
         if (fader < kFaderThreshold) return false;  // fader down = not on-air
 
         int assign = decks[idx].channelAssignment.load(std::memory_order_relaxed);
-        double xf = mixerState.crossfaderPosition.load(std::memory_order_relaxed);
+        double xf = getCrossfaderPosition();
 
         // Assumed: 0=THRU, 1=A (left), 2=B (right)
         if (assign == 1 && xf > (1.0 - kXfCutThreshold)) return false;  // A-side, xf fully right
@@ -1192,10 +1348,28 @@ public:
         return true;
     }
 
-    /// Returns true if we have mixer fader data (any fader ever received)
+    /// ON AIR follow (D34): how loud the deck is among the decks on air --
+    /// its ExternalMixerVolume when the device sends it, otherwise its
+    /// channel fader.  Negative when isDeckOnAir() says it is not on air.
+    double getOnAirLevel(int deckNum) const
+    {
+        if (!isDeckOnAir(deckNum)) return -1.0;
+        const int idx = deckNum - 1;
+        if (decks[idx].externalVolumeReceived.load(std::memory_order_acquire))
+            return decks[idx].externalVolume.load(std::memory_order_relaxed);
+        return getFaderPosition(deckNum);
+    }
+
+    /// Returns true once the device has sent any mixer data: its channel
+    /// count, a fader, the crossfader or a deck's ExternalMixerVolume.
+    /// (The channel count alone is not enough: the #23 PRIME 4+ capture
+    /// has faders, crossfader and ExternalMixerVolume from start to end,
+    /// and there is no telling from it whether NumberOfChannels was ever
+    /// sent -- it would only have come once, when STC subscribed.)
     bool hasMixerData() const
     {
-        return mixerState.numChannels.load(std::memory_order_relaxed) > 0;
+        return mixerState.numChannels.load(std::memory_order_relaxed) > 0
+            || mixerState.valuesReceived.load(std::memory_order_relaxed);
     }
 
     bool isReceiving() const
@@ -1845,6 +2019,8 @@ private:
             else if (sub == "ExternalMixerVolume")
             {
                 dk.externalVolume.store(value.asDouble(), std::memory_order_relaxed);
+                dk.externalVolumeReceived.store(true, std::memory_order_release);
+                mixerState.valuesReceived.store(true, std::memory_order_relaxed);
             }
             // Subscribed but not stored (logged once for discovery, then ignored)
             // PlayStatePath: string version of PlayState (redundant with getPlayStateString)
@@ -1861,11 +2037,19 @@ private:
         {
             int ch = path[9] - '0';  // /Mixer/CH1faderPosition -> 1
             if (ch >= 1 && ch <= StageLinQ::kMaxMixerChannels)
-                decks[ch - 1].faderPosition.store(value.asDouble(), std::memory_order_relaxed);
+            {
+                const double pos = value.asDouble();
+                notePositionRange(pos);
+                decks[ch - 1].faderPosition.store(pos, std::memory_order_relaxed);
+                mixerState.valuesReceived.store(true, std::memory_order_relaxed);
+            }
         }
         else if (path == "/Mixer/CrossfaderPosition")
         {
-            mixerState.crossfaderPosition.store(value.asDouble(), std::memory_order_relaxed);
+            const double pos = value.asDouble();
+            notePositionRange(pos);
+            mixerState.crossfaderPosition.store(pos, std::memory_order_relaxed);
+            mixerState.valuesReceived.store(true, std::memory_order_relaxed);
         }
         else if (path.startsWith("/Mixer/ChannelAssignment"))
         {
@@ -1931,6 +2115,22 @@ private:
     }
 
     //==========================================================================
+    // Learn the full scale of the faders and crossfader (see
+    // StageLinQ::kExtendedPositionScale).  Only ever grows during a session.
+    //==========================================================================
+    void notePositionRange(double raw)
+    {
+        if (!(raw > StageLinQ::kPositionOverrange) || !std::isfinite(raw)) return;
+        const double wanted = juce::jmax(StageLinQ::kExtendedPositionScale, raw);
+        double current = mixerState.positionScale.load(std::memory_order_relaxed);
+        while (wanted > current
+               && !mixerState.positionScale.compare_exchange_weak(current, wanted,
+                                                                   std::memory_order_relaxed))
+        {
+        }
+    }
+
+    //==========================================================================
     // BeatInfo PlayerInfo (mirrors go-stagelinq)
     //==========================================================================
     struct PlayerInfo
@@ -1943,8 +2143,13 @@ private:
     //==========================================================================
     // Handle BeatInfo data from a device
     //==========================================================================
-    void handleBeatInfo(uint64_t /*clock*/, const std::vector<PlayerInfo>& players,
-                        const std::vector<double>& timelines, int deckOffset = 0)
+    //
+    // `clock` is the device's clock (ns) and `hostMs` the moment the message
+    // was read; together with each deck's timeline they give the playback
+    // speed (StageLinQ::BeatSpeedTracker), which getActualSpeed() returns.
+    void handleBeatInfo(uint64_t clock, const std::vector<PlayerInfo>& players,
+                        const std::vector<double>& timelines, int deckOffset,
+                        double hostMs)
     {
         int numDecks = juce::jmin((int)players.size(), StageLinQ::kMaxDecks);
         for (int i = 0; i < numDecks; ++i)
@@ -1958,11 +2163,34 @@ private:
             dk.beatInfoBeat.store(players[i].beat, std::memory_order_relaxed);
             dk.beatInfoTotalBeats.store(players[i].totalBeats, std::memory_order_relaxed);
             dk.beatInfoBPM.store(players[i].bpm, std::memory_order_relaxed);
-            dk.lastUpdateTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+            dk.lastUpdateTime.store(hostMs, std::memory_order_relaxed);
 
             if (i < (int)timelines.size())
+            {
                 dk.beatInfoTimeline.store(timelines[i], std::memory_order_relaxed);
+
+                double speed = 0.0;
+                bool measured = false;
+                {
+                    // Normally one device thread per deck; the lock covers a
+                    // misconfigured network where two devices claim a deck.
+                    std::lock_guard<std::mutex> lock(beatSpeedMutex);
+                    measured = beatSpeedTrackers[(size_t)mapped].update(
+                        clock, timelines[i], dk.sampleRate.load(std::memory_order_relaxed), speed);
+                }
+                if (measured)
+                {
+                    dk.beatSpeed.store(speed, std::memory_order_relaxed);
+                    dk.beatSpeedTime.store(hostMs, std::memory_order_release);
+                }
+            }
         }
+    }
+
+    void resetBeatSpeedTrackers()
+    {
+        std::lock_guard<std::mutex> lock(beatSpeedMutex);
+        for (auto& t : beatSpeedTrackers) t.reset();
     }
 
     //==========================================================================
@@ -2664,7 +2892,8 @@ private:
                             pos += 8;
                         }
 
-                        owner.handleBeatInfo(clock, players, timelines, deckOffset);
+                        owner.handleBeatInfo(clock, players, timelines, deckOffset,
+                                             juce::Time::getMillisecondCounterHiRes());
                     }
                 }
 #if JUCE_DEBUG
@@ -2710,6 +2939,10 @@ private:
 
     // Mixer state
     StageLinQMixerState mixerState;
+
+    // Playback speed from BeatInfo, one tracker per STC deck
+    std::array<StageLinQ::BeatSpeedTracker, StageLinQ::kMaxDecks> beatSpeedTrackers {};
+    std::mutex beatSpeedMutex;
 
     // Unknown path logging (debug aid -- logs each unknown path once)
 #if JUCE_DEBUG

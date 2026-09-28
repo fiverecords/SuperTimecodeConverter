@@ -933,6 +933,7 @@ MainComponent::MainComponent()
     cmbProDJLinkPlayer.addItem("XF-A", 7);
     cmbProDJLinkPlayer.addItem("XF-B", 8);
     cmbProDJLinkPlayer.addItem("MASTER", 9);
+    cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
     cmbProDJLinkPlayer.setSelectedId(1, juce::dontSendNotification);
     cmbProDJLinkPlayer.onChange = [this]
     {
@@ -2712,8 +2713,8 @@ void MainComponent::syncUIFromEngine()
             sldBpmInputGain.setValue(eng.getAudioBpmInput().getInputGain() * 100.0f, juce::dontSendNotification);
         }
 
-        // Pro DJ Link (per-engine player) -- ids 1-6 = players, 7=XF-A, 8=XF-B, 9=MASTER
-        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 9, es.proDJLinkPlayer), juce::dontSendNotification);
+        // Pro DJ Link (per-engine player) -- ids 1-6 = players, 7=XF-A, 8=XF-B, 9=MASTER, 10=ON AIR
+        cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 10, es.proDJLinkPlayer), juce::dontSendNotification);
         // ProDJLink interface (global)
         int pdlIfId = settings.proDJLinkInterface + 1;
         if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
@@ -3012,7 +3013,7 @@ void MainComponent::startCurrentStageLinQInput()
         sharedStageLinQInput.start(iface);
     }
 
-    // Set this engine's deck (supports XF-A/XF-B)
+    // Set this engine's deck (DECK 1-4, XF-A / XF-B, ON AIR)
     eng.startStageLinQInput(player);
 }
 
@@ -5798,8 +5799,8 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbProDJLinkPlayer.setVisible(showProDJLinkIn);     lblProDJLinkPlayer.setVisible(showProDJLinkIn);
 
     // Repopulate player combo based on input source:
-    // ProDJLink: players 1-6 + XF-A + XF-B + MASTER
-    // StageLinQ: decks 1-4 + XF-A + XF-B
+    // ProDJLink: players 1-6 + XF-A + XF-B + MASTER + ON AIR
+    // StageLinQ: decks 1-4 + XF-A + XF-B + ON AIR
     {
         int prevId = cmbProDJLinkPlayer.getSelectedId();
         cmbProDJLinkPlayer.clear(juce::dontSendNotification);
@@ -5809,9 +5810,14 @@ void MainComponent::updateDeviceSelectorVisibility()
                 cmbProDJLinkPlayer.addItem("DECK " + juce::String(i), i);
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
+            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
             // MASTER is not offered for StageLinQ yet (would need parallel
             // resolveMasterPlayerStageLinQ -- the data is there, just not wired).
-            if (prevId < 1 || prevId > 8) prevId = 1;
+            // PLAYER 5-6 and MASTER have no StageLinQ item: back to DECK 1,
+            // as the engine does (TimecodeEngine::sanitiseStageLinQPlayer).
+            const bool offered = (prevId >= 1 && prevId <= StageLinQ::kMaxDecks)
+                              || prevId == 7 || prevId == 8 || prevId == 10;
+            if (!offered) prevId = 1;
         }
         else
         {
@@ -5820,7 +5826,8 @@ void MainComponent::updateDeviceSelectorVisibility()
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
             cmbProDJLinkPlayer.addItem("MASTER", 9);
-            if (prevId < 1 || prevId > 9) prevId = 1;
+            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
+            if (prevId < 1 || prevId > 10) prevId = 1;
         }
         cmbProDJLinkPlayer.setSelectedId(prevId, juce::dontSendNotification);
     }

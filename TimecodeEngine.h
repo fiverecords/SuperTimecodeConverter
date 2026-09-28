@@ -15,6 +15,7 @@
 #include "LtcOutput.h"
 #include "ProDJLinkInput.h"
 #include "StageLinQInput.h"
+#include "OnAirFollow.h"
 #include "HippotizerInput.h"
 #include "HippotizerOutput.h"
 #include "WinampInput.h"
@@ -831,7 +832,7 @@ public:
     }
     void setProDJLinkPlayer(int p)
     {
-        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, p);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerOnAir, p);
         resolvedXfPlayer = 0;  // force re-resolve on next tick
         resetProDJLinkCache();
         bpmPlayerOverride = kBpmNoOverride;
@@ -991,7 +992,7 @@ public:
         // LTC direct mode is now toggled dynamically per tick
         // (direct in transient, auto-increment in stable)
 
-        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, player);
+        proDJLinkPlayer = juce::jlimit(1, kPlayerOnAir, player);
         resolvedXfPlayer = 0;  // force resolve on first tick
 
         // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
@@ -1037,7 +1038,7 @@ public:
 
         // NOTE: do NOT overwrite currentFps here (see startProDJLinkInput).
 
-        proDJLinkPlayer = juce::jlimit(1, kPlayerMaster, player);
+        proDJLinkPlayer = sanitiseStageLinQPlayer(player);
         resolvedXfPlayer = 0;
 
         // NOTE: lastSeenTrackVersion stays at 0 (set by resetProDJLinkCache).
@@ -1683,21 +1684,20 @@ public:
             case InputSource::ProDJLink:
                 if (sharedProDJLink != nullptr && sharedProDJLink->getIsRunning())
                 {
-                    // --- XF / MASTER auto-follow: resolve physical player ---
+                    // --- XF / MASTER / ON AIR auto-follow: resolve physical player ---
                     if (isXfMode())          resolveXfPlayer();
                     else if (isMasterMode()) resolveMasterPlayer();
+                    else if (isOnAirMode())  resolveOnAirPlayer();
                     const int ep = getEffectivePlayer();
                     if (ep < 1 || ep > ProDJLink::kMaxPlayers)
                     {
                         sourceActive = false;
                         if (statusTextVisible)
                         {
-                            const char* label =
-                                isMasterMode() ? "MASTER"
-                                : (proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B");
-                            inputStatusText = juce::String(label)
+                            inputStatusText = juce::String(autoModeLabel())
                                 + (isMasterMode() ? ": NO MASTER PLAYER"
-                                                  : ": NO PLAYER ON SIDE");
+                                   : isOnAirMode() ? ": NO PLAYER ON AIR"
+                                                   : ": NO PLAYER ON SIDE");
                         }
                         break;
                     }
@@ -2024,11 +2024,9 @@ public:
                             if (pdlHasTC)
                             {
                                 juce::String pdlModel = sharedProDJLink->getPlayerModel(ep);
-                                if (isMasterMode())
-                                    inputStatusText = "MASTER P" + juce::String(ep);
-                                else if (isXfMode())
-                                    inputStatusText = (proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
-                                                      + juce::String(" P") + juce::String(ep);
+                                if (isAutoMode())     // "MASTER P2", "XF-A P1", "ON AIR P3"
+                                    inputStatusText = juce::String(autoModeLabel())
+                                                      + " P" + juce::String(ep);
                                 else
                                     inputStatusText = "RX P" + juce::String(ep);
                                 if (pdlModel.isNotEmpty())
@@ -2174,9 +2172,11 @@ public:
             case InputSource::StageLinQ:
                 if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
                 {
-                    // XF-A/XF-B auto-follow (same logic as ProDJLink)
+                    // XF-A/XF-B auto-follow (same logic as ProDJLink), ON AIR (D34)
                     if (isXfMode())
                         resolveXfPlayerStageLinQ();
+                    else if (isOnAirMode())
+                        resolveOnAirPlayer();
                     const int ep = getEffectivePlayer();
                     if (ep < 1 || ep > StageLinQ::kMaxDecks)
                     {
@@ -2184,8 +2184,9 @@ public:
                         if (statusTextVisible)
                         {
                             if (isXfMode())
-                                inputStatusText = juce::String(proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
-                                                + ": NO DECK ON SIDE";
+                                inputStatusText = juce::String(autoModeLabel()) + ": NO DECK ON SIDE";
+                            else if (isOnAirMode())
+                                inputStatusText = juce::String(autoModeLabel()) + ": NO DECK ON AIR";
                             else
                                 inputStatusText = "INVALID DECK";
                         }
@@ -2233,11 +2234,12 @@ public:
                     }
 
                     // Feed pitch to LTC output.
-                    // Use pll.pitch directly -- same as ProDJLink.  When the deck
-                    // pauses, Speed ramps toward 0, the PLL follows, and LTC
-                    // decelerates smoothly.  The previous code gated on isPlaying
+                    // Use pll.pitch directly -- same as ProDJLink.  The speed is
+                    // measured from BeatInfo (StageLinQInput::getActualSpeed): it
+                    // follows the deck through play, pause and SYNC, and the PLL
+                    // and LTC follow it.  The previous code gated on isPlaying
                     // which cut LTC to zero the instant Play=false arrived -- before
-                    // Speed had a chance to ramp down -- causing an audible click
+                    // the speed had come down -- causing an audible click
                     // in the LTC audio stream.
                     // No end-of-track freeze needed: Denon does not have the CDJ
                     // frozen-actualSpeed quirk.  sourceActive below gates on
@@ -2330,9 +2332,8 @@ public:
                             if (slqHasTC)
                             {
                                 juce::String slqModel = sharedStageLinQ->getPlayerModel(ep);
-                                inputStatusText = isXfMode()
-                                    ? (juce::String(proDJLinkPlayer == kPlayerXfA ? "XF-A" : "XF-B")
-                                       + " D" + juce::String(ep))
+                                inputStatusText = isAutoMode()     // "XF-A D1", "ON AIR D2"
+                                    ? (juce::String(autoModeLabel()) + " D" + juce::String(ep))
                                     : ("RX D" + juce::String(ep));
                                 if (slqModel.isNotEmpty())
                                     inputStatusText += " " + slqModel;
@@ -3304,17 +3305,42 @@ private:
     ProDJLinkInput* sharedProDJLink = nullptr;  // shared across engines
     StageLinQInput* sharedStageLinQ = nullptr;  // shared across engines
     DbServerClient* dbClient       = nullptr;  // shared across engines (Phase 2)
-    int             proDJLinkPlayer = 1;        // per-engine player selection (1..6, 7=XF-A, 8=XF-B)
+    int             proDJLinkPlayer = 1;        // per-engine player selection (1..6, 7=XF-A, 8=XF-B, 9=MASTER, 10=ON AIR)
 
-    // Crossfader auto-follow (XF-A / XF-B mode) and Master auto-follow.
+    // Crossfader auto-follow (XF-A / XF-B mode), Master and ON AIR auto-follow.
     static constexpr int kPlayerXfA    = 7;        // auto-follow crossfader side A
     static constexpr int kPlayerXfB    = 8;        // auto-follow crossfader side B
     static constexpr int kPlayerMaster = 9;        // auto-follow whichever player has DJM master
-    int  resolvedXfPlayer = 0;                  // physical player (1-4) currently followed in XF / MASTER mode
+    static constexpr int kPlayerOnAir  = 10;       // auto-follow the deck on air (D34, Pro DJ Link and StageLinQ)
+    int  resolvedXfPlayer = 0;                  // physical player currently followed in XF / MASTER / ON AIR mode
 
     bool isXfMode() const     { return proDJLinkPlayer == kPlayerXfA || proDJLinkPlayer == kPlayerXfB; }
     bool isMasterMode() const { return proDJLinkPlayer == kPlayerMaster; }
-    bool isAutoMode() const   { return isXfMode() || isMasterMode(); }
+    bool isOnAirMode() const  { return proDJLinkPlayer == kPlayerOnAir; }
+    bool isAutoMode() const   { return isXfMode() || isMasterMode() || isOnAirMode(); }
+
+    /// The auto mode's name as the player combo shows it, for status text.
+    const char* autoModeLabel() const
+    {
+        switch (proDJLinkPlayer)
+        {
+            case kPlayerXfA:    return "XF-A";
+            case kPlayerXfB:    return "XF-B";
+            case kPlayerMaster: return "MASTER";
+            case kPlayerOnAir:  return "ON AIR";
+            default:            return "";
+        }
+    }
+
+    /// The selections StageLinQ offers: DECK 1-4, XF-A, XF-B, ON AIR.  (No
+    /// MASTER: that would need its own resolver for StageLinQ.)
+    static int sanitiseStageLinQPlayer(int p)
+    {
+        if ((p >= 1 && p <= StageLinQ::kMaxDecks)
+            || p == kPlayerXfA || p == kPlayerXfB || p == kPlayerOnAir)
+            return p;
+        return 1;
+    }
 
     /// Resolve which physical player to follow in XF-A/XF-B mode.
     /// Sticky: stays on current player while it has on-air flag.
@@ -3476,6 +3502,37 @@ private:
             pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
             pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         }
+    }
+
+    /// Resolve which deck to follow in ON AIR mode (D34), for Pro DJ Link
+    /// (players 1-6, on air from the DJM, loudest by channel fader) and for
+    /// StageLinQ (decks 1-4, on air and loudest by ExternalMixerVolume).  The
+    /// rule itself is OnAirFollow::pick: the current deck until it goes quiet
+    /// or stops, then the loudest one playing on air, else stay.
+    void resolveOnAirPlayer()
+    {
+        OnAirFollow::Deck candidates[ProDJLink::kMaxPlayers];
+        int count = 0;
+
+        if (activeInput == InputSource::ProDJLink && sharedProDJLink != nullptr)
+        {
+            count = ProDJLink::kMaxPlayers;
+            for (int p = 1; p <= count; ++p)
+                candidates[p - 1] = { sharedProDJLink->isPlayerPlaying(p),
+                                      sharedProDJLink->getOnAirLevel(p) };
+        }
+        else if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
+        {
+            static_assert(StageLinQ::kMaxDecks <= ProDJLink::kMaxPlayers, "candidate array size");
+            count = StageLinQ::kMaxDecks;
+            for (int d = 1; d <= count; ++d)
+                candidates[d - 1] = { sharedStageLinQ->isPlayerPlaying(d),
+                                      sharedStageLinQ->getOnAirLevel(d) };
+        }
+
+        const int next = OnAirFollow::pick(resolvedXfPlayer, candidates, count);
+        if (next != resolvedXfPlayer)
+            switchResolvedPlayer(next);
     }
 
     /// Switch the resolved player with a mini-reset (PLL + track cache)
@@ -3841,7 +3898,12 @@ public:
         {
             float bpm = 0.0f;
             if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
-                bpm = (float)sharedStageLinQ->getBPM(proDJLinkPlayer);
+            {
+                // Same order as the StageLinQ tick: master tempo, then the
+                // followed deck (the selection itself is 7-10 in auto modes).
+                bpm = (float)sharedStageLinQ->getMasterBPM();
+                if (bpm <= 0.0f) bpm = (float)sharedStageLinQ->getBPM(getEffectivePlayer());
+            }
             else if (activeInput == InputSource::ProDJLink && sharedProDJLink != nullptr)
             {
                 bpm = (float)sharedProDJLink->getMasterBPM();

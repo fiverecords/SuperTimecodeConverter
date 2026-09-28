@@ -71,6 +71,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 - On-air status, master player detection, beat position
 - Per-player monitoring: any engine can follow any of 6 players independently
 - **Crossfader auto-follow (XF-A / XF-B):** instead of monitoring a fixed player, an engine can follow whichever deck is live on crossfader side A or B. When the DJ swaps decks, timecode seamlessly switches to the new player. Ideal for two-engine setups where each engine tracks one side of the crossfader.
+- **ON AIR auto-follow:** the engine follows the deck you are hearing -- it stays with the current deck while it plays on air, and when that deck goes quiet (fader down, crossfader cut) or stops, it moves to the loudest deck playing on air. Works in THRU too. Needs a DJM on the network for the on-air flags. Also available for Denon (StageLinQ).
 
 **Smooth timecode generation:**
 - Direct CDJ playhead display with linear interpolation between packets (60Hz smooth output from 30Hz CDJ data)
@@ -112,15 +113,17 @@ Both settings take effect on the next connection. A mixer decides whether to acc
 
 STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving deck state, track metadata, mixer fader positions, and beat information in real time.
 
-**Note:** This implementation is based entirely on open-source protocol references and has not yet been tested with real Denon hardware. If you have access to Denon Prime equipment, please try it and report results on [GitHub](https://github.com/fiverecords/SuperTimecodeConverter/issues).
+**Note:** This implementation is based on open-source protocol references. One network capture of a real unit has been checked against it so far -- a PRIME 4+ on Engine OS 5.0.4, from a user (#23) -- which fixed the playback speed of synced decks, the fader ranges and the on-air reading; the rest is still unconfirmed on Denon hardware. If you have access to Denon Prime equipment, please try it and report results on [GitHub](https://github.com/fiverecords/SuperTimecodeConverter/issues).
 
 **Supported hardware:** SC5000, SC6000, SC6000M, LC6000, Prime 4, Prime 2, Prime Go, X1800, X1850. Other StageLinQ-compatible hardware should work but has not been verified yet -- please report any issues on GitHub.
 
 **Deck state (via StateMap service):**
 - Play/pause/cue state per deck (up to 4 decks per device)
-- Current BPM, pitch/speed, speed state
+- Current BPM; playback speed measured from the BeatInfo stream (correct through SYNC)
 - Track metadata: artist, title, duration, loaded state
-- Channel fader positions and crossfader position
+- Channel fader positions and crossfader position (0-1.27 on the PRIME 4+, scaled to the full travel)
+- Per-deck mixer level after fader and crossfader (ExternalMixerVolume), used as the deck's on-air state
+- Deck selection per engine: DECK 1-4, XF-A / XF-B, or ON AIR (follows the deck you are hearing; see Pro DJ Link above)
 
 **Beat information (via BeatInfo service):**
 - Real-time beat position, total beats, and BPM per deck
@@ -142,7 +145,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 
 **Known limitations:**
 - No DJM-style mixer parameter mapping (Denon mixers expose basic fader data only via StateMap)
-- XF-A/XF-B crossfader auto-follow is preliminary -- channel assignment values (0=THRU, 1=A, 2=B) assumed from Pioneer convention, awaiting confirmation with real Denon hardware
+- XF-A/XF-B crossfader auto-follow is preliminary -- channel assignment values (0=THRU, 1=A, 2=B) assumed from Pioneer convention; the one PRIME 4+ capture available could not confirm them. ON AIR does not depend on them
 
 ### Track Map
 

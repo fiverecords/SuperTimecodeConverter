@@ -1407,6 +1407,19 @@ public:
         return players[idx].isOnAir.load(std::memory_order_relaxed);
     }
 
+    /// ON AIR follow (D34): how loud the player's channel is among the
+    /// players on air -- its channel fader (0-1) while the DJM's mixer
+    /// status arrives, 0 when only the on-air flags do (the lowest player
+    /// number then wins a tie).  Negative when the player is off air.
+    /// Channel N is player N, as the DJM's on-air report already assumes.
+    double getOnAirLevel(int playerNum) const
+    {
+        if (!isPlayerOnAir(playerNum)) return -1.0;
+        if (playerNum <= ProDJLink::kMaxMixerChannels && hasMixerFaderData())
+            return getChannelFader(playerNum) / 255.0;
+        return 0.0;
+    }
+
     /// Is the given player the current master?
     bool isPlayerMaster(int playerNum) const
     {
