@@ -2,9 +2,9 @@
 
 A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. **Green Hippo Hippotizer** support via HippoNet is in development. Ideal for live events, broadcast, post-production, and AV installations.
 
+[![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
 [![Downloads (latest release)](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/latest/total?label=Downloads%20%28latest%20release%29&color=blue&style=flat-square)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
 [![Total Downloads](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/total?label=Total%20Downloads&color=blue&style=flat-square)](https://github.com/fiverecords/SuperTimecodeConverter/releases)
-[![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
