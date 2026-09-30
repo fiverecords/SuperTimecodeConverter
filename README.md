@@ -10,7 +10,7 @@ A professional timecode routing and conversion tool built with C++ and [JUCE](ht
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Linux](https://img.shields.io/badge/platform-Linux-yellow)
 ![C++17](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![JUCE 8](https://img.shields.io/badge/framework-JUCE%208-green)
+![JUCE 9](https://img.shields.io/badge/framework-JUCE%209-green)
 ![Ableton Link](https://img.shields.io/badge/Ableton_Link-Supported-brightgreen)
 ![Pro DJ Link](https://img.shields.io/badge/Pro_DJ_Link-Native-00BCD4)
 ![StageLinQ](https://img.shields.io/badge/StageLinQ-Native-00CC66)
