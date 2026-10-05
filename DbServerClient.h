@@ -295,7 +295,10 @@ public:
         if (wp - rp >= kRequestQueueSize)
             return;  // queue full, drop request (will retry on next track change)
 
+        // Every field is set: a reused slot must not keep the phase of the
+        // phase-2 request it last held (AUDIT META-6).
         auto& req = requestQueue[wp & kRequestQueueMask];
+        req = MetadataRequest{};
         req.playerIP    = playerIP;
         req.playerModel = playerModel;
         req.slot        = slot;
@@ -304,6 +307,7 @@ public:
         req.ourPlayer   = (uint8_t)ourPlayer;
         req.wantArt     = true;
         req.wantWaveform = true;
+        req.phase       = 1;
 
         reqWritePos.store(wp + 1, std::memory_order_release);
         requestSemaphore.signal();
