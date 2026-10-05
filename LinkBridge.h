@@ -30,8 +30,10 @@
 //   - Uses captureAppSessionState / commitAppSessionState (app thread)
 //     NOT the audio thread variants -- we're not in an audio callback.
 //   - Tempo is updated from TimecodeEngine::tick() (message thread, 60Hz).
-//   - setTempo() only commits to Link when the BPM delta exceeds a threshold,
-//     preventing Link from constantly re-proposing micro-fluctuations.
+//   - setTempo() only commits to Link when the BPM has moved by a threshold
+//     from the last value WE committed -- not from the session's tempo, which
+//     a peer may have changed -- preventing Link from constantly re-proposing
+//     micro-fluctuations.
 //   - Beat phase is NOT synchronized -- we only set tempo. Phase alignment
 //     requires knowledge of the exact beat position which would need
 //     sub-frame timing from the CDJ beat marker.
@@ -67,8 +69,12 @@ public:
 
         link.setTempoCallback([this](double bpm)
         {
-            // A remote peer changed the tempo -- we note it but don't override.
-            // Our next setTempo() call will re-propose the DJ's BPM anyway.
+            // The session tempo changed (Link's thread) -- a remote peer's
+            // change included.  We note it and do not override it: setTempo()
+            // commits only when the DJ's BPM has moved kTempoThreshold from
+            // the value WE last committed, so while the deck holds its tempo
+            // the peer's tempo stands, and the DJ's is proposed again at its
+            // next real change (AUDIT NET-7).
             currentTempo.store(bpm, std::memory_order_relaxed);
         });
     }
@@ -111,8 +117,9 @@ public:
     //--------------------------------------------------------------------------
 
     /// Propose a new tempo to the Link session.
-    /// Only commits if the delta from the last committed value exceeds
-    /// the threshold (default 0.1 BPM) to avoid constant micro-updates.
+    /// Only commits if the BPM is at least the threshold (0.1 BPM) away from
+    /// the last value committed here, to avoid constant micro-updates; a
+    /// tempo a peer set in between does not count (see the tempo callback).
     void setTempo(double bpm)
     {
         if (!enabledFlag.load(std::memory_order_relaxed))
