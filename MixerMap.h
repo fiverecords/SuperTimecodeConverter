@@ -7,6 +7,7 @@
 #include "AppSettings.h"   // SafeJsonFile
 #include <vector>
 #include <cstring>
+#include <cmath>
 
 //==============================================================================
 // MixerMap -- Configurable mapping from DJM mixer parameters to MIDI CC, OSC, and Art-Net DMX.
@@ -81,13 +82,30 @@ struct MixerMapEntry
         {
             paramId    = obj->getProperty("paramId").toString();
             oscAddress = obj->getProperty("oscAddress").toString();
-            midiCC     = (int)obj->getProperty("midiCC");
-            artnetCh   = (int)obj->getProperty("artnetCh");
+            // A number outside the range the editor allows (CC and note
+            // -1..127, DMX 0..512) loads as "off", like a missing one or a
+            // value that is not a number: a missing midiCC used to load as
+            // 0, Bank Select, and a hand-edited or damaged file could load
+            // any value (AUDIT DEBT-9).
+            midiCC     = loadInt(obj->getProperty("midiCC"),   -1, -1, 127);
+            artnetCh   = loadInt(obj->getProperty("artnetCh"),  0,  0, 512);
             enabled    = (bool)obj->getProperty("enabled");
             // midiNote: default -1 for backward compat with files saved before v1.5
-            auto noteVal = obj->getProperty("midiNote");
-            midiNote = noteVal.isVoid() ? -1 : (int)noteVal;
+            midiNote   = loadInt(obj->getProperty("midiNote"), -1, -1, 127);
         }
+    }
+
+    /// A saved number in [lo, hi]; `missing` (off) when absent, not a
+    /// number (a string or a bool, which STC never writes here and which
+    /// converted to 0 or 1), not finite or out of range, so a damaged value
+    /// drives no output rather than CC 0 or the nearest edge (CC 127,
+    /// DMX 512).
+    static int loadInt(const juce::var& value, int missing, int lo, int hi)
+    {
+        if (!(value.isInt() || value.isInt64() || value.isDouble())) return missing;
+        const double d = (double) value;
+        if (!std::isfinite(d) || d < (double) lo || d > (double) hi) return missing;
+        return (int) d;
     }
 };
 
@@ -210,6 +228,14 @@ private:
 
     //------------------------------------------------------------------
     // Pioneer DJM defaults (faders, EQ, effects -- 45+ params)
+    //
+    // The ORDER of these entries is read by position:
+    // TimecodeEngine::readMixerValue maps entry i to a ProDJLinkInput getter
+    // by its index -- 13 per channel for 6 channels, then the globals in
+    // exactly this order.  Moving or removing an entry silently feeds every
+    // later one another control's value.  Add new entries at the end and
+    // give readMixerValue the same case; the jassert at the end of this
+    // function is the tripwire (AUDIT DEBT-9).
     //------------------------------------------------------------------
     void buildDefaults()
     {
@@ -332,6 +358,12 @@ private:
         addEntry("master_mix_level", "Master Mix Level",   "Sends (V10)",    "/mixer/master_mix_level",  -1, 0, false, V, C);
         addEntry("multi_io_select",  "Multi I/O Select",   "Multi I/O (A9/V10)","/mixer/multi_io_select",   -1, 0, false, A9, D);
         addEntry("multi_io_level",   "Multi I/O Level",    "Multi I/O (A9/V10)","/mixer/multi_io_level",    -1, 0, false, A9, C);
+
+        // readMixerValue's layout (see above): 6 x 13 channel entries, then
+        // 45 globals from the crossfader to Multi I/O Level.
+        jassert(entries.size() == (size_t) (kChCount * 13 + 45)
+                && entries[(size_t) (kChCount * 13)].paramId == "crossfader"
+                && entries.back().paramId == "multi_io_level");
     }
 
     void addEntry(const juce::String& id, const juce::String& name, const juce::String& group,
