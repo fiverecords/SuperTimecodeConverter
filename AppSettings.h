@@ -2204,15 +2204,15 @@ public:
     //------------------------------------------------------------------
     // Full configuration export/import (backup/restore)
     //
-    // Bundles four files -- settings.json, trackmap.json, mixermap.json
-    // and generator_presets.json -- into a single JSON file.  Import
-    // writes back each one the bundle carries (the current file kept as
-    // .bak); it reloads nothing and suspends nothing itself.  Its caller
-    // is to suspend every save until restart (suspendSavesUntilRestart)
-    // together with the message that says so.  MainComponent then reloads
-    // AppSettings (and with it the Track Map and the presets) and the
-    // mixer maps; the engines take the restored configuration at the next
-    // start.
+    // Bundles five files -- settings.json, trackmap.json, mixermap.json,
+    // slq_mixermap.json and generator_presets.json -- into a single JSON
+    // file.  Import writes back each one the bundle carries (the current
+    // file kept as .bak); it reloads nothing and suspends nothing itself.
+    // Its caller is to suspend every save until restart
+    // (suspendSavesUntilRestart) together with the message that says so.
+    // MainComponent then reloads AppSettings (and with it the Track Map and
+    // the presets) and the mixer maps; the engines take the restored
+    // configuration at the next start.
     //------------------------------------------------------------------
     static juce::var readJsonFile(const juce::File& f)
     {
@@ -2228,6 +2228,7 @@ public:
         root->setProperty("settings", readJsonFile(getSettingsFile()));
         root->setProperty("trackmap", readJsonFile(dir.getChildFile("trackmap.json")));
         root->setProperty("mixermap", readJsonFile(dir.getChildFile("mixermap.json")));
+        root->setProperty("slq_mixermap", readJsonFile(dir.getChildFile("slq_mixermap.json")));
         root->setProperty("generator_presets", readJsonFile(dir.getChildFile("generator_presets.json")));
         return juce::var(root);
     }
@@ -2241,6 +2242,7 @@ public:
         auto settingsVar = obj->getProperty("settings");
         auto trackmapVar = obj->getProperty("trackmap");
         auto mixermapVar = obj->getProperty("mixermap");
+        auto slqMixermapVar = obj->getProperty("slq_mixermap");   // absent from bundles before 1.9.14
         auto presetsVar  = obj->getProperty("generator_presets");
 
         // Write each section back to its file (only if present in bundle),
@@ -2253,6 +2255,8 @@ public:
             TrackMap::writeRestoredFile(juce::JSON::toString(trackmapVar));
         if (!mixermapVar.isVoid())
             SafeJsonFile::writeRotating(dir.getChildFile("mixermap.json"), juce::JSON::toString(mixermapVar));
+        if (!slqMixermapVar.isVoid())
+            SafeJsonFile::writeRotating(dir.getChildFile("slq_mixermap.json"), juce::JSON::toString(slqMixermapVar));
         if (!presetsVar.isVoid())
             SafeJsonFile::writeRotating(dir.getChildFile("generator_presets.json"), juce::JSON::toString(presetsVar));
 
