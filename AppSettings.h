@@ -31,6 +31,10 @@
 //    left for the UI, instead of being silently replaced by defaults on the
 //    next save -- which is how a whole show configuration used to vanish.
 //  * Writes are atomic (temporary file + rename, via replaceWithText).
+//
+// Saves can be suspended until STC restarts (writesSuspended), for a
+// configuration restore: the configuration the running engines still hold
+// must not be written over the files just restored.
 //==============================================================================
 struct SafeJsonFile
 {
@@ -63,6 +67,17 @@ struct SafeJsonFile
         return {};
     }
 
+    /// Every save of a settings, Track Map, preset or mixer map file: the
+    /// rotation and write of writeRotating(), unless saves are suspended
+    /// after a restore, in which case nothing is written and the result is
+    /// false.  Message thread, or the Track Map's background save thread.
+    static bool save(const juce::File& file, const juce::String& text)
+    {
+        if (writesSuspended().load())
+            return false;
+        return writeRotating(file, text);
+    }
+
     /// Rotate the previous file to .bak, then write atomically.  When the
     /// file already holds exactly `text`, do neither: the write would change
     /// nothing, and the rotation would replace the previous version in .bak
@@ -74,7 +89,9 @@ struct SafeJsonFile
     /// replaceWithText writes the JSON writer's CR LF line ends unchanged,
     /// so a file STC wrote compares equal to the text it was written from; a
     /// file that differs in any way is rotated and written as before.
-    static bool save(const juce::File& file, const juce::String& text)
+    /// Called directly only by a restore, which must write while saves are
+    /// suspended.
+    static bool writeRotating(const juce::File& file, const juce::String& text)
     {
         if (file.existsAsFile())
         {
@@ -106,6 +123,32 @@ struct SafeJsonFile
         std::sort(items.begin(), items.end(),
                   [](const auto* a, const auto* b) { return a->first < b->first; });
         return items;
+    }
+
+    /// Set by AppSettings::suspendSavesUntilRestart (for the caller of a
+    /// configuration restore, once the restored files are written), never
+    /// cleared: from then on save() writes nothing until the process ends
+    /// (AUDIT SET-5).  What it guards against:
+    ///  - settings.json: MainComponent reloads AppSettings after a restore,
+    ///    but the running engines keep their configuration (inputs,
+    ///    outputs, generator, their Track Map override sets) until the
+    ///    restart, and every flushSettings -- the debounced save, the exit
+    ///    saves -- copies it back into the engine blocks before
+    ///    AppSettings::save, undoing the restore.
+    ///  - the other files: MainComponent reloads the Track Map, the presets
+    ///    and the mixer maps too, so a later save of those writes the
+    ///    restored content plus the edit -- except from an editor left open
+    ///    across the restore, whose rows and references were taken from
+    ///    the maps before the reload.  (A background Track Map snapshot
+    ///    still on its way is dropped by the write order, AUDIT SET-7.)
+    /// The cost: an edit made between the restore and the restart is not
+    /// saved either, so the UI must say so when the restore completes.
+    /// Atomic: read on the message thread and on the Track Map's
+    /// background save thread.
+    static std::atomic<bool>& writesSuspended()
+    {
+        static std::atomic<bool> suspended { false };
+        return suspended;
     }
 
     /// Accumulated load problems, for the UI to show once at startup.
@@ -691,6 +734,17 @@ public:
     bool saveAgain    = false;
     std::shared_ptr<std::atomic<bool>> aliveToken;
 
+    /// Write `text` as trackmap.json for a configuration restore: in order
+    /// with the map's own saves -- a background snapshot still pending is
+    /// then dropped as older instead of landing over the restored file --
+    /// and past a save suspension.  Message thread.
+    static bool writeRestoredFile(const juce::String& text)
+    {
+        auto order = writeOrder();
+        const uint64_t seq = ++order->issued;
+        return writeInOrder(*order, seq, getTrackMapFile(), text, true);
+    }
+
     /// Entries as a JSON array (the "tracks" value of the file format), for
     /// storing a map somewhere other than trackmap.json -- the per-engine
     /// override layer keeps one inside the engine's settings block.  In key
@@ -1144,8 +1198,8 @@ private:
     std::unordered_map<std::string, TrackMapEntry> entries;
     uint64_t generation = 0;
 
-    /// Every write of trackmap.json -- save() and the background write of
-    /// saveAsync() -- carries a sequence number taken on the
+    /// Every write of trackmap.json -- save(), the background write of
+    /// saveAsync() and a restore -- carries a sequence number taken on the
     /// message thread when its content was built, and is made under one
     /// lock.  A write whose number is not above the last one written is
     /// dropped: the newest snapshot is the one left on disk whatever the
@@ -1166,14 +1220,16 @@ private:
         return order;
     }
 
-    /// Message thread or the saveAsync() thread.
+    /// Message thread or the saveAsync() thread.  `restore` writes past a
+    /// save suspension (SafeJsonFile::writeRotating); every other write goes
+    /// through SafeJsonFile::save, which honours it.
     static bool writeInOrder(WriteOrder& order, uint64_t seq, const juce::File& file,
-                             const juce::String& text)
+                             const juce::String& text, bool restore = false)
     {
         const std::lock_guard<std::mutex> hold(order.lock);
         if (seq <= order.written) return false;   // a newer snapshot is already on disk
         order.written = seq;
-        return SafeJsonFile::save(file, text);
+        return restore ? SafeJsonFile::writeRotating(file, text) : SafeJsonFile::save(file, text);
     }
 };
 
@@ -2148,8 +2204,15 @@ public:
     //------------------------------------------------------------------
     // Full configuration export/import (backup/restore)
     //
-    // Bundles settings.json + trackmap.json + mixermap.json into a
-    // single JSON file.  Import overwrites all three and reloads.
+    // Bundles four files -- settings.json, trackmap.json, mixermap.json
+    // and generator_presets.json -- into a single JSON file.  Import
+    // writes back each one the bundle carries (the current file kept as
+    // .bak); it reloads nothing and suspends nothing itself.  Its caller
+    // is to suspend every save until restart (suspendSavesUntilRestart)
+    // together with the message that says so.  MainComponent then reloads
+    // AppSettings (and with it the Track Map and the presets) and the
+    // mixer maps; the engines take the restored configuration at the next
+    // start.
     //------------------------------------------------------------------
     static juce::var readJsonFile(const juce::File& f)
     {
@@ -2182,15 +2245,30 @@ public:
 
         // Write each section back to its file (only if present in bundle),
         // keeping the current files as .bak -- a restore replaces the show.
+        // Written past a suspension left by an earlier restore in this
+        // session; the Track Map in order with its own saves.
         if (!settingsVar.isVoid())
-            SafeJsonFile::save(getSettingsFile(), juce::JSON::toString(settingsVar));
+            SafeJsonFile::writeRotating(getSettingsFile(), juce::JSON::toString(settingsVar));
         if (!trackmapVar.isVoid())
-            SafeJsonFile::save(dir.getChildFile("trackmap.json"), juce::JSON::toString(trackmapVar));
+            TrackMap::writeRestoredFile(juce::JSON::toString(trackmapVar));
         if (!mixermapVar.isVoid())
-            SafeJsonFile::save(dir.getChildFile("mixermap.json"), juce::JSON::toString(mixermapVar));
+            SafeJsonFile::writeRotating(dir.getChildFile("mixermap.json"), juce::JSON::toString(mixermapVar));
         if (!presetsVar.isVoid())
-            SafeJsonFile::save(dir.getChildFile("generator_presets.json"), juce::JSON::toString(presetsVar));
+            SafeJsonFile::writeRotating(dir.getChildFile("generator_presets.json"), juce::JSON::toString(presetsVar));
 
         return true;
     }
+
+    /// After a configuration restore: no settings, Track Map, preset or
+    /// mixer map file is written again until STC restarts -- every save
+    /// (synchronous, the Track Map's background one, the exit saves)
+    /// becomes a no-op, an operator's edit made meanwhile included, which
+    /// the UI must say (AUDIT SET-5; why, at SafeJsonFile::writesSuspended).
+    /// For the caller of applyImportBundle, once the restored files are on
+    /// disk; applyImportBundle does not call it, so the suspension cannot
+    /// take effect without the message that announces it.  Message thread.
+    static void suspendSavesUntilRestart() { SafeJsonFile::writesSuspended().store(true); }
+
+    /// True once saves are suspended (see suspendSavesUntilRestart).
+    static bool savesSuspended() { return SafeJsonFile::writesSuspended().load(); }
 };
