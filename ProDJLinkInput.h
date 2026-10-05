@@ -366,6 +366,43 @@ struct ProDJLinkPlayerState
     int  statusSeenCount = 0;
     char statusSeenIp[16] = {0};
     std::atomic<double>   absPositionTs  { 0.0 };  // timestamp of last abs position (for interpolation)
+    // playheadMs and absPositionTs are written as a pair, under a sequence
+    // count that is odd while the network thread writes them (a seqlock), so
+    // another thread can read both from the same packet: readPosition.  Read
+    // one at a time, a position could be paired with the next packet's
+    // timestamp (AUDIT PDL-8).
+    std::atomic<uint32_t> positionSeq    { 0 };
+
+    /// Network thread: publish a position and the time it was received.
+    void publishPosition(uint32_t ms, double ts)
+    {
+        const uint32_t seq = positionSeq.load(std::memory_order_relaxed);
+        positionSeq.store(seq + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        playheadMs.store(ms, std::memory_order_relaxed);
+        absPositionTs.store(ts, std::memory_order_relaxed);
+        positionSeq.store(seq + 2, std::memory_order_release);
+    }
+
+    /// Any thread: the last published position and its timestamp, as a pair.
+    /// Retries while a write is in progress (a few stores long; it never
+    /// blocks inside), yielding now and then in case the writer was
+    /// preempted there.
+    void readPosition(uint32_t& ms, double& ts) const
+    {
+        for (int attempt = 1; ; ++attempt)
+        {
+            const uint32_t before = positionSeq.load(std::memory_order_acquire);
+            ms = playheadMs.load(std::memory_order_relaxed);
+            ts = absPositionTs.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint32_t after = positionSeq.load(std::memory_order_relaxed);
+            if (before == after && (before & 1u) == 0)
+                return;
+            if (attempt % 64 == 0)
+                juce::Thread::yield();
+        }
+    }
 
     // Diagnostic counters (v1.9.11-beta15) -- the single most diagnostic
     // numbers for the NXS2 identity question: a player streaming 0x0a and
@@ -389,7 +426,7 @@ struct ProDJLinkPlayerState
             std::memset(macAddr, 0, sizeof(macAddr));
         }
         statusDiscovered = false;
-        playheadMs.store(0, std::memory_order_relaxed);
+        publishPosition(0, 0.0);
         trackLenSec.store(0, std::memory_order_relaxed);
         hasAbsolutePosition.store(false, std::memory_order_relaxed);
         hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
@@ -415,7 +452,6 @@ struct ProDJLinkPlayerState
         addrHeardMs = 0.0;
         statusSeenCount = 0;
         statusSeenIp[0] = '\0';
-        absPositionTs.store(0.0, std::memory_order_relaxed);
         cntStatusPkts.store(0, std::memory_order_relaxed);
         cntAbsPosPkts.store(0, std::memory_order_relaxed);
     }
@@ -1244,6 +1280,26 @@ public:
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0.0;
         return players[idx].absPositionTs.load(std::memory_order_relaxed);
+    }
+
+    /// The playhead and the time its packet arrived, from the same packet.
+    struct PositionSnapshot
+    {
+        uint32_t playheadMs = 0;
+        double   packetTs   = 0.0;   // as getAbsPositionTs
+    };
+
+    /// getPlayheadMs and getAbsPositionTs as one consistent pair (AUDIT
+    /// PDL-8): called one after the other they can pair one packet's
+    /// position with the next one's timestamp, and the PLL takes the
+    /// timestamp as "a new packet with this position".  Any thread.
+    PositionSnapshot getPositionSnapshot(int playerNum) const
+    {
+        PositionSnapshot snap;
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return snap;
+        players[idx].readPosition(snap.playheadMs, snap.packetTs);
+        return snap;
     }
 
     /// True if player is actively playing (for PLL advance)
@@ -2577,7 +2633,6 @@ private:
                 p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
 
                 double absNow = juce::Time::getMillisecondCounterHiRes();
-                p.absPositionTs.store(absNow, std::memory_order_relaxed);
                 p.lastPacketTime.store(absNow, std::memory_order_relaxed);
 
                 // Reverse play detection -- same logic as the CDJ-3000 path.
@@ -2597,7 +2652,7 @@ private:
                 }
                 p.prevAbsPosMs = playhead;
 
-                p.playheadMs.store(playhead, std::memory_order_relaxed);
+                p.publishPosition(playhead, absNow);
 
                 // Deliberately NOT touched here: trackLenSec, bpmRaw, pitchRaw.
                 // In this format those offsets hold constants, not data --
@@ -2674,7 +2729,6 @@ private:
             p.absPosIs3000Format.store(true, std::memory_order_relaxed);
 
             double absNow = juce::Time::getMillisecondCounterHiRes();
-            p.absPositionTs.store(absNow, std::memory_order_relaxed);
             p.lastPacketTime.store(absNow, std::memory_order_relaxed);
 
             // Reverse play detection: position decreasing while playing.
@@ -2694,7 +2748,7 @@ private:
             }
             p.prevAbsPosMs = playhead;
 
-            p.playheadMs.store(playhead, std::memory_order_relaxed);
+            p.publishPosition(playhead, absNow);
 
             pktCountAbsPos.fetch_add(1, std::memory_order_relaxed);
             p.cntAbsPosPkts.fetch_add(1, std::memory_order_relaxed);
@@ -2750,9 +2804,8 @@ private:
                         const double derived = double(bc) * msPerBeat;
                         if (derived < 4294967295.0)   // never convert out of range (UB)
                         {
-                            p.playheadMs.store(uint32_t(derived), std::memory_order_relaxed);
-                            p.absPositionTs.store(juce::Time::getMillisecondCounterHiRes(),
-                                                  std::memory_order_relaxed);
+                            p.publishPosition(uint32_t(derived),
+                                              juce::Time::getMillisecondCounterHiRes());
                         }
                     }
                 }
@@ -3025,9 +3078,7 @@ private:
                     {
                         const uint32_t derivedMs = uint32_t(derived);
 
-                        p.playheadMs.store(derivedMs, std::memory_order_relaxed);
-                        p.absPositionTs.store(juce::Time::getMillisecondCounterHiRes(),
-                                              std::memory_order_relaxed);
+                        p.publishPosition(derivedMs, juce::Time::getMillisecondCounterHiRes());
                         p.hasBeatDerivedPosition.store(true, std::memory_order_relaxed);
                     }
                 }
