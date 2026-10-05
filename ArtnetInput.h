@@ -106,13 +106,44 @@ public:
     int getListenPort() const { return listenPort; }
 
     //==============================================================================
-    // True if Art-Net TC packets are actively arriving
     /// Arrival instant of the last valid timecode packet (hi-res ms), which
     /// the sender emits at its frame boundary -- so it is the start of the
     /// frame carried in the packet.  0.0 when nothing has arrived.
     double getLastFrameArrivalMs() const
     {
         return lastPacketTime.load(std::memory_order_relaxed);
+    }
+
+    /// The last valid frame as the receive thread stored it: the value and
+    /// its arrival instant (see getLastFrameArrivalMs).  getCurrentTimecode()
+    /// and getLastFrameArrivalMs() read one field each, and a packet stored
+    /// between the two calls pairs a new value with an old arrival -- one
+    /// frame off for one tick.  This reads them as one record (AUDIT LTC-8).
+    struct ReceivedFrame
+    {
+        Timecode tc;
+        double   arrivalMs = 0.0;   // 0 = nothing received yet
+    };
+
+    /// Any thread.  A sequence lock: the writer (the receive thread, once
+    /// per packet) never waits; a reader that overlaps a write reads again.
+    ReceivedFrame getLastFrame() const
+    {
+        ReceivedFrame f;
+        for (;;)
+        {
+            const uint32_t before = frameSeq.load(std::memory_order_acquire);
+            if ((before & 1u) != 0)
+            {
+                juce::Thread::yield();   // a write is in progress
+                continue;
+            }
+            f.tc        = unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
+            f.arrivalMs = lastPacketTime.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (frameSeq.load(std::memory_order_relaxed) == before)
+                return f;
+        }
     }
 
     /// Freewheel (D10): how long after the last frame/packet the source still
@@ -124,6 +155,8 @@ public:
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
+    /// True while valid timecode packets keep arriving: the last one came
+    /// within the freewheel window.
     bool isReceiving() const
     {
         double lpt = lastPacketTime.load(std::memory_order_relaxed);
@@ -211,7 +244,7 @@ private:
         if (hours > 23 || minutes > 59 || seconds > 59 || frames > 29)
             return;
 
-        lastPacketTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+        const double arrivalMs = juce::Time::getMillisecondCounterHiRes();
 
         switch (rateCode)
         {
@@ -229,8 +262,17 @@ private:
             default: break;  // mask guarantees 0-3, but be explicit
         }
 
+        // Value and arrival go out as one record: the sequence is odd while
+        // they are being stored, and a reader that saw it odd or changed
+        // reads again (getLastFrame, AUDIT LTC-8).  Only this thread writes,
+        // so it never waits.
+        const uint32_t seq = frameSeq.load(std::memory_order_relaxed);
+        frameSeq.store(seq + 1u, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        lastPacketTime.store(arrivalMs, std::memory_order_relaxed);
         packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
                              std::memory_order_relaxed);
+        frameSeq.store(seq + 2u, std::memory_order_release);
     }
 
     std::unique_ptr<juce::DatagramSocket> socket;
@@ -246,6 +288,9 @@ private:
 
     std::atomic<uint64_t> packedTimecode { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
+    // Sequence lock over packedTimecode and lastPacketTime: odd while the
+    // receive thread is storing a frame (getLastFrame).
+    std::atomic<uint32_t> frameSeq { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetInput)
 };
