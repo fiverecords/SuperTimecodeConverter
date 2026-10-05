@@ -339,14 +339,21 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         int64_t totalSeconds = (int64_t)secondsTotal;
         double fractional = secondsTotal - (double)totalSeconds;
 
+        // Guard against floating-point truncation at frame boundaries:
+        // e.g. at 30fps, 33.333ms -> fractional*30 = 0.99999... truncates to 0
+        // instead of 1.  The epsilon is 1e-9 of a FRAME (tens of
+        // femtoseconds), which fixes boundary rounding without risk of
+        // pushing legitimate values past the next frame.  When it lifts the
+        // last frame of a second to the next one, the second carries: the
+        // remainder alone read 00:00:01:29 + 1 frame as 00:00:01:00, a
+        // second early.
+        int frames = (int)(fractional * fpsVal + 1e-9);
+        if (frames >= maxFrames) { frames -= maxFrames; ++totalSeconds; }
+
         tc.hours   = (int)((totalSeconds / 3600) % 24);
         tc.minutes = (int)((totalSeconds / 60) % 60);
         tc.seconds = (int)(totalSeconds % 60);
-        // Guard against floating-point truncation at frame boundaries:
-        // e.g. at 30fps, 33.333ms -> fractional*30 = 0.99999... truncates to 0
-        // instead of 1.  An epsilon of 1e-9 (~1ns) fixes boundary rounding
-        // without risk of pushing legitimate values past the next frame.
-        tc.frames  = (int)(fractional * fpsVal + 1e-9) % maxFrames;
+        tc.frames  = frames;
         return tc;
     }
 }
@@ -396,10 +403,15 @@ inline Timecode applyTimecodeOffset(const Timecode& tc, FrameRate tcFps,
 
     double totalMs = tcMs + offMs;
 
-    // Wrap at 24 hours
-    constexpr double kMsPerDay = 24.0 * 3600.0 * 1000.0;
-    totalMs = std::fmod(totalMs, kMsPerDay);
-    if (totalMs < 0.0) totalMs += kMsPerDay;
+    // Wrap at 24 hours of THIS rate's time address, which is not 24 real
+    // hours at the fractional rates: a 23.976 day is 86,486,400 ms (DESIGN
+    // D20) and a 29.97 DF day 86,399,913.6 ms.  Wrapped at 86,400,000, any
+    // result past 23:58:33:17 at 23.976 came out near 00:00, and at 29.97 a
+    // result just past midnight came out two or three frames early (AUDIT
+    // ENG-12).
+    const double msPerDay = (double) framesPerDay(tcFps) / frameRateToDouble(tcFps) * 1000.0;
+    totalMs = std::fmod(totalMs, msPerDay);
+    if (totalMs < 0.0) totalMs += msPerDay;
 
     return wallClockToTimecode(totalMs, tcFps);
 }
