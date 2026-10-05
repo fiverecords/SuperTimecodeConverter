@@ -263,9 +263,11 @@ public:
         oscSender.sendFloatDirect(address, value);
     }
 
+    /// One string argument, sent as it is: a quote in the BPM command
+    /// template no longer splits it (AUDIT NET-12).
     void sendOscString(const juce::String& address, const juce::String& value)
     {
-        oscSender.send(address, "s:\"" + value + "\"");
+        oscSender.sendString(address, value);
     }
 
     //--------------------------------------------------------------------------
@@ -420,16 +422,19 @@ private:
     {
         if (!oscSender.isConnected() || !entry.hasOscTrigger()) return;
 
-        // Expand built-in variables in oscArgs:
-        //   {artist}   -> artist string (quoted for space safety)
-        //   {title}    -> title string (quoted for space safety)
+        // Built-in variables in oscArgs, each a token of its own:
+        //   {artist}   -> artist string
+        //   {title}    -> title string
         //   {offset}   -> timecode offset string
-        juce::String args = entry.oscArgs;
-        args = args.replace("{artist}",  "s:\"" + entry.artist + "\"");
-        args = args.replace("{title}",   "s:\"" + entry.title + "\"");
-        args = args.replace("{offset}",  "s:\"" + entry.timecodeOffset + "\"");
-
-        oscSender.send(entry.oscAddress, args);
+        // OscSender puts the value in as one string argument after it has
+        // split the text, so nothing in a title can be read as syntax.  They
+        // used to be pasted in as s:"<value>" before the split, and a quote
+        // in a title -- Song (12" Mix) -- ended the string there and
+        // swallowed the arguments after it (AUDIT NET-12).
+        oscSender.send(entry.oscAddress, entry.oscArgs,
+                       { { "{artist}", entry.artist },
+                         { "{title}",  entry.title },
+                         { "{offset}", entry.timecodeOffset } });
     }
 
     //--------------------------------------------------------------------------

@@ -73,10 +73,28 @@ public:
     // Send an OSC message
     //--------------------------------------------------------------------------
 
+    /// A placeholder token and the text it stands for (see send()).
+    struct Substitution
+    {
+        juce::String token;   // e.g. "{title}"
+        juce::String value;
+    };
+
     /// Send with pre-parsed args string: "i:42 s:hello f:3.14"
     /// Each token is "type:value" separated by spaces.
     /// Supported types: i (int32), f (float32), s (string)
     bool send(const juce::String& address, const juce::String& argsString = {})
+    {
+        return send(address, argsString, {});
+    }
+
+    /// As above, and a token that is exactly one of `substitutions`' tokens
+    /// becomes a string argument holding its value, as it is.  The value is
+    /// never parsed, so a quote, a space or a backslash in a track title
+    /// cannot end the string early or swallow the arguments after it -- as
+    /// it did when callers pasted s:"<value>" into the text (AUDIT NET-12).
+    bool send(const juce::String& address, const juce::String& argsString,
+              std::initializer_list<Substitution> substitutions)
     {
         if (address.isEmpty()) return false;
 
@@ -96,6 +114,16 @@ public:
             for (auto& token : tokens)
             {
                 if (token.isEmpty()) continue;
+
+                const Substitution* sub = nullptr;
+                for (auto& candidate : substitutions)
+                    if (token == candidate.token) { sub = &candidate; break; }
+                if (sub != nullptr)
+                {
+                    typeTags += "s";
+                    writeOscString(argData, sub->value);
+                    continue;
+                }
 
                 if (token.length() < 3 || token[1] != ':')
                 {
@@ -208,10 +236,11 @@ public:
         return socket->write(destIp, destPort, packet, totalSize) > 0;
     }
 
-    /// Convenience: send with a single string argument
+    /// Convenience: send with a single string argument, as it is (quotes
+    /// and all -- see the substituting send()).
     bool sendString(const juce::String& address, const juce::String& value)
     {
-        return send(address, "s:\"" + value + "\"");
+        return send(address, "{value}", { { "{value}", value } });
     }
 
 private:
