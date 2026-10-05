@@ -453,7 +453,6 @@ struct TrackMapEntry
     bool hasOscTrigger()    const { return oscAddress.isNotEmpty(); }
     bool hasArtnetTrigger() const { return artnetCh > 0; }
     bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
-    bool hasCuePoints()     const { return !cuePoints.empty(); }
 
     /// Sort cue points by position (call after adding/editing cues).
     /// Stable; returns each cue's new index by its old one (sortCuesByPosition).
@@ -968,22 +967,6 @@ public:
     size_t size() const { return entries.size(); }
     bool   empty() const { return entries.empty(); }
 
-    /// Get all entries as a sorted vector (by artist then title) for UI display
-    std::vector<TrackMapEntry> getAllSorted() const
-    {
-        std::vector<TrackMapEntry> result;
-        result.reserve(entries.size());
-        for (auto& [k, entry] : entries)
-            result.push_back(entry);
-
-        std::sort(result.begin(), result.end(),
-                  [](const TrackMapEntry& a, const TrackMapEntry& b) {
-                      int cmp = a.artist.compareIgnoreCase(b.artist);
-                      return cmp != 0 ? cmp < 0 : a.title.compareIgnoreCase(b.title) < 0;
-                  });
-        return result;
-    }
-
     /// Lightweight variant returning const pointers -- avoids copying strings.
     /// IMPORTANT: Pointers are invalidated by ANY mutation of the TrackMap
     std::vector<const TrackMapEntry*> getAllSortedPtrs() const
@@ -1027,33 +1010,6 @@ public:
 
         juce::var jsonVar(root);
         return file.replaceWithText(juce::JSON::toString(jsonVar));
-    }
-
-    /// Import from a user-chosen file -- merges with existing entries.
-    int importFromFile(const juce::File& file)
-    {
-        if (!file.existsAsFile()) return 0;
-
-        auto parsed = juce::JSON::parse(file.loadFileAsString());
-        auto* obj = parsed.getDynamicObject();
-        if (!obj) return 0;
-
-        auto* arr = obj->getProperty("tracks").getArray();
-        if (!arr) return 0;
-
-        int count = 0;
-        for (auto& item : *arr)
-        {
-            TrackMapEntry e;
-            e.fromVar(item);
-            if (e.hasValidKey())
-            {
-                entries[e.key()] = std::move(e);
-                ++count;
-            }
-        }
-        if (count > 0) ++generation;
-        return count;
     }
 
     //------------------------------------------------------------------
