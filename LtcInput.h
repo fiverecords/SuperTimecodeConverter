@@ -91,6 +91,9 @@ public:
     double getActualSampleRate() const { return currentSampleRate; }
     int getActualBufferSize() const { return currentBufferSize; }
 
+    /// The last frame read (DESIGN D19: not the live value, which is the next
+    /// one).  For display; the engine should take getLiveTimecode(), which
+    /// ages it and pairs it with its phase (AUDIT LTC-10).
     Timecode getCurrentTimecode() const
     {
         return unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
@@ -119,13 +122,141 @@ public:
     /// Binary group flags of the last decoded frame (BGF0 in bit 0).
     uint8_t getBinaryGroupFlags() const { return binaryGroupFlags.load(std::memory_order_relaxed); }
 
+    /// One decoded frame as the audio thread published it: the value read,
+    /// when it arrived, the user bits and flags it carried, and how the
+    /// source was moving.  The getters above read one field each; a frame
+    /// decoded between two of them pairs a new value with an old arrival, or
+    /// one frame's user bits with another's flags.  This one reads them as
+    /// one record (AUDIT LTC-8).
+    struct DecodedFrame
+    {
+        Timecode tc;                   // the frame read (DESIGN D19)
+        double   arrivalMs = 0.0;      // its end on the wire; 0 = nothing decoded yet
+        uint32_t userBits = 0;
+        uint8_t  binaryGroupFlags = 0;
+        double   periodMs = 0.0;       // the source's own frame length, last measured; 0 = not yet
+        int      repeats = 0;          // frames in a row that repeated the value before them (0-2)
+    };
+
+    /// Any thread.  A sequence lock: the writer (the audio thread, once per
+    /// frame) never waits; a reader that overlaps a write reads again.
+    DecodedFrame getLastFrame() const
+    {
+        DecodedFrame f;
+        for (;;)
+        {
+            const uint32_t before = frameSeq.load(std::memory_order_acquire);
+            if ((before & 1u) != 0)
+            {
+                juce::Thread::yield();   // a write is in progress
+                continue;
+            }
+            f.tc               = unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
+            f.arrivalMs        = lastFrameTime.load(std::memory_order_relaxed);
+            f.userBits         = userBitsIn.load(std::memory_order_relaxed);
+            f.binaryGroupFlags = binaryGroupFlags.load(std::memory_order_relaxed);
+            f.periodMs         = framePeriodMs.load(std::memory_order_relaxed);
+            f.repeats          = frameRepeats.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (frameSeq.load(std::memory_order_relaxed) == before)
+                return f;
+        }
+    }
+
+    /// What the engine publishes from this input: the live value, its phase
+    /// inside the frame, and whether the source counts as present -- all
+    /// from one snapshot and one clock reading (AUDIT LTC-10; the principle
+    /// of DESIGN D29, there for MTC).
+    struct LiveTimecode
+    {
+        Timecode tc;
+        double   phaseMs = 0.0;
+        bool     phaseValid = false;   // false until a frame has been decoded
+        bool     receiving = false;
+    };
+
+    /// `atMs` is the hi-res ms counter, `fps` the engine's rate.  Any thread.
+    ///
+    /// The decoder delivers a frame when its sync word has gone by, which is
+    /// the instant the next frame begins: the live value at the arrival is
+    /// the decoded one plus one (DESIGN D19).  The engine reads it up to a
+    /// device period plus the input latency later, and with a buffer longer
+    /// than a frame that is several frames on: the value is aged by the
+    /// whole frames elapsed since the arrival and the phase is what remains,
+    /// one measurement expressed two ways.  Before, the value was the
+    /// decoded one plus one whatever its age, and the phase an fmod of the
+    /// same age -- the pair named the wrong frame on a third of the ticks at
+    /// 512 samples and on all of them from 2048 with a period of latency.
+    ///
+    /// The frames counted are the source's own.  Their length is the one
+    /// measured on the sample clock, which under varispeed is not the nominal
+    /// one (at 0.92 or 1.08, aging by the nominal length put the value a
+    /// frame off on two thirds of the ticks at 8192 samples with a period of
+    /// latency).  However long it is, it is what 80 whole bits of the source
+    /// took, so a slow source is aged at its own speed.  It is never taken as
+    /// shorter than half the nominal: a source above twice the speed is aged
+    /// at twice, and reads behind rather than ahead.  The phase is that
+    /// frame's fraction in nominal milliseconds, the source time LtcOutput
+    /// ages it in.  And only a source that advances is aged.  One that has
+    /// sent the same value three times running is holding a static frame: it
+    /// reads as that frame plus one at any age, as DESIGN D19 and BENCH B27
+    /// say, where aging made it a sawtooth up to eleven frames high.  A
+    /// single repeat is a running source that lost a frame, and is aged like
+    /// any other.
+    ///
+    /// The value is aged for as long as the source counts as receiving: the
+    /// freewheel (AUDIT D10) on top of the device period and the input
+    /// latency.  Through a dropout shorter than that it counts on at the
+    /// source's last speed, as MtcInput's does, and carries on where the
+    /// source does when the frames come back.  The price is at a real stop:
+    /// the value runs on through the whole window and then, once the source
+    /// no longer counts as receiving, steps back to the last frame read plus
+    /// one.  At 30 fps that is 4 or 5 frames at the default 150 ms with 512
+    /// samples, 14 at 8192 samples with a period of latency, 60 to 70 with a
+    /// 2 s freewheel.  A source that slows down before it stops (a brake) is
+    /// aged at the last frame's length, which is shorter than the next one:
+    /// at 8192 samples with a period of latency the value can run a frame
+    /// ahead and back while it slows.
+    ///
+    /// While not receiving the value is the last one read plus one and the
+    /// phase 0, as MtcInput does: the source has stopped.
+    LiveTimecode getLiveTimecode(double atMs, FrameRate fps) const
+    {
+        LiveTimecode live;
+        const DecodedFrame f = getLastFrame();
+        const double window = timeoutMs.load(std::memory_order_relaxed)
+                            + deliveryMs.load(std::memory_order_relaxed);
+        live.receiving = (atMs - f.arrivalMs) < window;   // isReceivingAt() on this snapshot
+
+        int64_t whole = 0;
+        if (f.arrivalMs > 0.0)
+        {
+            live.phaseValid = true;
+            const double nominalMs = 1000.0 / frameRateToDouble(fps);
+            if (live.receiving)
+            {
+                const double frameMs = (f.periodMs > 0.0)
+                                     ? juce::jmax(nominalMs * 0.5, f.periodMs)
+                                     : nominalMs;
+                const double frames = (atMs - f.arrivalMs) / frameMs;
+                const double fl = std::floor(frames);
+                live.phaseMs = (frames - fl) * nominalMs;
+                if (f.repeats < kHeldRepeats)
+                    whole = (int64_t) fl;
+            }
+        }
+        live.tc = offsetTimecode(f.tc, (int) (1 + whole), fps);
+        return live;
+    }
+
     /// Freewheel (AUDIT D10): how long a frame may be missing before the
     /// source stops counting as present, counted from when the device could
-    /// have delivered it (see isReceivingAt).  The senders count on their own
-    /// through it, so a short dropout -- a USB stall, a display wake -- never
-    /// reaches the wire; the price is that a real stop takes this long to
-    /// reach the outputs.  The operator sets it (engine setting), default
-    /// kSourceTimeoutMs.
+    /// have delivered it (see isReceivingAt).  The live value counts on
+    /// through it (getLiveTimecode), and the senders with it, so a short
+    /// dropout -- a USB stall, a display wake -- never reaches the wire; the
+    /// price is that a real stop takes this long to reach the outputs, which
+    /// run on through it and then step back to where the source stopped.
+    /// The operator sets it (engine setting), default kSourceTimeoutMs.
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
@@ -276,11 +407,21 @@ private:
     std::atomic<uint64_t> packedTimecode { 0 };
     // LTC user bits recovered from the incoming stream (32-bit binary
     // groups; 0 until the first good frame).  Written by the audio thread
-    // once per decoded frame, read by the UI for display.
+    // once per decoded frame, read by the UI for display and by the FROM LTC
+    // IN user-bits mode.
     std::atomic<uint32_t> userBitsIn { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameTime  { 0.0 };
     std::atomic<uint8_t> binaryGroupFlags { 0 };   // BGF0 | BGF1<<1 | BGF2<<2 of the last frame
+    // Sequence lock over packedTimecode, lastFrameTime, userBitsIn,
+    // binaryGroupFlags, framePeriodMs and frameRepeats: odd while the audio
+    // thread is storing a frame (getLastFrame).
+    std::atomic<uint32_t> frameSeq { 0 };
+    std::atomic<double> framePeriodMs { 0.0 };   // DecodedFrame::periodMs
+    std::atomic<int> frameRepeats { 0 };         // DecodedFrame::repeats
+    // Repeats after which a value counts as a static frame and is no longer
+    // aged (getLiveTimecode).
+    static constexpr int kHeldRepeats = 2;
     double decodeCallbackStartMs = 0.0;   // audio thread only: timestamp base for lastFrameTime
     int    decodeSamplesRemaining = 0;    // audio thread only: samples after the one being decoded
     double inputLatencyMs = 0.0;          // set in audioDeviceAboutToStart
@@ -309,6 +450,9 @@ private:
     double samplesSinceLastSync = 0.0;
     int consecutiveGoodFrames = 0;
     FrameRate candidateFps = FrameRate::FPS_25;   // rate the consecutive count refers to
+    bool   lastSyncClosedFrame = false;   // the last sync word ended a whole, valid frame
+    double sourcePeriodMs = 0.0;          // the source's frame length, last measured; 0 = not yet
+    int    valueRepeats = 0;              // frames in a row that repeated the value before them (0-2)
 
     void resetDecoder()
     {
@@ -323,6 +467,9 @@ private:
         // Initial bit period estimate: use ~27fps midpoint (2160 transitions/sec)
         // to minimize convergence time across all frame rates (24-30fps)
         bitPeriodEstimate = currentSampleRate / 2160.0;
+        lastSyncClosedFrame = false;
+        sourcePeriodMs = 0.0;
+        valueRepeats = 0;
     }
 
     void pushBit(int bit)
@@ -356,6 +503,7 @@ private:
         {
             consecutiveGoodFrames = 0;
             samplesSinceLastSync = 0.0;
+            lastSyncClosedFrame = false;
             return;
         }
 
@@ -396,6 +544,13 @@ private:
             consecutiveGoodFrames = 0;
         }
 
+        // The source's own frame length, for getLiveTimecode: the samples
+        // between this sync word and the last one, when that one also ended
+        // a whole frame -- exactly 80 of the source's bits, at whatever speed
+        // it runs.  Kept until the next such measurement.
+        if (lastSyncClosedFrame)
+            sourcePeriodMs = samplesSinceLastSync * 1000.0 / currentSampleRate;
+        lastSyncClosedFrame = true;
         samplesSinceLastSync = 0.0;
 
         // --- Binary group flags (12M-1 Table 2) ---
@@ -403,12 +558,12 @@ private:
         // 30 fps and 27/43 at 25 fps.  Reported alongside the user bits so
         // the reader can decode what the sender declared (ST 309 date, eight-
         // bit characters).  The rate used is the adopted one.
+        uint8_t bgf = 0;
         {
             const bool is25 = (detectedFps.load(std::memory_order_relaxed) == FrameRate::FPS_25);
             const int  b0 = is25 ? 27 : 43;
             const int  b2 = is25 ? 43 : 59;
-            const uint8_t bgf = (uint8_t)(((d >> b0) & 1) | (((d >> 58) & 1) << 1) | (((d >> b2) & 1) << 2));
-            binaryGroupFlags.store(bgf, std::memory_order_relaxed);
+            bgf = (uint8_t)(((d >> b0) & 1) | (((d >> 58) & 1) << 1) | (((d >> b2) & 1) << 2));
         }
 
         // --- User bits (SMPTE 12M binary groups) ---
@@ -417,21 +572,18 @@ private:
         // the LEAST significant hex digit.  Reassembled into a 32-bit word
         // so a value written by an STC output reads back identically.
         // Only stored on good frames (we are past the range check above).
+        uint32_t ub = 0;
         {
             static constexpr int kUserGroupStart[8] =
                 { 4, 12, 20, 28, 36, 44, 52, 60 };
-            uint32_t ub = 0;
             for (int g = 0; g < 8; ++g)
             {
                 const uint32_t nibble =
                     static_cast<uint32_t>((d >> kUserGroupStart[g]) & 0xF);
                 ub |= nibble << (g * 4);
             }
-            userBitsIn.store(ub, std::memory_order_relaxed);
         }
 
-        packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
-                             std::memory_order_relaxed);
         // Arrival instant of the frame end, at sample precision: the
         // callback runs after the buffer was captured, so the sample being
         // processed occurred (samples still to process in this buffer)
@@ -439,10 +591,32 @@ private:
         // Stamping with the callback time put the frame boundary up to a
         // buffer late and made it jitter by a buffer, which the phase
         // published to the LTC encoder (D5) inherited.
-        lastFrameTime.store(decodeCallbackStartMs
-                            - (double)(decodeSamplesRemaining) * 1000.0 / currentSampleRate
-                            - inputLatencyMs,
-                            std::memory_order_relaxed);
+        const double arrivalMs = decodeCallbackStartMs
+                               - (double)(decodeSamplesRemaining) * 1000.0 / currentSampleRate
+                               - inputLatencyMs;
+
+        // Frames in a row that repeated the value before them.  A source
+        // holding a static frame repeats every one; a running source that
+        // lost a frame repeats one (getLiveTimecode tells them apart).
+        const uint64_t packed = packTimecode(hours, minutes, seconds, frames);
+        const bool repeated = lastFrameTime.load(std::memory_order_relaxed) > 0.0
+                           && packed == packedTimecode.load(std::memory_order_relaxed);
+        valueRepeats = repeated ? juce::jmin(valueRepeats + 1, kHeldRepeats) : 0;
+
+        // Value, arrival, user bits, flags, period and repeats go out as one
+        // record: the sequence is odd while they are being stored, and a
+        // reader that saw it odd or changed reads again (getLastFrame, AUDIT
+        // LTC-8).  Only this thread writes, so it never waits.
+        const uint32_t seq = frameSeq.load(std::memory_order_relaxed);
+        frameSeq.store(seq + 1u, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        packedTimecode.store(packed, std::memory_order_relaxed);
+        lastFrameTime.store(arrivalMs, std::memory_order_relaxed);
+        userBitsIn.store(ub, std::memory_order_relaxed);
+        binaryGroupFlags.store(bgf, std::memory_order_relaxed);
+        framePeriodMs.store(sourcePeriodMs, std::memory_order_relaxed);
+        frameRepeats.store(valueRepeats, std::memory_order_relaxed);
+        frameSeq.store(seq + 2u, std::memory_order_release);
     }
 
     void onEdgeDetected(int64_t intervalSamples)
