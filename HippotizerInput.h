@@ -21,7 +21,10 @@
 //     3. Sender sees receiver's 6092 announcement → TCP connect to receiver:6091
 //        - Sender sends: 8 bytes (IP_BE + randomID) + HippoNet announcement
 //        - Receiver responds: 8 bytes (IP_BE + ID) + HippoNet announcement
-//        - Sender sends: ~13KB Zookeeper node tree (consumed, not parsed)
+//        - Sender sends its Zookeeper node tree (consumed, not parsed)
+//        - Receiver (STC) answers with its own, replayed from a Hippotizer
+//          PLAY capture: 79 messages, 40139 bytes (HippoNetNodeData.h),
+//          a batch per read, then 25 TYPE4 subscribes
 //     4. TC flows: UDP unicast 6091→6091
 //
 //   Timecode packets (UDP port 6091):
@@ -264,7 +267,6 @@ public:
     int getListenPort() const { return listenPort; }
 
     //==============================================================================
-    /// True if Hippotizer timecode packets are actively arriving
     /// Freewheel (D10): how long after the last frame/packet the source still
     /// counts as present.  The senders count on their own through it, so a
     /// short dropout -- a USB stall, a display wake -- never reaches the
@@ -274,6 +276,8 @@ public:
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
+    /// True if Hippotizer timecode packets are actively arriving: the last
+    /// one came within the freewheel window.
     bool isReceiving() const
     {
         double lpt = lastPacketTime.load(std::memory_order_relaxed);
@@ -1102,7 +1106,6 @@ private:
             + juce::String((int)buf.size()) + "B)");
     }
 
-    /// Send Zookeeper node tree response (15KB first wave from working PLAY capture).
     // Discovery state
     mutable juce::SpinLock discoveryLock;
     juce::String discoveredName;
