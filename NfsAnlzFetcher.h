@@ -38,6 +38,7 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <map>
 
 class NfsAnlzFetcher
@@ -311,13 +312,67 @@ private:
         return out.getMemoryBlock();
     }
 
+    /// What one datagram on the RPC socket is to the call waiting for an xid.
+    struct RpcReply
+    {
+        enum Status { NotOurs, Rejected, Accepted };
+        Status status = NotOurs;
+        int bodyOffset = 0;   // Accepted: the procedure's results start here
+    };
+
+    /// Read an ONC RPC v2 reply header (RFC 5531 section 9):
+    ///   [0] xid, [4] msg_type (1 = REPLY), [8] reply_stat (0 = MSG_ACCEPTED,
+    ///   1 = MSG_DENIED); accepted: [12] verifier flavor, [16] verifier length,
+    ///   the verifier body padded to 4 bytes (XDR opaque, RFC 4506), then
+    ///   accept_stat (0 = SUCCESS) and the results.
+    /// NotOurs: not the reply to this call (another xid, not a REPLY, or
+    /// truncated) -- keep waiting.  Rejected: MSG_DENIED (RPC_MISMATCH or
+    /// AUTH_ERROR), an accept_stat other than SUCCESS (PROG_UNAVAIL,
+    /// PROG_MISMATCH, PROC_UNAVAIL, GARBAGE_ARGS, SYSTEM_ERR) or a verifier
+    /// over RFC 5531's 400 bytes -- sending the same call again cannot help.
+    static RpcReply parseRpcReply(const uint8_t* buf, int len, uint32_t xid)
+    {
+        RpcReply r;
+        if (len < 12) return r;
+        if (xdrRead32(buf) != xid) return r;
+        if (xdrRead32(buf + 4) != 1) return r;              // not a REPLY
+        if (xdrRead32(buf + 8) != 0)                         // MSG_DENIED
+        {
+            r.status = RpcReply::Rejected;
+            return r;
+        }
+        if (len < 20) return r;
+        const uint32_t verfLen = xdrRead32(buf + 16);
+        if (verfLen > 400)
+        {
+            r.status = RpcReply::Rejected;
+            return r;
+        }
+        const int acceptOff = 20 + (int)((verfLen + 3) & ~3u);
+        if (acceptOff + 4 > len) return r;
+        if (xdrRead32(buf + acceptOff) != 0)                 // accept_stat
+        {
+            r.status = RpcReply::Rejected;
+            return r;
+        }
+        r.status = RpcReply::Accepted;
+        r.bodyOffset = acceptOff + 4;
+        return r;
+    }
+
     /// Send an RPC call and receive the reply. Returns reply body (after accept_stat).
     /// Returns empty MemoryBlock on failure.
+    ///
+    /// A reply counts only if it carries this call's xid and comes from
+    /// @p host (an IP literal: the player's address from its status packets);
+    /// anything else on the socket is skipped while the attempt's timeout
+    /// runs.  A rejected call fails at once.
     juce::MemoryBlock rpcCall(const juce::String& host, int port,
                               uint32_t program, uint32_t version, uint32_t procedure,
                               const juce::MemoryBlock& args)
     {
-        auto msg = buildRpcCall(nextXid++, program, version, procedure, args);
+        const uint32_t xid = nextXid++;
+        auto msg = buildRpcCall(xid, program, version, procedure, args);
 
         juce::DatagramSocket sock(false);
         sock.bindToPort(0);
@@ -331,42 +386,30 @@ private:
             if (sock.write(host, port, msg.getData(), (int)msg.getSize()) < 0)
                 return {};
 
-            if (sock.waitUntilReady(true, timeoutMs) > 0)
+            const double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
+            for (;;)
             {
+                const int waitMs = (int)std::ceil(deadline - juce::Time::getMillisecondCounterHiRes());
+                if (waitMs <= 0) break;
+                const int ready = sock.waitUntilReady(true, waitMs);
+                if (ready < 0) return {};
+                if (ready == 0) break;
+
                 juce::String senderIP;
                 int senderPort = 0;
-                int bytesRead = sock.read(recvBuf, sizeof(recvBuf), false, senderIP, senderPort);
-                if (bytesRead >= 24)
+                const int bytesRead = sock.read(recvBuf, (int)sizeof(recvBuf), false, senderIP, senderPort);
+                if (bytesRead < 0) return {};
+                if (senderIP != host) continue;   // not the player we called
+
+                const auto reply = parseRpcReply(recvBuf, bytesRead, xid);
+                if (reply.status == RpcReply::NotOurs) continue;
+                if (reply.status == RpcReply::Rejected)
                 {
-                    // Parse RPC reply header
-                    // [0-3] XID, [4-7] msg_type=1(REPLY), [8-11] reply_stat=0(ACCEPTED)
-                    // [12-15] verf_flavor, [16-19] verf_length, [20-23] accept_stat=0(SUCCESS)
-                    // [24+] reply body
-                    uint32_t replyType = xdrRead32(recvBuf + 4);
-                    if (replyType != 1) continue;  // not a REPLY
-
-                    uint32_t replyStat = xdrRead32(recvBuf + 8);
-                    if (replyStat != 0) continue;  // not ACCEPTED
-
-                    uint32_t verfLen = xdrRead32(recvBuf + 16);
-                    // Wire length: bound it unsigned before it becomes an offset.
-                    // RFC 5531 caps the verifier at 400 bytes; anything larger is
-                    // not a reply we can use.  (A value >= 2^31 cast to int went
-                    // negative here and read before the buffer.)
-                    if (verfLen > 400) continue;
-                    int bodyOffset = 20 + (int)verfLen + 4;  // skip verifier + accept_stat
-
-                    if (bodyOffset > bytesRead) continue;
-
-                    uint32_t acceptStat = xdrRead32(recvBuf + bodyOffset - 4);
-                    if (acceptStat != 0)
-                    {
-                        DBG("NfsAnlzFetcher: RPC accept_stat=" + juce::String(acceptStat));
-                        return {};
-                    }
-
-                    return juce::MemoryBlock(recvBuf + bodyOffset, bytesRead - bodyOffset);
+                    DBG("NfsAnlzFetcher: RPC call rejected (prog=" + juce::String(program)
+                        + " proc=" + juce::String(procedure) + ")");
+                    return {};
                 }
+                return juce::MemoryBlock(recvBuf + reply.bodyOffset, (size_t)(bytesRead - reply.bodyOffset));
             }
             timeoutMs *= 2;  // exponential backoff
         }
