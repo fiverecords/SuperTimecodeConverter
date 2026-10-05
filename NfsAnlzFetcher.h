@@ -38,6 +38,7 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 
@@ -96,6 +97,7 @@ public:
                               uint32_t trackId)
     {
         AnlzResult result;
+        fetchGeneration = cancelGeneration.load(std::memory_order_relaxed);
         if (playerIP.isEmpty() || trackId == 0) return result;
 
         juce::String mountPath = slotToMountPath(slot);
@@ -133,6 +135,7 @@ public:
                              const juce::String& anlzPath)
     {
         AnlzResult result;
+        fetchGeneration = cancelGeneration.load(std::memory_order_relaxed);
 
         if (playerIP.isEmpty() || anlzPath.isEmpty())
             return result;
@@ -188,6 +191,12 @@ public:
         return m;
     }
 
+    /// Abandon the fetch in progress, if any: it returns within ~50 ms with
+    /// what it has (ok=false when a file is missing).  Any thread; a fetch that
+    /// starts after the call is not affected.  For DbServerClient::stop(),
+    /// before it joins the NFS thread.
+    void cancel() noexcept { cancelGeneration.fetch_add(1, std::memory_order_relaxed); }
+
     /// Clear cached NFS mount handles for a player (call when player disappears).
     void removePlayer(const juce::String& playerIP)
     {
@@ -221,6 +230,13 @@ private:
     // cost is roughly 100-400 ms more per track load, well inside the time
     // the player itself spends on the same load.
     static constexpr int kNfsReadChunk     = 1280;
+    // Largest file STC will download.  The size comes from the LOOKUP reply
+    // (fattr.size, a wire value up to 4 GB), and it sizes the buffer.  ANLZ
+    // files are tens of KB (a few MB for the detail of a very long track);
+    // export.pdb is the large one, ~20 MB for a 20,000-track library.
+    static constexpr uint32_t kMaxFileBytes = 128u * 1024u * 1024u;
+    // How often a wait for an RPC reply looks at the cancel flag.
+    static constexpr int kCancelPollMs     = 50;
     static constexpr int kRpcTimeoutMs     = 2000;
     static constexpr int kMountProgram     = 100005;
     static constexpr int kMountVersion     = 1;
@@ -383,6 +399,8 @@ private:
 
         for (int attempt = 0; attempt < 3; attempt++)
         {
+            if (isCancelled())
+                return {};
             if (sock.write(host, port, msg.getData(), (int)msg.getSize()) < 0)
                 return {};
 
@@ -391,9 +409,10 @@ private:
             {
                 const int waitMs = (int)std::ceil(deadline - juce::Time::getMillisecondCounterHiRes());
                 if (waitMs <= 0) break;
-                const int ready = sock.waitUntilReady(true, waitMs);
+                if (isCancelled()) return {};
+                const int ready = sock.waitUntilReady(true, juce::jmin(waitMs, kCancelPollMs));
                 if (ready < 0) return {};
-                if (ready == 0) break;
+                if (ready == 0) continue;   // re-check the deadline and the cancel flag
 
                 juce::String senderIP;
                 int senderPort = 0;
@@ -718,6 +737,11 @@ private:
 
         uint32_t totalSize = lr.fileSize;
         DBG("NfsAnlzFetcher: file size=" + juce::String(totalSize) + " bytes");
+        if (totalSize > kMaxFileBytes)
+        {
+            DBG("NfsAnlzFetcher: file too large to download");
+            return false;
+        }
 
         // Step 3: Read file in chunks
         outData.ensureSize(totalSize, false);
@@ -726,6 +750,11 @@ private:
         uint32_t offset = 0;
         while (offset < totalSize)
         {
+            if (isCancelled())
+            {
+                DBG("NfsAnlzFetcher: download cancelled at offset " + juce::String(offset));
+                return false;
+            }
             uint32_t chunkSize = std::min((uint32_t)kNfsReadChunk, totalSize - offset);
             auto chunk = nfsRead(playerIP, currentHandle, offset, chunkSize);
             if (chunk.getSize() == 0)
@@ -733,8 +762,10 @@ private:
                 DBG("NfsAnlzFetcher: read failed at offset " + juce::String(offset));
                 return false;
             }
-            outData.append(chunk.getData(), chunk.getSize());
-            offset += (uint32_t)chunk.getSize();
+            // A server that answers with more than asked cannot grow the file.
+            const uint32_t take = (uint32_t)std::min<size_t>(chunk.getSize(), totalSize - offset);
+            outData.append(chunk.getData(), take);
+            offset += take;
         }
 
         return true;
@@ -1397,6 +1428,16 @@ private:
     }
 
     uint32_t nextXid = 1;  // RPC transaction ID counter
+
+    // Cancellation (cancel()).  A fetch runs on DbServerClient's NFS thread,
+    // one at a time; it notes cancelGeneration when it begins and stops when
+    // the value moves.
+    std::atomic<uint32_t> cancelGeneration { 0 };
+    uint32_t fetchGeneration = 0;   // NFS thread only
+    bool isCancelled() const noexcept
+    {
+        return cancelGeneration.load(std::memory_order_relaxed) != fetchGeneration;
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(NfsAnlzFetcher)
 };
