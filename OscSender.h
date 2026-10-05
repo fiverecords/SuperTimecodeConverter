@@ -35,7 +35,10 @@ public:
         destIp = ip;
         destPort = port;
 
-        socket = std::make_unique<juce::DatagramSocket>(false);
+        // canBroadcast: SO_BROADCAST, so a broadcast destination (x.x.x.255,
+        // 255.255.255.255) can be sent to; without it macOS and Linux refuse
+        // every send to one (EACCES) and the trigger was lost (AUDIT NET-15).
+        socket = std::make_unique<juce::DatagramSocket>(true);
         // Bind to any local port (ephemeral)
         if (!socket->bindToPort(0))
         {
