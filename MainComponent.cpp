@@ -553,6 +553,10 @@ MainComponent::MainComponent()
     cmbHippoTcChannel.onChange = [this]
     {
         if (syncing) return;
+        if (isShowLockedRestore([this] {
+                cmbHippoTcChannel.setSelectedId(currentEngine().getHippotizerInput().getSelectedTcIndex() + 1,
+                                                juce::dontSendNotification); }))
+            return;
         int sel = cmbHippoTcChannel.getSelectedId() - 1;  // 0-based
         currentEngine().getHippotizerInput().setSelectedTcIndex(sel);
         saveSettings();
@@ -614,9 +618,12 @@ MainComponent::MainComponent()
         setupTcEditor(txtGenStopTC,  lblGenStopTC,  "STOP TC (0=FREE):");
 
         // Callbacks use member pointers directly (no dangling reference)
+        // Locked: the field shows the engine's value again rather than the
+        // one typed and not applied.
         auto applyStartTC = [this] {
-            if (isShowLocked()) return;
             auto& eng = currentEngine();
+            if (isShowLockedRestore([&] { txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false); }))
+                return;
             eng.setGeneratorStartMs(parseTimecodeToMs(txtGenStartTC.getText(), eng.getCurrentFps()));
             txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false);
             saveSettings();
@@ -625,8 +632,9 @@ MainComponent::MainComponent()
         txtGenStartTC.onFocusLost = applyStartTC;
 
         auto applyStopTC = [this] {
-            if (isShowLocked()) return;
             auto& eng = currentEngine();
+            if (isShowLockedRestore([&] { txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false); }))
+                return;
             eng.setGeneratorStopMs(parseTimecodeToMs(txtGenStopTC.getText(), eng.getCurrentFps()));
             txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
             saveSettings();
@@ -736,6 +744,11 @@ MainComponent::MainComponent()
         cmbGenAudioFileMode.onChange = [this]
         {
             if (syncing) return;
+            if (isShowLockedRestore([this] {
+                    cmbGenAudioFileMode.setSelectedId(
+                        juce::jlimit(0, 2, currentEngine().getGeneratorAudioFileChannelMode()) + 1,
+                        juce::dontSendNotification); }))
+                return;
             // No need to reopen the device or reload the file -- the player
             // reads this flag in the audio callback on every block, so the
             // change takes effect immediately.
@@ -764,6 +777,8 @@ MainComponent::MainComponent()
         sldGenAudioVolume.setTextBoxStyle(juce::Slider::TextBoxRight, false, 50, 18);
         sldGenAudioVolume.setNumDecimalPlacesToDisplay(2);
         sldGenAudioVolume.setVisible(false);
+        // Not locked by Show Lock: a level ridden during the show, like the
+        // generator transport and preset buttons.
         sldGenAudioVolume.onValueChange = [this]
         {
             if (syncing) return;
@@ -814,7 +829,8 @@ MainComponent::MainComponent()
     addLabelAndCombo(lblOscInputInterface, cmbOscInputInterface, "OSC NETWORK DEVICE:");
     cmbOscInputInterface.onChange = [this]
     {
-        if (isShowLocked()) return;
+        if (isShowLockedRestore([this] { cmbOscInputInterface.setSelectedId(settings.oscInputInterface + 1, juce::dontSendNotification); }))
+            return;
         settings.oscInputInterface = cmbOscInputInterface.getSelectedId() - 1;
         if (btnOscIn.getToggleState())
         {
@@ -838,7 +854,8 @@ MainComponent::MainComponent()
     txtOscInPort.setVisible(false);
     auto applyOscPort = [this]
     {
-        if (isShowLocked()) return;
+        if (isShowLockedRestore([this] { txtOscInPort.setText(juce::String(settings.oscInputPort), false); }))
+            return;
         int port = juce::jlimit(1, 65535, txtOscInPort.getText().getIntValue());
         txtOscInPort.setText(juce::String(port), false);
         settings.oscInputPort = port;
@@ -1049,7 +1066,7 @@ MainComponent::MainComponent()
     btnMixerMapEdit.setVisible(false);
     btnMixerMapEdit.setColour(juce::TextButton::buttonColourId, pdlAccent.withAlpha(0.15f));
     btnMixerMapEdit.setColour(juce::TextButton::textColourOffId, pdlAccent.brighter(0.3f));
-    btnMixerMapEdit.onClick = [this] { openMixerMapEditor(); };
+    btnMixerMapEdit.onClick = [this] { if (!isShowLocked()) openMixerMapEditor(); };   // like Track Map (AUDIT UI-3)
 
     addAndMakeVisible(btnBackup);
     btnBackup.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
@@ -1108,9 +1125,22 @@ MainComponent::MainComponent()
         }
         else
         {
+            // Save what was changed before the lock while flushSettings still
+            // reads the destination fields (they are not saved while locked).
+            if (settingsDirty)
+                flushSettings();
             settings.showModeLocked = true;
-            // Close cue editor (config window -- shouldn't be open during show)
+            // Close the configuration editors -- cue points, Track Map, Mixer
+            // Map, generator presets.  They shouldn't be open during the
+            // show: their edits change what goes out (Track Map offsets and
+            // triggers, mixer forwarding, generator cues), and none of them
+            // checks Show Lock itself (AUDIT UI-3).  The floating ones close
+            // as from their close button, which keeps their bounds.
             if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); cuePointEditedArtist.clear(); cuePointEditedTitle.clear(); }
+            for (auto* w : { trackMapWindow.getComponent(), mixerMapWindow.getComponent(),
+                             genPresetWindow.getComponent() })
+                if (w != nullptr)
+                    w->closeButtonPressed();
             updateShowLockVisuals();
             saveSettings();
         }
@@ -1385,6 +1415,8 @@ MainComponent::MainComponent()
         sldBpmSmoothing.onValueChange = [this]
         {
             if (syncing) return;
+            if (isShowLockedSlider(sldBpmSmoothing, currentEngine().getAudioBpmInput().getSmoothing() * 100.0f))
+                return;
             float s = (float)sldBpmSmoothing.getValue() / 100.0f;
             currentEngine().getAudioBpmInput().setSmoothing(s);
             saveSettings();
@@ -1414,6 +1446,8 @@ MainComponent::MainComponent()
         sldBpmInputGain.onValueChange = [this]
         {
             if (syncing) return;
+            if (isShowLockedSlider(sldBpmInputGain, currentEngine().getAudioBpmInput().getInputGain() * 100.0f))
+                return;
             float gain = (float)sldBpmInputGain.getValue() / 100.0f;
             currentEngine().getAudioBpmInput().setInputGain(gain);
             saveSettings();
@@ -1515,8 +1549,16 @@ MainComponent::MainComponent()
     edOscIp.setColour(juce::TextEditor::textColourId, textBright);
     edOscIp.setColour(juce::TextEditor::outlineColourId, borderCol);
     edOscIp.setTextToShowWhenEmpty("127.0.0.1", textDim);
-    edOscIp.onFocusLost = [this] { applyTriggerSettings(); saveSettings(); };
-    edOscIp.onReturnKey  = [this] { applyTriggerSettings(); saveSettings(); };
+    // The OSC destination of triggers, BPM and mixer forwarding: locked like
+    // the other destination fields (AUDIT UI-3).
+    auto applyOscDestination = [this]
+    {
+        if (syncing || isShowLockedRevert()) return;
+        applyTriggerSettings();
+        saveSettings();
+    };
+    edOscIp.onFocusLost = applyOscDestination;
+    edOscIp.onReturnKey  = applyOscDestination;
 
     leftContent.addAndMakeVisible(edOscPort);
     edOscPort.setVisible(false);
@@ -1526,8 +1568,8 @@ MainComponent::MainComponent()
     edOscPort.setColour(juce::TextEditor::outlineColourId, borderCol);
     edOscPort.setTextToShowWhenEmpty("53000", textDim);
     edOscPort.setInputRestrictions(5, "0123456789");
-    edOscPort.onFocusLost = [this] { applyTriggerSettings(); saveSettings(); };
-    edOscPort.onReturnKey  = [this] { applyTriggerSettings(); saveSettings(); };
+    edOscPort.onFocusLost = applyOscDestination;
+    edOscPort.onReturnKey  = applyOscDestination;
 
     leftContent.addAndMakeVisible(btnArtnetTrigger);
     btnArtnetTrigger.setVisible(false);
@@ -1617,8 +1659,14 @@ MainComponent::MainComponent()
     sldLtcInputGain.onValueChange = [this]
     {
         if (syncing) return;
-        float gain = (float)sldLtcInputGain.getValue() / 100.0f;
         auto& eng = currentEngine();
+        // The slider shows the Audio BPM gain when that analyser has the
+        // shared input (as syncUIFromEngine sets it), the LTC gain otherwise.
+        const bool showsBpmGain = eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC;
+        if (isShowLockedSlider(sldLtcInputGain, (showsBpmGain ? eng.getAudioBpmInput().getInputGain()
+                                                               : eng.getLtcInput().getInputGain()) * 100.0f))
+            return;
+        float gain = (float)sldLtcInputGain.getValue() / 100.0f;
         if (eng.getActiveInput() == SrcType::LTC)
             eng.getLtcInput().setInputGain(gain);
         if (eng.isAudioBpmRunning())
@@ -1632,7 +1680,7 @@ MainComponent::MainComponent()
     leftContent.addAndMakeVisible(sldThruInputGain); styleGainSlider(sldThruInputGain);
     leftContent.addAndMakeVisible(lblThruInputGain); lblThruInputGain.setText("AUDIO THRU INPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruInputGain);
     leftContent.addAndMakeVisible(mtrThruInput); mtrThruInput.setMeterColour(accentCyan);
-    sldThruInputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); } };
+    sldThruInputGain.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldThruInputGain, currentEngine().getLtcInput().getPassthruGain() * 100.0f)) { currentEngine().getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f); saveSettings(); } };
 
     leftContent.addAndMakeVisible(lblInputStatus); styleLabel(lblInputStatus); lblInputStatus.setColour(juce::Label::textColourId, accentGreen);
     // LTC IN: recovered user bits (only meaningful when the source is LTC).
@@ -1691,7 +1739,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblOutputMtcStatus); styleLabel(lblOutputMtcStatus); lblOutputMtcStatus.setColour(juce::Label::textColourId, accentRed);
     rightContent.addAndMakeVisible(sldMtcOffset); styleOffsetSlider(sldMtcOffset);
     rightContent.addAndMakeVisible(lblMtcOffset); lblMtcOffset.setText("MTC OFFSET:", juce::dontSendNotification); styleLabel(lblMtcOffset);
-    sldMtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setMtcOutputOffset((int)sldMtcOffset.getValue()); saveSettings(); } };
+    sldMtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldMtcOffset, currentEngine().getMtcOutputOffset())) { currentEngine().setMtcOutputOffset((int)sldMtcOffset.getValue()); saveSettings(); } };
 
     addRightLabelAndCombo(lblArtnetOutputInterface, cmbArtnetOutputInterface, "ART-NET OUTPUT DEVICE:");
     cmbArtnetOutputInterface.onChange = [this]
@@ -1714,7 +1762,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblOutputArtnetStatus); styleLabel(lblOutputArtnetStatus); lblOutputArtnetStatus.setColour(juce::Label::textColourId, accentOrange);
     rightContent.addAndMakeVisible(sldArtnetOffset); styleOffsetSlider(sldArtnetOffset);
     rightContent.addAndMakeVisible(lblArtnetOffset); lblArtnetOffset.setText("ART-NET OFFSET:", juce::dontSendNotification); styleLabel(lblArtnetOffset);
-    sldArtnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setArtnetOutputOffset((int)sldArtnetOffset.getValue()); saveSettings(); } };
+    sldArtnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldArtnetOffset, currentEngine().getArtnetOutputOffset())) { currentEngine().setArtnetOutputOffset((int)sldArtnetOffset.getValue()); saveSettings(); } };
 
     addRightLabelAndCombo(lblLANetTCOutputInterface, cmbLANetTCOutputInterface, "LA-NET OUTPUT DEVICE:");
     cmbLANetTCOutputInterface.onChange = [this]
@@ -1737,7 +1785,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblOutputLANetTCStatus); styleLabel(lblOutputLANetTCStatus); lblOutputLANetTCStatus.setColour(juce::Label::textColourId, accentOrange);
     rightContent.addAndMakeVisible(sldLANetTCOffset); styleOffsetSlider(sldLANetTCOffset);
     rightContent.addAndMakeVisible(lblLANetTCOffset); lblLANetTCOffset.setText("LA-NET OFFSET:", juce::dontSendNotification); styleLabel(lblLANetTCOffset);
-    sldLANetTCOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLANetTCOutputOffset((int)sldLANetTCOffset.getValue()); saveSettings(); } };
+    sldLANetTCOffset.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldLANetTCOffset, currentEngine().getLANetTCOutputOffset())) { currentEngine().setLANetTCOutputOffset((int)sldLANetTCOffset.getValue()); saveSettings(); } };
 
     // TCNet interface combo (shown when TCNET OUT is enabled)
     addRightLabelAndCombo(lblTcnetInterface, cmbTcnetInterface, "TCNET INTERFACE:");
@@ -1783,7 +1831,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblTcnetOffset);
     lblTcnetOffset.setText("TCNET OFFSET:", juce::dontSendNotification);
     styleLabel(lblTcnetOffset);
-    sldTcnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setTcnetOutputOffsetMs((int)sldTcnetOffset.getValue()); saveSettings(); } };
+    sldTcnetOffset.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldTcnetOffset, currentEngine().getTcnetOutputOffsetMs())) { currentEngine().setTcnetOutputOffsetMs((int)sldTcnetOffset.getValue()); saveSettings(); } };
 
     // Global TCNet offset: same range as per-engine ±1000 ms doubled to
     // ±2000 ms (full venue capture/encode chains can run hundreds of ms
@@ -1811,7 +1859,7 @@ MainComponent::MainComponent()
     sldTcnetGlobalOffset.onValueChange = [this]
     {
         if (syncing) return;
-        if (isShowLockedRevert()) return;
+        if (isShowLockedSlider(sldTcnetGlobalOffset, settings.tcnetGlobalOffsetMs)) return;
         const int v = (int) sldTcnetGlobalOffset.getValue();
         settings.tcnetGlobalOffsetMs = v;
         sharedTcnetOutput.setGlobalOffsetMs(v);
@@ -1909,7 +1957,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(sldLtcOutputGain); styleGainSlider(sldLtcOutputGain);
     rightContent.addAndMakeVisible(lblLtcOutputGain); lblLtcOutputGain.setText("LTC OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblLtcOutputGain);
     rightContent.addAndMakeVisible(mtrLtcOutput); mtrLtcOutput.setMeterColour(accentPurple);
-    sldLtcOutputGain.onValueChange = [this] { if (!syncing) { currentEngine().getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); } };
+    sldLtcOutputGain.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldLtcOutputGain, currentEngine().getLtcOutput().getOutputGain() * 100.0f)) { currentEngine().getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f); saveSettings(); } };
 
     rightContent.addAndMakeVisible(btnLtcHoldOnPause);
     // A boolean option of the LTC output, not an output in its own right, so
@@ -1944,7 +1992,7 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblOutputLtcStatus); styleLabel(lblOutputLtcStatus); lblOutputLtcStatus.setColour(juce::Label::textColourId, accentPurple);
     rightContent.addAndMakeVisible(sldLtcOffset); styleOffsetSlider(sldLtcOffset);
     rightContent.addAndMakeVisible(lblLtcOffset); lblLtcOffset.setText("LTC OFFSET:", juce::dontSendNotification); styleLabel(lblLtcOffset);
-    sldLtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedRevert()) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
+    sldLtcOffset.onValueChange = [this] { if (!syncing && !isShowLockedSlider(sldLtcOffset, currentEngine().getLtcOutputOffset())) { currentEngine().setLtcOutputOffset((int)sldLtcOffset.getValue()); saveSettings(); } };
 
     // LTC user bits (SMPTE 12M binary groups).  Issue #13.
     // Source mode first, then the manual value field.
@@ -2032,8 +2080,11 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblThruOutputGain); lblThruOutputGain.setText("AUDIO THRU OUTPUT GAIN:", juce::dontSendNotification); styleLabel(lblThruOutputGain);
     rightContent.addAndMakeVisible(mtrThruOutput); mtrThruOutput.setMeterColour(accentCyan);
     sldThruOutputGain.onValueChange = [this] {
-        if (!syncing && currentEngine().getAudioThru())
-        { currentEngine().getAudioThru()->setOutputGain((float)sldThruOutputGain.getValue() / 100.0f); saveSettings(); }
+        auto* thru = currentEngine().getAudioThru();
+        if (syncing || thru == nullptr) return;
+        if (isShowLockedSlider(sldThruOutputGain, thru->getOutputGain() * 100.0f)) return;
+        thru->setOutputGain((float)sldThruOutputGain.getValue() / 100.0f);
+        saveSettings();
     };
 
     rightContent.addAndMakeVisible(lblOutputThruStatus); styleLabel(lblOutputThruStatus); lblOutputThruStatus.setColour(juce::Label::textColourId, accentCyan);
@@ -5204,8 +5255,16 @@ void MainComponent::flushSettings()
             es.laNetTCInputInterface = cmbLANetTCInputInterface.getSelectedId() - 1;
             es.hippotizerInputInterface = cmbHippoInputInterface.getSelectedId() - 1;
             es.hippotizerTcChannel = cmbHippoTcChannel.getSelectedId() - 1;
-            es.hippotizerDestIp = txtHippoDestIp.getText().trim();
-            if (es.hippotizerDestIp.isEmpty()) es.hippotizerDestIp = "255.255.255.255";
+            // The destination fields are saved from their text, and they can
+            // be typed into while Show Lock is on: the edit is reverted only
+            // when focus leaves the field.  So while locked the saved
+            // destinations stay as they are (AUDIT UI-3); engaging the lock
+            // flushes what was applied before it.
+            if (!settings.showModeLocked)
+            {
+                es.hippotizerDestIp = txtHippoDestIp.getText().trim();
+                if (es.hippotizerDestIp.isEmpty()) es.hippotizerDestIp = "255.255.255.255";
+            }
             es.generatorClockMode = eng.getGeneratorClockMode();
             es.generatorPresetName = eng.getGeneratorPresetName();
         es.generatorPresetName = eng.getGeneratorPresetName();
@@ -5244,10 +5303,13 @@ void MainComponent::flushSettings()
                 es.triggerMidiDevice = cmbTriggerMidiDevice.getText();
             else if (eng.getTriggerOutput().isMidiOpen())
                 es.triggerMidiDevice = eng.getTriggerOutput().getCurrentMidiDeviceName();
-            auto oscIpText = edOscIp.getText().trim();
-            es.oscDestIp   = oscIpText.isNotEmpty() ? oscIpText : "127.0.0.1";
-            auto oscPortText = edOscPort.getText().trim();
-            es.oscDestPort = oscPortText.isNotEmpty() ? juce::jlimit(1, 65535, oscPortText.getIntValue()) : 53000;
+            if (!settings.showModeLocked)   // as the HippoNet destination above
+            {
+                auto oscIpText = edOscIp.getText().trim();
+                es.oscDestIp   = oscIpText.isNotEmpty() ? oscIpText : "127.0.0.1";
+                auto oscPortText = edOscPort.getText().trim();
+                es.oscDestPort = oscPortText.isNotEmpty() ? juce::jlimit(1, 65535, oscPortText.getIntValue()) : 53000;
+            }
 
             if (audioReady)
             {
@@ -6522,6 +6584,13 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
 
     if (targetEngine < 0 || targetEngine >= (int)engines.size()) return;
     auto& eng = *engines[(size_t)targetEngine];
+
+    // Show Lock does not gate these commands, the configuration ones
+    // included (clock, start, stoptime, preset): it guards the panel
+    // against a stray click, and OSC IN is the show's own remote control,
+    // where loading a preset or setting Start TC is a cue.  OSC IN itself
+    // is switched on and set up (port, interface) only while unlocked
+    // (AUDIT UI-3).
 
     // --- Generator commands ---
     if (cmd == "/stc/gen/play")

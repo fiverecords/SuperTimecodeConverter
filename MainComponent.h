@@ -535,6 +535,29 @@ private:
         showLockFlashCountdown = 18;
         return true;
     }
+
+    /// Same as isShowLocked(), for a control that has already taken its new
+    /// value when its callback runs: `restore` puts back that control alone,
+    /// without notification.  For sliders, which call back once per drag
+    /// step -- isShowLockedRevert's whole syncUIFromEngine per step was the
+    /// cost (AUDIT UI-3) -- and for single combos.
+    template <typename Restore>
+    bool isShowLockedRestore(Restore&& restore)
+    {
+        if (!settings.showModeLocked) return false;
+        restore();
+        btnShowLock.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFFFF3333));
+        showLockFlashCountdown = 18;
+        return true;
+    }
+
+    /// isShowLockedRestore for a slider: puts back `value`, the one the
+    /// engine (or the settings) holds.
+    bool isShowLockedSlider(juce::Slider& sld, double value)
+    {
+        return isShowLockedRestore([&] { sld.setValue(value, juce::dontSendNotification); });
+    }
+
     std::unique_ptr<juce::FileChooser> configFileChooser;
     juce::ScopedMessageBox importConfirmBox;
     std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
