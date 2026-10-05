@@ -305,7 +305,11 @@ public:
         // 2^20 fixed-point = 100 %; the Bridge sends this range.  Scaled by
         // the source's pitch so a receiver that extrapolates between packets
         // runs at the right rate (it was fixed at 100 % under pitch).
-        L.speed         = isPlaying ? (uint32_t) (juce::jlimit(0.0, 4.0, speedRatio) * 1048576.0 + 0.5) : 0u;
+        // Clamped to 0-4 before rounding, so the rounding never sees a
+        // negative value (reverse reads as 0); a NaN ratio reads as 0 too,
+        // where jlimit passed it on to an undefined float-to-int conversion.
+        const double ratio = (speedRatio > 0.0) ? juce::jmin(4.0, speedRatio) : 0.0;
+        L.speed         = isPlaying ? (uint32_t) std::lround(ratio * 1048576.0) : 0u;
 
         // Derive HH:MM:SS:FF from the committed currentTimeMs (post-deadband)
         // so all fields in the Time Packet stay internally consistent.
@@ -335,7 +339,7 @@ public:
             case FrameRate::FPS_24:   return kSmpte24;
             case FrameRate::FPS_25:   return kSmpte25;
             case FrameRate::FPS_2997: return kSmpteDf;
-            case FrameRate::FPS_30:   return kSmpte30;
+            case FrameRate::FPS_30:
             default:                  return kSmpte30;
         }
     }
