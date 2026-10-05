@@ -844,8 +844,10 @@ struct StageLinQDeckState
     std::atomic<double>   lastUpdateTime { 0.0 };     // juce hiRes ms
     std::atomic<uint32_t> trackVersion { 0 };          // incremented on track change
 
-    // Derived playhead in ms (computed from beatInfo timeline or speed+time)
+    // Playhead in ms, from each BeatInfo message's timeline over the sample
+    // rate (handleBeatInfo), and the host time that message was read
     std::atomic<uint32_t> playheadMs { 0 };
+    std::atomic<double>   playheadTime { 0.0 };    // hiRes ms, 0 = none yet
 
     mutable std::mutex metaMutex;
 
@@ -906,6 +908,7 @@ struct StageLinQDeckState
         lastUpdateTime.store(0.0);
         trackVersion.store(0);
         playheadMs.store(0);
+        playheadTime.store(0.0);
     }
 };
 
@@ -1477,12 +1480,15 @@ public:
         return decks[idx].lastUpdateTime.load(std::memory_order_relaxed) > 0.0;
     }
 
-    // Timeline position from BeatInfo (milliseconds)
+    // When the current playhead was read: the host time (hiRes ms) of the
+    // BeatInfo message it comes from, 0 before any.  The engine's PLL takes
+    // a change of it for a new position.  (It returned the time of the
+    // deck's last update of any kind, a StateMap value included.)
     double getAbsPositionTs(int deckNum) const
     {
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0.0;
-        return decks[idx].lastUpdateTime.load(std::memory_order_relaxed);
+        return decks[idx].playheadTime.load(std::memory_order_acquire);
     }
 
     bool isPositionMoving(int deckNum) const
@@ -1893,34 +1899,12 @@ private:
     }
 
     //==========================================================================
-    // Update derived state (playhead from BeatInfo timeline)
+    // Update derived state, on the discovery loop (about every 60 ms).
+    // The playhead is no longer derived here but per BeatInfo message, in
+    // handleBeatInfo (AUDIT SLQ-4).
     //==========================================================================
     void updateDerivedState()
     {
-        for (int i = 0; i < StageLinQ::kMaxDecks; ++i)
-        {
-            auto& dk = decks[i];
-            if (!dk.active.load(std::memory_order_relaxed)) continue;
-
-            // Compute absolute playhead from the BeatInfo sample-position field.
-            //
-            // Real-hardware testing on an SC5000 running Engine OS 5.0.4 confirms
-            // that beatInfoTimeline is the current position in audio samples.
-            // Dividing by Track/SampleRate yields the absolute position in the
-            // source track and prevents pitch changes from shifting the playhead.
-            double samples    = dk.beatInfoTimeline.load(std::memory_order_relaxed);
-            double sampleRate = dk.sampleRate.load(std::memory_order_relaxed);
-            double bpm        = dk.beatInfoBPM.load(std::memory_order_relaxed);
-
-            // BPM > 0 confirms BeatInfo is active and a track is loaded.
-            // samples=0 is valid at the beginning of a track.
-            if (bpm > 0.0 && sampleRate > 0.0)
-            {
-                double clampedSamples = juce::jmax(0.0, samples);
-                double ms = (clampedSamples / sampleRate) * 1000.0;
-                dk.playheadMs.store((uint32_t)ms, std::memory_order_relaxed);
-            }
-        }
     }
 
     //==========================================================================
@@ -2275,6 +2259,27 @@ private:
             {
                 dk.beatInfoTimeline.store(timelines[i], std::memory_order_relaxed);
 
+                // The playhead, from this message and stamped with the time it
+                // was read (AUDIT SLQ-4).  It was derived on the discovery loop
+                // instead, every ~60 ms against BeatInfo's 35 ms, so the value
+                // the engine snapped to was up to a loop old and changed in
+                // steps the engine's 50 ms interpolation could not bridge: on
+                // the #23 capture 11-16 % of the engine's ticks stepped a frame
+                // back (slq_capture_replay playhead).
+                // The timeline is the position in samples (the #23 PRIME 4+
+                // capture: BeatInfo's timeline over Track/SampleRate gives the
+                // playback speed, DESIGN D35); dividing by the rate gives the
+                // position in the track, whatever the pitch.  BPM > 0 means a
+                // track is loaded; samples = 0 is the start of one.
+                const double bpm = players[i].bpm;
+                const double samples = timelines[i];
+                if (bpm > 0.0 && std::isfinite(samples))
+                {
+                    const double ms = juce::jmax(0.0, samples) / effectiveSampleRate(mapped) * 1000.0;
+                    dk.playheadMs.store((uint32_t)juce::jmin(ms, 4.0e9), std::memory_order_relaxed);
+                    dk.playheadTime.store(hostMs, std::memory_order_release);
+                }
+
                 double speed = 0.0;
                 bool measured = false;
                 {
@@ -2282,7 +2287,7 @@ private:
                     // misconfigured network where two devices claim a deck.
                     std::lock_guard<std::mutex> lock(beatSpeedMutex);
                     measured = beatSpeedTrackers[(size_t)mapped].update(
-                        clock, timelines[i], dk.sampleRate.load(std::memory_order_relaxed), speed);
+                        clock, timelines[i], effectiveSampleRate(mapped), speed);
                 }
                 if (measured)
                 {
