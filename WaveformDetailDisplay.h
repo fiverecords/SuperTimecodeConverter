@@ -129,7 +129,10 @@ public:
     /// @param ms        Current position from CDJ
     /// @param playing   True if the CDJ is actively playing
     /// @param pitchRatio  Playback speed ratio from CDJ fader (1.0 = normal, 1.05 = +5%)
-    void setPlayheadMs(uint32_t ms, bool playing, double pitchRatio = 1.0)
+    /// @param reverse   True if the deck plays backwards (ProDJLinkInput::isPlayingReverse).
+    ///                  A smaller position is then the deck playing, not a seek, and
+    ///                  the view moves backwards between updates.
+    void setPlayheadMs(uint32_t ms, bool playing, double pitchRatio = 1.0, bool reverse = false)
     {
         double now = juce::Time::getMillisecondCounterHiRes();
         double frameDelta = now - lastFrameTime;
@@ -138,23 +141,34 @@ public:
         if (frameDelta < 1.0 || frameDelta > 200.0)
             frameDelta = 16.67;
 
+        // A change of direction makes the speed estimate meaningless.
+        if (reverse != lastReverse)
+        {
+            playheadSpeed = 0.0;
+            lastReverse = reverse;
+        }
+
         if (ms != targetPlayheadMs)
         {
-            // New position from CDJ -- update speed estimate
-            if (targetPlayheadMs > 0 && ms > targetPlayheadMs && playing)
+            const bool backwards = ms < targetPlayheadMs;
+            const uint32_t step = backwards ? targetPlayheadMs - ms : ms - targetPlayheadMs;
+            const bool withPlay = (backwards == reverse);   // moved the way the deck plays
+
+            // New position from CDJ -- update speed estimate (signed: < 0 in reverse)
+            if (targetPlayheadMs > 0 && withPlay && playing)
             {
                 double dt = now - lastCdjUpdateTime;
                 if (dt > 5.0 && dt < 1000.0)
                 {
-                    double dMs = (double)(ms - targetPlayheadMs);
+                    double dMs = (double)step;
                     if (dMs < 2000.0)
                     {
-                        double newSpeed = dMs / dt;
+                        double newSpeed = (backwards ? -dMs : dMs) / dt;
                         playheadSpeed = playheadSpeed * 0.6 + newSpeed * 0.4;
                     }
                 }
             }
-            else if (ms < targetPlayheadMs || (ms - targetPlayheadMs) > 2000)
+            else if (!withPlay || step > 2000)
             {
                 // Seek or track change -- snap immediately
                 smoothPlayheadMs = (double)ms;
@@ -174,14 +188,14 @@ public:
 
         if (playing)
         {
-            // Use pitch-adjusted speed if available, else PLL estimate
+            // PLL estimate; until there is one in the play direction, the pitch
+            // fader (or 1.0), signed by the direction
+            const double dir = reverse ? -1.0 : 1.0;
             double speed = playheadSpeed;
-            if (speed < 0.01 && pitchRatio > 0.5)
-                speed = pitchRatio;
-            else if (speed < 0.01)
-                speed = 1.0;
+            if (speed * dir < 0.01)
+                speed = dir * (pitchRatio > 0.5 ? pitchRatio : 1.0);
 
-            smoothPlayheadMs += speed * frameDelta;
+            smoothPlayheadMs = juce::jmax(0.0, smoothPlayheadMs + speed * frameDelta);
         }
         else
         {
@@ -230,6 +244,7 @@ public:
         lastCdjUpdateTime = 0.0;
         lastFrameTime = 0.0;
         playheadSpeed = 0.0;
+        lastReverse = false;
         durationMs = 0;
         diagLogged = false;
         invalidateStaticCache();
@@ -939,7 +954,8 @@ private:
     double smoothPlayheadMs = 0.0;
     double lastCdjUpdateTime = 0.0;
     double lastFrameTime = 0.0;
-    double playheadSpeed = 0.0;  // estimated ms-per-ms (1.0 = normal speed)
+    double playheadSpeed = 0.0;  // estimated ms-per-ms (1.0 = normal speed, < 0 in reverse)
+    bool lastReverse = false;    // direction of the last setPlayheadMs
 
     int scale = 4;  // entries per pixel (zoom)
     juce::Rectangle<float> zoomInBounds, zoomOutBounds;  // set during paint
