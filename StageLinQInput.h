@@ -806,6 +806,7 @@ struct StageLinQDeckState
     // sent seconds would read as a length of 0 s here (BENCH).
     std::atomic<double>   trackLengthSamples { 0.0 }; // from Track/TrackLength (samples)
     std::atomic<bool>     songLoaded { false };     // from Track/SongLoaded
+    std::atomic<bool>     songLoadedReceived { false };
     std::atomic<bool>     songAnalyzed { false };   // from Track/SongAnalyzed
     std::atomic<double>   trackBPM { 0.0 };        // from Track/CurrentBPM
     std::atomic<double>   cuePosition { 0.0 };     // from Track/CuePosition (samples: 11659.7 in the #23 capture, 0.26 s)
@@ -842,7 +843,17 @@ struct StageLinQDeckState
 
     // Timing
     std::atomic<double>   lastUpdateTime { 0.0 };     // juce hiRes ms
-    std::atomic<uint32_t> trackVersion { 0 };          // incremented on track change
+    // Track identity (AUDIT ENG-7).  trackVersion goes up once per track
+    // loaded: when artist, title, length and SongLoaded have settled
+    // (StageLinQInput::publishSettledTracks) and differ from the identity
+    // last published.  It never goes back (reset() leaves it and the
+    // published identity alone), so an engine never mistakes a new track
+    // for the one it last saw.  Guarded by metaMutex but trackVersion.
+    std::atomic<uint32_t> trackVersion { 0 };
+    juce::String          publishedArtist, publishedTitle;
+    uint32_t              publishedLengthSec = 0;
+    bool                  identityPending = false;  // a field changed since the last publication check
+    double                identityFirstChange = 0.0, identityLastChange = 0.0;  // hiRes ms
 
     // Playhead in ms, from each BeatInfo message's timeline over the sample
     // rate (handleBeatInfo), and the host time that message was read
@@ -880,6 +891,7 @@ struct StageLinQDeckState
         }
         trackLengthSamples.store(0.0);
         songLoaded.store(false);
+        songLoadedReceived.store(false);
         songAnalyzed.store(false);
         trackBPM.store(0.0);
         cuePosition.store(0.0);
@@ -906,7 +918,10 @@ struct StageLinQDeckState
         isMaster.store(false);
         channelAssignment.store(0);
         lastUpdateTime.store(0.0);
-        trackVersion.store(0);
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            identityPending = false;        // trackVersion and the published identity stay
+        }
         playheadMs.store(0);
         playheadTime.store(0.0);
     }
@@ -1899,12 +1914,76 @@ private:
     }
 
     //==========================================================================
-    // Update derived state, on the discovery loop (about every 60 ms).
-    // The playhead is no longer derived here but per BeatInfo message, in
-    // handleBeatInfo (AUDIT SLQ-4).
+    // Update derived state, on the discovery loop (about every 60 ms): the
+    // track versions.  (The playhead is derived per BeatInfo message, in
+    // handleBeatInfo -- AUDIT SLQ-4.)
     //==========================================================================
     void updateDerivedState()
     {
+        publishSettledTracks(juce::Time::getMillisecondCounterHiRes());
+    }
+
+    //==========================================================================
+    // Track identity (AUDIT ENG-7).  A load arrives as several StateMap
+    // values -- ArtistName, SongName, TrackLength, SongLoaded, SampleRate,
+    // in that order in the #23 PRIME 4+ subscription dump, all within a
+    // millisecond; the order and spacing of a live load are not captured.
+    // Each change is noted here (caller holds metaMutex) ...
+    //==========================================================================
+    static constexpr double kTrackSettleMs = 250.0;   // quiet this long = the load is complete
+    static constexpr double kTrackSettleMaxMs = 1000.0;   // ... or this long after its first value
+
+    static void noteIdentityChange(StageLinQDeckState& dk)
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        if (!dk.identityPending)
+            dk.identityFirstChange = now;
+        dk.identityPending = true;
+        dk.identityLastChange = now;
+    }
+
+    // ... and once nothing has changed for kTrackSettleMs (kTrackSettleMaxMs
+    // at most), the identity is compared with the one last published.  The
+    // version goes up when a track is loaded (SongLoaded true, when the
+    // device sends it) with an artist or a title, and differs from the last
+    // one published: by artist or title, or by length when both lengths
+    // are known.  A length that arrives after the rest completes the same
+    // track (the engine picks it up without firing again), and reloading
+    // the track already published is not a change (Pro DJ Link's engine
+    // branch has the same guard on the rekordbox ID).
+    void publishSettledTracks(double nowMs)
+    {
+        for (int i = 0; i < StageLinQ::kMaxDecks; ++i)
+        {
+            auto& dk = decks[(size_t)i];
+            std::lock_guard<std::mutex> lock(dk.metaMutex);
+            if (!dk.identityPending) continue;
+            if (nowMs - dk.identityLastChange < kTrackSettleMs
+                && nowMs - dk.identityFirstChange < kTrackSettleMaxMs)
+                continue;
+            dk.identityPending = false;
+
+            if (dk.songLoadedReceived.load(std::memory_order_relaxed)
+                && !dk.songLoaded.load(std::memory_order_relaxed))
+                continue;                                   // nothing loaded
+            if (dk.artistName.isEmpty() && dk.songName.isEmpty())
+                continue;
+
+            const uint32_t lengthSec = getTrackLengthSec(i + 1);
+            if (dk.artistName == dk.publishedArtist && dk.songName == dk.publishedTitle)
+            {
+                if (lengthSec == dk.publishedLengthSec) continue;          // the same track
+                if (dk.publishedLengthSec == 0 || lengthSec == 0)
+                {
+                    dk.publishedLengthSec = juce::jmax(dk.publishedLengthSec, lengthSec);
+                    continue;                               // its length came late
+                }
+            }
+            dk.publishedArtist = dk.artistName;
+            dk.publishedTitle = dk.songName;
+            dk.publishedLengthSec = lengthSec;
+            dk.trackVersion.fetch_add(1, std::memory_order_release);
+        }
     }
 
     //==========================================================================
@@ -1956,6 +2035,11 @@ private:
                 dk.speedState.store(value.asDouble(), std::memory_order_relaxed);
                 dk.speedStateReceived.store(true, std::memory_order_release);
             }
+            // Artist, title, length and SongLoaded make up the track's
+            // identity: each change is noted, and the track version goes up
+            // once they have settled (publishSettledTracks, ENG-7) -- not on
+            // each of them, which bumped it two or three times per load
+            // with artist and title from different tracks in between.
             else if (sub == "Track/ArtistName")
             {
                 std::lock_guard<std::mutex> lock(dk.metaMutex);
@@ -1963,7 +2047,7 @@ private:
                 if (newArtist != dk.artistName)
                 {
                     dk.artistName = newArtist;
-                    dk.trackVersion.fetch_add(1, std::memory_order_relaxed);
+                    noteIdentityChange(dk);
                 }
             }
             else if (sub == "Track/SongName")
@@ -1973,20 +2057,21 @@ private:
                 if (newTitle != dk.songName)
                 {
                     dk.songName = newTitle;
-                    dk.trackVersion.fetch_add(1, std::memory_order_relaxed);
+                    noteIdentityChange(dk);
                 }
             }
             else if (sub == "Track/TrackLength")
             {
                 dk.trackLengthSamples.store(value.asDouble(), std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(dk.metaMutex);
+                noteIdentityChange(dk);
             }
             else if (sub == "Track/SongLoaded")
             {
-                bool newLoaded = value.asBool();
-                bool wasLoaded = dk.songLoaded.load(std::memory_order_relaxed);
-                dk.songLoaded.store(newLoaded, std::memory_order_relaxed);
-                if (newLoaded && !wasLoaded)
-                    dk.trackVersion.fetch_add(1, std::memory_order_relaxed);
+                dk.songLoaded.store(value.asBool(), std::memory_order_relaxed);
+                dk.songLoadedReceived.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(dk.metaMutex);
+                noteIdentityChange(dk);
             }
             else if (sub == "Track/CurrentBPM")
             {
@@ -2052,6 +2137,8 @@ private:
             else if (sub == "Track/SampleRate")
             {
                 dk.sampleRate.store(value.asDouble(), std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(dk.metaMutex);
+                noteIdentityChange(dk);     // the length in seconds depends on it
             }
             else if (sub == "Track/SongAnalyzed")
             {
