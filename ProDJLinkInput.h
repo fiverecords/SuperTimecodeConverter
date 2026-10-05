@@ -1223,7 +1223,9 @@ public:
     uint8_t getColorFxSelect() const { return mixerColorFxSel.load(std::memory_order_relaxed); }
     /// Color FX parameter knob (0-255).
     uint8_t getColorFxParam()  const { return mixerColorFxParam.load(std::memory_order_relaxed); }
-    /// Color FX channel assign (same enum as Beat FX assign).
+    /// Color FX channel assign -- NOT read from its own byte: no capture on
+    /// record shows where the DJM carries it, so this is a copy of Beat FX
+    /// Assign (byte 0x0ca), and changes only with it (AUDIT PDL-12).
     uint8_t getColorFxAssign() const { return mixerColorFxAssign.load(std::memory_order_relaxed); }
     /// Send Ext1 On/Off (0/1).  V10 only; always 0 on 900NXS2.
     uint8_t getSendExt1()      const { return mixerSendExt1.load(std::memory_order_relaxed); }
@@ -3555,6 +3557,8 @@ private:
     //   [0x0ca]  FX Assign        900NXS2: (0=Mic,1=CH1,2=CH2,3=CH3,7=CH4,
     //                               6=XF-A,8=XF-B,9=Master)
     //                            V10: (0-5=CH1-CH6, 6=Mic, 7=Master)
+    //            Beat FX Assign.  Color FX Assign has no known offset yet;
+    //            STC copies this byte into it (AUDIT PDL-12).
     //   [0x0cb]  Beat FX Level    (0-255)
     //   [0x0cc]  Beat FX ON/OFF   (0/1)
     //   [0x0ce]  900NXS2: Beat FX Assign (mirrors 0x0ca)
@@ -3665,7 +3669,7 @@ private:
             mixerFxFreqMid.store    (data[0x0c7], std::memory_order_relaxed);
             mixerFxFreqHi.store     (data[0x0c8], std::memory_order_relaxed);
             mixerBeatFxSel.store    (data[0x0c9], std::memory_order_relaxed);
-            mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);
+            mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);  // Beat FX Assign's byte: Color FX Assign's offset unknown (PDL-12)
             mixerBeatFxLevel.store  (data[0x0cb], std::memory_order_relaxed);
             mixerBeatFxOn.store     (data[0x0cc], std::memory_order_relaxed);
             mixerBeatFxAssign.store (data[0x0ca], std::memory_order_relaxed);  // 900NXS2: same as 0x0ce; A9/V10: 0x0ce is Multi I/O
@@ -3943,7 +3947,7 @@ private:
     std::atomic<uint8_t> mixerBeatFxLevel  { 0 };
     std::atomic<uint8_t> mixerBeatFxOn     { 0 };
     std::atomic<uint8_t> mixerBeatFxAssign { 9 };     // 0=Mic..9=Master
-    std::atomic<uint8_t> mixerColorFxAssign{ 9 };
+    std::atomic<uint8_t> mixerColorFxAssign{ 9 };     // a copy of Beat FX Assign (PDL-12)
     std::atomic<uint8_t> mixerSendReturn   { 0 };
     // --- Multi I/O (A9/V10; on 900NXS2 these offsets are Beat FX Assign / Send Return) ---
     std::atomic<uint8_t> mixerMultiIoSelect { 0 };    // 0=Mic,1-6=CH1-CH6,7=Master

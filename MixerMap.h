@@ -296,7 +296,11 @@ private:
         // --- Color FX ---
         addEntry("colorfx_select", "Color FX Select", "Color FX", "/mixer/colorfx_select", 42, 0, false, A, D);
         addEntry("colorfx_param",  "Color FX Param",  "Color FX", "/mixer/colorfx_param",  36, 0, false, A, C);
-        addEntry("colorfx_assign", "Color FX Assign", "Color FX", "/mixer/colorfx_assign", -1, 0, false, A, D);
+        // Color FX Assign: no capture shows where the DJM carries it, so the
+        // value is a copy of Beat FX Assign (byte 0x0ca); the label, under
+        // the "Color FX" group, says so in a width the editor's Parameter
+        // column shows (AUDIT PDL-12).  paramId and OSC address unchanged.
+        addEntry("colorfx_assign", "Assign = Beat FX", "Color FX", "/mixer/colorfx_assign", -1, 0, false, A, D);
 
         // --- Mic ---
         addEntry("mic_eq_hi",  "Mic EQ High", "Mic", "/mixer/mic_eq_hi", 38, 0, false, A, C);
