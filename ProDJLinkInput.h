@@ -118,7 +118,8 @@ namespace ProDJLink
     static constexpr uint8_t kStatusTypeDJM    = 0x29;  // Mixer status (no channel flags; see handleDJMStatusPacket)
     static constexpr uint8_t kStatusTypeVU     = 0x58;  // DJM VU meter data (unicast, 524B, port 50001)
 
-    // Play states (from status packet, bytes 120-123)
+    // Play states (from status packet, bytes 120-123): P1, every value in
+    // dysentery's table (vcdj.adoc, "Known P1 values").
     static constexpr uint32_t kPlayNoTrack   = 0x00;
     static constexpr uint32_t kPlayLoading   = 0x02;
     static constexpr uint32_t kPlayPlaying   = 0x03;
@@ -126,7 +127,9 @@ namespace ProDJLink
     static constexpr uint32_t kPlayPaused    = 0x05;
     static constexpr uint32_t kPlayCued      = 0x06;
     static constexpr uint32_t kPlayCueing    = 0x07;
+    static constexpr uint32_t kPlayCueScratch = 0x08;  // cue scratch in progress
     static constexpr uint32_t kPlaySeeking   = 0x09;
+    static constexpr uint32_t kPlayCdSpunDown = 0x0e;  // audio CD spun down for lack of use
     static constexpr uint32_t kPlayEndTrack  = 0x11;
     static constexpr uint32_t kPlayEmergency = 0x12;
 
@@ -261,7 +264,9 @@ namespace ProDJLink
             case kPlayPaused:    return "PAUSED";
             case kPlayCued:      return "CUE";
             case kPlayCueing:    return "CUE PLAY";
+            case kPlayCueScratch: return "CUE SCRATCH";
             case kPlaySeeking:   return "SEEKING";
+            case kPlayCdSpunDown: return "CD STOPPED";
             case kPlayEndTrack:  return "END";
             case kPlayEmergency: return "EMERGENCY";
             default:             return "UNKNOWN";
@@ -837,6 +842,13 @@ public:
     }
 
     /// Is the player's playhead actively advancing?
+    /// An emergency loop (0x12) is counted, like a loop (0x04): Pioneer's
+    /// player manuals describe it as the player looping what it has so the
+    /// audio does not stop; dysentery's table only names the state, and no
+    /// capture has it, so this is unverified on hardware (AUDIT PDL-10).
+    /// Cue scratch (0x08) and search (0x09) move the playhead by hand or in
+    /// jumps, at no rate to interpolate at: not counted (unverified on
+    /// hardware; no capture has either).
     bool isPositionMoving(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -844,6 +856,7 @@ public:
         uint32_t ps = players[idx].playState.load(std::memory_order_relaxed);
         return ps == ProDJLink::kPlayPlaying
             || ps == ProDJLink::kPlayLooping
+            || ps == ProDJLink::kPlayEmergency
             || ps == ProDJLink::kPlayCueing;
     }
 
@@ -858,6 +871,7 @@ public:
         {
             case ProDJLink::kPlayPlaying:
             case ProDJLink::kPlayLooping:
+            case ProDJLink::kPlayEmergency:
             case ProDJLink::kPlayCueing:  return 1; // playing
             case ProDJLink::kPlayPaused:
             case ProDJLink::kPlayCued:    return 2; // paused/cued
@@ -872,6 +886,18 @@ public:
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return "?";
         return ProDJLink::playStateToString(
             players[idx].playState.load(std::memory_order_relaxed));
+    }
+
+    /// True if the player is in an emergency loop (playState 0x12).  It
+    /// counts as moving and playing (AUDIT PDL-10), so a status line that
+    /// shows the state only while the deck is not moving needs this to
+    /// still show EMERGENCY.
+    bool isEmergencyLoop(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].playState.load(std::memory_order_relaxed)
+            == ProDJLink::kPlayEmergency;
     }
 
     /// True if player has reached end of track (CDJ reports playState 0x11).
@@ -1307,13 +1333,17 @@ public:
         return snap;
     }
 
-    /// True if player is actively playing (for PLL advance)
+    /// True if player is actively playing (for PLL advance, and the ON AIR
+    /// rule's "playing").  An emergency loop counts as playing: by Pioneer's
+    /// manuals the player loops what it has so the audio does not stop
+    /// (unverified on hardware; see isPositionMoving, AUDIT PDL-10).
     bool isPlayerPlaying(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
         uint32_t ps = players[idx].playState.load(std::memory_order_relaxed);
-        return (ps == ProDJLink::kPlayPlaying || ps == ProDJLink::kPlayLooping);
+        return (ps == ProDJLink::kPlayPlaying || ps == ProDJLink::kPlayLooping
+                || ps == ProDJLink::kPlayEmergency);
     }
 
     /// True if the status-flag PLAYING bit is set (F byte, bit 0x40).
