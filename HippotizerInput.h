@@ -743,8 +743,11 @@ private:
         if (std::memcmp(data, kPrefix, (size_t)kPrefixLen) != 0)
             return;
 
-        juce::String payload(reinterpret_cast<const char*>(data + kPrefixLen),
-                             (size_t)(size - kPrefixLen));
+        // The machine name is whatever the operator typed: decoded as UTF-8
+        // when it is, one character per byte otherwise.  The 8-bit
+        // juce::String constructor asserted on any byte above 127 and showed
+        // a UTF-8 name as mojibake (AUDIT NET-17).
+        const juce::String payload = stringFromWire(data + kPrefixLen, size - kPrefixLen);
         auto fields = juce::StringArray::fromTokens(payload, ";", "");
 
         if (fields.size() < 3)
