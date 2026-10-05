@@ -9,6 +9,9 @@
 #include <unordered_set>
 #include <functional>
 #include <string>
+#include <atomic>
+#include <memory>
+#include <mutex>
 
 //==============================================================================
 // SafeJsonFile -- the three persistence rules every STC JSON file follows.
@@ -604,21 +607,29 @@ public:
     }
 
     /// Synchronous save: serialise and write now.  Used for operator edits
-    /// (rare, and a few milliseconds are fine) and at shutdown.
+    /// (rare, and a few milliseconds are fine) and at shutdown.  Message
+    /// thread.  Ordered with the background writes (see writeInOrder): it
+    /// waits for one that is writing, and one that has not written yet is
+    /// then dropped as older.
     void save() const
     {
         if (! persistsToFile) return;   // an override set is persisted by its engine's settings block
-        SafeJsonFile::save(getTrackMapFile(), juce::JSON::toString(buildFileVar()));
+        auto order = writeOrder();
+        const uint64_t seq = ++order->issued;
+        writeInOrder(*order, seq, getTrackMapFile(), juce::JSON::toString(buildFileVar()));
     }
 
-    /// Asynchronous save for the engine's auto-fill (C8): the tree is built
-    /// here, on the message thread, and serialised and written on a
+    /// Asynchronous save for the engine's auto-fill (AUDIT C8): the tree is
+    /// built here, on the message thread, and serialised and written on a
     /// background thread, so the 60 Hz tick -- which also dispatches cues
     /// and triggers -- is not held for a JSON write of the whole map.  One
     /// write in flight at a time; a request that arrives meanwhile is
     /// honoured with a fresh snapshot once the write has finished.  The
     /// completion is posted back to the message thread through an alive
-    /// token, so a map destroyed in between is simply not touched.
+    /// token, so a map destroyed in between is simply not touched.  The
+    /// snapshot takes its place in the write order here, when it is built:
+    /// a save() made after this call wins even if the background write is
+    /// slower (AUDIT SET-7).
     void saveAsync()
     {
         if (! persistsToFile) return;
@@ -628,12 +639,14 @@ public:
         saveInFlight = true;
         const juce::var snapshot = buildFileVar();
         const juce::File file = getTrackMapFile();
+        auto order = writeOrder();
+        const uint64_t seq = ++order->issued;
         auto token = aliveToken;
         TrackMap* self = this;
 
-        juce::Thread::launch([snapshot, file, token, self]
+        juce::Thread::launch([snapshot, file, order, seq, token, self]
         {
-            SafeJsonFile::save(file, juce::JSON::toString(snapshot));
+            writeInOrder(*order, seq, file, juce::JSON::toString(snapshot));
             juce::MessageManager::callAsync([token, self]
             {
                 if (! token->load()) return;
@@ -646,6 +659,14 @@ public:
     ~TrackMap()
     {
         if (aliveToken) aliveToken->store(false);
+        // A background save still pending -- in flight, or asked for again
+        // meanwhile -- would otherwise be left to race the process exit, and
+        // the re-save would never run (its trigger is posted to a message
+        // loop that is shutting down).  Write the current map now, in order:
+        // the older background snapshot, if it has not landed yet, is then
+        // dropped (AUDIT SET-7).  Message thread, like every other save.
+        if (persistsToFile && (saveInFlight || saveAgain))
+            save();
     }
 
     TrackMap() = default;
@@ -1122,6 +1143,38 @@ public:
 private:
     std::unordered_map<std::string, TrackMapEntry> entries;
     uint64_t generation = 0;
+
+    /// Every write of trackmap.json -- save() and the background write of
+    /// saveAsync() -- carries a sequence number taken on the
+    /// message thread when its content was built, and is made under one
+    /// lock.  A write whose number is not above the last one written is
+    /// dropped: the newest snapshot is the one left on disk whatever the
+    /// threads' timing.  Before, a background write that serialised a large
+    /// map more slowly than a later save() landed after it, and put the
+    /// older map back (AUDIT SET-7).  One order for the file, shared by every
+    /// TrackMap that writes it; the background thread holds a reference.
+    struct WriteOrder
+    {
+        std::mutex lock;
+        std::atomic<uint64_t> issued { 0 };   // incremented on the message thread
+        uint64_t written = 0;                 // guarded by lock
+    };
+
+    static std::shared_ptr<WriteOrder> writeOrder()
+    {
+        static const std::shared_ptr<WriteOrder> order = std::make_shared<WriteOrder>();
+        return order;
+    }
+
+    /// Message thread or the saveAsync() thread.
+    static bool writeInOrder(WriteOrder& order, uint64_t seq, const juce::File& file,
+                             const juce::String& text)
+    {
+        const std::lock_guard<std::mutex> hold(order.lock);
+        if (seq <= order.written) return false;   // a newer snapshot is already on disk
+        order.written = seq;
+        return SafeJsonFile::save(file, text);
+    }
 };
 
 //==============================================================================
