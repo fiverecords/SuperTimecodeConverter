@@ -447,6 +447,8 @@ private:
     uint64_t shiftRegLow  = 0;
     uint16_t shiftRegHigh = 0;
     static constexpr uint16_t LTC_SYNC_WORD = 0xBFFC;
+    static constexpr int LTC_FRAME_BITS = 80;
+    int bitsSinceSync = 0;          // bits since the last sync word (or the reset); 81 = frame broken
     double samplesSinceLastSync = 0.0;
     int consecutiveGoodFrames = 0;
     FrameRate candidateFps = FrameRate::FPS_25;   // rate the consecutive count refers to
@@ -462,6 +464,7 @@ private:
         firstEdgeAfterReset = true;
         shiftRegLow = 0;
         shiftRegHigh = 0;
+        bitsSinceSync = 0;
         samplesSinceLastSync = 0.0;
         consecutiveGoodFrames = 0;
         // Initial bit period estimate: use ~27fps midpoint (2160 transitions/sec)
@@ -476,8 +479,32 @@ private:
     {
         shiftRegLow  = (shiftRegLow >> 1) | (static_cast<uint64_t>(shiftRegHigh & 1) << 63);
         shiftRegHigh = static_cast<uint16_t>((shiftRegHigh >> 1) | ((bit & 1) << 15));
+        if (bitsSinceSync <= LTC_FRAME_BITS)
+            ++bitsSinceSync;   // saturates past 80: "not a whole frame"
         if (shiftRegHigh == LTC_SYNC_WORD)
-            onSyncWordDetected();
+        {
+            // A frame is exactly 80 bits, sync word included.  Anything else
+            // between two sync words -- decoding that began part-way through
+            // a frame, bits lost to a dropout or a jump in the stream, extra
+            // ones from noise -- leaves bits of another frame, or zeros, in
+            // the register, and it still passes the range check: it decoded
+            // as 01:23:40.00 or 00:00:00.00 where 01:23:45.13 was on the
+            // wire, and that frame alone made the source "receiving" and the
+            // outputs snap to it and back (AUDIT LTC-12).  Such a frame is
+            // dropped, and so is one in which an edge came at an interval no
+            // bit has (onEdgeDetected); the sync word itself is real, so the
+            // period to the next one still measures the rate.
+            const bool whole = (bitsSinceSync == LTC_FRAME_BITS);
+            bitsSinceSync = 0;
+            if (whole)
+                onSyncWordDetected();
+            else
+            {
+                consecutiveGoodFrames = 0;
+                samplesSinceLastSync = 0.0;
+                lastSyncClosedFrame = false;
+            }
+        }
     }
 
     void onSyncWordDetected()
@@ -633,7 +660,11 @@ private:
 
         if (interval < halfBit * 0.4 || interval > bitPeriodEstimate * 1.8)
         {
+            // No bit lasts this long or this short: the signal dropped out,
+            // jumped or took a spike, and the frame in progress cannot come
+            // out whole however many bits follow (see pushBit).
             halfBitPending = false;
+            bitsSinceSync = LTC_FRAME_BITS + 1;
             return;
         }
 
