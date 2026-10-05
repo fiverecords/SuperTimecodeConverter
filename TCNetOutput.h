@@ -135,12 +135,14 @@ public:
         bool     wasPlaying    = false;
     };
 
+    // A receiver that sent us an OptIn, identified by its IP and its
+    // listener port: two receivers on one host are two slaves.
     struct SlaveNode
     {
         juce::String ip;
         uint16_t listenerPort = 0;
         uint16_t nodeId       = 0;
-        int64_t  lastSeen     = 0;     // ms since epoch
+        double   lastSeenMs   = 0.0;   // hi-res counter (monotonic), not the wall clock
         bool     active       = false;
     };
 
@@ -584,7 +586,10 @@ private:
             if (n < 24) continue;
             if (buf[4] != 'T' || buf[5] != 'C' || buf[6] != 'N') continue;
             if (buf[7] != kMsgOptIn) continue;
-            // Don't register ourselves
+            // Don't register ourselves.  Any other OptIn registers, whatever
+            // its NodeType (byte 17): no filter, since the TCNet spec's rule
+            // on which node types a master serves was not available to check
+            // (AUDIT NET-9).
             uint16_t remoteId = buf[0] | (buf[1] << 8);
             if (remoteId == nodeId) continue;
             // Extract slave's listener port
@@ -598,14 +603,18 @@ private:
 
     void registerSlave(const juce::String& ip, uint16_t port, uint16_t nid)
     {
-        int64_t now = juce::Time::currentTimeMillis();
-        // Update existing
+        // The hi-res counter, not currentTimeMillis(): the wall clock jumps
+        // when NTP or the operator sets it, and a jump expired every slave
+        // at once (forward) or none for as long as it went back (AUDIT NET-9).
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        // Update existing.  A slave is its IP and listener port: matching
+        // the IP alone made two receivers on one PC (Resolume and a console
+        // emulator) one slave whose port flipped with every OptIn.
         for (auto& s : slaves)
         {
-            if (s.active && s.ip == ip)
+            if (s.active && s.ip == ip && s.listenerPort == port)
             {
-                s.listenerPort = port;
-                s.lastSeen = now;
+                s.lastSeenMs = now;
                 return;
             }
         }
@@ -617,7 +626,7 @@ private:
                 s.ip = ip;
                 s.listenerPort = port;
                 s.nodeId = nid;
-                s.lastSeen = now;
+                s.lastSeenMs = now;
                 s.active = true;
                 // Send initial data burst to new slave
                 sendInitialDataToSlave(s);
@@ -628,10 +637,26 @@ private:
 
     void expireSlaves()
     {
-        int64_t now = juce::Time::currentTimeMillis();
+        const double now = juce::Time::getMillisecondCounterHiRes();
         for (auto& s : slaves)
-            if (s.active && (now - s.lastSeen) > 10000)
+            if (s.active && (now - s.lastSeenMs) > 10000.0)
                 s.active = false;
+    }
+
+    /// The listener port to answer a request from srcIp:srcPort on: the
+    /// slave with that IP whose listener port is srcPort, else the first
+    /// slave with that IP (a request need not come from the listener
+    /// port).  0 when no slave has that IP.
+    uint16_t replyPortFor(const juce::String& srcIp, int srcPort) const
+    {
+        uint16_t first = 0;
+        for (auto& s : slaves)
+        {
+            if (!s.active || s.ip != srcIp) continue;
+            if ((int) s.listenerPort == srcPort) return s.listenerPort;
+            if (first == 0) first = s.listenerPort;
+        }
+        return first;
     }
 
     void sendInitialDataToSlave(const SlaveNode& slave)
@@ -673,22 +698,19 @@ private:
             {
                 uint8_t dataType = buf[24];
                 uint8_t layerId  = buf[25];  // 1-based
-                handleRequest(srcIp, dataType, layerId);
+                handleRequest(srcIp, srcPort, dataType, layerId);
             }
             else if (msgType == kMsgApp)
             {
-                handleApplication(srcIp, buf, n);
+                handleApplication(srcIp, srcPort, buf, n);
             }
         }
     }
 
-    void handleRequest(const juce::String& srcIp, uint8_t dataType, uint8_t layerId)
+    void handleRequest(const juce::String& srcIp, int srcPort, uint8_t dataType, uint8_t layerId)
     {
         // Find slave's listener port
-        uint16_t dstPort = 0;
-        for (auto& s : slaves)
-            if (s.active && s.ip == srcIp)
-                { dstPort = s.listenerPort; break; }
+        const uint16_t dstPort = replyPortFor(srcIp, srcPort);
         if (dstPort == 0) return;
 
         int layerIdx = layerId - 1;  // 0-based
@@ -909,13 +931,10 @@ private:
         unicastSocket->write(srcIp, (int)initiatorPort, p, 32);
     }
 
-    void handleApplication(const juce::String& srcIp, const uint8_t* /*buf*/, int /*len*/)
+    void handleApplication(const juce::String& srcIp, int srcPort, const uint8_t* /*buf*/, int /*len*/)
     {
         // Bridge responds with Application + then Error(255). We just send Error.
-        uint16_t dstPort = 0;
-        for (auto& s : slaves)
-            if (s.active && s.ip == srcIp)
-                { dstPort = s.listenerPort; break; }
+        const uint16_t dstPort = replyPortFor(srcIp, srcPort);
         if (dstPort == 0 || !unicastSocket) return;
 
         // Error packet (30 bytes): "not supported"
