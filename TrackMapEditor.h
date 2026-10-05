@@ -1579,11 +1579,10 @@ private:
         alert->addButton("Import Tracks", 2);
         alert->addButton("Cancel", 0);
 
-        auto fileCopy = xmlFile;
         juce::Component::SafePointer<TrackMapEditor> safeThis(this);
 
         alert->enterModalState(true, juce::ModalCallbackFunction::create(
-            [safeThis, fileCopy, alert](int result)
+            [safeThis, fileCopy = xmlFile, alert](int result)
         {
             if (!safeThis || result == 0) return;
 

@@ -1180,8 +1180,8 @@ public:
 
                 if (type == 1)  // playlist
                 {
-                    int entries = child->getIntAttribute("Entries", 0);
-                    if (entries > 0)
+                    int numEntries = child->getIntAttribute("Entries", 0);
+                    if (numEntries > 0)
                         result.add(path.isEmpty() ? name : path + " / " + name);
                 }
                 else if (type == 0)  // folder
