@@ -1590,8 +1590,9 @@ public:
                     bool rx = mtcInput.isReceiving();
                     if (rx)
                     {
-                        auto d = mtcInput.getDetectedFrameRate();
-                        if (d != currentFps) setFrameRate(d);
+                        // Rate code 0 is 24 and 23.976 alike: a 23.976 the
+                        // user chose stays, as for LTC (AUDIT NET-4).
+                        followDetectedRate(mtcInput.getDetectedFrameRate(), false);
                         if (statusTextVisible)
                             inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
                     }
@@ -1616,8 +1617,9 @@ public:
                     bool rx = artnetInput.isReceiving();
                     if (rx)
                     {
-                        auto d = artnetInput.getDetectedFrameRate();
-                        if (d != currentFps) setFrameRate(d);
+                        // Rate code 0 is 24 and 23.976 alike: a 23.976 the
+                        // user chose stays, as for LTC (AUDIT NET-4).
+                        followDetectedRate(artnetInput.getDetectedFrameRate(), false);
                         if (statusTextVisible)
                             inputStatusText = "RX ON " + artnetInput.getBindInfo();
                     }
@@ -1638,8 +1640,9 @@ public:
                     bool rx = laNetTCInput.isReceiving();
                     if (rx)
                     {
-                        auto d = laNetTCInput.getDetectedFrameRate();
-                        if (d != currentFps) setFrameRate(d);
+                        // LA-Net carries 24, 25 or 30: 23.976 and 29.97 the
+                        // user chose stay, as for LTC (AUDIT NET-4).
+                        followDetectedRate(laNetTCInput.getDetectedFrameRate(), true);
                         if (statusTextVisible)
                             inputStatusText = "RX ON " + laNetTCInput.getBindInfo();
                     }
@@ -1673,16 +1676,8 @@ public:
                     bool rx = live.receiving;
                     if (rx)
                     {
-                        auto d = ltcInput.getDetectedFrameRate();
-                        bool ambiguousOverride = userOverrodeLtcFps
-                            && ((currentFps == FrameRate::FPS_2398 && d == FrameRate::FPS_24)
-                             || (currentFps == FrameRate::FPS_2997 && d == FrameRate::FPS_30));
-                        if (d != currentFps && !ambiguousOverride)
-                        {
-                            if (d != FrameRate::FPS_24 && d != FrameRate::FPS_30)
-                                userOverrodeLtcFps = false;
-                            setFrameRate(d);
-                        }
+                        // The decoder reads 23.976 as 24 and 29.97 as 30.
+                        followDetectedRate(ltcInput.getDetectedFrameRate(), true);
                         if (statusTextVisible)
                             inputStatusText = "RX: " + ltcInput.getCurrentDeviceName()
                                             + " Ch " + juce::String(ltcInput.getSelectedChannel() + 1)
@@ -3183,6 +3178,9 @@ private:
     Timecode currentTimecode;
     bool sourceActive = true;
     bool outputsWereActive = false;  // previous sourceActive state for transition detection
+    // A 23.976 or 29.97 the user chose over a signal input that reads it as
+    // 24 or 30 (followDetectedRate).  Named for LTC, where it began; MTC,
+    // Art-Net and LA-Net honour it too (AUDIT NET-4).
     bool userOverrodeLtcFps = false;
 
     // Generator state (internal timecode source)
@@ -4990,6 +4988,25 @@ private:
         if (p < 0.0) p += frameMs;
         framePhaseMs = p;
         framePhaseValid = true;
+    }
+
+    /// Follow the frame rate a signal input detected (tick, message thread).
+    /// Rates its wire cannot tell apart -- 24 for 23.976 always, 30 for
+    /// 29.97 when `thirtyAmbiguous` -- leave a 23.976 or 29.97 the user chose
+    /// in place (userOverrodeLtcFps); a rate that is not ambiguous ends the
+    /// choice.  LTC and LA-Net carry 24/25/30 only; MTC's and Art-Net's rate
+    /// code 0 is 24 and 23.976 alike, while 29.97 has its own code, and
+    /// these forced 24 every tick (AUDIT NET-4).
+    void followDetectedRate(FrameRate d, bool thirtyAmbiguous)
+    {
+        const bool held = userOverrodeLtcFps
+            && ((currentFps == FrameRate::FPS_2398 && d == FrameRate::FPS_24)
+             || (thirtyAmbiguous && currentFps == FrameRate::FPS_2997 && d == FrameRate::FPS_30));
+        if (d == currentFps || held)
+            return;
+        if (d != FrameRate::FPS_24 && ! (thirtyAmbiguous && d == FrameRate::FPS_30))
+            userOverrodeLtcFps = false;
+        setFrameRate(d);
     }
 
     void routeTimecodeToOutputs()
