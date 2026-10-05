@@ -15,6 +15,13 @@
 //
 //  * Save keeps the previous version as "<name>.bak" (one rotation), so a
 //    save that goes wrong, or a change the operator regrets, has a way back.
+//    A save of the text the file already holds writes nothing and rotates
+//    nothing, so .bak stays the previous *different* version however many
+//    times the same state is saved, in one session or after a restart:
+//    every file is written in a fixed order -- the Track Map and the
+//    presets in key order (inKeyOrder), not the hash order a reload
+//    changes.  The first save after a load that changed the text (an
+//    older format migrated, a value normalised) still rotates.
 //  * Load distinguishes "file is missing" (first run, nothing to say) from
 //    "file exists but does not parse".  In the second case the unreadable
 //    file is moved aside as "<name>.corrupt-<timestamp>" and a message is
@@ -53,17 +60,49 @@ struct SafeJsonFile
         return {};
     }
 
-    /// Rotate the previous file to .bak, then write atomically.
+    /// Rotate the previous file to .bak, then write atomically.  When the
+    /// file already holds exactly `text`, do neither: the write would change
+    /// nothing, and the rotation would replace the previous version in .bak
+    /// with a second copy of the current one.  Saves of an unchanged state
+    /// come in runs (the exit path alone saves three times), so without this
+    /// a file written wrongly once -- an empty map, defaults after a
+    /// quarantine -- reached .bak on the next save and the last good version
+    /// was gone (AUDIT SET-1).  The comparison reads the file back as text:
+    /// replaceWithText writes the JSON writer's CR LF line ends unchanged,
+    /// so a file STC wrote compares equal to the text it was written from; a
+    /// file that differs in any way is rotated and written as before.
     static bool save(const juce::File& file, const juce::String& text)
     {
         if (file.existsAsFile())
+        {
+            if (file.loadFileAsString() == text)
+                return true;
             file.copyFileTo(backupFor(file));
+        }
         return file.replaceWithText(text);
     }
 
     static juce::File backupFor(const juce::File& file)
     {
         return file.getSiblingFile(file.getFileName() + ".bak");
+    }
+
+    /// The elements of an unordered_map in key order, for writing it to a
+    /// file: its own iteration order changes when the map is reloaded, so an
+    /// unchanged map written in that order gave other text after every
+    /// restart, and the first save rotated a reordered copy of the current
+    /// file over .bak (AUDIT SET-1).  Pointers into `map`, valid until it
+    /// changes.  Calling thread.
+    template <typename Map>
+    static std::vector<const typename Map::value_type*> inKeyOrder(const Map& map)
+    {
+        std::vector<const typename Map::value_type*> items;
+        items.reserve(map.size());
+        for (auto& item : map)
+            items.push_back(&item);
+        std::sort(items.begin(), items.end(),
+                  [](const auto* a, const auto* b) { return a->first < b->first; });
+        return items;
     }
 
     /// Accumulated load problems, for the UI to show once at startup.
@@ -549,15 +588,16 @@ public:
     //------------------------------------------------------------------
     // Persistence
     //------------------------------------------------------------------
-    /// The file's JSON tree, built on the calling thread.
+    /// The file's JSON tree, built on the calling thread.  Entries in key
+    /// order (SafeJsonFile::inKeyOrder).
     juce::var buildFileVar() const
     {
         auto* root = new juce::DynamicObject();
         root->setProperty("version", 2);  // v2 = artist|title keyed
 
         juce::Array<juce::var> arr;
-        for (auto& [k, entry] : entries)
-            arr.add(entry.toVar());
+        for (auto* item : SafeJsonFile::inKeyOrder(entries))
+            arr.add(item->second.toVar());
 
         root->setProperty("tracks", arr);
         return juce::var(root);
@@ -632,12 +672,14 @@ public:
 
     /// Entries as a JSON array (the "tracks" value of the file format), for
     /// storing a map somewhere other than trackmap.json -- the per-engine
-    /// override layer keeps one inside the engine's settings block.
+    /// override layer keeps one inside the engine's settings block.  In key
+    /// order (SafeJsonFile::inKeyOrder), so settings.json does not change
+    /// with the override set's hash order.
     juce::var toVar() const
     {
         juce::Array<juce::var> arr;
-        for (auto& [k, entry] : entries)
-            arr.add(entry.toVar());
+        for (auto* item : SafeJsonFile::inKeyOrder(entries))
+            arr.add(item->second.toVar());
         return arr;
     }
 
@@ -1173,14 +1215,15 @@ public:
         return dir.getChildFile("generator_presets.json");
     }
 
+    /// Presets in key order (SafeJsonFile::inKeyOrder).  Message thread.
     void save() const
     {
         auto* root = new juce::DynamicObject();
         root->setProperty("version", 1);
 
         juce::Array<juce::var> arr;
-        for (auto& [k, preset] : entries)
-            arr.add(preset.toVar());
+        for (auto* item : SafeJsonFile::inKeyOrder(entries))
+            arr.add(item->second.toVar());
 
         root->setProperty("presets", arr);
         juce::var jsonVar(root);
@@ -1866,6 +1909,16 @@ struct AppSettings
 
     bool load()
     {
+        // The Track Map and the generator presets have files of their own
+        // and load whether or not settings.json exists or parses.  Loaded
+        // only after a good settings.json, they stayed empty when it was
+        // missing (an operator resetting the audio setup) or quarantined, and
+        // the next save wrote the empty maps over trackmap.json and
+        // generator_presets.json (AUDIT SET-1).  Returns whether settings.json
+        // itself was read.
+        trackMap.load();
+        generatorPresets.load();
+
         auto parsed = SafeJsonFile::load(getSettingsFile());
         auto* obj = parsed.getDynamicObject();
         if (!obj) return false;
@@ -1935,18 +1988,11 @@ struct AppSettings
                 engines.push_back({});
 
             selectedEngine = juce::jlimit(0, (int)engines.size() - 1, selectedEngine);
-
-            // TrackMap is loaded from its own file (trackmap.json)
-            trackMap.load();
-            generatorPresets.load();
             return true;
         }
         else
         {
-            bool ok = migrateFromV1(obj);
-            trackMap.load();  // load track map even from v1 migration
-            generatorPresets.load();
-            return ok;
+            return migrateFromV1(obj);
         }
     }
 
