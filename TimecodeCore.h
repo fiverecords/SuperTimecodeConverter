@@ -196,6 +196,14 @@ inline int64_t timecodeToFrameIndex(const Timecode& tc, FrameRate fps)
         // Two addresses dropped per minute, except every tenth minute.
         const int totalMinutes = tc.hours * 60 + tc.minutes;
         idx -= 2 * (totalMinutes - totalMinutes / 10);
+        // ;00 and ;01 at second 0 of such a minute do not exist.  They still
+        // arrive -- a TrackMap offset typed as HH:MM:00:00, LTC IN forced to
+        // 29.97 over a stream that counts all 30 -- and the formula put them
+        // on ;28 and ;29 of the second before, two frames back.  They count
+        // as ;02, the first address that exists, which is what the text
+        // parser makes of them (normaliseDropFrame; AUDIT C1, LTC-21).
+        if (tc.seconds == 0 && tc.frames < 2 && (tc.minutes % 10) != 0)
+            idx += 2 - tc.frames;
     }
     return idx;
 }
