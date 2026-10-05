@@ -222,6 +222,9 @@ private:
         if (protVer < 14)
             return;
 
+        // Byte 13 is the StreamId in Art-Net 4 (0 = master).  Not checked:
+        // every stream is taken, so two senders on different streams
+        // interleave here (AUDIT NET-14; no change).
         int frames  = data[14];
         int seconds = data[15];
         int minutes = data[16];

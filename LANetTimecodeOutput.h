@@ -38,7 +38,7 @@ public:
     //==============================================================================
     void refreshNetworkInterfaces()
     {
-        availableInterfaces = ::getNetworkInterfaces();   // has its own Localhost entry (see setInterface)
+        availableInterfaces = ::getNetworkInterfaces();   // no Localhost entry: start(-1) sends to 127.0.0.1
     }
 
     juce::StringArray getInterfaceNames() const
@@ -267,10 +267,12 @@ private:
             pending = timecodeToSend;
         }
 
-        // Auto-increment: advance by 1 frame per send.  Compare with
-        // pendingTimecode and only resync on diff > 1 (seek/jump).
-        // Prevents 1-frame backward jitter from interpolation overshoot.
-        // Same architectural pattern as the LTC, MTC and ArtNet encoders.
+        // Auto-increment: advance by 1 frame per send, then the shared
+        // tracking policy (TimecodeCore::trackPublishedValue, DESIGN D16): a
+        // repeated or skipped frame when the source has drifted by one, a
+        // snap only beyond kTrackingHardResync (a seek).  Absorbs the 1-frame
+        // backward jitter of the engine's interpolation.  Same policy as the
+        // LTC, MTC and Art-Net senders.
         Timecode tc;
         if (!seeded)
         {
@@ -294,10 +296,20 @@ private:
 
         std::memcpy(packet, laNetPacketHeader, sizeof(laNetPacketHeader));
 
-        // timecode format
+        // timecode format: the nominal rate.  What is known of the protocol
+        // (proprietary) has integer rates only -- the input takes 24, 25 and
+        // 30 and ignores 50, 60 and 100 -- so 23.976 goes out as 24 and
+        // 29.97 drop-frame as 30, and the count below is the drop-frame
+        // LABEL read as if every number existed: at each dropped pair (every
+        // minute but the tenth) it jumps by 3 where one frame went by --
+        // 00:00:59;29 = 1799, 00:01:00;02 = 1802 -- and runs 2 more frames
+        // ahead each time.  A receiver taking the 23.976 count as 24 per
+        // second reads 0.1 % slow against the wall clock.  Left as is until
+        // a receiver or a capture says what it expects (DESIGN D2; AUDIT
+        // NET-6, deferred).
         packet[19] = uint8_t(maxFrames);
 
-        // endian conversion
+        // frames since midnight at maxFrames per second, big-endian
         uint32_t be = juce::ByteOrder::swapIfLittleEndian((int32_t(tc.hours) * 3600 * maxFrames)
                                                     + (int32_t(tc.minutes) * 60 * maxFrames)
                                                     + (int32_t(tc.seconds) * maxFrames)
