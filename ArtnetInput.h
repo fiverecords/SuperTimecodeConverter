@@ -249,12 +249,12 @@ private:
         switch (rateCode)
         {
             case 0:
-                // Art-Net rate code 0 means "24fps".  Like MTC, Art-Net has
-                // no dedicated code for 23.976, so if the user has already
-                // selected FPS_2398 we preserve it rather than silently
-                // overwriting with FPS_24.
-                if (detectedFps.load(std::memory_order_relaxed) != FrameRate::FPS_2398)
-                    detectedFps.store(FrameRate::FPS_24, std::memory_order_relaxed);
+                // Rate code 0 is 24 fps.  Art-Net has no code for 23.976 -- a
+                // 23.976 sender uses 0 too -- so this reports 24 and cannot
+                // tell the two apart.  Keeping a 23.976 the user selected is
+                // the engine's job (as userOverrodeLtcFps does for LTC), not
+                // the parser's: nothing here knows the selection (AUDIT NET-4).
+                detectedFps.store(FrameRate::FPS_24, std::memory_order_relaxed);
                 break;
             case 1: detectedFps.store(FrameRate::FPS_25, std::memory_order_relaxed);   break;
             case 2: detectedFps.store(FrameRate::FPS_2997, std::memory_order_relaxed); break;
