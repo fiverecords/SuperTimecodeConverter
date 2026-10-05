@@ -375,8 +375,7 @@ public:
             }
             cp.name = "CUE " + juce::String(preset.cuePoints.size() + 1);
             preset.cuePoints.push_back(std::move(cp));
-            preset.sortCuePoints();
-            table.updateContent();
+            sortCuesKeepingSelection();
             table.repaint();
             updateCount();
             refreshStripCues();
@@ -702,6 +701,43 @@ private:
         return msToTimecodeText(ms, frameRateFromDouble(fps));
     }
 
+    /// Sort the cues by position, keeping the table's selection -- and the
+    /// cue the detail panel edits (selectedCue) -- on the same cues.  Add
+    /// inserts a cue and Apply can move one; a selection left on its row
+    /// index named another cue, and the next Apply wrote the detail panel
+    /// over that one (AUDIT SET-4).  The panel's fields are left as they
+    /// are, so an edit not yet applied survives an Add.  ListBox's anchor
+    /// (the row a shift-click range starts from, which is also selectedCue
+    /// here) is put on selectedCue's new row.
+    void sortCuesKeepingSelection()
+    {
+        const auto selected = table.getSelectedRows();   // indices before the sort
+        const auto newIndexOf = preset.sortCuePoints();
+
+        juce::SparseSet<int> moved;
+        for (int i = 0; i < selected.size(); ++i)
+        {
+            const int row = selected[i];
+            if (row >= 0 && row < (int) newIndexOf.size())
+                moved.addRange({ newIndexOf[(size_t) row], newIndexOf[(size_t) row] + 1 });
+        }
+        if (selectedCue >= 0 && selectedCue < (int) newIndexOf.size())
+            selectedCue = newIndexOf[(size_t) selectedCue];
+
+        table.updateContent();
+        // setSelectedRows keeps the anchor only when its old index is still
+        // selected, else moves it to the first selected row: selecting
+        // selectedCue's row alone first makes it the anchor.
+        if (selectedCue >= 0 && moved.contains(selectedCue))
+        {
+            juce::SparseSet<int> anchor;
+            anchor.addRange({ selectedCue, selectedCue + 1 });
+            table.setSelectedRows(anchor, juce::dontSendNotification);
+        }
+        table.setSelectedRows(moved, juce::dontSendNotification);
+        strip.setSelectedCueIndex(selectedCue);
+    }
+
     /// Recompute the cue marker positions on the strip.  Each cue's
     /// absolute TC is projected onto the audio file's time axis by
     /// subtracting the preset's startTC offset; cues outside the audio
@@ -769,34 +805,18 @@ private:
         }
         cue.artnetVal = juce::jlimit(0, 255, edDmxVal.getText().getIntValue());
 
-        // Re-sort and re-locate the edited cue.  Same pattern as TrackMap:
-        // snapshot the full cue value (the position is the dominant key but
-        // duplicates can exist if the user has multiple cues with the same
-        // TC) and walk the sorted vector to find the matching entry.
-        GeneratorCuePoint editedSnapshot = cue;
-        preset.sortCuePoints();
-
-        for (int i = 0; i < (int) preset.cuePoints.size(); ++i)
+        // Re-sort in case the position changed; the selection follows the
+        // edited cue to its new row, scrolled into view, and the detail
+        // panel shows it as stored.
+        sortCuesKeepingSelection();
+        if (selectedCue >= 0 && selectedCue < (int) preset.cuePoints.size())
         {
-            auto& c = preset.cuePoints[(size_t) i];
-            if (c.positionTC   == editedSnapshot.positionTC
-                && c.name       == editedSnapshot.name
-                && c.midiChannel == editedSnapshot.midiChannel
-                && c.midiNoteNum == editedSnapshot.midiNoteNum
-                && c.midiCCNum   == editedSnapshot.midiCCNum
-                && c.oscAddress  == editedSnapshot.oscAddress
-                && c.artnetCh    == editedSnapshot.artnetCh)
-            {
-                selectedCue = i;
-                table.selectRow(i);
-                break;
-            }
+            loadDetailFromCue(preset.cuePoints[(size_t) selectedCue]);
+            table.scrollToEnsureRowIsOnscreen(selectedCue);
         }
 
-        table.updateContent();
         table.repaint();
         refreshStripCues();
-        strip.setSelectedCueIndex(selectedCue);
         if (onChange) onChange();
     }
 

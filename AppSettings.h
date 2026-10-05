@@ -12,6 +12,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <algorithm>
 
 //==============================================================================
 // SafeJsonFile -- the three persistence rules every STC JSON file follows.
@@ -365,6 +367,36 @@ struct GeneratorCuePoint
 };
 
 //==============================================================================
+/// Stable sort of a cue list by position (`positionOf`, called once per
+/// cue).  Returns, for each cue's index before the sort, its index after,
+/// so an editor can keep its selection on the same cues (AUDIT SET-4).  Cues
+/// at the same position keep their order.
+template <typename Cue, typename PositionOf>
+inline std::vector<int> sortCuesByPosition(std::vector<Cue>& cues, PositionOf positionOf)
+{
+    std::vector<uint32_t> pos;
+    pos.reserve(cues.size());
+    for (auto& c : cues)
+        pos.push_back(positionOf(c));
+
+    std::vector<size_t> order(cues.size());
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::stable_sort(order.begin(), order.end(),
+                     [&pos](size_t a, size_t b) { return pos[a] < pos[b]; });
+
+    std::vector<Cue> sorted;
+    sorted.reserve(cues.size());
+    std::vector<int> newIndexOf(cues.size());
+    for (size_t i = 0; i < order.size(); ++i)
+    {
+        newIndexOf[order[i]] = (int) i;
+        sorted.push_back(std::move(cues[order[i]]));
+    }
+    cues = std::move(sorted);
+    return newIndexOf;
+}
+
+//==============================================================================
 // TrackMapEntry -- per-track config: offset, triggers, cue points
 //==============================================================================
 struct TrackMapEntry
@@ -423,11 +455,11 @@ struct TrackMapEntry
     bool hasAnyTrigger()    const { return hasMidiTrigger() || hasOscTrigger() || hasArtnetTrigger(); }
     bool hasCuePoints()     const { return !cuePoints.empty(); }
 
-    /// Sort cue points by position (call after adding/editing cues)
-    void sortCuePoints()
+    /// Sort cue points by position (call after adding/editing cues).
+    /// Stable; returns each cue's new index by its old one (sortCuesByPosition).
+    std::vector<int> sortCuePoints()
     {
-        std::sort(cuePoints.begin(), cuePoints.end(),
-                  [](const CuePoint& a, const CuePoint& b) { return a.positionMs < b.positionMs; });
+        return sortCuesByPosition(cuePoints, [](const CuePoint& c) { return c.positionMs; });
     }
 
     //------------------------------------------------------------------
@@ -1254,14 +1286,14 @@ struct GeneratorPreset
 
     bool hasCuePoints() const { return ! cuePoints.empty(); }
 
-    /// Sort cue points by position (ms), with frame-rate cancellation: any
-    /// reasonable fps gives the same ordering since positionTC ordering is
-    /// dominated by H/M/S, frames only matter in tie-breaking.
-    void sortCuePoints()
+    /// Sort cue points by position, read at 30 fps.  The text parse only
+    /// ever clamps frames to the rate or moves a missing drop-frame number
+    /// up, so the order is still sorted at the rate the engine runs (cues
+    /// that differ only in frames past that rate become ties).  Stable;
+    /// returns each cue's new index by its old one (sortCuesByPosition).
+    std::vector<int> sortCuePoints()
     {
-        std::sort(cuePoints.begin(), cuePoints.end(),
-                  [](const GeneratorCuePoint& a, const GeneratorCuePoint& b)
-                  { return a.positionMs() < b.positionMs(); });
+        return sortCuesByPosition(cuePoints, [](const GeneratorCuePoint& c) { return c.positionMs(); });
     }
 
     juce::var toVar() const

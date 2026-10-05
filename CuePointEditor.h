@@ -307,8 +307,7 @@ public:
             cp.positionMs = ms;
             cp.name = "CUE " + juce::String(trackEntry.cuePoints.size() + 1);
             trackEntry.cuePoints.push_back(std::move(cp));
-            trackEntry.sortCuePoints();
-            table.updateContent();
+            sortCuesKeepingSelection();
             table.repaint();
             updateCueCount();
             updateWaveformCueMarkers();
@@ -324,8 +323,7 @@ public:
             cp.positionMs = editCursorActive ? editCursorMs : 0;
             cp.name = "CUE " + juce::String(trackEntry.cuePoints.size() + 1);
             trackEntry.cuePoints.push_back(std::move(cp));
-            trackEntry.sortCuePoints();
-            table.updateContent();
+            sortCuesKeepingSelection();
             table.repaint();
             updateCueCount();
             updateWaveformCueMarkers();
@@ -713,6 +711,32 @@ private:
                             juce::dontSendNotification);
     }
 
+    /// Sort the cues by position, keeping the table's selection -- and the
+    /// cue the detail panel edits (selectedCue) -- on the same cues.  Add
+    /// and Capture insert a cue and Apply can move one; a selection left on
+    /// its row index named another cue, and the next Apply wrote the
+    /// detail panel over that one (AUDIT SET-4).  The panel's fields are
+    /// left as they are, so an edit not yet applied survives an Add.
+    void sortCuesKeepingSelection()
+    {
+        const auto selected = table.getSelectedRows();   // indices before the sort
+        const auto newIndexOf = trackEntry.sortCuePoints();
+
+        juce::SparseSet<int> moved;
+        for (int i = 0; i < selected.size(); ++i)
+        {
+            const int row = selected[i];
+            if (row >= 0 && row < (int)newIndexOf.size())
+                moved.addRange({ newIndexOf[(size_t)row], newIndexOf[(size_t)row] + 1 });
+        }
+        if (selectedCue >= 0 && selectedCue < (int)newIndexOf.size())
+            selectedCue = newIndexOf[(size_t)selectedCue];
+
+        table.updateContent();
+        table.setSelectedRows(moved, juce::dontSendNotification);
+        waveformStrip.setSelectedCueIndex(selectedCue);
+    }
+
     void updateWaveformCueMarkers()
     {
         std::vector<uint32_t> positions;
@@ -785,32 +809,16 @@ private:
         }
         cue.artnetVal = juce::jlimit(0, 255, edDmxVal.getText().getIntValue());
 
-        // Re-sort in case position changed.
-        // Snapshot full cue state so we can find it after sort even when
-        // duplicates exist (position + name alone can be ambiguous).
-        CuePoint editedSnapshot = cue;  // value copy after edits applied
-        trackEntry.sortCuePoints();
-
-        // Update selectedCue to follow the cue to its new position after sort.
-        // Compare all trigger fields to disambiguate true duplicates.
-        for (int i = 0; i < (int)trackEntry.cuePoints.size(); ++i)
+        // Re-sort in case the position changed; the selection follows the
+        // edited cue to its new row, scrolled into view, and the detail
+        // panel shows it as stored.
+        sortCuesKeepingSelection();
+        if (selectedCue >= 0 && selectedCue < (int)trackEntry.cuePoints.size())
         {
-            auto& c = trackEntry.cuePoints[(size_t)i];
-            if (c.positionMs   == editedSnapshot.positionMs
-                && c.name       == editedSnapshot.name
-                && c.midiChannel == editedSnapshot.midiChannel
-                && c.midiNoteNum == editedSnapshot.midiNoteNum
-                && c.midiCCNum   == editedSnapshot.midiCCNum
-                && c.oscAddress  == editedSnapshot.oscAddress
-                && c.artnetCh    == editedSnapshot.artnetCh)
-            {
-                selectedCue = i;
-                table.selectRow(i);
-                break;
-            }
+            loadDetailFromCue(trackEntry.cuePoints[(size_t)selectedCue]);
+            table.scrollToEnsureRowIsOnscreen(selectedCue);
         }
 
-        table.updateContent();
         table.repaint();
         updateCueCount();
         updateWaveformCueMarkers();
