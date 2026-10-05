@@ -202,6 +202,7 @@ private:
     bool   lockSlewing = false;   // absorbing a step the PI cannot reach (D27)
     int     trackOffFrames = 0;   // boundaries in a row the reference has disagreed (D30)
     int64_t trackOffD      = -1;  // the disagreement being counted
+    bool    heldPastGrace  = false;  // packFrame is holding a frame past the grace (AUDIT LTC-11)
     std::atomic<double> lastLockErrorMs { 0.0 };
 
     // Output gap detector (#19): audio thread state and counters for the UI.
@@ -280,7 +281,7 @@ private:
     {
         lastCallbackMs = 0.0;
         lockAdj = 0.0; lockIntegral = 0.0; lockErrFilt = 0.0; lockSlewing = false;
-        trackOffFrames = 0; trackOffD = -1;
+        trackOffFrames = 0; trackOffD = -1; heldPastGrace = false;
         currentBitIndex = 0;
         halfCellIndex = 0;
         samplePositionInHalfBit = 0.0;
@@ -438,7 +439,9 @@ private:
     /// the frame being packed is the one that reaches the connector that many
     /// source frames after the publication, and the tracking below has to age
     /// the published value by it (issue #21).
-    void packFrame(int seedAdvanceFrames = 0, int publishedAheadFrames = 0)
+    /// referenceFrozen: the publication is older than the grace allows
+    /// (kPublicationGraceMs), so the aged reference has stopped moving.
+    void packFrame(int seedAdvanceFrames = 0, int publishedAheadFrames = 0, bool referenceFrozen = false)
     {
         FrameRate fps = pendingFps.load(std::memory_order_relaxed);
         Timecode pendingTc = unpackTimecode(packedPendingTc.load(std::memory_order_relaxed));
@@ -449,6 +452,7 @@ private:
             for (int i = 0; i < seedAdvanceFrames; ++i)
                 encoderTc = incrementFrame(encoderTc, fps);
             encoderSeeded.store(true, std::memory_order_relaxed);
+            heldPastGrace = false;
         }
         else if (paused.load(std::memory_order_relaxed))
         {
@@ -457,6 +461,7 @@ private:
             // auto-increment here -- with it, the resync rule below pulled the
             // value back every other frame and the output alternated V / V+1.
             encoderTc = pendingTc;
+            heldPastGrace = false;
         }
         else
         {
@@ -501,23 +506,70 @@ private:
             // push it forward.  A persistent 0 is handed to the policy with
             // the reference one frame up, so it reads as behind and skips.
             const bool seek = (d > kTrackingHardResync || d < -kTrackingHardResync);
-            if (d == -1) { trackOffFrames = 0; trackOffD = -1; }
-            else if (d == trackOffD) ++trackOffFrames;
-            else { trackOffD = d; trackOffFrames = 1; }
+            bool resumeSnap = false;
 
-            if (seek || trackOffFrames >= kTrackPersistFrames)
+            if (referenceFrozen && d < -kTrackingHardResync)
             {
-                const Timecode ref = (d == 0) ? incrementFrame(publishedAtConnector, fps)
-                                              : publishedAtConnector;
-                encoderTc = trackPublishedValue(next, ref, 1, fps);
+                // Past the grace (DESIGN D26) the engine has not published for
+                // over a second and the aged reference has stopped, while the
+                // encoder's next value still advances a frame per frame.  The
+                // distance walks -2, -3, -4 -- a different value at every
+                // boundary, so the persistence gate below lets nothing through
+                // and the encoder runs on unconfirmed; a stall that ends there
+                // comes back clean.  One frame further the distance is past the
+                // hard-resync one, and the tracking used to take it for a seek:
+                // a snap back and a re-seed that cut the codeword, over and
+                // over (11.05 ... 11.09, 11.05 ... 11.09 on the wire with the
+                // engine frozen for 1.5 s; AUDIT LTC-11).  A reference that has
+                // stopped moving is no evidence of a seek, and DESIGN D26
+                // decided on a held value: from here this frame is repeated,
+                // whole, until the engine publishes again.  The distance stays
+                // where it is while it does, so the hold lasts by itself.
+                heldPastGrace = true;
                 trackOffFrames = 0; trackOffD = -1;
-                noteTrackEvent(seek ? 3 : (d > -1 ? 2 : 1), d, next, publishedAtConnector);
+                noteTrackEvent(1, d, next, publishedAtConnector);
+                // encoderTc unchanged: the frame is repeated.
+            }
+            else if (heldPastGrace && ! referenceFrozen)
+            {
+                // The first boundary with a fresh publication after that hold.
+                // Whatever the distance is now, it is what the hold left
+                // behind, not a drift: it is taken in one step -- a snap and a
+                // re-seed at the published phase, as for a seek -- instead of
+                // the one skip per persistence period that a hold of one to
+                // four frames would otherwise cost (DESIGN D26: the value
+                // catches up in one step).  Aligned (d == -1), nothing moves.
+                heldPastGrace = false;
+                trackOffFrames = 0; trackOffD = -1;
+                if (d != -1)
+                {
+                    encoderTc  = publishedAtConnector;
+                    resumeSnap = true;
+                    noteTrackEvent(3, d, next, publishedAtConnector);
+                }
+                else
+                    encoderTc = next;
             }
             else
-                encoderTc = next;
+            {
+                if (d == -1) { trackOffFrames = 0; trackOffD = -1; }
+                else if (d == trackOffD) ++trackOffFrames;
+                else { trackOffD = d; trackOffFrames = 1; }
+
+                if (seek || trackOffFrames >= kTrackPersistFrames)
+                {
+                    const Timecode ref = (d == 0) ? incrementFrame(publishedAtConnector, fps)
+                                                  : publishedAtConnector;
+                    encoderTc = trackPublishedValue(next, ref, 1, fps);
+                    trackOffFrames = 0; trackOffD = -1;
+                    noteTrackEvent(seek ? 3 : (d > -1 ? 2 : 1), d, next, publishedAtConnector);
+                }
+                else
+                    encoderTc = next;
+            }
 
             const int64_t moved = frameDistance(encoderTc, next, fps);
-            valueSnapped = (moved > 1 || moved < -1);
+            valueSnapped = resumeSnap || (moved > 1 || moved < -1);
         }
 
         int frames  = encoderTc.frames;
@@ -792,6 +844,7 @@ private:
                 int    aheadValueFrames = 0;   // to mid-frame: the value tracking
                 double aheadRemainderMs = 0.0;
                 bool   haveAhead        = false;
+                bool   referenceFrozen  = false;   // aging past the ceiling: no publication for the grace
                 {
                     double pitchNow = pitchMultiplier.load(std::memory_order_relaxed);
                     if (pitchNow <= 0.0) pitchNow = 1.0;
@@ -846,8 +899,12 @@ private:
                         // frame high in exactly that case, the aligned state
                         // read as d == 0 instead of -1, and the dead band the
                         // policy used to have was the only thing hiding it.
-                        aheadValueFrames = (int) juce::jlimit(-1.0, maxAhead,
-                                                              std::floor(elapsedRaw / frameMs - 0.5));
+                        const double valueCount = std::floor(elapsedRaw / frameMs - 0.5);
+                        aheadValueFrames = (int) juce::jlimit(-1.0, maxAhead, valueCount);
+                        // Past the ceiling the publication is older than the
+                        // buffer, the latency and the grace together: the
+                        // engine has stopped, and the reference with it.
+                        referenceFrozen  = valueCount > maxAhead;
                         aheadRemainderMs = elapsed;
                         haveAhead        = true;
                     }
@@ -875,7 +932,7 @@ private:
                     seedHalfCellsIn = (aheadRemainderMs / frameMs) * (double)(LTC_FRAME_BITS * 2);
                 }
 
-                packFrame(seedAdvance, aheadValueFrames);
+                packFrame(seedAdvance, aheadValueFrames, referenceFrozen);
                 if (valueSnapped)
                 {
                     noteTrackEvent(5, 0, encoderTc, encoderTc);
