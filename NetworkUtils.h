@@ -142,8 +142,13 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
         char ipStr[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
 
+        // The broadcast address only on an interface that has one.  On a
+        // point-to-point link (a VPN's utun or tun, ppp) the same field
+        // holds the peer's address -- ifa_broadaddr and ifa_dstaddr share
+        // storage -- and it was offered as the "broadcast" (AUDIT NET-16).
         char broadcastStr[INET_ADDRSTRLEN] = "255.255.255.255";
-        if (ifa->ifa_broadaddr)
+        if ((ifa->ifa_flags & IFF_BROADCAST) != 0 && ifa->ifa_broadaddr != nullptr
+            && ifa->ifa_broadaddr->sa_family == AF_INET)
         {
             auto* baddr = (sockaddr_in*)ifa->ifa_broadaddr;
             inet_ntop(AF_INET, &baddr->sin_addr, broadcastStr, sizeof(broadcastStr));
