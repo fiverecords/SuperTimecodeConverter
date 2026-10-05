@@ -97,7 +97,7 @@ public:
         uint8_t  onAir         = 0;     // fader position 0-255 (0=off, >=1=on-air)
         uint32_t trackId       = 0;
         uint32_t bpm100        = 0;
-        uint32_t trackLenMs    = 0;    // real duration or kDefaultDurationMs (24h)
+        uint32_t trackLenMs    = 0;    // real duration or kDefaultDurationMs (2 h)
         uint32_t speed         = 0;    // 2^20 fixed-point (1048576 = 100%). Matches Bridge.
         uint8_t  masterPlayerNum = 0;  // Sync Master value: 0=not master, 1-8=master player number
         juce::String artist;
@@ -532,6 +532,11 @@ public:
     }
 
 private:
+    // A juce::Timer, so it runs on the message thread: unlike the MTC,
+    // Art-Net, LA-Net and HippoNet senders (each on its own
+    // HighResolutionTimer thread) and LTC (the audio callback), TCNet's Time
+    // packets stop for as long as the message thread is busy (AUDIT D8,
+    // NET-11, deferred).
     void timerCallback() override
     {
         if (!running) return;
@@ -774,8 +779,10 @@ private:
         //   Multi-packet: Total Packets > 1, Packet No 0..N-1.
         //
         // We need the grid to cover the ENTIRE track duration so MagicQ's beat
-        // counter doesn't stall at the end of the grid. For a 1-hour default
-        // at 120 BPM = 7201 entries = 57608 bytes = ~24 packets.
+        // counter doesn't stall at the end of the grid. For the 2-hour default
+        // (kDefaultDurationMs) at 120 BPM = 14401 entries = 115208 bytes = 49
+        // packets.  All of them go out here, back to back, inside one timer
+        // callback on the message thread (AUDIT NET-11, deferred).
         constexpr int kEntrySize = 8;
         constexpr int kMaxEntriesPerPacket = 300;  // 2400 bytes / 8
         constexpr int kClusterSize = kMaxEntriesPerPacket * kEntrySize;  // 2400
@@ -799,8 +806,9 @@ private:
             if (beatCount < 1) beatCount = 1;
             // Cap at a sane upper bound to prevent pathological traffic.
             // 2h at 220 BPM = 26400 beats. 30000 covers it with margin.
-            // At 8 bytes/entry + multi-packet overhead, 30k beats =
-            // 100 packets of 2400 bytes = ~240 KB sent on each Beat Grid request.
+            // At 8 bytes/entry + the zero entry, 30k beats = 240008 bytes =
+            // 101 packets of up to 2442 bytes (each IP-fragmented) = ~240 KB
+            // sent on each Beat Grid request.
             if (beatCount > 30000) beatCount = 30000;
             entries.reserve((size_t)beatCount);
             for (int i = 1; i <= beatCount; ++i)
@@ -1120,7 +1128,7 @@ private:
         w16(p + 28, (uint16_t)(uptimeSeconds & 0xFFFF));
         wstr(p + 32, "Fiverecords", 16);
         wstr(p + 48, "STC", 16);
-        p[64] = 1; p[65] = 7; p[66] = 0;
+        p[64] = 1; p[65] = 7; p[66] = 0;   // application version 1.7.0, never bumped (see sendOptIn)
         for (auto& s : slaves)
             if (s.active)
                 unicastSocket->write(s.ip, (int)s.listenerPort, p, 68);
@@ -1179,6 +1187,10 @@ private:
         w16(p + 28, (uint16_t)(uptimeSeconds & 0xFFFF));
         wstr(p + 32, "Fiverecords", 16);
         wstr(p + 48, "STC", 16);
+        // Application version 1.7.0: a constant since 1.7, never bumped.
+        // Left as the receivers saw it working rather than changed without
+        // knowing what they do with it -- the same choice DESIGN D35 made
+        // for StageLinQ's 1.7.0 (AUDIT NET-10, deferred).
         p[64] = 1; p[65] = 7; p[66] = 0;
         broadcastSocket->write(broadcastIp, kPortBroadcast, p, 68);
     }
@@ -1311,6 +1323,10 @@ private:
     LayerData layers[kPacketLayers] = {};
     LayerData emptyLayer;
     SlaveNode slaves[kMaxSlaves] = {};
+    // Fixed: two STCs on one network (a main and a backup) send the same
+    // NodeID and NodeName, and each takes the other's OptIn for its own
+    // (pollDiscovery).  Left as is: what receivers do with two nodes of one
+    // ID is not known without a capture (AUDIT NET-8, deferred).
     char nodeName[9] = {};
     uint16_t nodeId = 0x5443;
     uint8_t seq = 0;
