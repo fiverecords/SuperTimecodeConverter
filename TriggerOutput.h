@@ -16,7 +16,8 @@
 // When a track change is detected and the track has triggers configured,
 // fires the appropriate MIDI and/or OSC messages.
 //
-// MIDI output device is independent from MTC output.
+// The MIDI device can be the MTC output's: both then hold the same
+// MidiOutputHub port, and every send goes through its lock (DESIGN D32).
 //==============================================================================
 class TriggerOutput
 {
@@ -56,7 +57,7 @@ public:
             return false;
 
         // The same port object as the MTC output when both name one device
-        // (MidiOutputHub, D32), so the two never race on it.
+        // (MidiOutputHub, DESIGN D32), so the two never race on it.
         ownPort = MidiOutputHub::get().acquire(midiDevices[deviceIndex]);
         if (ownPort)
         {
@@ -109,7 +110,7 @@ public:
 
     /// Drop our OWN port (if open) without affecting the shared one.  Used
     /// before MtcOutput opens the same device -- a double open conflicted
-    /// before D32; MidiOutputHub now hands both the same port.
+    /// before DESIGN D32; MidiOutputHub now hands both the same port.
     void releaseOwnMidi()
     {
         if (ownPort)
@@ -174,9 +175,11 @@ public:
     /// NOTE: This method is called from TimecodeEngine::tick() which runs on the
     /// JUCE message thread (60Hz timer callback).  Port::send is synchronous
     /// and may briefly block (~microseconds on healthy drivers, or up to a few
-    /// ms if another thread is sending a SysEx on the same port).  For Note On +
-    /// Note Off back-to-back, two synchronous calls are made.  This is acceptable
-    /// for show control trigger use cases but could cause a UI stutter if a MIDI
+    /// ms if another thread is sending a SysEx on the same port).  A note
+    /// trigger sends its Note On here and its Note Off kTriggerNoteHoldMs
+    /// later, from a message-thread callback (sendTriggerNote, AUDIT C7);
+    /// a CC is one more synchronous send.  This is acceptable for show
+    /// control trigger use cases but could cause a UI stutter if a MIDI
     /// driver is exceptionally slow.
     void fire(const TrackMapEntry& entry)
     {
