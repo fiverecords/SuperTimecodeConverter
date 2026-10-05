@@ -39,6 +39,17 @@ static uint32_t bpmToTimes100(double bpm)
 }
 
 //==============================================================================
+// An Engine DJ cue's sample offset as ms, 0 when it is not a finite value
+// that fits: the database is the device's, and a double -> uint32_t cast of
+// a value out of range is undefined.
+//==============================================================================
+static uint32_t denonCueToMs(double sampleOffset, double sampleRate)
+{
+    const double ms = sampleOffset / sampleRate * 1000.0;
+    return (std::isfinite(ms) && ms >= 0.0 && ms <= 4294967295.0) ? (uint32_t) ms : 0u;
+}
+
+//==============================================================================
 // BACKGROUND AUDIO DEVICE SCANNER
 //==============================================================================
 MainComponent::AudioScanThread::AudioScanThread(MainComponent* owner)
@@ -995,6 +1006,9 @@ MainComponent::MainComponent()
                 displayedArtworkId = 0;
                 artworkDisplay.clearImage();
                 displayedWaveformTrackId = 0;
+                displayedSlqTrackVersion = 0;
+                slqPanelClearedFor = 0;
+                displayedPdlMedia.clear();
                 waveformDisplay.clearWaveform();
                 lblProDJLinkTrackInfo.setText("", juce::dontSendNotification);
                 lblProDJLinkMetadata.setText("", juce::dontSendNotification);
@@ -3425,14 +3439,18 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
             && TrackMapEntry::makeKey(info.artist, info.title, info.durationSec)
                 == entry->key())
         {
-            if (info.trackId != 0)
+            // The dbserver cache holds Pro DJ Link tracks only, keyed by the
+            // player holding the media, the slot and the rekordbox ID
+            // (AUDIT META-5); a StageLinQ engine's track ID is something else.
+            if (info.trackId != 0 && eng->getActiveInput() == SrcType::ProDJLink)
             {
-                auto meta = sharedDbClient.getCachedMetadataByTrackId(info.trackId);
+                const auto media = getPdlMediaSource(eng->getEffectivePlayer());
+                auto meta = sharedDbClient.getCachedMetadata(media.ip, media.slot, info.trackId);
 
                 // Artwork
                 if (meta.artworkId != 0)
                 {
-                    auto art = sharedDbClient.getCachedArtwork(meta.artworkId);
+                    auto art = sharedDbClient.getCachedArtwork(media.ip, media.slot, meta.artworkId);
                     if (art.isValid())
                     {
                         cuePointWindow->setArtwork(art);
@@ -3525,7 +3543,8 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
             uint32_t tid = sharedProDJLinkInput.getTrackID(pn);
             if (tid == 0) continue;
 
-            auto meta = sharedDbClient.getCachedMetadataByTrackId(tid);
+            const auto media = getPdlMediaSource(pn);
+            auto meta = sharedDbClient.getCachedMetadata(media.ip, media.slot, tid);
             if (!meta.isValid()) continue;
 
             auto metaKey = TrackMapEntry::makeKey(meta.artist, meta.title, meta.durationSeconds);
@@ -3533,7 +3552,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
 
             if (!foundArtwork && meta.artworkId != 0)
             {
-                auto art = sharedDbClient.getCachedArtwork(meta.artworkId);
+                auto art = sharedDbClient.getCachedArtwork(media.ip, media.slot, meta.artworkId);
                 if (art.isValid())
                 {
                     cuePointWindow->setArtwork(art);
@@ -8645,11 +8664,32 @@ void MainComponent::timerCallback()
             }
         }
 
+        // Artwork and waveform come from the DbServerClient cache entry of
+        // the SOURCE player (the CDJ that holds the media), its slot and the
+        // track's ID, as TimecodeEngine::requestDbMetadata keyed the request.
+        // When CDJ 2 loads a track from CDJ 1's USB via Link export, CDJ 2's
+        // own address finds nothing; and rekordbox IDs are per export, so the
+        // same ID from another medium is another track (AUDIT META-5).  A
+        // change of medium therefore shows as a new track here.
+        const auto media = getPdlMediaSource(pdlPlayer);
+        {
+            const juce::String mediaKey = media.ip + "/" + juce::String((int) media.slot);
+            if (mediaKey != displayedPdlMedia)
+            {
+                displayedPdlMedia = mediaKey;
+                displayedArtworkId = 0;
+                displayedWaveformTrackId = 0;
+            }
+        }
+        // The StageLinQ branch below shares the two displays.
+        displayedSlqTrackVersion = 0;
+        slqPanelClearedFor = 0;
+
         // Phase 2c: update artwork from DbServerClient cache
         uint32_t artId = trackInfo.artworkId;
         if (artId != 0 && artId != displayedArtworkId)
         {
-            auto artImg = sharedDbClient.getCachedArtwork(artId);
+            auto artImg = sharedDbClient.getCachedArtwork(media.ip, media.slot, artId);
             if (artImg.isValid())
             {
                 artworkDisplay.setImage(artImg);
@@ -8662,30 +8702,16 @@ void MainComponent::timerCallback()
             displayedArtworkId = 0;
         }
 
-        // Phase 3: update color waveform from DbServerClient cache
-        //
-        // IMPORTANT: Use the SOURCE player's IP (the CDJ that owns the media),
-        // not the deck's own IP.  When CDJ 2 loads a track from CDJ 1's USB
-        // via Link export, the cache entry is keyed by CDJ 1's IP (set by
-        // TimecodeEngine::requestDbMetadata).  Looking up with CDJ 2's IP
-        // would miss the cache entry and the waveform would never load.
+        // Phase 3: update color waveform from DbServerClient cache.  The
+        // waveform arrives after the metadata; until it is there the entry
+        // is looked at again only when its version has changed -- a version
+        // read, no copy, per tick (AUDIT META-16, which the TCNet feed
+        // shares).
         uint32_t wfTrackId = trackInfo.trackId;
-        uint8_t wfSrcPlayer = sharedProDJLinkInput.getLoadedPlayer(pdlPlayer);
-        if (wfSrcPlayer == 0) wfSrcPlayer = (uint8_t)pdlPlayer;
-        juce::String srcIP = sharedProDJLinkInput.getPlayerIP((int)wfSrcPlayer);
-        if (srcIP.isEmpty()) srcIP = sharedProDJLinkInput.getPlayerIP(pdlPlayer);
-
-        if (wfTrackId != 0 && wfTrackId != displayedWaveformTrackId)
+        auto showCachedWaveform = [&]
         {
-            // Track changed -- clear old waveform immediately (avoids stale cursor)
-            waveformDisplay.clearWaveform();
-            // Mark this track as "attempted" so we don't re-enter this block
-            // every frame.  The retry path below uses hasWaveformData() to
-            // detect when the async waveform query completes.
-            displayedWaveformTrackId = wfTrackId;
-
-            // Try to populate from cache (may not have waveform yet)
-            auto meta = sharedDbClient.getCachedMetadata(srcIP, wfTrackId);
+            displayedWaveformVersion = sharedDbClient.getMetadataVersion(media.ip, media.slot, wfTrackId);
+            auto meta = sharedDbClient.getCachedMetadata(media.ip, media.slot, wfTrackId);
             if (meta.hasWaveform())
             {
                 waveformDisplay.setColorWaveformData(meta.waveformData,
@@ -8700,24 +8726,26 @@ void MainComponent::timerCallback()
                 if (meta.hasBeatGrid())
                     eng.setBeatGrid(meta.beatGrid, wfTrackId);
             }
-        }
-        else if (wfTrackId != 0 && !waveformDisplay.hasWaveformData())
+        };
+
+        if (wfTrackId != 0 && wfTrackId != displayedWaveformTrackId)
         {
-            // Waveform not yet loaded -- retry from cache (async: arrives after metadata)
-            auto meta = sharedDbClient.getCachedMetadata(srcIP, wfTrackId);
-            if (meta.hasWaveform())
-            {
-                waveformDisplay.setColorWaveformData(meta.waveformData,
-                    meta.waveformEntryCount, meta.waveformBytesPerEntry);
-                if (meta.durationSeconds > 0)
-                    waveformDisplay.setDurationMs((uint32_t)meta.durationSeconds * 1000);
-                if (meta.hasCueList())
-                    waveformDisplay.setRekordboxCues(meta.cueList);
-                if (meta.hasBeatGrid())
-                    waveformDisplay.setBeatGrid(meta.beatGrid);
-                if (meta.hasBeatGrid())
-                    eng.setBeatGrid(meta.beatGrid, wfTrackId);
-            }
+            // Track changed -- clear old waveform immediately (avoids stale cursor)
+            waveformDisplay.clearWaveform();
+            // Mark this track as "attempted" so we don't re-enter this block
+            // every frame.  The retry path below uses hasWaveformData() to
+            // detect when the async waveform query completes.
+            displayedWaveformTrackId = wfTrackId;
+
+            // Try to populate from cache (may not have waveform yet)
+            showCachedWaveform();
+        }
+        else if (wfTrackId != 0 && !waveformDisplay.hasWaveformData()
+                 && sharedDbClient.getMetadataVersion(media.ip, media.slot, wfTrackId) != displayedWaveformVersion)
+        {
+            // Waveform not yet loaded and the entry has changed -- retry
+            // from cache (async: arrives after metadata)
+            showCachedWaveform();
         }
         else if (wfTrackId == 0 && displayedWaveformTrackId != 0)
         {
@@ -8776,10 +8804,19 @@ void MainComponent::timerCallback()
                     slqMeta += "  -> " + juce::String(multBpm, 1) + " (" + multLabel + ")";
                 }
             }
-            double slqSpeed = sharedStageLinQInput.getActualSpeed(slqDeck);
-            if (slqSpeed > 0.01)
+            // The pitch as the device states it (SpeedState); the speed
+            // measured from BeatInfo scatters by 0.3 % a message and made the
+            // figure flicker.  The measured one only when SpeedState is absent.
+            double pitchPct = 0.0;
+            bool havePitch = sharedStageLinQInput.getPitchPercent(slqDeck, pitchPct);
+            if (!havePitch)
             {
-                double pitchPct = (slqSpeed - 1.0) * 100.0;
+                const double slqSpeed = sharedStageLinQInput.getActualSpeed(slqDeck);
+                havePitch = slqSpeed > 0.01;
+                pitchPct = (slqSpeed - 1.0) * 100.0;
+            }
+            if (havePitch)
+            {
                 slqMeta += "  " + (pitchPct >= 0.0 ? juce::String("+") : juce::String(""))
                                 + juce::String(pitchPct, 2) + "%";
             }
@@ -8793,19 +8830,34 @@ void MainComponent::timerCallback()
             // Next cue countdown
             updateNextCueLabel(eng);
 
-            // Artwork + waveform from StageLinQ database
-            if (sharedStageLinQDb.isDatabaseReady())
+            // Artwork + waveform from StageLinQ database.  The panel's
+            // StageLinQ state is a track version, kept apart from the Pro DJ
+            // Link branch's rekordbox IDs, which the two used to share
+            // (AUDIT SLQ-12); each branch resets the other's.
+            displayedWaveformTrackId = 0;
+            displayedArtworkId = 0;
+            displayedPdlMedia.clear();
             {
                 auto netPath = sharedStageLinQInput.getTrackNetworkPath(slqDeck);
                 uint32_t slqTrackVer = sharedStageLinQInput.getTrackVersion(slqDeck);
 
                 // Only update displays on track change (avoid 60Hz cache thrashing)
-                if (netPath.isNotEmpty() && slqTrackVer != displayedWaveformTrackId)
+                if (netPath.isNotEmpty() && slqTrackVer != displayedSlqTrackVersion)
                 {
-                    auto dbMeta = sharedStageLinQDb.getTrackByNetworkPath(netPath);
+                    auto dbMeta = sharedStageLinQDb.isDatabaseReady()
+                                    ? sharedStageLinQDb.getTrackByNetworkPath(netPath) : DenonTrackMeta{};
+                    if (!dbMeta.valid && slqPanelClearedFor != slqTrackVer)
+                    {
+                        // Not in the database (or none loaded yet): clear the
+                        // previous track's artwork and waveform rather than
+                        // leave them up, and keep looking (AUDIT SLQ-12).
+                        slqPanelClearedFor = slqTrackVer;
+                        artworkDisplay.clearImage();
+                        waveformDisplay.clearWaveform();
+                    }
                     if (dbMeta.valid)
                     {
-                        displayedWaveformTrackId = slqTrackVer;
+                        displayedSlqTrackVersion = slqTrackVer;
 
                         auto artImg = sharedStageLinQDb.getArtworkForTrack(netPath);
                         if (artImg.isValid())
@@ -8840,7 +8892,7 @@ void MainComponent::timerCallback()
                                 TrackMetadata::RekordboxCue rc;
                                 rc.type = TrackMetadata::RekordboxCue::HotCue;
                                 rc.hotCueNumber = (uint8_t)(ci + 1);
-                                rc.positionMs = (uint32_t)((qc.sampleOffset / perf.sampleRate) * 1000.0);
+                                rc.positionMs = denonCueToMs(qc.sampleOffset, perf.sampleRate);
                                 rc.colorR = qc.r;
                                 rc.colorG = qc.g;
                                 rc.colorB = qc.b;
@@ -8867,7 +8919,7 @@ void MainComponent::timerCallback()
                                     {
                                         auto& qc = perf.quickCues[(size_t)ci];
                                         if (!qc.isSet()) continue;
-                                        uint32_t posMs = (uint32_t)((qc.sampleOffset / perf.sampleRate) * 1000.0);
+                                        uint32_t posMs = denonCueToMs(qc.sampleOffset, perf.sampleRate);
                                         if (posMs == 0) continue;
 
                                         CuePoint cp;
@@ -8889,11 +8941,12 @@ void MainComponent::timerCallback()
                         }
                     }
                 }
-                else if (netPath.isEmpty() && displayedWaveformTrackId != 0)
+                else if (netPath.isEmpty() && (displayedSlqTrackVersion != 0 || slqPanelClearedFor != 0))
                 {
                     artworkDisplay.clearImage();
                     waveformDisplay.clearWaveform();
-                    displayedWaveformTrackId = 0;
+                    displayedSlqTrackVersion = 0;
+                    slqPanelClearedFor = 0;
                 }
             }
 
@@ -8950,11 +9003,15 @@ void MainComponent::timerCallback()
             artworkDisplay.clearImage();
             displayedArtworkId = 0;
         }
-        if (displayedWaveformTrackId != 0)
+        if (displayedWaveformTrackId != 0 || displayedSlqTrackVersion != 0 || slqPanelClearedFor != 0)
         {
+            artworkDisplay.clearImage();
             waveformDisplay.clearWaveform();
             displayedWaveformTrackId = 0;
+            displayedSlqTrackVersion = 0;
+            slqPanelClearedFor = 0;
         }
+        displayedPdlMedia.clear();
     }
 
     // Ableton Link status label
@@ -9355,10 +9412,13 @@ void MainComponent::saveBpmMultToTrackMap(int clickedMult)
         newEntry.durationSec = info.durationSec;
         newEntry.bpmMultiplier = newValue;
 
-        // Auto-populate cue points from rekordbox if available
-        if (info.trackId != 0)
+        // Auto-populate cue points from rekordbox if available: the cache
+        // entry of the medium the track was loaded from (AUDIT META-5); only
+        // a Pro DJ Link engine's track ID is a rekordbox ID.
+        if (info.trackId != 0 && eng.getActiveInput() == SrcType::ProDJLink)
         {
-            auto meta = sharedDbClient.getCachedMetadataByTrackId(info.trackId);
+            const auto media = getPdlMediaSource(eng.getEffectivePlayer());
+            auto meta = sharedDbClient.getCachedMetadata(media.ip, media.slot, info.trackId);
             if (meta.isValid() && !meta.cueList.empty())
             {
                 for (auto& rc : meta.cueList)
