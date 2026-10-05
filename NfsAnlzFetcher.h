@@ -87,9 +87,10 @@ public:
     //==========================================================================
 
     /// Complete NFS pipeline: download export.pdb, find ANLZ path for the
-    /// given track ID, download BOTH .DAT and .EXT files, parse and merge.
+    /// given track ID, download BOTH .DAT and .EXT files, parse and merge
+    /// (see mergeDatExt).
     /// .DAT has: PQTZ (beat grid), PCOB (standard cues), PPTH, PVBR, PWAV
-    /// .EXT has: PCO2 (extended cues), PSSI (song structure), PWV4, PWV5
+    /// .EXT has: PCO2 and PCOB (cues), PSSI (song structure), PWV3, PWV4, PWV5
     AnlzResult fetchByTrackId(const juce::String& playerIP, uint8_t slot,
                               uint32_t trackId)
     {
@@ -112,71 +113,20 @@ public:
 
         DBG("NfsAnlzFetcher: found ANLZ path: " + anlzPath);
 
-        // Ensure we have the .DAT base path
-        juce::String datPath = anlzPath;
-        if (!datPath.endsWithIgnoreCase(".DAT"))
-            datPath = datPath.upToLastOccurrenceOf(".", false, true) + ".DAT";
-        juce::String extPath = datPath.dropLastCharacters(4) + ".EXT";
-
-        // Step 2: Download .DAT (has beat grid PQTZ + standard cues PCOB)
-        juce::MemoryBlock datData;
-        if (nfsDownloadFile(playerIP, mountPath, datPath, datData))
-        {
-            DBG("NfsAnlzFetcher: .DAT downloaded " + juce::String((int)datData.getSize()) + " bytes");
-            result = parseAnlzFile(datData);
-        }
-        else
-        {
-            DBG("NfsAnlzFetcher: .DAT download failed");
-        }
-
-        // Step 3: Download .EXT (has extended cues PCO2 + song structure PSSI)
-        juce::MemoryBlock extData;
-        if (nfsDownloadFile(playerIP, mountPath, extPath, extData))
-        {
-            DBG("NfsAnlzFetcher: .EXT downloaded " + juce::String((int)extData.getSize()) + " bytes");
-            auto extResult = parseAnlzFile(extData);
-
-            // Merge: .EXT data overwrites .DAT data where available
-            if (!extResult.cueList.empty())
-                result.cueList = std::move(extResult.cueList);
-            if (!extResult.songStructure.empty())
-            {
-                result.songStructure = std::move(extResult.songStructure);
-                result.phraseMood = extResult.phraseMood;
-            }
-            if (extResult.detailEntryCount > 0 && result.detailEntryCount == 0)
-            {
-                result.detailData = std::move(extResult.detailData);
-                result.detailEntryCount = extResult.detailEntryCount;
-                result.detailBytesPerEntry = extResult.detailBytesPerEntry;
-            }
-            // Beat grid stays from .DAT (PQTZ is only in .DAT)
-            result.ok = true;
-        }
-        else
-        {
-            DBG("NfsAnlzFetcher: .EXT download failed");
-        }
-
-        if (!result.ok && !result.beatGrid.empty())
-            result.ok = true;
-
-        DBG("NfsAnlzFetcher: final merged -- beats=" + juce::String((int)result.beatGrid.size())
-            + " cues=" + juce::String((int)result.cueList.size())
-            + " phrases=" + juce::String((int)result.songStructure.size()));
-        return result;
+        // Steps 2-3: .DAT and .EXT
+        return fetchAnalysisFiles(playerIP, mountPath, anlzPath);
     }
 
     //==========================================================================
-    // High-level API: fetch and parse an ANLZ .EXT file from a CDJ
+    // High-level API: fetch ANLZ by the path dbserver gave
     //==========================================================================
 
-    /// Fetch the ANLZ .EXT file for a track and parse all tags.
+    /// Fetch the ANLZ .DAT and .EXT files of a track and merge them, as
+    /// fetchByTrackId does once it has the path.
     /// @param playerIP   IP address of the CDJ
     /// @param slot        Media slot (2=SD, 3=USB)
     /// @param anlzPath   Path from dbserver metadata, e.g. "PIONEER/USBANLZ/P053/0000/ANLZ0006.DAT"
-    ///                   The .DAT extension is replaced with .EXT automatically.
+    ///                   (.DAT, .EXT or .2EX; the other extension is derived).
     /// @return Parsed ANLZ data, or result with ok=false on failure.
     AnlzResult fetchAndParse(const juce::String& playerIP, uint8_t slot,
                              const juce::String& anlzPath)
@@ -194,28 +144,47 @@ public:
             return result;
         }
 
-        // Convert .DAT path to .EXT
-        juce::String extPath = anlzPath;
-        if (extPath.endsWithIgnoreCase(".DAT"))
-            extPath = extPath.dropLastCharacters(4) + ".EXT";
-        else if (!extPath.endsWithIgnoreCase(".EXT"))
-            extPath = extPath + ".EXT";
+        return fetchAnalysisFiles(playerIP, mountPath, anlzPath);
+    }
 
-        DBG("NfsAnlzFetcher: fetching " + mountPath + extPath + " from " + playerIP);
+    /// Merge what a track's .DAT and .EXT gave, file by file as beat-link's
+    /// CrateDigger reads them: the beat grid from the .DAT (PQTZ is a .DAT
+    /// tag); the cues from the .EXT when it has cue tags (its PCO2 lists, or
+    /// its PCOB when it has no PCO2 -- see parseAnlzFile), else from the .DAT;
+    /// the song structure (PSSI), the detail (PWV5) and the colour preview
+    /// (PWV4) from the .EXT.  Each falls back to the other file when the
+    /// preferred one does not have it.  ok if either file parsed.
+    static AnlzResult mergeDatExt(AnlzResult dat, AnlzResult ext)
+    {
+        if (!dat.ok) return ext;
+        if (!ext.ok) return dat;
 
-        // Download file via NFS
-        juce::MemoryBlock fileData;
-        if (!nfsDownloadFile(playerIP, mountPath, extPath, fileData))
+        AnlzResult m = std::move(dat);
+        if (m.beatGrid.empty())
+            m.beatGrid = std::move(ext.beatGrid);
+        if (ext.cueTagsFound)
         {
-            DBG("NfsAnlzFetcher: NFS download failed");
-            return result;
+            m.cueList = std::move(ext.cueList);
+            m.cueTagsFound = true;
         }
-
-        DBG("NfsAnlzFetcher: downloaded " + juce::String((int)fileData.getSize()) + " bytes");
-
-        // Parse the PMAI container
-        result = parseAnlzFile(fileData);
-        return result;
+        if (!ext.songStructure.empty())
+        {
+            m.songStructure = std::move(ext.songStructure);
+            m.phraseMood = ext.phraseMood;
+        }
+        if (ext.detailEntryCount > 0)
+        {
+            m.detailData = std::move(ext.detailData);
+            m.detailEntryCount = ext.detailEntryCount;
+            m.detailBytesPerEntry = ext.detailBytesPerEntry;
+        }
+        if (ext.previewEntryCount > 0)
+        {
+            m.previewData = std::move(ext.previewData);
+            m.previewEntryCount = ext.previewEntryCount;
+            m.previewBytesPerEntry = ext.previewBytesPerEntry;
+        }
+        return m;
     }
 
     /// Clear cached NFS mount handles for a player (call when player disappears).
@@ -726,6 +695,57 @@ private:
         }
 
         return true;
+    }
+
+    //==========================================================================
+    // A track's .DAT and .EXT
+    //==========================================================================
+
+    /// Download the .DAT and the .EXT of the analysis at @p anlzPath, parse
+    /// both and merge them (mergeDatExt).  crate-digger documents which tags
+    /// live in which file; beat-link's CrateDigger opens the .DAT for the beat
+    /// grid and the .EXT first for cues and waveforms.
+    AnlzResult fetchAnalysisFiles(const juce::String& playerIP, const juce::String& mountPath,
+                                  const juce::String& anlzPath)
+    {
+        juce::String basePath = anlzPath;
+        if (basePath.endsWithIgnoreCase(".DAT") || basePath.endsWithIgnoreCase(".EXT")
+            || basePath.endsWithIgnoreCase(".2EX"))
+            basePath = basePath.dropLastCharacters(4);
+        const juce::String datPath = basePath + ".DAT";
+        const juce::String extPath = basePath + ".EXT";
+
+        AnlzResult dat, ext;
+
+        // .DAT: beat grid (PQTZ), standard cues (PCOB)
+        juce::MemoryBlock datData;
+        if (nfsDownloadFile(playerIP, mountPath, datPath, datData))
+        {
+            DBG("NfsAnlzFetcher: .DAT downloaded " + juce::String((int)datData.getSize()) + " bytes");
+            dat = parseAnlzFile(datData);
+        }
+        else
+        {
+            DBG("NfsAnlzFetcher: .DAT download failed");
+        }
+
+        // .EXT: cues (PCO2/PCOB), song structure (PSSI), waveforms (PWV4, PWV5)
+        juce::MemoryBlock extData;
+        if (nfsDownloadFile(playerIP, mountPath, extPath, extData))
+        {
+            DBG("NfsAnlzFetcher: .EXT downloaded " + juce::String((int)extData.getSize()) + " bytes");
+            ext = parseAnlzFile(extData);
+        }
+        else
+        {
+            DBG("NfsAnlzFetcher: .EXT download failed");
+        }
+
+        auto result = mergeDatExt(std::move(dat), std::move(ext));
+        DBG("NfsAnlzFetcher: final merged -- beats=" + juce::String((int)result.beatGrid.size())
+            + " cues=" + juce::String((int)result.cueList.size())
+            + " phrases=" + juce::String((int)result.songStructure.size()));
+        return result;
     }
 
     //==========================================================================
