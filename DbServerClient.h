@@ -2804,8 +2804,14 @@ private:
                     cooldownRetries.erase(std::remove_if(cooldownRetries.begin(), cooldownRetries.end(),
                                                          [&ip](const CooldownRetry& r) { return r.req.playerIP == ip; }),
                                           cooldownRetries.end());
+                    nfsLostPlayers.addIfNotAlreadyThere(ip);
                 }
             }
+
+            // The NFS fetcher's state for lost players (mount handles, ports,
+            // ANLZ paths from the PDB) is dropped once no download is running.
+            if (!nfsLostPlayers.isEmpty() && nfsIdle())
+                forgetLostPlayersInNfs();
 
             // Close idle connections after kIdleTimeoutMs.  See the comment
             // on kIdleTimeoutMs above for the rationale -- the previous 1 s
@@ -3283,6 +3289,7 @@ private:
     NfsAnlzFetcher nfsAnlzFetcher;
     std::thread nfsThread;
     std::atomic<bool> nfsBusy { false };   // set by the worker at launch, cleared by the NFS thread when done
+    juce::StringArray nfsLostPlayers;      // worker thread only: lost players the fetcher still has to forget
 
     // dbserver port-discovery listener (TCP 12523).
     //
@@ -3408,6 +3415,7 @@ private:
             wait(50);
         }
         if (threadShouldExit()) return;
+        forgetLostPlayersInNfs();   // before a download could use their stale handles
 
         nfsBusy.store(true, std::memory_order_release);
         nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey]()
@@ -3442,6 +3450,18 @@ private:
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
         });
+    }
+
+    /// Worker thread, with no NFS download running (nfsIdle()).  Tell the
+    /// NFS fetcher to forget every player reported lost since the last call:
+    /// NfsAnlzFetcher::removePlayer(ip) for each (AUDIT META-4).  Called only
+    /// here, so the fetcher is never used by two threads at once.  Nothing
+    /// calls clearPdbCache(): no media-change signal reaches DbServerClient.
+    void forgetLostPlayersInNfs()
+    {
+        for (auto& ip : nfsLostPlayers)
+            nfsAnlzFetcher.removePlayer(ip);
+        nfsLostPlayers.clear();
     }
 
     /// Worker thread.  True when no NFS download is running; then joins the
