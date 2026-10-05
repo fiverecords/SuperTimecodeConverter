@@ -49,10 +49,11 @@ public:
             selectedChannel.store(ch, std::memory_order_relaxed);
         }
 
-        currentSampleRate = device->getCurrentSampleRate();
-        currentBufferSize = device->getCurrentBufferSizeSamples();
-
-        resetEncoder();
+        // The rate, the buffer size, the latency and the encoder reset were
+        // done in audioDeviceAboutToStart(), before the hub registered this
+        // callback.  From here on the audio thread may be running it, so
+        // nothing it reads is written here: the reset this function used to
+        // repeat raced the first callbacks (AUDIT LTC-17).
         peakLevel.store(0.0f, std::memory_order_relaxed);
         isRunningFlag.store(true, std::memory_order_relaxed);
         return true;

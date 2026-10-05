@@ -59,13 +59,12 @@ public:
         selectedChannel.store(selCh, std::memory_order_relaxed);
         passthruChannel.store(thruCh, std::memory_order_relaxed);
 
-        currentSampleRate = device->getCurrentSampleRate();
-        currentBufferSize = device->getCurrentBufferSizeSamples();
-
-        // resetDecoder() and resetPassthruBuffer() are called by
-        // audioDeviceAboutToStart() when addAudioCallback triggers the device;
-        // only peak levels need explicit reset here since they're not part of
-        // the device-start callback.
+        // The rate, the buffer size, the latency, resetDecoder() and
+        // resetPassthruBuffer() were done in audioDeviceAboutToStart(), before
+        // the hub registered this callback.  From here on the audio thread
+        // may be running it, so nothing it reads is written here (it used to
+        // rewrite the sample rate; AUDIT LTC-17).  Only the peak levels,
+        // which are atomics, are reset.
         ltcPeakLevel.store(0.0f, std::memory_order_relaxed);
         thruPeakLevel.store(0.0f, std::memory_order_relaxed);
         isRunningFlag.store(true, std::memory_order_relaxed);
