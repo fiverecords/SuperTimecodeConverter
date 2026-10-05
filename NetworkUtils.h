@@ -34,11 +34,14 @@ struct NetworkInterface
 //
 // includeLoopback appends "Localhost (127.0.0.1)" as the LAST entry, so the
 // interface indices stored in settings keep their meaning.  Its "broadcast"
-// address is 127.0.0.1 itself: a sender writing to it reaches every socket
-// on this machine bound to that port (Resolume, a console emulator, another
-// STC), which is what the software protocols -- TCNet, Art-Net, LA-Net,
-// HippoNet, OSC -- need when the receiver runs on the same PC (#20).  The
-// hardware protocols (Pro DJ Link, StageLinQ) do not ask for it.
+// address is 127.0.0.1 itself, so the software protocols -- TCNet, Art-Net,
+// LA-Net, HippoNet, OSC -- reach a receiver running on the same PC (#20).
+// That is a unicast, and it reaches ONE socket bound to the port, not every
+// one: with several (Resolume and a console emulator, another STC, or STC's
+// own TCNet discovery socket on 60000) the kernel picks -- on Linux the most
+// specific bind, then the one opened last (net_localhost_sim; macOS and
+// Windows untested, BENCH B36; AUDIT NET-3).  The hardware protocols (Pro DJ
+// Link, StageLinQ) do not ask for it.
 //==============================================================================
 inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback = false)
 {

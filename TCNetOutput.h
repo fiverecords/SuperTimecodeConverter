@@ -201,7 +201,14 @@ public:
             { listenerSocket = nullptr; /* non-fatal, unicast won't work */ }
 
         // Socket 4: listener on port 60000 for slave OptIn discovery
-        // (separate from our broadcast sender)
+        // (separate from our broadcast sender).  In Localhost mode STC's
+        // OptIn and Status go to 127.0.0.1:60000, a unicast that only one
+        // socket on the port gets: if the receiver on this PC opened 60000
+        // before STC, this socket is the one, and the receiver misses them
+        // (measured on Linux, net_localhost_sim).  The Time packets (60001),
+        // the OptIn unicast to discovered slaves and the replies are not
+        // affected.  Left as is: no fix that is both clear and local
+        // (AUDIT NET-3, BENCH B36).
         discoverySocket = std::make_unique<juce::DatagramSocket>(false);
         discoverySocket->setEnablePortReuse(true);
         if (!discoverySocket->bindToPort(kPortBroadcast))
