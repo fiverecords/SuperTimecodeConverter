@@ -310,40 +310,6 @@ public:
     }
 
     //==========================================================================
-    // Request artwork only (if metadata is cached but art isn't)
-    //==========================================================================
-    void requestArtwork(const juce::String& playerIP, uint8_t slot,
-                        uint8_t trackType, uint32_t artworkId, int ourPlayer)
-    {
-        if (artworkId == 0 || playerIP.isEmpty()) return;
-        if (ourPlayer < 1 || ourPlayer > 4) return;
-
-        // Check artwork cache
-        {
-            const juce::SpinLock::ScopedLockType lock(artCacheLock);
-            if (artworkCache.count(artworkId) > 0)
-                return;  // already cached
-        }
-
-        const juce::SpinLock::ScopedLockType producerLock(queueProducerLock);
-        uint32_t wp = reqWritePos.load(std::memory_order_relaxed);
-        uint32_t rp = reqReadPos.load(std::memory_order_acquire);
-        if (wp - rp >= kRequestQueueSize) return;
-
-        auto& req = requestQueue[wp & kRequestQueueMask];
-        req.playerIP  = playerIP;
-        req.slot      = slot;
-        req.trackType = trackType;
-        req.trackId   = 0;       // signals "artwork-only request"
-        req.artworkId = artworkId;
-        req.ourPlayer = (uint8_t)ourPlayer;
-        req.wantArt   = true;
-
-        reqWritePos.store(wp + 1, std::memory_order_release);
-        requestSemaphore.signal();
-    }
-
-    //==========================================================================
     // Retrieve cached metadata (called from UI/engine thread)
     //==========================================================================
     TrackMetadata getCachedMetadata(const juce::String& playerIP, uint32_t trackId) const
@@ -487,19 +453,6 @@ public:
         }
     }
 
-    /// Clear all caches
-    void clearCache()
-    {
-        {
-            const juce::SpinLock::ScopedLockType lock(cacheLock);
-            metadataCache.clear();
-        }
-        {
-            const juce::SpinLock::ScopedLockType lock(artCacheLock);
-            artworkCache.clear();
-        }
-    }
-
     /// Stats for UI/debugging
     int getCacheSize() const
     {
@@ -507,7 +460,6 @@ public:
         return (int)metadataCache.size();
     }
 
-    uint32_t getQueryCount() const  { return queryCount.load(std::memory_order_relaxed); }
     uint32_t getErrorCount() const  { return errorCount.load(std::memory_order_relaxed); }
 
     /// Inbound TCP connections accepted on port 12523 since start().
@@ -536,7 +488,6 @@ private:
         r.ourPlayer   = ourPlayer;
         r.wantArt     = false;
         r.wantWaveform = true;
-        r.artworkId   = 0;
         r.phase       = phase;
 
         reqWritePos.store(wp + 1, std::memory_order_release);
@@ -547,7 +498,6 @@ private:
     // Constants
     //==========================================================================
     static constexpr int kPortDiscoveryPort = 12523;
-    static constexpr int kDefaultDbPort     = 1051;
     static constexpr int kConnectTimeoutMs  = 3000;
     static constexpr int kReadTimeoutMs     = 1000;  // CDJ responds in <10ms; 3000 was wasteful
     static constexpr int kMaxCacheEntries   = 256;
@@ -623,7 +573,6 @@ private:
         juce::String playerIP;
         juce::String playerModel;  // e.g. "CDJ-3000", "CDJ-2000NXS2"
         uint32_t trackId   = 0;
-        uint32_t artworkId = 0;
         uint8_t  slot      = 0;
         uint8_t  trackType = 1;
         uint8_t  ourPlayer = 1;
@@ -1820,24 +1769,6 @@ private:
         return (uint16_t(p[0]) << 8) | p[1];
     }
 
-    /// Hex dump for debug logging (first N bytes).
-#if JUCE_DEBUG
-    static juce::String hexDump(const void* data, int size, int maxBytes = 64)
-    {
-        const uint8_t* p = static_cast<const uint8_t*>(data);
-        int n = juce::jmin(size, maxBytes);
-        juce::String s;
-        for (int i = 0; i < n; i++)
-        {
-            if (i > 0 && i % 16 == 0) s += "\n  ";
-            else if (i > 0) s += " ";
-            s += juce::String::toHexString(p[i]).paddedLeft('0', 2);
-        }
-        if (n < size) s += " ...(" + juce::String(size - n) + " more)";
-        return s;
-    }
-#endif
-
     //==========================================================================
     // BEAT GRID QUERY (PQTZ tag from .EXT via 0x2c04)
     //==========================================================================
@@ -2637,8 +2568,6 @@ private:
 
     void processRequest(const MetadataRequest& req)
     {
-        queryCount.fetch_add(1, std::memory_order_relaxed);
-
         auto* conn = getConnection(req.playerIP, req.ourPlayer);
         if (!conn)
         {
@@ -2999,14 +2928,6 @@ private:
                 }
             }
         }
-        else if (req.artworkId != 0)
-        {
-            // Artwork-only request
-            auto img = queryArtwork(*conn, req.slot, req.trackType,
-                                     req.artworkId, req.ourPlayer);
-            if (img.isValid())
-                cacheArtwork(req.artworkId, img);
-        }
     }
 
     //==========================================================================
@@ -3015,7 +2936,7 @@ private:
     std::atomic<bool> isRunningFlag { false };
 
     // Request queue (MPSC: any thread produces via queueLock, DB thread consumes)
-    juce::SpinLock queueProducerLock;  // serialises requestMetadata/requestArtwork callers
+    juce::SpinLock queueProducerLock;  // serialises requestMetadata callers (and enqueueInternal)
     std::array<MetadataRequest, kRequestQueueSize> requestQueue;
     std::atomic<uint32_t> reqWritePos { 0 };
     std::atomic<uint32_t> reqReadPos  { 0 };
@@ -3046,7 +2967,6 @@ private:
     std::unordered_map<uint32_t, juce::Image> artworkCache;
 
     // Stats
-    std::atomic<uint32_t> queryCount { 0 };
     std::atomic<uint32_t> dbPortInboundCount { 0 };  // TCP 12523 accepts (diagnostic)
     std::atomic<uint32_t> errorCount { 0 };
 
