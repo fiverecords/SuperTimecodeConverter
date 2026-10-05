@@ -864,6 +864,10 @@ public:
 
     /// Find by artist+title, ignoring duration.  Used as a last-resort fallback
     /// when the caller's duration doesn't match the entry's saved duration.
+    /// An entry saved without duration wins; among entries saved with one,
+    /// the shortest duration (then the smallest key) -- the same entry
+    /// every time, for every caller.  The first match in hash order, as
+    /// before, could change when the map rehashed (AUDIT SET-9).
     const TrackMapEntry* findIgnoringDuration(const juce::String& artist,
                                               const juce::String& title) const
     {
@@ -873,24 +877,24 @@ public:
         if (it != entries.end()) return &it->second;
         // Prefix match (entry saved with some duration: "base|NNN")
         auto prefix = base + "|";
+        const TrackMapEntry* best = nullptr;
+        const std::string* bestKey = nullptr;
         for (auto& [k, v] : entries)
-            if (k.size() > prefix.size() && k.substr(0, prefix.size()) == prefix)
-                return &v;
-        return nullptr;
+            if (k.size() > prefix.size() && k.compare(0, prefix.size(), prefix) == 0
+                && (best == nullptr || v.durationSec < best->durationSec
+                    || (v.durationSec == best->durationSec && k < *bestKey)))
+            {
+                best = &v;
+                bestKey = &k;
+            }
+        return best;
     }
 
     /// Mutable version of findIgnoringDuration
     TrackMapEntry* findIgnoringDuration(const juce::String& artist,
                                         const juce::String& title)
     {
-        auto base = TrackMapEntry::makeKey(artist, title, 0);
-        auto it = entries.find(base);
-        if (it != entries.end()) return &it->second;
-        auto prefix = base + "|";
-        for (auto& [k, v] : entries)
-            if (k.size() > prefix.size() && k.substr(0, prefix.size()) == prefix)
-                return &v;
-        return nullptr;
+        return const_cast<TrackMapEntry*>(static_cast<const TrackMap&>(*this).findIgnoringDuration(artist, title));
     }
 
     //------------------------------------------------------------------
