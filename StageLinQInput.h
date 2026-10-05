@@ -795,14 +795,23 @@ struct StageLinQDeckState
     juce::String          trackNetworkPath;        // from Track/TrackNetworkPath (guarded by metaMutex)
     juce::String          trackUri;                // from Track/TrackUri (streaming) (guarded by metaMutex)
     juce::String          soundSwitchGuid;         // from Track/SoundSwitchGuid (guarded by metaMutex)
-    std::atomic<double>   trackLength { 0.0 };     // seconds, from Track/TrackLength
+    // Track/TrackLength is in samples, not seconds (AUDIT SLQ-2): the #23
+    // PRIME 4+ capture has 49,545,472 for a 1123.5 s track at 44.1 kHz, and
+    // its TrackBytes, 297,272,864, is six bytes a sample (24-bit stereo)
+    // plus a 32-byte header.  Seconds are worked out with Track/SampleRate
+    // when asked (getTrackLengthSec): the rate may come after the length,
+    // as it does in that capture's subscription dump.  Samples are
+    // confirmed on that unit only (Engine OS 5.0.4); chrisle's
+    // docs/protocol.md calls it a duration in seconds, and a unit that
+    // sent seconds would read as a length of 0 s here (BENCH).
+    std::atomic<double>   trackLengthSamples { 0.0 }; // from Track/TrackLength (samples)
     std::atomic<bool>     songLoaded { false };     // from Track/SongLoaded
     std::atomic<bool>     songAnalyzed { false };   // from Track/SongAnalyzed
     std::atomic<double>   trackBPM { 0.0 };        // from Track/CurrentBPM
-    std::atomic<double>   cuePosition { 0.0 };     // from Track/CuePosition
+    std::atomic<double>   cuePosition { 0.0 };     // from Track/CuePosition (samples: 11659.7 in the #23 capture, 0.26 s)
     std::atomic<int>      currentKeyIndex { -1 };  // from Track/CurrentKeyIndex (live, changes with key shift)
     std::atomic<bool>     keyLock { false };        // from Track/KeyLock
-    std::atomic<double>   sampleRate { 44100.0 };  // from Track/SampleRate
+    std::atomic<double>   sampleRate { 44100.0 };  // from Track/SampleRate (44100 in the #23 captures)
     std::atomic<int>      trackBytes { 0 };        // from Track/TrackBytes (file size)
     std::atomic<bool>     trackWasPlayed { false }; // from Track/TrackWasPlayed
     std::atomic<int>      playPauseLEDState { 0 }; // from Track/PlayPauseLEDState
@@ -867,7 +876,7 @@ struct StageLinQDeckState
             trackUri.clear();
             soundSwitchGuid.clear();
         }
-        trackLength.store(0.0);
+        trackLengthSamples.store(0.0);
         songLoaded.store(false);
         songAnalyzed.store(false);
         trackBPM.store(0.0);
@@ -1153,21 +1162,25 @@ public:
         return 1.0;
     }
 
+    /// Track length in seconds: Track/TrackLength (samples) over
+    /// Track/SampleRate (AUDIT SLQ-2; it was stored as seconds, so a 1123 s
+    /// track read 49.5 million seconds).
     uint32_t getTrackLengthSec(int deckNum) const
     {
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0;
-        return (uint32_t)decks[idx].trackLength.load(std::memory_order_relaxed);
+        const double sec = getTrackLengthSecExact(idx);
+        return (uint32_t)juce::jlimit(0.0, 86400.0, sec);   // a day at most: off the wire
     }
 
     float getPlayPositionRatio(int deckNum) const
     {
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 0.0f;
-        double len = decks[idx].trackLength.load(std::memory_order_relaxed);
-        if (len <= 0.0) return 0.0f;
+        const double len = getTrackLengthSecExact(idx);
+        if (!(len > 0.0)) return 0.0f;
         double posMs = (double)decks[idx].playheadMs.load(std::memory_order_relaxed);
-        return juce::jlimit(0.0f, 1.0f, (float)(posMs / (len * 1000.0)));
+        return (float)juce::jlimit(0.0, 1.0, posMs / (len * 1000.0));
     }
 
     TrackInfo getTrackInfo(int deckNum) const
@@ -1497,15 +1510,31 @@ public:
         return (uint8_t)juce::jlimit(1, 4, beatInBar);
     }
 
-    // Set track length from TrackMap (same pattern as ProDJLinkInput)
+    // Set track length from TrackMap (same pattern as ProDJLinkInput; no
+    // caller today).  Stored in samples, as Track/TrackLength is.
     void setTrackLengthSec(int deckNum, uint32_t seconds)
     {
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return;
-        decks[idx].trackLength.store((double)seconds, std::memory_order_relaxed);
+        decks[idx].trackLengthSamples.store((double)seconds * effectiveSampleRate(idx), std::memory_order_relaxed);
     }
 
 private:
+    /// Track/SampleRate, or 44100 when the device has not sent a usable one
+    /// (DESIGN D35 assumed 44100; the #23 captures confirm it).
+    double effectiveSampleRate(int idx) const
+    {
+        const double sr = decks[(size_t)idx].sampleRate.load(std::memory_order_relaxed);
+        return (std::isfinite(sr) && sr > 0.0) ? sr : 44100.0;
+    }
+
+    double getTrackLengthSecExact(int idx) const
+    {
+        const double samples = decks[(size_t)idx].trackLengthSamples.load(std::memory_order_relaxed);
+        if (!std::isfinite(samples) || samples <= 0.0) return 0.0;
+        return samples / effectiveSampleRate(idx);
+    }
+
     //==========================================================================
     // Thread main loop
     //==========================================================================
@@ -1965,7 +1994,7 @@ private:
             }
             else if (sub == "Track/TrackLength")
             {
-                dk.trackLength.store(value.asDouble(), std::memory_order_relaxed);
+                dk.trackLengthSamples.store(value.asDouble(), std::memory_order_relaxed);
             }
             else if (sub == "Track/SongLoaded")
             {
