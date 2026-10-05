@@ -112,7 +112,8 @@ namespace StageLinQ
     // cannot be interrupted is one TCP connect (kSocketTimeoutMs); every wait
     // besides is cut short by stopThread() or checks threadShouldExit()
     // (AUDIT SLQ-6: a 2 s connect plus a 500 ms sleep outlasted the 2 s
-    // stopThread, which then killed the thread).
+    // stopThread, which then killed the thread).  The database client's
+    // start(), called on a connection thread, does not wait for its session.
     static constexpr int    kConnectionStopMs      = kSocketTimeoutMs + 2000;
 
     // Largest StateMap or BeatInfo block accepted from the wire; a longer

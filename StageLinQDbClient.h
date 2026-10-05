@@ -309,40 +309,66 @@ public:
     }
 
     //--------------------------------------------------------------------------
-    // Start: connect to FileTransfer service at given IP:port
+    // Start: serve the database of the device at ip, FileTransfer port
+    // fileTransferPort.  Called on a StageLinQ connection thread
+    // (onFileTransferAvailable) each time a device's services are found,
+    // i.e. on every (re)connection.  It only records what is wanted and
+    // wakes this client's thread, which runs the sessions: it never waits
+    // for one (StageLinQ::kConnectionStopMs counts on that).
+    //  - While a session is wanted, another device's offer is ignored: one
+    //    database, the first device's (AUDIT SLQ-3).  The same device on
+    //    the same port (a reconnection) keeps what is loaded.
+    //  - The same device on another port has restarted its services (the
+    //    PRIME 4+ had a new port in each #23 capture): the session ends and
+    //    the database is fetched again (AUDIT SLQ-9).
+    //  - After a session failed (no sources, download or open failed), the
+    //    next device to offer FileTransfer starts a new one.
+    // start() and stop() are serialised.  MainComponent calls stop() only
+    // after StageLinQInput::stop() has joined the connection threads, so a
+    // start() does not wait on a stop() there.
     //--------------------------------------------------------------------------
     bool start(const juce::String& ip, uint16_t fileTransferPort,
                const uint8_t tkn[StageLinQ::kTokenLen])
     {
-        if (isRunningFlag.load()) return true;
-
-        deviceIp = ip;
-        ftPort = fileTransferPort;
-        std::memcpy(token, tkn, StageLinQ::kTokenLen);
-        fltxReadBuf.clear();  // clear stale data from any previous session
-
-        isRunningFlag.store(true);
-        startThread(juce::Thread::Priority::normal);
+        std::lock_guard<std::mutex> life(lifecycleMutex);
+        {
+            std::lock_guard<std::mutex> lock(targetMutex);
+            if (isRunningFlag.load())
+            {
+                if (ip != targetIp || fileTransferPort == targetPort) return true;
+                DBG("StageLinQ DB: " + ip + " is back on FileTransfer port "
+                    + juce::String(fileTransferPort) + " -- fetching its database again");
+            }
+            targetIp = ip;
+            targetPort = fileTransferPort;
+            std::memcpy(targetToken, tkn, StageLinQ::kTokenLen);
+            targetSerial.store(targetSerial.load() + 1);
+            isRunningFlag.store(true);
+        }
+        // The thread lives from the first start() to stop(), between
+        // sessions too, so it is either running or fully stopped here
+        if (isThreadRunning())
+            notify();                       // idle, or in a session to end
+        else if (!startThread(juce::Thread::Priority::normal))
+            isRunningFlag.store(false);     // no thread: the next offer tries again
         return true;
     }
 
+    // Message thread.  Ends the session and the thread; the database and
+    // its temp file are closed, the caches kept until the next session.
     void stop()
     {
-        if (!isRunningFlag.load()) return;
-        isRunningFlag.store(false);
-        signalThreadShouldExit();
-
+        std::lock_guard<std::mutex> life(lifecycleMutex);
         {
-            std::lock_guard<std::mutex> lock(sockMutex);
-            if (ftSocket)
-            {
-                ftSocket->close();
-                ftSocket.reset();
-            }
+            std::lock_guard<std::mutex> lock(targetMutex);
+            isRunningFlag.store(false);
         }
+        if (!isThreadRunning()) return;
+        signalThreadShouldExit();
+        closeFtSocket();                    // ends a blocking read at once
 
-        stopThread(5000);
-        closeDatabase();
+        if (!stopThread(5000))
+            closeDatabase();                // the thread closes it, unless it was killed
 
         DBG("StageLinQ DB: Stopped");
     }
@@ -427,7 +453,58 @@ private:
     //==========================================================================
     // Thread main loop
     //==========================================================================
+    // Runs from the first start() to stop(): one session for each device
+    // and port start() asks for, and a wait for the next one in between.
+    // A session returns when it fails, when stop() is called, or when
+    // start() wants another (a restarted device); it leaves no socket,
+    // database or temp file behind.
     void run() override
+    {
+        while (!threadShouldExit())
+        {
+            bool haveTarget = false;
+            {
+                std::lock_guard<std::mutex> lock(targetMutex);
+                if (isRunningFlag.load() && targetSerial.load() != servedSerial)
+                {
+                    deviceIp = targetIp;
+                    ftPort = targetPort;
+                    std::memcpy(token, targetToken, StageLinQ::kTokenLen);
+                    servedSerial = targetSerial.load();
+                    haveTarget = true;
+                }
+            }
+            if (!haveTarget)
+            {
+                wait(-1);                   // until start() or stop()
+                continue;
+            }
+
+            fltxReadBuf.clear();            // nothing of the last session's stream
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);   // built from the last database
+                trackCache.clear();
+                artworkCache.clear();
+                waveformCache.clear();
+                perfCache.clear();
+            }
+            runSession();
+            closeFtSocket();
+            closeDatabase();
+
+            std::lock_guard<std::mutex> lock(targetMutex);
+            if (targetSerial.load() == servedSerial)
+                isRunningFlag.store(false); // it failed (or stop()): the next start() begins anew
+        }
+    }
+
+    // True when the session must end: stop(), or start() wants another
+    bool sessionShouldEnd() const
+    {
+        return threadShouldExit() || targetSerial.load() != servedSerial;
+    }
+
+    void runSession()
     {
         DBG("StageLinQ DB: Connecting to FileTransfer at " + deviceIp + ":" + juce::String(ftPort));
 
@@ -437,9 +514,9 @@ private:
             if (!sock->connect(deviceIp, ftPort, StageLinQ::kSocketTimeoutMs))
             {
                 DBG("StageLinQ DB: FileTransfer connect failed");
-                isRunningFlag.store(false);
                 return;
             }
+            if (sessionShouldEnd()) return;     // stop() or start() came during the connect
 
             // Send service announcement (same as StateMap/BeatInfo)
             auto announce = StageLinQ::buildServiceAnnouncement(token, "FileTransfer", 0);
@@ -452,22 +529,21 @@ private:
         }
 
         // Per chrisle/StageLinq: 500 ms before the first request.  Waited to
-        // a deadline, not with one wait(): this Thread object serves every
-        // session, and JUCE's startThread() does not reset its event, so a
-        // notify() the last session left unconsumed (stopThread's) would end
-        // a single wait() at once.  stopThread() still cuts it short.
+        // a deadline, not with one wait(): this thread's event is also
+        // signalled by start(), and a notify() left unconsumed (JUCE's
+        // startThread() does not reset the event) would end a single wait()
+        // at once.  stop() still cuts it short.
         const double requestsAt = juce::Time::getMillisecondCounterHiRes() + 500.0;
-        for (double left; !threadShouldExit()
+        for (double left; !sessionShouldEnd()
                           && (left = requestsAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
             wait((int)std::ceil(left));
+        if (sessionShouldEnd()) return;
 
         // --- Get source locations ---
         juce::StringArray sources = fetchSources();
         if (sources.isEmpty())
         {
             DBG("StageLinQ DB: No sources found on device");
-            closeFtSocket();
-            isRunningFlag.store(false);
             return;
         }
 
@@ -481,8 +557,6 @@ private:
         if (dbFile == juce::File() || !dbFile.existsAsFile())
         {
             DBG("StageLinQ DB: Failed to download database");
-            closeFtSocket();
-            isRunningFlag.store(false);
             return;
         }
 
@@ -490,8 +564,6 @@ private:
         if (!openDatabase(dbFile))
         {
             DBG("StageLinQ DB: Failed to open database");
-            closeFtSocket();
-            isRunningFlag.store(false);
             return;
         }
 
@@ -499,7 +571,7 @@ private:
         DBG("StageLinQ DB: Database ready (" + dbFile.getFullPathName() + ")");
 
         // --- Process metadata requests ---
-        while (!threadShouldExit() && isRunningFlag.load())
+        while (!sessionShouldEnd())
         {
             drainFltx();
 
@@ -510,17 +582,22 @@ private:
                 pendingRequests.clear();
             }
 
-            for (auto& networkPath : requests)
+            for (int i = 0; i < requests.size(); ++i)
             {
-                if (threadShouldExit()) break;
-                processTrackRequest(networkPath);
+                if (sessionShouldEnd())
+                {
+                    // Left for the next session: a request made just after
+                    // a restarted device's start() is for its new database
+                    std::lock_guard<std::mutex> lock(requestMutex);
+                    for (int j = i; j < requests.size(); ++j)
+                        pendingRequests.addIfNotAlreadyThere(requests[j]);
+                    break;
+                }
+                processTrackRequest(requests[i]);
             }
 
-            wait(100);   // cut short by stopThread()
+            wait(100);   // cut short by stop() and start()
         }
-
-        closeDatabase();
-        isRunningFlag.store(false);
     }
 
     //==========================================================================
@@ -550,7 +627,7 @@ private:
 
             for (auto& dbPath : paths)
             {
-                if (threadShouldExit()) return {};
+                if (sessionShouldEnd()) return {};
 
                 // Check if file exists (stat)
                 uint32_t fileSize = fetchFileStat(dbPath);
@@ -669,7 +746,7 @@ private:
         // 5 s, after 30 s, or when the device disconnects.
         while (bytesReceived < fileSize
                && juce::Time::getMillisecondCounterHiRes() < deadline
-               && !threadShouldExit())
+               && !sessionShouldEnd())
         {
             auto chunkResp = fltxReadResponse(1000);
             if (chunkResp.received && chunkResp.code == 0
@@ -751,7 +828,7 @@ private:
     FltxResponse fltxWaitFor(uint32_t wantedId, int timeoutMs)
     {
         const double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
-        while (!threadShouldExit())
+        while (!sessionShouldEnd())
         {
             const double left = deadline - juce::Time::getMillisecondCounterHiRes();
             if (left <= 0.0) break;
@@ -775,7 +852,7 @@ private:
         FltxResponse resp;
         double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
 
-        while (!threadShouldExit())
+        while (!sessionShouldEnd())
         {
             // Try to parse a complete message
             while (fltxReadBuf.size() >= 4)
@@ -1598,9 +1675,21 @@ private:
     //==========================================================================
     // Member data
     //==========================================================================
+    // The session's device: written and read on this client's thread only
     juce::String deviceIp;
     uint16_t ftPort = 0;
     uint8_t token[StageLinQ::kTokenLen] = {};
+    uint32_t servedSerial = 0;           // the targetSerial of that session
+
+    // What start() wants served (guarded by targetMutex; targetSerial is
+    // also read lock-free, by sessionShouldEnd)
+    std::mutex targetMutex;
+    juce::String targetIp;
+    uint16_t targetPort = 0;
+    uint8_t targetToken[StageLinQ::kTokenLen] = {};
+    std::atomic<uint32_t> targetSerial { 0 };
+
+    std::mutex lifecycleMutex;           // serialises start() and stop()
 
     std::unique_ptr<juce::StreamingSocket> ftSocket;
     std::mutex sockMutex;
@@ -1622,5 +1711,6 @@ private:
     std::mutex requestMutex;
     juce::StringArray pendingRequests;
 
+    // A session is wanted: from start() until it fails, or stop()
     std::atomic<bool> isRunningFlag { false };
 };
