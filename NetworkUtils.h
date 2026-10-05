@@ -392,3 +392,28 @@ inline int readInputDatagram(juce::DatagramSocket& socket, void* buffer, int siz
    #endif
     return socket.read(buffer, size, false);
 }
+
+//==============================================================================
+/// Text received from the network (an OSC address or string, a HippoNet
+/// machine name) as a juce::String: UTF-8 when the bytes up to the first
+/// NUL, at most numBytes, are valid UTF-8; otherwise each byte as one
+/// character (ISO 8859-1).  juce::String's constructors assert on what they
+/// cannot decode -- 8-bit text in (const char*, size_t), malformed UTF-8 in
+/// fromUTF8 -- and decode it as mojibake in release builds; nothing from the
+/// wire reaches them unchecked this way.
+inline juce::String stringFromWire(const void* data, int numBytes)
+{
+    auto* p = static_cast<const char*>(data);
+    if (p == nullptr || numBytes <= 0)
+        return {};
+    int len = 0;
+    while (len < numBytes && p[len] != 0)
+        ++len;
+    if (juce::CharPointer_UTF8::isValidString(p, len))
+        return juce::String::fromUTF8(p, len);
+    juce::String latin1;
+    latin1.preallocateBytes((size_t) len * 2);
+    for (int i = 0; i < len; ++i)
+        latin1 += (juce::juce_wchar) (uint8_t) p[i];
+    return latin1;
+}

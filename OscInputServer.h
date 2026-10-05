@@ -12,8 +12,12 @@
 // OscInputServer -- Listens for incoming OSC messages on a UDP port.
 //
 // Parses OSC 1.0 packets and dispatches to a callback with the address
-// pattern and parsed arguments.  Supports int32 (i), float32 (f), and
-// string (s) argument types.
+// pattern and parsed arguments.  Reads int32 (i), float32 (f), and string
+// (s) arguments; the other OSC 1.0 type tags are skipped by their size and
+// kept as Arg::Other so the positions stay right.  A #bundle is unpacked,
+// nested bundles included, and its messages dispatched at once, in order
+// (the time tag is ignored).  No address pattern matching: the address is
+// compared as written.
 //
 // Usage:
 //   OscInputServer osc;
@@ -30,7 +34,7 @@ public:
     //--------------------------------------------------------------------------
     struct Arg
     {
-        enum Type { Int, Float, String };
+        enum Type { Int, Float, String, Other };   // Other: a type STC does not read (T, h, b, ...)
         Type type = Int;
         int32_t     intVal   = 0;
         float       floatVal = 0.0f;
@@ -50,7 +54,10 @@ public:
             if (index < 0 || index >= (int)args.size()) return def;
             auto& a = args[(size_t)index];
             if (a.type == Arg::Int)   return a.intVal;
-            if (a.type == Arg::Float) return (int)a.floatVal;
+            if (a.type == Arg::Float)   // a NaN or an out-of-range float made the cast undefined
+                return std::isfinite(a.floatVal)
+                         ? (int) juce::jlimit(-2147483648.0, 2147483647.0, (double) a.floatVal)
+                         : def;
             if (a.type == Arg::String) return a.strVal.getIntValue();
             return def;
         }
@@ -171,18 +178,48 @@ private:
             // (readInputDatagram, AUDIT NET-2).
             int bytesRead = readInputDatagram(*sock, buf, sizeof(buf), sourceFilter);
 
-            if (bytesRead > 0)
-            {
-                Message msg;
-                if (parseOscMessage(buf, bytesRead, msg) && onMessage)
-                    onMessage(msg);
-            }
+            if (bytesRead > 0 && onMessage)
+                parsePacket(buf, bytesRead, [this](const Message& msg) { onMessage(msg); });
         }
     }
 
     //--------------------------------------------------------------------------
     // OSC 1.0 parser
     //--------------------------------------------------------------------------
+    static constexpr int kMaxBundleDepth = 8;
+
+    /// One datagram: a message, or a bundle.  `emit` gets every message, in
+    /// order.  A bundle is "#bundle\0", an 8-byte time tag, then elements of
+    /// int32 size + content, each a message or a bundle; the time tag is
+    /// ignored and the contents dispatched at once (STC acts on arrival).
+    /// Each size is checked against what is left, and the first one that
+    /// does not fit ends the bundle; nesting deeper than kMaxBundleDepth is
+    /// dropped.  Receive thread (and the fuzz harness).
+    template <typename Emit>
+    static void parsePacket(const uint8_t* data, int size, Emit&& emit, int depth = 0)
+    {
+        if (size >= 16 && std::memcmp(data, "#bundle", 8) == 0)   // 8 bytes: the NUL too
+        {
+            if (depth >= kMaxBundleDepth)
+                return;
+            int pos = 16;   // past "#bundle\0" and the time tag
+            while (size - pos >= 4)
+            {
+                const int32_t elementSize = readInt32BE(data + pos);
+                pos += 4;
+                if (elementSize <= 0 || elementSize > size - pos)
+                    return;
+                parsePacket(data + pos, elementSize, emit, depth + 1);
+                pos += elementSize;
+            }
+            return;
+        }
+
+        Message msg;
+        if (parseOscMessage(data, size, msg))
+            emit(msg);
+    }
+
     static bool parseOscMessage(const uint8_t* data, int size, Message& msg)
     {
         if (size < 4 || data[0] != '/') return false;
@@ -192,7 +229,7 @@ private:
         // Address string (null-terminated, padded to 4 bytes)
         int addrEnd = findNull(data, pos, size);
         if (addrEnd < 0) return false;
-        msg.address = juce::String::fromUTF8(reinterpret_cast<const char*>(data + pos), addrEnd - pos);
+        msg.address = stringFromWire(data + pos, addrEnd - pos);
         pos = padTo4(addrEnd + 1);
 
         // Type tag string (starts with ',')
@@ -201,15 +238,15 @@ private:
 
         int tagEnd = findNull(data, pos, size);
         if (tagEnd < 0) return true;
-        juce::String typeTags = juce::String::fromUTF8(
-            reinterpret_cast<const char*>(data + pos + 1), tagEnd - pos - 1);  // skip ','
+        const uint8_t* typeTags = data + pos + 1;   // skip ','
+        const int numTags = tagEnd - pos - 1;
         pos = padTo4(tagEnd + 1);
 
-        // Parse arguments
-        for (int i = 0; i < typeTags.length(); ++i)
+        // Parse arguments.  Each case checks that its own data is there, so
+        // a tag with no data (T, F, N, I) is read even at the very end.
+        for (int i = 0; i < numTags; ++i)
         {
-            if (pos >= size) break;
-            char tag = (char)typeTags[i];
+            const char tag = (char) typeTags[i];
 
             Arg arg;
             switch (tag)
@@ -233,14 +270,51 @@ private:
                     int strEnd = findNull(data, pos, size);
                     if (strEnd < 0) return true;
                     arg.type = Arg::String;
-                    arg.strVal = juce::String::fromUTF8(
-                        reinterpret_cast<const char*>(data + pos), strEnd - pos);
+                    arg.strVal = stringFromWire(data + pos, strEnd - pos);
                     pos = padTo4(strEnd + 1);
                     break;
                 }
 
+                // The rest of OSC 1.0's types are skipped by their size and
+                // kept as Other.  Stopping at the first of them, as before,
+                // dropped every argument after it (AUDIT WIRE-10).
+                case 'T': case 'F': case 'N': case 'I':   // true, false, nil, impulse: no data
+                    arg.type = Arg::Other;
+                    break;
+
+                case 'h': case 't': case 'd':             // int64, time tag, double
+                    if (pos + 8 > size) return true;
+                    arg.type = Arg::Other;
+                    pos += 8;
+                    break;
+
+                case 'c': case 'r': case 'm':             // char, RGBA, MIDI
+                    if (pos + 4 > size) return true;
+                    arg.type = Arg::Other;
+                    pos += 4;
+                    break;
+
+                case 'S':                                 // symbol: laid out as a string
+                {
+                    int strEnd = findNull(data, pos, size);
+                    if (strEnd < 0) return true;
+                    arg.type = Arg::Other;
+                    pos = padTo4(strEnd + 1);
+                    break;
+                }
+
+                case 'b':                                 // blob: int32 size, bytes, padding
+                {
+                    if (pos + 4 > size) return true;
+                    const int32_t blobSize = readInt32BE(data + pos);
+                    if (blobSize < 0 || blobSize > size - pos - 4) return true;
+                    arg.type = Arg::Other;
+                    pos = padTo4(pos + 4 + blobSize);
+                    break;
+                }
+
                 default:
-                    return true;  // unknown type — stop parsing args
+                    return true;  // a type whose size is unknown: stop parsing args
             }
             msg.args.push_back(std::move(arg));
         }
