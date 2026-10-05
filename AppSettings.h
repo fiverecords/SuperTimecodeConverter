@@ -29,9 +29,11 @@
 //    older format migrated, a value normalised) still rotates.
 //  * Load distinguishes "file is missing" (first run, nothing to say) from
 //    "file exists but does not parse".  In the second case the unreadable
-//    file is moved aside as "<name>.corrupt-<timestamp>" and a message is
-//    left for the UI, instead of being silently replaced by defaults on the
-//    next save -- which is how a whole show configuration used to vanish.
+//    file is moved aside as "<name>.corrupt-<timestamp>", its .bak is
+//    copied to "<name>.previous-<timestamp>" (which no save rotates), and
+//    a message naming both is left for the UI, instead of the file being
+//    silently replaced by defaults on the next save -- which is how a
+//    whole show configuration used to vanish.
 //  * Writes are atomic (temporary file + rename, via replaceWithText).
 //
 // Saves can be suspended until STC restarts (writesSuspended), for a
@@ -41,8 +43,9 @@
 struct SafeJsonFile
 {
     /// Parse `file`.  Returns an object var on success.  Returns void when the
-    /// file is absent.  When present but unreadable, quarantines it, records
-    /// the problem in `lastLoadProblem`, and returns void.
+    /// file is absent.  When present but unreadable, quarantines it, keeps a
+    /// copy of its .bak, records the problem in `lastLoadProblem`, and
+    /// returns void.  Message thread (startup, or a reload after a restore).
     static juce::var load(const juce::File& file)
     {
         if (!file.existsAsFile()) return {};
@@ -62,9 +65,18 @@ struct SafeJsonFile
                            + (moved ? " and was moved to " + aside.getFileName()
                                     : " and could not be moved aside")
                            + ". Defaults are in use";
+        // The previous version in .bak is the one to go back to, but .bak
+        // rotates: the first save whose text differs -- a single edit in
+        // this session -- moves the defaults written meanwhile over it.  A
+        // copy under a name no save touches keeps it, and the message
+        // names the copy.
         const juce::File bak = backupFor(file);
         if (bak.existsAsFile())
-            lastLoadProblem() += "; the previous version is " + bak.getFileName();
+        {
+            const juce::File kept = file.getSiblingFile(file.getFileName() + ".previous-" + stamp);
+            lastLoadProblem() += "; the previous version is "
+                               + (bak.copyFileTo(kept) ? kept.getFileName() : bak.getFileName());
+        }
         lastLoadProblem() += ".\n";
         return {};
     }
