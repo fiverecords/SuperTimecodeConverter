@@ -21,6 +21,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <unordered_map>
@@ -554,7 +555,9 @@ private:
     static constexpr int kMaxCacheEntries   = 256;
     static constexpr int kMaxArtCacheEntries = 64;
     static constexpr int kMaxConnections    = 6;
-    static constexpr int kReconnectCooldownMs = 5000;
+    static constexpr int kReconnectCooldownMs = 5000;   // per player IP, after a failed attempt or fresh session (AUDIT META-8)
+    static constexpr int kCooldownRetries     = 3;      // asks again after the cooldown, per request (AUDIT META-8)
+    static constexpr int kMaxCooldownRetryRequests = 16;
     // Idle connection lifetime.  Set to 30 s to mirror the way Beat Link's
     // ConnectionManager keeps a Client open between successive queries to the
     // same player (see ConnectionManager.invokeWithClientSession in the
@@ -643,8 +646,8 @@ private:
         bool contextSetUp = false;
         uint8_t contextPlayer = 0;  // player number used in setupQueryContext
         uint32_t txId = 0;
-        double lastFailTime = 0.0;
         double lastActivityTime = 0.0;  // hiRes ms -- for idle timeout
+        bool reused = false;            // a later request than the one that opened it is using it (AUDIT META-8)
 
         bool isConnected() const { return socket && socket->isConnected(); }
 
@@ -713,6 +716,7 @@ private:
             txId = 0;
             dbPort = 0;
             lastActivityTime = 0.0;
+            reused = false;
             playerIP.clear();
         }
     };
@@ -1200,8 +1204,19 @@ private:
     /// out-of-order response (answer to query N delivered when we expected
     /// answer to query N+1) -- accepting such a response would attach
     /// metadata to the wrong track.
-    static ResponseMessage readMessageOrInvalidate(PlayerConnection& conn, int timeoutMs,
-                                                   uint32_t expectedTxId = 0)
+    ///
+    /// On a session opened for the current request, either failure also
+    /// starts the player's reconnect cooldown, so the next request does not
+    /// open a new session at once (AUDIT META-8).  On a session kept from an
+    /// earlier request it does not: such a session can go stale between
+    /// requests (the player closed it, or went mute meanwhile), and the
+    /// request's phase 2 -- or the next request -- opens a fresh one at once.
+    /// If that fresh one fails too, the cooldown starts.  So a failure with
+    /// no cooldown costs one session that had answered before, and a player
+    /// that does not answer still gets at most one session per cooldown.
+    /// Worker thread.
+    ResponseMessage readMessageOrInvalidate(PlayerConnection& conn, int timeoutMs,
+                                            uint32_t expectedTxId = 0)
     {
         ResponseMessage msg;
         if (!conn.socket) return msg;  // already closed by a prior failure
@@ -1209,6 +1224,8 @@ private:
         if (!msg.ok)
         {
             DBG("DbServerClient: read failed, closing connection to " + conn.playerIP);
+            if (!conn.reused)
+                noteFailure(conn.playerIP);
             conn.closeAbrupt();
             return msg;
         }
@@ -1219,6 +1236,8 @@ private:
                 + " (expected 0x" + juce::String::toHexString((int)expectedTxId)
                 + ") -- connection is out of sync, closing " + conn.playerIP);
             msg.ok = false;
+            if (!conn.reused)
+                noteFailure(conn.playerIP);
             conn.closeAbrupt();
         }
         return msg;
@@ -1245,16 +1264,23 @@ private:
                     DBG("DbServerClient: context player mismatch ("
                         + juce::String(conn.contextPlayer) + " vs "
                         + juce::String(ourPlayer) + ") -- reconnecting to " + playerIP);
-                    conn.close();
-                    conn.lastFailTime = 0.0;  // intentional close, not a failure
+                    conn.close();   // intentional close, not a failure
                     break;  // fall through to new connection below
                 }
                 conn.lastActivityTime = juce::Time::getMillisecondCounterHiRes();
+                conn.reused = true;
                 return &conn;
             }
         }
 
-        // Find empty slot or recycle oldest
+        // A player whose last attempt failed gets no new session until its
+        // cooldown has passed.  Checked before a slot is chosen, so it never
+        // closes another player's session for nothing (AUDIT META-8).
+        double now = juce::Time::getMillisecondCounterHiRes();
+        if (inFailureCooldown(playerIP, now))
+            return nullptr;
+
+        // Find empty slot or recycle the first one held by another player
         PlayerConnection* slot = nullptr;
         for (auto& conn : connections)
         {
@@ -1272,18 +1298,12 @@ private:
                 if (conn.playerIP != playerIP)
                 {
                     conn.close();
-                    conn.lastFailTime = 0.0;  // don't apply old player's cooldown
                     slot = &conn;
                     break;
                 }
             }
         }
         if (!slot) return nullptr;
-
-        // Check reconnect cooldown
-        double now = juce::Time::getMillisecondCounterHiRes();
-        if (now - slot->lastFailTime < kReconnectCooldownMs)
-            return nullptr;
 
         // Step 1: Discover database port via port 12523 (cached after first success)
         int dbPort = 0;
@@ -1298,7 +1318,7 @@ private:
             if (dbPort <= 0)
             {
                 DBG("DbServerClient: no valid db port found for " + playerIP);
-                slot->lastFailTime = now;
+                noteFailure(playerIP);
                 return nullptr;
             }
             const juce::ScopedLock sl(knownDbPortsLock);
@@ -1311,7 +1331,7 @@ private:
         {
             DBG("DbServerClient: TCP connect to " + playerIP + ":"
                 + juce::String(dbPort) + " failed");
-            slot->lastFailTime = now;
+            noteFailure(playerIP);
             return nullptr;
         }
 
@@ -1334,7 +1354,7 @@ private:
             if (sock->write(hello, sizeof(hello)) != sizeof(hello))
             {
                 DBG("DbServerClient: handshake write failed to " + playerIP);
-                slot->lastFailTime = now;
+                noteFailure(playerIP);
                 return nullptr;
             }
             // Expect same 5 bytes back
@@ -1342,7 +1362,7 @@ private:
             if (!readExact(*sock, reply, 5, kReadTimeoutMs))
             {
                 DBG("DbServerClient: handshake reply timeout from " + playerIP);
-                slot->lastFailTime = now;
+                noteFailure(playerIP);
                 return nullptr;
             }
             DBG("DbServerClient: handshake OK with " + playerIP + ":" + juce::String(dbPort));
@@ -1354,7 +1374,7 @@ private:
         slot->contextSetUp = false;
         slot->lastActivityTime = now;
         slot->txId = 0;
-        slot->lastFailTime = 0.0;
+        slot->reused = false;
 
         // Step 4: Setup query context
         if (!setupQueryContext(*slot, ourPlayer))
@@ -1362,13 +1382,95 @@ private:
             // Setup was rejected -- the CDJ won't accept our player identity.
             // Sending a teardown on a socket the CDJ just refused would only
             // add noise; close abruptly.
+            noteFailure(playerIP);
             slot->closeAbrupt();
-            slot->lastFailTime = juce::Time::getMillisecondCounterHiRes();
             return nullptr;
         }
 
+        failedAtMs.erase(playerIP.toStdString());
         DBG("DbServerClient: connected to " + playerIP + ":" + juce::String(dbPort));
         return slot;
+    }
+
+    /// Worker thread.  Is this player inside its reconnect cooldown?
+    bool inFailureCooldown(const juce::String& playerIP, double nowMs) const
+    {
+        auto it = failedAtMs.find(playerIP.toStdString());
+        return it != failedAtMs.end() && nowMs - it->second < kReconnectCooldownMs;
+    }
+
+    /// Worker thread.  A connection attempt to this player, or a session
+    /// opened for the current request, failed: start its cooldown.
+    void noteFailure(const juce::String& playerIP)
+    {
+        if (playerIP.isNotEmpty())
+            failedAtMs[playerIP.toStdString()] = juce::Time::getMillisecondCounterHiRes();
+    }
+
+    /// Worker thread.  req found no dbserver session.  If that is because
+    /// its player is in the reconnect cooldown and the entry still has no
+    /// title, remember req: requeueCooldownRetries() asks again once the
+    /// cooldown has passed.  Nothing else would -- TimecodeEngine asks once
+    /// per track change -- so without this a title (and the Track Map offset
+    /// that depends on it) missed during a cooldown stayed missing
+    /// (AUDIT META-8).  A request already remembered keeps its count.
+    void retryAfterCooldown(const MetadataRequest& req, const CacheKey& cacheKey)
+    {
+        if (!inFailureCooldown(req.playerIP, juce::Time::getMillisecondCounterHiRes()))
+            return;
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            auto it = metadataCache.find(cacheKey);
+            if (it != metadataCache.end() && it->second.isValid())
+                return;   // the title is known; the NFS route does the rest
+        }
+        for (auto& r : cooldownRetries)
+            if (r.req.playerIP == req.playerIP && r.req.slot == req.slot
+                && r.req.trackId == req.trackId)
+                return;
+        if ((int)cooldownRetries.size() >= kMaxCooldownRetryRequests)
+            cooldownRetries.erase(cooldownRetries.begin());   // drop the oldest
+        CooldownRetry r;
+        r.req = req;
+        r.retriesLeft = kCooldownRetries;
+        cooldownRetries.push_back(std::move(r));
+    }
+
+    /// Worker thread, before the queue is drained.  Each remembered request
+    /// whose player is out of its cooldown is queued again as a new phase-1
+    /// request (requestMetadata), at most kCooldownRetries times; it is
+    /// forgotten once its entry has a title or it has no retries left.  A
+    /// retry that fails starts the cooldown again, so a player that does not
+    /// answer gets at most one session per cooldown (AUDIT META-8).
+    void requeueCooldownRetries()
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        for (size_t i = 0; i < cooldownRetries.size(); )
+        {
+            auto& r = cooldownRetries[i];
+            if (inFailureCooldown(r.req.playerIP, now))
+            {
+                ++i;
+                continue;
+            }
+            bool hasTitle = false;
+            {
+                const juce::SpinLock::ScopedLockType lock(cacheLock);
+                auto it = metadataCache.find(makeCacheKey(r.req.playerIP, r.req.slot, r.req.trackId));
+                hasTitle = it != metadataCache.end() && it->second.isValid();
+            }
+            if (hasTitle || r.retriesLeft <= 0)
+            {
+                cooldownRetries.erase(cooldownRetries.begin() + (std::ptrdiff_t)i);
+                continue;
+            }
+            --r.retriesLeft;
+            DBG("DbServerClient: asking " + r.req.playerIP + " again for trackId="
+                + juce::String(r.req.trackId) + " after its cooldown");
+            requestMetadata(r.req.playerIP, r.req.slot, r.req.trackType, r.req.trackId,
+                            r.req.ourPlayer, r.req.playerModel);
+            ++i;
+        }
     }
 
     /// Discover the dbserver port by querying TCP 12523.
@@ -2682,6 +2784,10 @@ private:
                             conn.closeAbrupt();
                         }
                     }
+                    failedAtMs.erase(ip.toStdString());   // a player that returns starts afresh
+                    cooldownRetries.erase(std::remove_if(cooldownRetries.begin(), cooldownRetries.end(),
+                                                         [&ip](const CooldownRetry& r) { return r.req.playerIP == ip; }),
+                                          cooldownRetries.end());
                 }
             }
 
@@ -2704,6 +2810,8 @@ private:
             }
 
             if (threadShouldExit()) break;
+
+            requeueCooldownRetries();
 
             // Process all queued requests
             while (true)
@@ -2730,12 +2838,18 @@ private:
             // No dbserver session (refused, silent, or in its failure
             // cooldown).  The NFS route needs none -- it is stateless and
             // works whatever player number STC asks as -- so it runs now, in
-            // phase 1 as in phase 2 (AUDIT META-7).
+            // phase 1 as in phase 2 (AUDIT META-7).  A title still missing
+            // is asked for again once the cooldown has passed
+            // (retryAfterCooldown, AUDIT META-8).
             errorCount.fetch_add(1, std::memory_order_relaxed);
             DBG("DbServerClient: no dbserver connection to " + req.playerIP
                 + " (phase " + juce::String(req.phase) + ") -- trying NFS only");
             if (req.trackId != 0)
-                processNfsFallback(req, makeCacheKey(req.playerIP, req.slot, req.trackId));
+            {
+                const CacheKey cacheKey = makeCacheKey(req.playerIP, req.slot, req.trackId);
+                processNfsFallback(req, cacheKey);
+                retryAfterCooldown(req, cacheKey);
+            }
             return;
         }
 
@@ -3101,6 +3215,19 @@ private:
 
     // TCP connections (one per CDJ, max 6)
     std::array<PlayerConnection, kMaxConnections> connections;
+
+    // When each player's last connection attempt or fresh session failed
+    // (hiRes ms), keyed by IP.  Worker thread only.  AUDIT META-8.
+    std::unordered_map<std::string, double> failedAtMs;
+
+    // Requests that found their player in its cooldown with no title yet
+    // (retryAfterCooldown).  Worker thread only.  AUDIT META-8.
+    struct CooldownRetry
+    {
+        MetadataRequest req;
+        int retriesLeft = 0;
+    };
+    std::vector<CooldownRetry> cooldownRetries;
 
     // Cache of discovered db ports per player IP. Once we know the port
     // (1051 for NXS2, 1052 for CDJ-3000), reusing it on reconnect avoids
