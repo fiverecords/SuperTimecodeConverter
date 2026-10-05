@@ -60,6 +60,11 @@ public:
             bindIp = "0.0.0.0";
         }
 
+        // juce::DatagramSocket's constructor sets SO_REUSEADDR -- what
+        // LA-Net and HippoNet set again by hand -- so on Linux and Windows
+        // another program (or engine) can hold the port too.  macOS shares
+        // one address and port only with SO_REUSEPORT, which no input sets
+        // (AUDIT NET-13).
         socket = std::make_unique<juce::DatagramSocket>(false);
 
         // On macOS and Linux a selected interface is all interfaces plus a
