@@ -117,16 +117,18 @@ public:
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
 
     //==============================================================================
-    // True if QF messages are actively arriving
-    /// Freewheel (D10): how long after the last frame/packet the source still
-    /// counts as present.  The senders count on their own through it, so a
-    /// short dropout -- a USB stall, a display wake -- never reaches the
-    /// wire; the price is that a real stop takes this long to reach the
-    /// outputs.  The operator sets it (engine setting), default
+    /// Freewheel (AUDIT D10): how long after the last frame/packet the
+    /// source still counts as present.  The senders count on their own
+    /// through it, so a short dropout -- a USB stall, a display wake -- never
+    /// reaches the wire; the price is that a real stop takes this long to
+    /// reach the outputs.  The operator sets it (engine setting), default
     /// kSourceTimeoutMs.
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
+    /// True while the source counts as present: a quarter frame arrived
+    /// within the freewheel window -- or, after a Full Frame, as presentAt()
+    /// says (AUDIT LTC-13).
     bool isReceiving() const
     {
         if (!synced.load(std::memory_order_acquire))
@@ -164,7 +166,7 @@ public:
     /// The live value at `nowMs`, and how far into that frame the source is
     /// (`phaseMsOut`, 0 .. one frame).  Both come from ONE elapsed against ONE
     /// sync point, read under one lock -- that is the whole point of this
-    /// overload (D29, issue #22).
+    /// overload (DESIGN D29, issue #22).
     ///
     /// The sync point is dated a quarter frame into the future on purpose
     /// (piece 7 arrives at N + 1.75 frames; the value N + 2 begins a quarter
@@ -521,9 +523,15 @@ private:
             // Uses incrementFrame so 29.97 drop-frame skips are honoured --
             // linear arithmetic here used to emit frames 00/01 of a
             // non-tenth minute, which do not exist in drop-frame numbering.
-            // NOTE: this compensation assumes forward playback.  Reverse
-            // operations may briefly show a +/-4 frame discrepancy until the
-            // next full 8-QF cycle completes.
+            // NOTE: this compensation, and the interpolation in
+            // getCurrentTimecode, assume forward playback.  Reverse play is
+            // not decoded as such (BENCH B7, AUDIT LTC-20): the quarter frames
+            // come 7..0, a sequence completes when the next piece 7 arrives,
+            // and its value is two frames LOWER than the last one -- inside
+            // the continuity tolerance, so it is accepted -- then gets +2 here
+            // and runs forward from its sync point.  For as long as reverse
+            // play lasts the published value is a sawtooth going backwards:
+            // two frames forward, four back, every sequence.
             lastSyncTimecode = advanceTwoFrames(assembled, detectedFps);
 
             // Piece 7 is sent at the start of the last quarter of the second
@@ -593,7 +601,7 @@ private:
     juce::Array<juce::MidiDeviceInfo> availableDevices;
     int currentDeviceIndex = -1;
     std::atomic<bool> isRunningFlag { false };
-    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (AUDIT D10)
 
     // Quarter-frame accumulator -- MIDI-callback-thread-only (resetState()
     // writes it on the message thread, but only while no device is started)

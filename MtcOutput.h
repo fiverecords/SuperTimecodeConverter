@@ -60,7 +60,8 @@ public:
         if (deviceIndex < 0 || deviceIndex >= availableDevices.size())
             return false;
 
-        // One port per device for the whole application (MidiOutputHub, D32).
+        // One port per device for the whole application (MidiOutputHub,
+        // DESIGN D32).
         // MTC has no channel: a second MTC stream in the same cable cannot be
         // received, so the port refuses it and names the stream it carries.
         auto p = MidiOutputHub::get().acquire(availableDevices[deviceIndex]);
@@ -78,10 +79,14 @@ public:
             mtcSeeded = false;
             resyncRequested.store(false, std::memory_order_relaxed);
 
-            // Full Frame is sent after the first setTimecode() call populates
-            // pendingTimecode -- avoids transmitting a misleading 00:00:00.00
-            // to receivers before the real timecode is available.
-            // Receivers will sync within 8 QFs (~2 frames) regardless.
+            // No Full Frame here: pendingTimecode may not hold the source's
+            // value yet (the engine sets it on its next tick), and a
+            // misleading 00:00:00.00 is worse than none.  Receivers lock from
+            // the quarter frames within a sequence (2 frames); the next
+            // resume (setPaused(false)) or seek (forceResync) sends one.
+            // The quarter frames do start now, though, and the first cycle
+            // is seeded from whatever pendingTimecode holds when its piece 0
+            // goes out.
 
             lastQfSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
             updateTimerRate();
@@ -250,11 +255,12 @@ private:
         double lastSend = lastQfSendTime.load(std::memory_order_relaxed);
         while ((now - lastSend) >= qfInterval && sent < 2)
         {
-            // At QF index 0, determine the timecode for this entire 8-QF cycle.
-            // Auto-increment: advance by 2 frames (one QF cycle = 2 frame durations).
-            // Compare with pendingTimecode and only resync on diff > 2 (seek/jump).
-            // This prevents 1-frame backward jitter from interpolation overshoot
-            // causing a full QF cycle of wrong data → MTC receiver flicker.
+            // At QF index 0, determine the timecode for this entire 8-QF cycle:
+            // the last cycle's value advanced by 2 frames (one QF cycle = 2
+            // frame durations), steered toward pendingTimecode by the shared
+            // tracking policy (trackPublishedValue: one frame at a time, a
+            // snap only beyond kTrackingHardResync), so a frame of jitter in
+            // the published value does not become a cycle of wrong data.
             // Same architectural pattern as the LTC encoder's auto-increment.
             if (resyncRequested.exchange(false, std::memory_order_acquire))
             {
@@ -337,7 +343,13 @@ private:
     void updateTimerRate()
     {
         // Run timer at 1ms fixed rate -- the fractional accumulator in
-        // hiResTimerCallback handles exact QF timing to avoid drift
+        // hiResTimerCallback handles exact QF timing to avoid drift.
+        // The cadence is anchored here, on the CPU clock, at start(), on
+        // resume and on a rate change -- not at the source's frame boundary.
+        // So the quarter frames' phase against the source is arbitrary, up
+        // to a frame, for each run: LTC out locks to the source's phase
+        // (DESIGN D24), MTC out does not (AUDIT LTC-14, deferred: it would
+        // change the sender's timing on the wire).
         lastQfSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
         startTimer(1);
     }
