@@ -165,7 +165,7 @@ public:
         }
     }
 
-    /// Freewheel (D10): how long after the last frame/packet the source still
+    /// Freewheel (AUDIT D10): how long after the last frame/packet the source still
     /// counts as present.  The senders count on their own through it, so a
     /// short dropout -- a USB stall, a display wake -- never reaches the
     /// wire; the price is that a real stop takes this long to reach the
@@ -331,7 +331,7 @@ private:
     int listenPort = 8201;
     int selectedInterface = 0;
     std::atomic<bool> isRunningFlag { false };
-    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (AUDIT D10)
     std::atomic<bool> bindFellBack { false };
 
     juce::Array<NetworkInterface> availableInterfaces;
