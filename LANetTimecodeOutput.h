@@ -166,8 +166,6 @@ public:
 
         paused.store(shouldPause, std::memory_order_relaxed);
 
-        std::cout << "set paused: " << shouldPause << std::endl;
-
         if (shouldPause)
         {
             stopTimer();
