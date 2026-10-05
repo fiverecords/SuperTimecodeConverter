@@ -1843,7 +1843,7 @@ private:
                 if (selected[i]) { ++sel; if (isDuplicate[i]) ++dup; }
             }
             juce::String s = juce::String(sel) + " of " + juce::String(items.size()) + " selected";
-            if (dup > 0) s += " (" + juce::String(dup) + " will overwrite existing)";
+            if (dup > 0) s += " (" + juce::String(dup) + " already in the map -- left unchanged)";
             lblInfo.setText(s, juce::dontSendNotification);
         }
     };
