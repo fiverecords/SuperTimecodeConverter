@@ -63,18 +63,23 @@ public:
     };
 
     //==========================================================================
-    // Result struct -- all ANLZ data extracted from one .EXT file
+    // Result struct -- the ANLZ data extracted from one file, or merged from a
+    // track's .DAT and .EXT
     //==========================================================================
     struct AnlzResult
     {
         bool ok = false;
         std::vector<BeatEntry>   beatGrid;
-        std::vector<CueEntry>    cueList;
+        std::vector<CueEntry>    cueList;        // memory points, hot cues and loops, by position
+        bool cueTagsFound = false;               // the file had a PCO2 or PCOB tag (possibly empty)
         std::vector<PhraseEntry> songStructure;
         uint16_t phraseMood = 0;
         std::vector<uint8_t> detailData;
         int detailEntryCount = 0;
-        int detailBytesPerEntry = 0;
+        int detailBytesPerEntry = 0;             // 2 = PWV5, 3 = PWV7
+        std::vector<uint8_t> previewData;        // PWV4 colour preview (in .EXT), as TrackMetadata::waveformData
+        int previewEntryCount = 0;
+        int previewBytesPerEntry = 0;            // 6 = PWV4
     };
 
     //==========================================================================
@@ -902,12 +907,25 @@ private:
     // ANLZ PMAI Container Parser
     //==========================================================================
 
-    /// Parse a complete ANLZ .EXT file (PMAI container with tagged sections).
+    /// Parse one ANLZ file (.DAT or .EXT): a PMAI header, then tagged sections.
+    ///
+    /// Layout per crate-digger's rekordbox_anlz.ksy: the file header is
+    /// len_header bytes long; each section is fourcc(4) + len_header(4) +
+    /// len_tag(4) and its body starts at byte 12 of the section (the ksy and
+    /// crate-digger's anlz doc ignore a section's len_header, and so does this
+    /// parser).  Every length comes from the file, so each one is checked as an
+    /// unsigned value against what is left before it is used (AUDIT WIRE-5: a
+    /// len_tag of 0xFFFFFFF4 used to step backwards and loop for ever).
+    ///
+    /// Cues follow beat-link's CueList: a file holds two lists of each kind
+    /// (memory points and hot cues); the entries of every PCO2 tag are kept,
+    /// and the PCOB tags are used only when the file has no PCO2.  The result
+    /// is sorted by position, as the dbserver parsers sort theirs.
     static AnlzResult parseAnlzFile(const juce::MemoryBlock& fileData)
     {
         AnlzResult result;
         const uint8_t* d = static_cast<const uint8_t*>(fileData.getData());
-        int size = (int)fileData.getSize();
+        const size_t size = fileData.getSize();
 
         // Verify PMAI magic
         if (size < 12 || d[0] != 'P' || d[1] != 'M' || d[2] != 'A' || d[3] != 'I')
@@ -916,47 +934,65 @@ private:
             return result;
         }
 
-        uint32_t headerLen = readBE32(d + 4);
-        int pos = (int)headerLen;
+        const uint32_t headerLen = readBE32(d + 4);
+        if (headerLen < 12 || headerLen > size)
+        {
+            DBG("NfsAnlzFetcher: bad PMAI header length " + juce::String(headerLen));
+            return result;
+        }
+
+        std::vector<CueEntry> extendedCues, standardCues;
+        bool sawPco2 = false, sawPcob = false;
 
         // Iterate tagged sections
-        while (pos + 12 <= size)
+        size_t pos = headerLen;
+        while (size - pos >= 12)
         {
             char tag[5] = { (char)d[pos], (char)d[pos+1], (char)d[pos+2], (char)d[pos+3], 0 };
-            // uint32_t lenHeader = readBE32(d + pos + 4);  // not needed for real ANLZ files
-            uint32_t lenTag    = readBE32(d + pos + 8);
+            const uint32_t lenTag = readBE32(d + pos + 8);
 
-            if (lenTag < 12 || pos + (int)lenTag > size)
+            if (lenTag < 12 || lenTag > size - pos)
             {
-                DBG("NfsAnlzFetcher: invalid section at offset " + juce::String(pos)
+                DBG("NfsAnlzFetcher: invalid section at offset " + juce::String((int64_t)pos)
                     + " tag=" + juce::String(tag) + " len=" + juce::String(lenTag));
                 break;
             }
 
             const uint8_t* body = d + pos + 12;
-            int bodyLen = (int)lenTag - 12;
+            const int bodyLen = (int)(lenTag - 12);
 
             if (std::strcmp(tag, "PQTZ") == 0)
                 result.beatGrid = parsePQTZ(body, bodyLen, 0);
             else if (std::strcmp(tag, "PCO2") == 0)
-                result.cueList = parsePCO2(body, bodyLen);
-            else if (std::strcmp(tag, "PCOB") == 0 && result.cueList.empty())
-                result.cueList = parsePCOB(body, bodyLen);
-            else if (std::strcmp(tag, "PSSI") == 0)
+                { sawPco2 = true; appendPCO2(body, bodyLen, extendedCues); }
+            else if (std::strcmp(tag, "PCOB") == 0)
+                { sawPcob = true; appendPCOB(body, bodyLen, standardCues); }
+            else if (std::strcmp(tag, "PSSI") == 0 && result.songStructure.empty())
                 parsePSSI(body, bodyLen, 0, result.songStructure, result.phraseMood);
             else if (std::strcmp(tag, "PWV7") == 0 && result.detailEntryCount == 0)
-                parseDetailWaveform(body, bodyLen, 3, result);
+                parseEntryTable(body, bodyLen, 3, kMaxDetailEntries,
+                                result.detailData, result.detailEntryCount, result.detailBytesPerEntry);
             else if (std::strcmp(tag, "PWV5") == 0 && result.detailEntryCount == 0)
-                parseDetailWaveform(body, bodyLen, 2, result);
+                parseEntryTable(body, bodyLen, 2, kMaxDetailEntries,
+                                result.detailData, result.detailEntryCount, result.detailBytesPerEntry);
+            else if (std::strcmp(tag, "PWV4") == 0 && result.previewEntryCount == 0)
+                parseEntryTable(body, bodyLen, 6, kMaxPreviewEntries,
+                                result.previewData, result.previewEntryCount, result.previewBytesPerEntry);
 
-            pos += (int)lenTag;
+            pos += lenTag;
         }
+
+        result.cueList = std::move(sawPco2 ? extendedCues : standardCues);
+        std::stable_sort(result.cueList.begin(), result.cueList.end(),
+                         [](const CueEntry& a, const CueEntry& b) { return a.positionMs < b.positionMs; });
+        result.cueTagsFound = sawPco2 || sawPcob;
 
         result.ok = true;
         DBG("NfsAnlzFetcher: parsed ANLZ -- beats=" + juce::String((int)result.beatGrid.size())
             + " cues=" + juce::String((int)result.cueList.size())
             + " phrases=" + juce::String((int)result.songStructure.size())
-            + " detailEntries=" + juce::String(result.detailEntryCount));
+            + " detailEntries=" + juce::String(result.detailEntryCount)
+            + " previewEntries=" + juce::String(result.previewEntryCount));
         return result;
     }
 
@@ -998,16 +1034,17 @@ private:
     //==========================================================================
     // PCO2: Extended Cue List (nxs2+ with colors and comments)
     //==========================================================================
-    static std::vector<CueEntry> parsePCO2(const uint8_t* body, int bodyLen)
+    /// Append the entries of one PCO2 tag (a file has one for memory points
+    /// and one for hot cues) to @p cues.
+    static void appendPCO2(const uint8_t* body, int bodyLen, std::vector<CueEntry>& cues)
     {
         // Format: type(u4) + numCues(u2) + padding(u2) + PCP2 entries...
-        if (bodyLen < 8) return {};
+        if (bodyLen < 8) return;
 
         // uint32_t listType = readBE32(body);  // 0=memory, 1=hot cues (unused)
         uint16_t numCues  = readBE16(body + 4);
-        if (numCues == 0) return {};
+        if (numCues == 0) return;
 
-        std::vector<CueEntry> cues;
         int pos = 8;  // start of PCP2 entries
 
         for (int i = 0; i < numCues && pos + 12 <= bodyLen; i++)
@@ -1017,7 +1054,7 @@ private:
                 break;
 
             uint32_t entryLen = readBE32(body + pos + 8);  // total entry size incl header
-            if (entryLen < 0x1D || entryLen > 4096 || pos + (int)entryLen > bodyLen) break;
+            if (entryLen < 0x1D || entryLen > 4096 || entryLen > (uint32_t)(bodyLen - pos)) break;
 
             const uint8_t* e = body + pos;  // points to PCP2 magic
 
@@ -1037,11 +1074,11 @@ private:
             // Color and comment (variable position fields)
             // len_comment at offset 0x28 (u4, byte count of UTF-16BE string)
             uint32_t commentBytes = 0;
-            if ((int)entryLen >= 0x2C)
+            if (entryLen >= 0x2C)
             {
                 commentBytes = readBE32(e + 0x28);
                 if (commentBytes > 0 && commentBytes < 512
-                    && 0x2C + (int)commentBytes <= (int)entryLen)
+                    && commentBytes <= entryLen - 0x2C)
                 {
                     int numChars = (int)commentBytes / 2;
                     juce::String comment;
@@ -1055,10 +1092,13 @@ private:
                 }
             }
 
-            // Color RGB after comment
-            int colorOff = 0x2C + (int)commentBytes;
-            if (colorOff + 4 <= (int)entryLen)
+            // Color RGB after the comment: code, R, G, B.  Entries that end
+            // before them (crate-digger's anlz doc warns some do) have none.
+            // Unsigned arithmetic: len_comment is a wire value.
+            if (entryLen >= 0x2C && commentBytes <= entryLen - 0x2C
+                && entryLen - 0x2C - commentBytes >= 4)
             {
+                const int colorOff = 0x2C + (int)commentBytes;
                 cue.colorCode = e[colorOff];
                 cue.colorR    = e[colorOff + 1];
                 cue.colorG    = e[colorOff + 2];
@@ -1069,22 +1109,20 @@ private:
             cues.push_back(cue);
             pos += (int)entryLen;  // entryLen = total size including PCP2 header
         }
-
-        return cues;
     }
 
     //==========================================================================
-    // PCOB: Standard Cue List (fallback, no colors/comments)
+    // PCOB: Standard Cue List (no colors/comments; used when there is no PCO2)
     //==========================================================================
-    static std::vector<CueEntry> parsePCOB(const uint8_t* body, int bodyLen)
+    /// Append the entries of one PCOB tag (memory points or hot cues) to @p cues.
+    static void appendPCOB(const uint8_t* body, int bodyLen, std::vector<CueEntry>& cues)
     {
         // Format: type(u4) + pad(u2) + numCues(u2) + memoryCount(u4) + PCPT entries
-        if (bodyLen < 12) return {};
+        if (bodyLen < 12) return;
 
         uint16_t numCues = readBE16(body + 6);
-        if (numCues == 0) return {};
+        if (numCues == 0) return;
 
-        std::vector<CueEntry> cues;
         int pos = 12;
 
         for (int i = 0; i < numCues && pos + 12 <= bodyLen; i++)
@@ -1092,8 +1130,10 @@ private:
             if (body[pos] != 'P' || body[pos+1] != 'C' || body[pos+2] != 'P' || body[pos+3] != 'T')
                 break;
 
-            uint32_t entryLen = readBE32(body + pos + 8);  // total PCPT size incl header
-            if (entryLen < 0x24 || entryLen > 4096 || pos + (int)entryLen > bodyLen) break;
+            // total PCPT size incl header (0x38 in every file crate-digger has
+            // seen); the fields read below end at 0x28
+            uint32_t entryLen = readBE32(body + pos + 8);
+            if (entryLen < 0x28 || entryLen > 4096 || entryLen > (uint32_t)(bodyLen - pos)) break;
 
             const uint8_t* e = body + pos;  // points to PCPT magic
 
@@ -1115,8 +1155,6 @@ private:
             cues.push_back(cue);
             pos += (int)entryLen;  // entryLen = total size including PCPT header
         }
-
-        return cues;
     }
 
     //==========================================================================
@@ -1133,9 +1171,16 @@ private:
         int offset = (headerExtra > 0) ? headerExtra : 0;
         if (offset + 6 > bodyLen) return;
 
-        uint32_t entrySize = readBE32(body + offset);       // usually 24
+        // rekordbox_anlz.ksy reads the phrases as consecutive 24-byte
+        // song_structure_entry records; len_entry_bytes "seems to always be
+        // 24".  A file that says otherwise has a layout nobody has described,
+        // so it is not read (the dbserver parser applies the same rule).  The
+        // stride is the fixed 24 -- never the wire value (AUDIT WIRE-5: a
+        // len_entry_bytes >= 2^31 cast to int read before the buffer).
+        static constexpr int kPhraseEntrySize = 24;
+        uint32_t entrySize = readBE32(body + offset);
         uint16_t numEntries = readBE16(body + offset + 4);
-        if (numEntries == 0 || entrySize < 24) return;
+        if (numEntries == 0 || entrySize != (uint32_t)kPhraseEntrySize) return;
 
         int dataStart = offset + 6;
         int dataLen = bodyLen - dataStart;
@@ -1185,8 +1230,8 @@ private:
         int entriesOff = 14;
         for (int i = 0; i < numEntries; i++)
         {
-            int eOff = entriesOff + i * (int)entrySize;
-            if (eOff + 24 > (int)unmasked.size()) break;
+            int eOff = entriesOff + i * kPhraseEntrySize;
+            if (eOff + kPhraseEntrySize > (int)unmasked.size()) break;
 
             const uint8_t* e = unmasked.data() + eOff;
             PhraseEntry phrase;
@@ -1202,7 +1247,7 @@ private:
             // Calculate beat count from next phrase's beat number
             if (i + 1 < numEntries)
             {
-                int nextOff = entriesOff + (i + 1) * (int)entrySize;
+                int nextOff = entriesOff + (i + 1) * kPhraseEntrySize;
                 if (nextOff + 4 <= (int)unmasked.size())
                     phrase.beatCount = readBE16(unmasked.data() + nextOff + 2) - phrase.beatNumber;
             }
@@ -1212,26 +1257,34 @@ private:
     }
 
     //==========================================================================
-    // Detail Waveform (PWV5 / PWV7)
+    // Waveform tables: PWV5 / PWV7 detail, PWV4 colour preview
     //==========================================================================
-    static void parseDetailWaveform(const uint8_t* body, int bodyLen, int bpe,
-                                    AnlzResult& result)
+    // Detail entries are 150 per second of audio.  5,000,000 is the dbserver
+    // parser's cap (9 h 15 min; 10 MB of PWV5): the 500,000 used here before
+    // dropped the detail of every track longer than 55 min (AUDIT DEBT-7).
+    static constexpr uint32_t kMaxDetailEntries  = 5000000;
+    // The colour preview is 1,200 columns in every file crate-digger documents.
+    static constexpr uint32_t kMaxPreviewEntries = 65536;
+
+    /// Read a len_entry_bytes(u4) + len_entries(u4) + unknown(u4) + entries
+    /// table (PWV4, PWV5 and PWV7 share this layout in rekordbox_anlz.ksy).
+    static void parseEntryTable(const uint8_t* body, int bodyLen, int bpe, uint32_t maxEntries,
+                                std::vector<uint8_t>& data, int& entryCount, int& bytesPerEntry)
     {
-        // Format: wordSize(u4) + entryCount(u4) + pad(u4) + data[entryCount*wordSize]
         if (bodyLen < 12) return;
 
-        uint32_t wordSize   = readBE32(body);
-        uint32_t entryCount = readBE32(body + 4);
-        if ((int)wordSize != bpe || entryCount == 0 || entryCount > 500000) return;
+        uint32_t wordSize = readBE32(body);
+        uint32_t count    = readBE32(body + 4);
+        if (wordSize != (uint32_t)bpe || count == 0 || count > maxEntries) return;
 
-        int dataOff = 12;
-        int64_t dataLen64 = (int64_t)wordSize * (int64_t)entryCount;
-        if (dataLen64 > (int64_t)(bodyLen - dataOff) || dataLen64 <= 0) return;
+        const int dataOff = 12;
+        const int64_t dataLen64 = (int64_t)wordSize * (int64_t)count;
+        if (dataLen64 > (int64_t)(bodyLen - dataOff)) return;
 
-        int dataLen = (int)dataLen64;
-        result.detailData.assign(body + dataOff, body + dataOff + dataLen);
-        result.detailEntryCount = (int)entryCount;
-        result.detailBytesPerEntry = bpe;
+        const int dataLen = (int)dataLen64;
+        data.assign(body + dataOff, body + dataOff + dataLen);
+        entryCount = (int)count;
+        bytesPerEntry = bpe;
     }
 
     //==========================================================================
