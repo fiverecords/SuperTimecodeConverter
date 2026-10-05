@@ -344,8 +344,11 @@ private:
         auto bottomStrip = juce::Rectangle<int>(waveArea.getX(), waveArea.getBottom(),
                                                  waveArea.getWidth(), kMarkerAreaH);
 
-        for (double t = 0.0; t <= totalLen + 0.0001; t += interval)
+        // Integer tick counter: t is computed per tick, not accumulated.
+        const int lastTick = (int) std::floor((totalLen + 0.0001) / interval);
+        for (int tick = 0; tick <= lastTick; ++tick)
         {
+            const double t    = (double) tick * interval;
             const double frac = t / totalLen;
             const int x = waveArea.getX() + (int)(frac * waveArea.getWidth());
 
