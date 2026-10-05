@@ -170,8 +170,9 @@ private:
     public:
         AudioScanThread(MainComponent* owner);
         void run() override;
-        // Created on message thread before startThread() -- JUCE 8.x requires
-        // AudioDeviceManager construction on the message thread.
+        // Created and initialised on the message thread before startThread(),
+        // and deleted there only once run() has returned (see
+        // startAudioDeviceScan and ~MainComponent).
         std::unique_ptr<juce::AudioDeviceManager> tempManager;
     private:
         juce::Component::SafePointer<MainComponent> safeOwner;
@@ -613,6 +614,7 @@ private:
 
     // --- Methods ---
     void startAudioDeviceScan();
+    bool stopAudioScanThread();   // false: the scan did not stop and was left behind
     void populateMidiAndNetworkCombos();
     void populateAudioCombos();
     void repopulateTcnetLayerCombo();

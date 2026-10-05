@@ -50,9 +50,14 @@ void MainComponent::AudioScanThread::run()
             outputs.add({ typeName, name, AudioDeviceEntry::makeDisplayName(typeName, name) });
     }
 
-    juce::MessageManager::callAsync([safeOwner = this->safeOwner, inputs, outputs]()
+    // A scan asked to stop -- by the destructor, or by a newer scan that
+    // replaces it -- posts nothing: its lists would arrive after, or on top
+    // of, the newer state (AUDIT UI-1).
+    if (threadShouldExit()) return;
+
+    juce::MessageManager::callAsync([owner = safeOwner, inputs, outputs]()
     {
-        if (auto* comp = safeOwner.getComponent())
+        if (auto* comp = owner.getComponent())
             comp->onAudioScanComplete(inputs, outputs);
     });
 }
@@ -2137,18 +2142,8 @@ MainComponent::~MainComponent()
 
     // 4. UpdateChecker thread stops in its own destructor (10s timeout)
 
-    // 5. Stop AudioScanThread
-    if (scanThread)
-    {
-        scanThread->signalThreadShouldExit();
-        if (scanThread->isThreadRunning())
-        {
-            if (!scanThread->stopThread(2000))
-            { DBG("WARNING: AudioScanThread did not stop within 2s timeout"); }
-        }
-        scanThread->tempManager = nullptr;  // release AudioDeviceManager early
-        scanThread = nullptr;
-    }
+    // 5. Stop AudioScanThread (see stopAudioScanThread)
+    stopAudioScanThread();
 
     // 6. Capture window bounds before closing (delete doesn't call closeButtonPressed)
     if (trackMapWindow != nullptr)
@@ -4070,21 +4065,62 @@ void MainComponent::updateCurrentOutputStates()
 //==============================================================================
 void MainComponent::startAudioDeviceScan()
 {
-    if (scanThread && scanThread->isThreadRunning())
-    {
-        if (!scanThread->stopThread(2000))
-        { DBG("WARNING: AudioScanThread did not stop within 2s timeout -- skipping new scan"); return; }
-    }
+    // A scan still running is asked to stop, and posts nothing (run()).  If
+    // it does not stop in time, no new scan starts this time.
+    if (!stopAudioScanThread())
+    { DBG("WARNING: AudioScanThread did not stop within 2s timeout -- skipping new scan"); return; }
     scanThread = std::make_unique<AudioScanThread>(this);
-    // Create AudioDeviceManager on the message thread -- JUCE 8.x internally
-    // registers a MIDI device-change listener that requires JUCE_ASSERT_MESSAGE_THREAD.
+    // The manager is made, initialised and later deleted on the message
+    // thread: its MIDI device-list connection registers with, and removes
+    // itself from, a JUCE broadcaster that asserts the message thread.
     scanThread->tempManager = std::make_unique<juce::AudioDeviceManager>();
     // Zero channels "needed": JUCE then fills in no default device names and
     // opens nothing.  With 128/128 this manager opened the current type's
     // default input and output devices at startup and kept them open for
     // the life of the application, for a scan that only needs the names.
+    //
+    // initialise() is where most of the scanning happens, here on the
+    // message thread: it creates every device type and scans each one twice
+    // (createDeviceTypesIfNeeded, then scanDevicesIfNeeded; JUCE 9.0.3).  It
+    // cannot move to the scan thread: WASAPI's device type creates a hidden
+    // message window when it is constructed, and its first scan creates the
+    // COM device enumerator, which needs a thread that has called
+    // CoInitialize -- the scan thread has not.  The thread then scans every
+    // type once more and posts the names.  A scan therefore holds the
+    // message thread, and with it every engine's tick (DESIGN D8), for as
+    // long as the drivers take to enumerate (AUDIT UI-8).
     scanThread->tempManager->initialise(0, 0, nullptr, false);
     scanThread->startThread();
+}
+
+bool MainComponent::stopAudioScanThread()
+{
+    // The thread scans with the AudioDeviceManager it owns (tempManager), so
+    // the two can be deleted only once run() has returned.  It is asked to
+    // stop, which run() checks between device types, and waited for.  A
+    // driver that hangs in scanForDevices() keeps it past the wait.  Such a
+    // thread is released, with its manager, and never deleted -- a leak,
+    // only when a driver hangs; it finishes when the driver returns, and
+    // posts nothing (run()).  It is not killed, as stopThread() would kill
+    // it after its timeout (AUDIT UI-7).  On Linux the kill is a
+    // pthread_cancel: at the thread's next cancellation point -- a driver
+    // blocked in poll, read or open, or any later close or write -- the
+    // unwind it starts reaches JUCE's catch (...) around run(), and STC
+    // aborts.  On Windows it is a TerminateThread, which can leave a heap
+    // or driver lock held.  And deleting the manager after the kill, as
+    // this code used to, freed it under a scan still running.  Message
+    // thread.
+    if (scanThread == nullptr)
+        return true;
+    scanThread->signalThreadShouldExit();
+    if (scanThread->isThreadRunning() && !scanThread->waitForThreadToExit(2000))
+    {
+        DBG("WARNING: AudioScanThread did not stop within 2s timeout -- left behind");
+        juce::ignoreUnused(scanThread.release());
+        return false;
+    }
+    scanThread = nullptr;   // stopped: deletes the thread object and its manager
+    return true;
 }
 
 void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
