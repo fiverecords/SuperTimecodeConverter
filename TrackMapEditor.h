@@ -281,7 +281,7 @@ public:
     std::function<LearnTrackInfo()> onLearnTrackInfo;
 
     //--------------------------------------------------------------------------
-    // Set the active track ID (for visual highlighting in the table)
+    // Scope and active track
     //--------------------------------------------------------------------------
     /// Configure the scope selector and, for an engine scope, the override
     /// behaviour.  `engineNames` are the choices after "Global"; `engine` is
@@ -312,10 +312,16 @@ public:
 
     int getScopeEngine() const { return scopeEngine; }
 
+    /// The track playing on the current engine, highlighted in the table and
+    /// named in the status line.  Artist and title only: every entry of that
+    /// artist and title matches, whatever its duration (isActiveEntry).
+    /// MainComponent's timer calls it on every tick; a change of track
+    /// repaints the table and rewrites the status line (one pass over the
+    /// map), which before waited for the next refresh().  Message thread.
     void setActiveTrack(const juce::String& artist, const juce::String& title)
     {
         auto newKey = TrackMapEntry::makeKey(artist, title);
-        if (activeTrackKey != newKey) { activeTrackKey = newKey; table.repaint(); }
+        if (activeTrackKey != newKey) { activeTrackKey = newKey; table.repaint(); updateStatusText(); }
     }
 
     /// Set the Learn player combo to match the engine's current player.
@@ -442,7 +448,7 @@ public:
     {
         if (rowNumber < 0 || rowNumber >= (int)rows.size()) return;
 
-        bool isActive = (!activeTrackKey.empty() && rows[(size_t)rowNumber]->key() == activeTrackKey);
+        bool isActive = isActiveEntry(*rows[(size_t)rowNumber]);
 
         if (isSelected)
             g.fillAll(accentCyan.withAlpha(0.15f));
@@ -459,7 +465,7 @@ public:
         jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
         const auto& entry = *rows[(size_t)rowNumber];
 
-        bool isActive = (!activeTrackKey.empty() && entry.key() == activeTrackKey);
+        bool isActive = isActiveEntry(entry);
         g.setColour(isActive ? accentGreen.brighter(0.3f) : textBright);
         g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
 
@@ -581,7 +587,7 @@ private:
     int  activeSortColumn = ColPlaylistPos;     // default: playlist order
     bool sortForwards     = true;
     uint64_t rowsGeneration = 0;               // generation at which rows were built
-    std::string activeTrackKey;  // artist|title key of currently playing track
+    std::string activeTrackKey;  // artist|title key of currently playing track (no duration)
 
     // The entry the form edits, by identity -- artist, title and duration,
     // the map's key -- not by row: rows are rebuilt by every refresh(), sort
@@ -729,6 +735,16 @@ private:
         return editingExisting ? trackMap.find(editingArtist, editingTitle, editingDurationSec) : nullptr;
     }
 
+    /// True for the entry of the track playing now.  activeTrackKey has no
+    /// duration (setActiveTrack gets artist and title), so the entry's key
+    /// is compared without its duration too: an entry learned from a deck
+    /// or imported from rekordbox carries one and never matched (AUDIT
+    /// SET-11).
+    bool isActiveEntry(const TrackMapEntry& entry) const
+    {
+        return !activeTrackKey.empty() && TrackMapEntry::makeKey(entry.artist, entry.title) == activeTrackKey;
+    }
+
     void notifyChanged()
     {
         rebuildRows();
@@ -746,7 +762,7 @@ private:
             // Find the entry to show artist - title
             for (auto& [k, entry] : trackMap.getEntries())
             {
-                if (k == activeTrackKey)
+                if (isActiveEntry(entry))
                 {
                     s += " | Active: " + entry.artist + " - " + entry.title + " (MAPPED)";
                     break;
