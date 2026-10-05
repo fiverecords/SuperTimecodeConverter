@@ -223,10 +223,16 @@ public:
         // Wake the thread if it's waiting
         requestSemaphore.signal();
 
+        // The worker checks threadShouldExit() between steps and every wait
+        // it makes is bounded, the longest being one TCP connect
+        // (kConnectTimeoutMs), so it exits within that plus a few hundred ms
+        // and stopThread never has to kill it (AUDIT META-14).
         if (isThreadRunning())
-            stopThread(3000);
+            stopThread(kStopTimeoutMs);
 
-        // Wait for any in-flight NFS download to finish
+        // Wait for any in-flight NFS download to finish.  It is not
+        // cancelled: a long export.pdb download keeps stop() waiting until
+        // it ends (stopping it is the NFS side's, AUDIT WIRE-6).
         if (nfsThread.joinable())
             nfsThread.join();
 
@@ -551,6 +557,7 @@ private:
     //==========================================================================
     static constexpr int kPortDiscoveryPort = 12523;
     static constexpr int kConnectTimeoutMs  = 3000;
+    static constexpr int kStopTimeoutMs     = kConnectTimeoutMs + 2000;   // see stop()
     static constexpr int kReadTimeoutMs     = 1000;  // CDJ responds in <10ms; 3000 was wasteful
     static constexpr int kMaxCacheEntries   = 256;
     static constexpr int kMaxArtCacheEntries = 64;
@@ -678,14 +685,19 @@ private:
                 // kernel to emit RST instead of a clean shutdown.
                 // 200 ms is generous: the CDJ typically responds within 2 ms.
                 // We drain any pending bytes so the socket is empty when we
-                // close it, further reducing the chance of a reset.
+                // close it, further reducing the chance of a reset.  read()
+                // with shouldBlock=false never blocks (JUCE puts the socket in
+                // non-blocking mode for it); the same 200 ms also bounds a
+                // peer that keeps sending (AUDIT META-14).
+                const double drainUntil = juce::Time::getMillisecondCounterHiRes() + 200.0;
                 if (socket->waitUntilReady(true, 200) == 1)
                 {
                     uint8_t drain[256];
-                    while (socket->getRawSocketHandle() >= 0
+                    while (juce::Time::getMillisecondCounterHiRes() < drainUntil
+                           && socket->getRawSocketHandle() >= 0
                            && socket->read(drain, sizeof(drain), false) > 0)
                     {
-                        // keep draining until empty or connection gone
+                        // keep draining until empty, connection gone, or time up
                     }
                 }
             }
@@ -890,7 +902,8 @@ private:
 
         while (remaining > 0)
         {
-            if (juce::Time::getMillisecondCounterHiRes() > deadline)
+            if (juce::Time::getMillisecondCounterHiRes() > deadline
+                || juce::Thread::currentThreadShouldExit())   // stop() (AUDIT META-14)
                 return false;
 
             if (!sock.waitUntilReady(true, 100))
@@ -912,7 +925,8 @@ private:
         auto deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
         while (numBytes > 0)
         {
-            if (juce::Time::getMillisecondCounterHiRes() > deadline)
+            if (juce::Time::getMillisecondCounterHiRes() > deadline
+                || juce::Thread::currentThreadShouldExit())
                 return false;
             if (!sock.waitUntilReady(true, 100))
                 continue;
@@ -1303,7 +1317,7 @@ private:
                 }
             }
         }
-        if (!slot) return nullptr;
+        if (!slot || threadShouldExit()) return nullptr;
 
         // Step 1: Discover database port via port 12523 (cached after first success)
         int dbPort = 0;
@@ -1324,6 +1338,8 @@ private:
             const juce::ScopedLock sl(knownDbPortsLock);
             knownDbPorts[playerIP.toStdString()] = dbPort;
         }
+
+        if (threadShouldExit()) return nullptr;
 
         // Step 2: Connect to database port
         auto sock = std::make_unique<juce::StreamingSocket>();
@@ -1487,10 +1503,10 @@ private:
             {
                 DBG("DbServerClient: port discovery retry " + juce::String(attempt)
                     + "/" + juce::String(kMaxRetries - 1) + " for " + playerIP);
-                juce::Thread::sleep(kRetryDelayMs);
-                if (!isRunningFlag.load(std::memory_order_relaxed))
-                    return 0;
+                wait(kRetryDelayMs);   // stopThread() ends the wait (AUDIT META-14)
             }
+            if (threadShouldExit() || !isRunningFlag.load(std::memory_order_relaxed))
+                return 0;
 
             int port = discoverDbPortOnce(playerIP);
             if (port > 0)
@@ -3266,6 +3282,7 @@ private:
     // other request meanwhile.
     NfsAnlzFetcher nfsAnlzFetcher;
     std::thread nfsThread;
+    std::atomic<bool> nfsBusy { false };   // set by the worker at launch, cleared by the NFS thread when done
 
     // dbserver port-discovery listener (TCP 12523).
     //
@@ -3382,10 +3399,17 @@ private:
                         uint8_t slot, uint32_t trackId,
                         const std::string& diskCacheKey)
     {
-        // Join previous NFS thread if still running
-        if (nfsThread.joinable())
-            nfsThread.join();
+        // Wait for the previous download in short slices rather than in
+        // join(), so that stop() never waits on this thread behind a long
+        // NFS download (AUDIT META-14).  Not launched once stopping.
+        while (!nfsIdle())
+        {
+            if (threadShouldExit()) return;
+            wait(50);
+        }
+        if (threadShouldExit()) return;
 
+        nfsBusy.store(true, std::memory_order_release);
         nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
@@ -3416,7 +3440,20 @@ private:
                 if (!diskCacheKey.empty())
                     saveAnlzToDisk(cacheKey, diskCacheKey);
             }
+            nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
         });
+    }
+
+    /// Worker thread.  True when no NFS download is running; then joins the
+    /// finished thread (at once), so nfsAnlzFetcher is free until the next
+    /// launch.
+    bool nfsIdle()
+    {
+        if (nfsBusy.load(std::memory_order_acquire))
+            return false;
+        if (nfsThread.joinable())
+            nfsThread.join();
+        return true;
     }
 
     /// Build a CachedAnlz from in-memory TrackMetadata and save to disk.
