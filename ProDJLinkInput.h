@@ -3411,14 +3411,14 @@ private:
             }
         }
 
-        // Fallback: match by adapter friendly name or description
+        // Fallback: match by adapter friendly name, exactly -- ifaceName is
+        // the FriendlyName NetworkUtils listed (getNetworkInterfaces).  A
+        // substring test took "Ethernet"'s MAC for "Ethernet 2" (or the
+        // reverse), the AUDIT A19 bug on Windows (AUDIT PDL-14).
         for (auto* adapter = addresses; adapter; adapter = adapter->Next)
         {
-            juce::String friendlyName(adapter->FriendlyName);
-            juce::String description(adapter->Description);
-            if (friendlyName.containsIgnoreCase(ifaceName)
-                || description.containsIgnoreCase(ifaceName)
-                || ifaceName.containsIgnoreCase(friendlyName))
+            const juce::String friendlyName(adapter->FriendlyName);
+            if (friendlyName == ifaceName)
             {
                 if (adapter->PhysicalAddressLength >= 6)
                 {
