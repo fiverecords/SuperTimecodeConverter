@@ -1649,8 +1649,11 @@ struct EngineSettings
         laNetTCInputInterface    = getInt("laNetTCInputInterface", 0);
         generatorClockMode       = getBool("generatorClockMode", true);
         generatorPresetName      = getString("generatorPresetName", "");
-        generatorStartMs         = (double)getInt("generatorStartMs", 0);
-        generatorStopMs          = (double)getInt("generatorStopMs", 0);
+        // Saved as double -- at 24, 30 and the 1001 rates a frame is not a
+        // whole number of milliseconds -- and read back as one.  Read as an
+        // int, 01:00:00:01 at 30 fps came back as 01:00:00:00 (AUDIT SET-6).
+        generatorStartMs         = getDouble("generatorStartMs", 0.0);
+        generatorStopMs          = getDouble("generatorStopMs", 0.0);
         generatorLoopInMs        = (double) obj->getProperty("generatorLoopInMs");
         generatorLoopOutMs       = (double) obj->getProperty("generatorLoopOutMs");
         generatorLoopEnabled     = getBool("generatorLoopEnabled", false);
@@ -2027,8 +2030,8 @@ private:
         es.laNetTCInputInterface = getInt("laNetTCInputInterface", 0);
         es.generatorClockMode   = getBool("generatorClockMode", true);
         es.generatorPresetName  = getString("generatorPresetName", "");
-        es.generatorStartMs     = (double)getInt("generatorStartMs", 0);
-        es.generatorStopMs      = (double)getInt("generatorStopMs", 0);
+        es.generatorStartMs     = getDouble("generatorStartMs", 0.0);   // doubles, as EngineSettings::fromVar
+        es.generatorStopMs      = getDouble("generatorStopMs", 0.0);
         es.generatorLoopInMs    = (double) obj->getProperty("generatorLoopInMs");
         es.generatorLoopOutMs   = (double) obj->getProperty("generatorLoopOutMs");
         es.generatorLoopEnabled = getBool("generatorLoopEnabled", false);
