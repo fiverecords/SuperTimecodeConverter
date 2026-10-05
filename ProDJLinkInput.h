@@ -882,7 +882,12 @@ public:
     /// product).  Without that multiplication every non-3000 player sent the
     /// track tempo whatever the pitch fader said (AUDIT A15, @Joren2087's
     /// report on the NXS2); dividing by 10 whenever hasAbsolutePosition was
-    /// set also froze an NXS2 streaming 0x0b at ten times its tempo (A16).
+    /// set also froze an NXS2 streaming 0x0b at ten times its tempo (AUDIT A16).
+    ///
+    /// Unknown tempo reads 0.0 in both formats: ffffffff in the 0x0b ("tracks
+    /// with unknown BPM", dysentery beats.adoc) -- it used to come out as
+    /// 429,496,729.5 BPM (AUDIT PDL-1) -- and ffff in status and beat
+    /// packets.  With no track loaded the status handler clears it (PDL-9).
     double getBPM(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -890,7 +895,7 @@ public:
         const auto& p = players[idx];
         const uint32_t raw = p.bpmRaw.load(std::memory_order_relaxed);
         if (p.absPosIs3000Format.load(std::memory_order_relaxed))
-            return double(raw) / 10.0;
+            return (raw == 0xFFFFFFFFu) ? 0.0 : double(raw) / 10.0;
         if (raw == 0 || raw == 0xFFFF) return 0.0;   // no track, or tempo unknown
         return double(raw) / 100.0
              * ProDJLink::pitchFromStatus(p.pitchRaw.load(std::memory_order_relaxed));
@@ -2803,26 +2808,39 @@ private:
         }
 
         // Track BPM x100, unless the CDJ-3000's 0x0b supplies the BPM (x10,
-        // effective).  The NXS2's 0x0b has no BPM (AUDIT A16).
-        if (len > 147 && !p.absPosIs3000Format.load(std::memory_order_relaxed))
+        // effective).  The NXS2's 0x0b has no BPM (AUDIT A16).  ffff (tempo
+        // unknown: no track, a track still loading or not analysed) is stored
+        // like any value and getBPM reads it as 0; skipping it kept the
+        // previous track's tempo after an eject (AUDIT PDL-9, the S13 capture
+        // ends with one).  The CDJ-3000 stops sending 0x0b when no track is
+        // loaded (dysentery beats.adoc), so its last 0x0b BPM is cleared here
+        // when P1 says "no track".
+        if (len > 147)
         {
-            uint16_t bpm = ProDJLink::readU16BE(data + 146);
-            if (bpm != 0xFFFF)
+            const uint16_t bpm = ProDJLink::readU16BE(data + 146);
+            if (!p.absPosIs3000Format.load(std::memory_order_relaxed))
                 p.bpmRaw.store(bpm, std::memory_order_relaxed);
+            else if (p.playState.load(std::memory_order_relaxed) == ProDJLink::kPlayNoTrack)
+                p.bpmRaw.store(0, std::memory_order_relaxed);
         }
 
-        // Pitch and actual playback speed from status packets.
-        // Offset 140: fader pitch (0x100000 = 0% = 1.0x multiplier).
-        //   This is the DJ's physical fader setting. Does NOT include
-        //   motor ramp -- jumps to target instantly.
-        // Offset 152: actual playback speed (0 = stopped, 0x100000 = 1.0x).
-        //   Includes motor ramp -- ramps 0->target on play, target->0 on pause.
-        //   This is what the CDJ is ACTUALLY doing right now.
+        // Pitch from status packets (0x100000 = 0 % = 1.0x), as dysentery
+        // vcdj.adoc reads the four copies:
+        // Offset 140 (0x8c), Pitch1 -> pitchRaw: the pitch actually in effect,
+        //   as the BPM display shows it, whether from the local fader or a
+        //   synced tempo master.  No motor ramp.
+        // Offset 152 (0x98), Pitch2 -> actualSpeedRaw: the local pitch
+        //   fader, ramping 0 -> fader on play and fader -> 0 on pause (brake
+        //   and release settings); 0 while paused or the jog is held.  Under
+        //   sync it is NOT the effective speed (AUDIT B13: which copy the
+        //   interpolation should use waits for a synced capture).
+        // Pitch1 = 0 is -100 %, a stop reachable in Wide tempo mode, not "no
+        // value": it is stored like any other, so getBPM reads 0 there
+        // instead of the last tempo (AUDIT PDL-9).
         if (len > 143)
         {
             uint32_t fader = ProDJLink::readU32BE(data + 140);
-            if (fader != 0)
-                p.pitchRaw.store(fader, std::memory_order_relaxed);
+            p.pitchRaw.store(fader, std::memory_order_relaxed);
         }
         if (len > 155)
         {
