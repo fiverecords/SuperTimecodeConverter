@@ -1400,7 +1400,7 @@ private:
         {
             out.mainCueSampleOffset = StageLinQ::readF64BE(p); p += 8;
             p += 1;  // isAdjusted
-            double defaultCue = StageLinQ::readF64BE(p); p += 8;
+            double defaultCue = StageLinQ::readF64BE(p);
             if (out.mainCueSampleOffset <= 0.0)
                 out.mainCueSampleOffset = defaultCue;
         }

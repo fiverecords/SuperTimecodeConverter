@@ -24,11 +24,20 @@
 // development.  Extensive logging is included for Wireshark-assisted
 // debugging when hardware becomes available.
 //
-// One field capture has been read since: a PRIME 4+ on Engine OS 5.0.4,
-// from issue #23 (replayed by tools/audit/slq_capture_replay.cpp).  It set
-// the playback speed (from BeatInfo, not /Engine/DeckN/Speed), the 0 - 1.27
-// range of its faders and crossfader, and ExternalMixerVolume as the on-air
-// signal.  Everything else here is still unconfirmed on Denon hardware.
+// Two field captures have been read since: a PRIME 4+ on Engine OS 5.0.4,
+// from issue #23 (replayed by tools/audit/slq_capture_replay.cpp;
+// DESIGN D35).  They set the playback speed (from BeatInfo, not
+// /Engine/DeckN/Speed), the 0 - 1.27 range of its faders and crossfader,
+// ExternalMixerVolume as the on-air signal, Track/TrackLength in samples,
+// and the FileTransfer messages the unit sends unasked.  Everything else
+// here is still unconfirmed on Denon hardware.
+//
+// One device at a time (AUDIT SLQ-3): decks map to STC decks 1-4 by the
+// device's /Client/Preferences/Player -- 1 (a PRIME 4+ sends "1") to 1-4,
+// 2 to 3-4 -- so two units that both say Player 1 (two PRIME units), or
+// SC6000 players 3 and 4, write into the same decks in turn.  The speed
+// tracker, isReceiving(), getPlayerModel() and the database client (the
+// first device to offer FileTransfer) are not per device either.
 
 #pragma once
 #include <JuceHeader.h>
@@ -136,7 +145,7 @@ namespace StageLinQ
     // down, 0 with the crossfader cutting the deck's side, 1 with the fader
     // up and the crossfader on its side, about half each near the centre.
     // A deck is off air at or below the level the engine's OFF AIR AT
-    // setting names (D34): SILENCE (the default) is exactly 0, which the
+    // setting names (DESIGN D34): SILENCE (the default) is exactly 0, which the
     // PRIME 4+ sends with the fader in the bottom 1-4 % of its travel or the
     // crossfader in the last 3-6 %; -80, -60 and -40 dB go off air earlier
     // (-60 dB, beta1's fixed value, around 13-20 % of the fader and 10-15 %
@@ -391,6 +400,13 @@ namespace StageLinQ
     // Random tokens can fail silently on some firmware versions due to
     // undocumented constraints.  Both chrisle/StageLinq and djctl switched
     // to pre-defined tokens after encountering issues with random generation.
+    //
+    // Every STC instance announces this same token, and so does SoundSwitch.
+    // STC drops discovery frames carrying its own token, so it ignores
+    // another STC's (it offers no services anyway) and SoundSwitch's (also
+    // skipped by name).  What a Denon unit does with two clients of one
+    // token -- a main and a backup STC, or STC beside SoundSwitch -- is not
+    // known: a wire question for a capture (AUDIT SLQ-10, DESIGN D2).
     //
     // CRITICAL CONSTRAINT (from PyStageLinQ protocol docs): if the most
     // significant bit of the token's first byte is 1, the device will
@@ -857,7 +873,7 @@ struct StageLinQDeckState
     std::atomic<double>   externalVolume { 0.0 };   // from ExternalMixerVolume: level after fader and crossfader, 0-1
     std::atomic<bool>     externalVolumeReceived { false };
     std::atomic<bool>     isMaster { false };        // from /Client/DeckN/DeckIsMaster
-    std::atomic<int>      channelAssignment { 0 };   // from /Mixer/ChannelAssignment{N} (deck->channel map)
+    std::atomic<int>      channelAssignment { 0 };   // from /Mixer/ChannelAssignment{N}: crossfader side, assumed 0=THRU 1=A 2=B (never sent by a PRIME 4+)
 
     // Timing
     std::atomic<double>   lastUpdateTime { 0.0 };     // juce hiRes ms
@@ -1395,9 +1411,9 @@ public:
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return "Denon";
         if (!decks[idx].active.load(std::memory_order_relaxed)) return {};
 
-        // Return device name from discovery.
-        // TODO: with multi-device, track which device sent each deck's data
-        // to return the correct model per deck.
+        // The name of whichever discovered device sorts first by IP, not
+        // necessarily the one feeding this deck: STC handles one device at a
+        // time (AUDIT SLQ-3, the file's header).
         std::lock_guard<std::mutex> lock(devicesMutex);
         if (!discoveredDevices.empty())
             return discoveredDevices.begin()->second.deviceName;
@@ -1494,7 +1510,7 @@ public:
         return true;
     }
 
-    /// ON AIR follow (D34): how loud the deck is among the decks on air --
+    /// ON AIR follow (DESIGN D34): how loud the deck is among the decks on air --
     /// its ExternalMixerVolume when the device sends it, otherwise its
     /// channel fader.  Negative when isDeckOnAir(deckNum, quietLevel) says
     /// it is not on air.
@@ -1519,6 +1535,8 @@ public:
             || mixerState.valuesReceived.load(std::memory_order_relaxed);
     }
 
+    // Any deck updated in the last 3 s, from any device (not per device:
+    // AUDIT SLQ-3)
     bool isReceiving() const
     {
         double now = juce::Time::getMillisecondCounterHiRes();
@@ -1554,7 +1572,8 @@ public:
         return isPlayerPlaying(deckNum);
     }
 
-    // For compatibility: always true for StageLinQ (position comes from BeatInfo timeline)
+    // For compatibility with the Pro DJ Link API: always false -- StageLinQ
+    // has no end-of-track state STC reads (the position comes from BeatInfo)
     bool isEndOfTrack(int /*deckNum*/) const { return false; }
 
     // For compatibility: StageLinQ doesn't have track IDs like rekordbox
@@ -2333,7 +2352,9 @@ private:
         }
         else if (path.startsWith("/Mixer/ChannelAssignment"))
         {
-            // /Mixer/ChannelAssignment1 -> channel 1 is assigned to deck N
+            // /Mixer/ChannelAssignment1 -> channel 1's crossfader side, as
+            // getChannelAssignment() reads it (assumed 0=THRU, 1=A, 2=B;
+            // a PRIME 4+ never sends it, DESIGN D35)
             int ch = path[24] - '0';
             if (ch >= 1 && ch <= StageLinQ::kMaxMixerChannels)
             {
@@ -2478,8 +2499,11 @@ private:
                 double speed = 0.0;
                 bool measured = false;
                 {
-                    // Normally one device thread per deck; the lock covers a
-                    // misconfigured network where two devices claim a deck.
+                    // One connection thread per deck while one device feeds
+                    // it; the lock covers two devices mapped onto the same
+                    // deck -- two units that both say Player 1, or SC6000
+                    // players 3/4 (AUDIT SLQ-3), which then mix two clocks
+                    // in one tracker.
                     std::lock_guard<std::mutex> lock(beatSpeedMutex);
                     measured = beatSpeedTrackers[(size_t)mapped].update(
                         clock, timelines[i], effectiveSampleRate(mapped), speed);
@@ -2773,7 +2797,10 @@ private:
         // Multi-device deck mapping:
         // SC6000 player 1 -> deckOffset=0 (STC decks 1-2)
         // SC6000 player 2 -> deckOffset=2 (STC decks 3-4)
-        // Prime 4 player 1 -> deckOffset=0 (STC decks 1-4)
+        // Prime 4 player 1 -> deckOffset=0 (STC decks 1-4; the PRIME 4+
+        //   sends Player "1", #23 capture)
+        // Players 3 and 4, and a second unit that is also player 1, get
+        // offset 0 too and share decks with the first (AUDIT SLQ-3).
         int deckOffset = 0;   // set when /Client/Preferences/Player arrives
 
         std::unique_ptr<juce::StreamingSocket> mainSocket;
@@ -2883,7 +2910,11 @@ private:
                         if (offset + refSize > (int)buf.size()) break;
                         offset += refSize;
 
-                        // Reference after services = end of list
+                        // Reference after services = end of list.  What
+                        // is left in buf goes with it, and a service
+                        // announced after this Reference is not seen
+                        // (AUDIT SLQ-11; the PRIME 4+ announces its five
+                        // services before its Reference, #23 capture).
                         if (stateMapPort > 0 || beatInfoPort > 0)
                         {
                             buf.erase(buf.begin(), buf.begin() + offset);
