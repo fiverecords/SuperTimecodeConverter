@@ -99,6 +99,12 @@ namespace StageLinQ
     static constexpr double kReconnectDelay        = 3.0;   // seconds before reconnect attempt
     static constexpr int    kSocketTimeoutMs       = 2000;   // TCP read timeout
     static constexpr double kDeviceTimeoutSec      = 5.0;   // no discovery = device gone
+    // How long stop() waits for a connection thread.  Its longest step that
+    // cannot be interrupted is one TCP connect (kSocketTimeoutMs); every wait
+    // besides is cut short by stopThread() or checks threadShouldExit()
+    // (AUDIT SLQ-6: a 2 s connect plus a 500 ms sleep outlasted the 2 s
+    // stopThread, which then killed the thread).
+    static constexpr int    kConnectionStopMs      = kSocketTimeoutMs + 2000;
 
     // Largest StateMap or BeatInfo block accepted from the wire; a longer
     // length field is taken for corruption (AUDIT WIRE-3).  A StateMap value
@@ -769,6 +775,8 @@ namespace StageLinQ
 struct StageLinQDeckState
 {
     std::atomic<bool>     active { false };       // deck exists / has data
+    std::atomic<uint32_t> sourceId { 0 };         // connection that last wrote its /Engine/DeckN values or BeatInfo (StageLinQInput::clearDecksOf)
+    std::atomic<uint32_t> mixerSourceId { 0 };    // connection that last wrote its /Mixer/ channel values
     std::atomic<int>      deckNumber { 0 };       // 1-4
 
     // Playback
@@ -872,9 +880,12 @@ struct StageLinQDeckState
 
     mutable std::mutex metaMutex;
 
-    void reset()
+    // keepMixerChannel: leave the channel's /Mixer/ values (fader,
+    // crossfader side), which have an owner of their own (mixerSourceId)
+    void reset(bool keepMixerChannel = false)
     {
         active.store(false, std::memory_order_release);
+        sourceId.store(0);
         deckNumber.store(0);
         isPlaying.store(false);
         playState.store(0);
@@ -922,11 +933,15 @@ struct StageLinQDeckState
         beatInfoTimeline.store(0.0);
         beatSpeed.store(0.0);
         beatSpeedTime.store(0.0);
-        faderPosition.store(0.0);
+        if (!keepMixerChannel)
+        {
+            mixerSourceId.store(0);
+            faderPosition.store(0.0);
+            channelAssignment.store(0);
+        }
         externalVolume.store(0.0);
         externalVolumeReceived.store(false);
         isMaster.store(false);
-        channelAssignment.store(0);
         lastUpdateTime.store(0.0);
         {
             std::lock_guard<std::mutex> lock(metaMutex);
@@ -987,6 +1002,7 @@ struct StageLinQDeviceInfo
     double        lastConnectAttempt = 0.0;   // hiRes ms -- for reconnect cooldown
     int           deckCount = 0;              // from /Engine/DeckCount or default 2
     bool          connected = false;
+    uint32_t      connectionId = 0;           // the connection thread launched last (markDisconnected)
 };
 
 //==============================================================================
@@ -1097,10 +1113,14 @@ public:
             }
         }
 
-        // Close all device connections
-        closeAllDeviceConnections();
-
+        // The discovery thread first: it is the one that launches connection
+        // threads.  Closing the connections before it had stopped let it
+        // launch a new one that outlived stop() and, at destruction, ran
+        // against freed decks (AUDIT SLQ-6).
         stopThread(3000);
+
+        // Then every device connection
+        closeAllDeviceConnections();
 
         for (auto& d : decks) d.reset();
         mixerState.reset();
@@ -1819,46 +1839,70 @@ private:
     //==========================================================================
     void manageConnections()
     {
-        std::lock_guard<std::mutex> lock(devicesMutex);
-
-        double now = juce::Time::getMillisecondCounterHiRes();
-
-        for (auto& [ip, dev] : discoveredDevices)
+        // Decide under devicesMutex, launch under connThreadsMutex -- never
+        // one inside the other.  It took connThreadsMutex inside
+        // devicesMutex while closeAllDeviceConnections() held
+        // connThreadsMutex and waited for threads whose markDisconnected()
+        // needs devicesMutex: a lock-order cycle (AUDIT SLQ-6).
+        std::vector<StageLinQDeviceInfo> toLaunch;
         {
-            // Skip already connected
-            if (dev.connected) continue;
+            std::lock_guard<std::mutex> lock(devicesMutex);
 
-            // Skip devices without service port
-            if (dev.servicePort == 0) continue;
+            double now = juce::Time::getMillisecondCounterHiRes();
 
-            // Only attempt connection if we've seen a discovery frame recently
-            // (prevents reconnect loops to devices that have gone offline)
-            double age = now - dev.lastSeenTime;
-            if (age > StageLinQ::kDeviceTimeoutSec * 1000.0) continue;
+            for (auto it = discoveredDevices.begin(); it != discoveredDevices.end();)
+            {
+                auto& dev = it->second;
+                double age = now - dev.lastSeenTime;
 
-            // Wait 500ms after first discovery for stability, and enforce a
-            // minimum cooldown between reconnect attempts
-            if (age < 500.0) continue;
-            if (dev.lastConnectAttempt > 0.0
-                && (now - dev.lastConnectAttempt) < StageLinQ::kReconnectDelay * 1000.0)
-                continue;
+                // A device that stopped announcing itself and has no
+                // connection left is forgotten (AUDIT SLQ-7: entries were
+                // never removed but on EXIT).  It is found again by its
+                // next discovery frame.
+                if (!dev.connected && age > StageLinQ::kDeviceTimeoutSec * 1000.0)
+                {
+                    it = discoveredDevices.erase(it);
+                    continue;
+                }
+                ++it;
 
-            // Connect in a background thread to avoid blocking discovery
-            dev.connected = true;  // Mark as connecting to prevent re-entry
-            dev.lastConnectAttempt = now;
+                // Skip already connected
+                if (dev.connected) continue;
 
+                // Skip devices without service port
+                if (dev.servicePort == 0) continue;
+
+                // Connect only 0.5 s or more after the device's LAST discovery
+                // frame (not its first, as this said): a PRIME 4+ announces
+                // once a second (#23 captures), so the window opens every
+                // second, but a device announcing more often than every 0.5 s
+                // would never be connected.  And a minimum cooldown between
+                // reconnect attempts.
+                if (age < 500.0) continue;
+                if (dev.lastConnectAttempt > 0.0
+                    && (now - dev.lastConnectAttempt) < StageLinQ::kReconnectDelay * 1000.0)
+                    continue;
+
+                // Connect in a background thread to avoid blocking discovery
+                dev.connected = true;  // Mark as connecting to prevent re-entry
+                dev.lastConnectAttempt = now;
+                dev.connectionId = nextConnectionId++;
+                toLaunch.push_back(dev);
+            }
+        }
+
+        std::lock_guard<std::mutex> cLock(connThreadsMutex);
+        for (const auto& dev : toLaunch)
+        {
             // Kill any stale thread for the same IP before launching a new one
             // (can happen if device did EXIT + re-announce faster than thread teardown)
+            for (auto& ct : connectionThreads)
             {
-                std::lock_guard<std::mutex> cLock(connThreadsMutex);
-                for (auto& ct : connectionThreads)
+                if (ct && ct->getDeviceIp() == dev.ip && ct->isThreadRunning())
                 {
-                    if (ct && ct->getDeviceIp() == dev.ip && ct->isThreadRunning())
-                    {
-                        DBG("StageLinQ: Stopping stale thread for " + dev.ip + " before reconnect");
-                        ct->signalThreadShouldExit();
-                        ct->closeSocket();
-                    }
+                    DBG("StageLinQ: Stopping stale thread for " + dev.ip + " before reconnect");
+                    ct->signalThreadShouldExit();
+                    ct->closeSocket();
                 }
             }
 
@@ -1866,23 +1910,17 @@ private:
             // if push_back throws during vector realloc, the thread is still owned)
             auto connThread = std::make_unique<DeviceConnectionThread>(*this, dev);
             auto* connPtr = connThread.get();
-            {
-                std::lock_guard<std::mutex> cLock(connThreadsMutex);
-                connectionThreads.push_back(std::move(connThread));
-            }
+            connectionThreads.push_back(std::move(connThread));
             connPtr->startThread();
         }
 
         // Prune stopped connection threads to prevent unbounded growth
-        {
-            std::lock_guard<std::mutex> cLock(connThreadsMutex);
-            connectionThreads.erase(
-                std::remove_if(connectionThreads.begin(), connectionThreads.end(),
-                    [](const std::unique_ptr<DeviceConnectionThread>& ct) {
-                        return !ct->isThreadRunning();
-                    }),
-                connectionThreads.end());
-        }
+        connectionThreads.erase(
+            std::remove_if(connectionThreads.begin(), connectionThreads.end(),
+                [](const std::unique_ptr<DeviceConnectionThread>& ct) {
+                    return !ct->isThreadRunning();
+                }),
+            connectionThreads.end());
     }
 
     //==========================================================================
@@ -1910,17 +1948,56 @@ private:
     //==========================================================================
     void closeAllDeviceConnections()
     {
-        std::lock_guard<std::mutex> lock(connThreadsMutex);
-        for (auto& ct : connectionThreads)
+        // Taken out of the list under the lock, joined outside it: a thread
+        // that is ending takes devicesMutex (markDisconnected), and nothing
+        // may wait on it while holding a lock someone else needs.
+        std::vector<std::unique_ptr<DeviceConnectionThread>> threads;
+        {
+            std::lock_guard<std::mutex> lock(connThreadsMutex);
+            threads.swap(connectionThreads);
+        }
+        for (auto& ct : threads)
         {
             ct->signalThreadShouldExit();
             ct->closeSocket();
         }
-        for (auto& ct : connectionThreads)
+        for (auto& ct : threads)
         {
-            ct->stopThread(2000);
+            ct->stopThread(StageLinQ::kConnectionStopMs);
         }
-        connectionThreads.clear();
+    }
+
+    //==========================================================================
+    // A connection has ended (its thread is exiting): clear the decks it fed,
+    // so they do not stay PLAYING with a frozen position -- and, through the
+    // 1 + SpeedState/100 fallback, keep an engine active while another
+    // device keeps isReceiving() true (AUDIT SLQ-7).  The track version and
+    // the identity last published stay (StageLinQDeckState), so a device
+    // that comes back with the same track does not fire it again.
+    // A deck is owned through its /Engine/DeckN values and BeatInfo; the
+    // mixer channel of the same number through its /Mixer/ values, which
+    // may come from another unit (a mixer, or a second player relaying
+    // one).  Each is cleared only with its own connection: a unit that only
+    // sent a channel's fader leaves the deck another unit plays alone.
+    //==========================================================================
+    void clearDecksOf(uint32_t connectionId)
+    {
+        if (connectionId == 0) return;
+        for (int i = 0; i < StageLinQ::kMaxDecks; ++i)
+        {
+            auto& dk = decks[(size_t)i];
+            uint32_t mixerOwner = connectionId;
+            if (dk.mixerSourceId.compare_exchange_strong(mixerOwner, 0u))
+            {
+                dk.faderPosition.store(0.0, std::memory_order_relaxed);
+                dk.channelAssignment.store(0, std::memory_order_relaxed);
+            }
+            uint32_t owner = connectionId;
+            if (!dk.sourceId.compare_exchange_strong(owner, 0u)) continue;
+            dk.reset(true);
+            std::lock_guard<std::mutex> lock(beatSpeedMutex);
+            beatSpeedTrackers[(size_t)i].reset();
+        }
     }
 
     //==========================================================================
@@ -1999,8 +2076,12 @@ private:
     //==========================================================================
     // Handle a StateMap value update from a device
     //==========================================================================
+    // sourceId: the connection the value came from (0: none, as in the
+    // replay tools); a deck remembers the last one that wrote its
+    // /Engine/DeckN values, a mixer channel the last one that wrote its
+    // /Mixer/ values (clearDecksOf).
     void handleStateMapValue(const juce::String& path, const StageLinQ::JsonValue& value,
-                             int deckOffset = 0)
+                             int deckOffset = 0, uint32_t sourceId = 0)
     {
         // Parse deck number from path: /Engine/Deck{N}/...
         // Must check for digit at pos 12 -- "/Engine/DeckCount" also starts
@@ -2016,6 +2097,7 @@ private:
             int idx = mappedDeck - 1;
 
             auto& dk = decks[idx];
+            if (sourceId != 0) dk.sourceId.store(sourceId, std::memory_order_relaxed);
             dk.active.store(true, std::memory_order_relaxed);
             dk.deckNumber.store(mappedDeck, std::memory_order_relaxed);
             dk.lastUpdateTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
@@ -2224,6 +2306,7 @@ private:
             {
                 const double pos = value.asDouble();
                 notePositionRange(pos);
+                if (sourceId != 0) decks[ch - 1].mixerSourceId.store(sourceId, std::memory_order_relaxed);
                 decks[ch - 1].faderPosition.store(pos, std::memory_order_relaxed);
                 mixerState.valuesReceived.store(true, std::memory_order_relaxed);
             }
@@ -2241,6 +2324,7 @@ private:
             int ch = path[24] - '0';
             if (ch >= 1 && ch <= StageLinQ::kMaxMixerChannels)
             {
+                if (sourceId != 0) decks[ch - 1].mixerSourceId.store(sourceId, std::memory_order_relaxed);
                 decks[ch - 1].channelAssignment.store(value.asInt(), std::memory_order_relaxed);
                 mixerState.assignmentReceived.store(true, std::memory_order_relaxed);
             }
@@ -2336,7 +2420,7 @@ private:
     // speed (StageLinQ::BeatSpeedTracker), which getActualSpeed() returns.
     void handleBeatInfo(uint64_t clock, const std::vector<PlayerInfo>& players,
                         const std::vector<double>& timelines, int deckOffset,
-                        double hostMs)
+                        double hostMs, uint32_t sourceId = 0)
     {
         int numDecks = juce::jmin((int)players.size(), StageLinQ::kMaxDecks);
         for (int i = 0; i < numDecks; ++i)
@@ -2345,6 +2429,7 @@ private:
             if (mapped < 0 || mapped >= StageLinQ::kMaxDecks) continue;
 
             auto& dk = decks[mapped];
+            if (sourceId != 0) dk.sourceId.store(sourceId, std::memory_order_relaxed);
             dk.active.store(true, std::memory_order_relaxed);
             dk.deckNumber.store(mapped + 1, std::memory_order_relaxed);
             dk.beatInfoBeat.store(players[i].beat, std::memory_order_relaxed);
@@ -2407,9 +2492,10 @@ private:
     class DeviceConnectionThread : public juce::Thread
     {
     public:
-        DeviceConnectionThread(StageLinQInput& owner, const StageLinQDeviceInfo& device)
+        DeviceConnectionThread(StageLinQInput& ownerRef, const StageLinQDeviceInfo& device)
             : Thread("SLQ-" + device.ip.fromLastOccurrenceOf(".", false, false)),
-              owner(owner), deviceIp(device.ip), devicePort(device.servicePort)
+              owner(ownerRef), deviceIp(device.ip), devicePort(device.servicePort),
+              connectionId(device.connectionId)
         {
             std::memcpy(deviceToken, device.token, StageLinQ::kTokenLen);
             deviceName = device.deviceName;
@@ -2417,7 +2503,7 @@ private:
 
         ~DeviceConnectionThread() override
         {
-            stopThread(2000);
+            stopThread(StageLinQ::kConnectionStopMs);
         }
 
         const juce::String& getDeviceIp() const { return deviceIp; }
@@ -2447,7 +2533,7 @@ private:
                         + " (attempt " + juce::String(attempt) + "/" + juce::String(kMaxRetries) + ")");
                     if (attempt < kMaxRetries)
                     {
-                        juce::Thread::sleep(500);
+                        wait(500);   // cut short by stopThread()
                         continue;
                     }
                     markDisconnected();
@@ -2493,7 +2579,8 @@ private:
             // chrisle/StageLinq adds a 500ms delay before connecting to services
             // ("find out why we need these waits before connecting to a service")
             // Some firmware versions may need time between main handshake and service connect.
-            juce::Thread::sleep(500);
+            wait(500);   // cut short by stopThread()
+            if (threadShouldExit()) { markDisconnected(); return; }
             if (stateMapPort > 0)
             {
                 auto sm = std::make_unique<juce::StreamingSocket>();
@@ -2523,6 +2610,7 @@ private:
             }
 
             // --- Phase 3: Connect to BeatInfo service ---
+            if (threadShouldExit()) { markDisconnected(); return; }
             if (beatInfoPort > 0)
             {
                 auto bi = std::make_unique<juce::StreamingSocket>();
@@ -2603,20 +2691,32 @@ private:
                         readBeatInfoData(beatSocket.get());
                 }
 
-                // Detect dead service sockets.  If StateMap dies (the primary
-                // data channel), the connection is useless -- exit the loop so
+                // Detect dead sockets.  If StateMap dies (the primary data
+                // channel), the connection is useless -- exit the loop so
                 // markDisconnected() fires and manageConnections() can relaunch.
                 // Without this check the thread becomes a zombie: keepalives
                 // keep the main socket alive but no deck data flows, and
                 // dev.connected stays true so no reconnect is attempted.
                 // chrisle and go-stagelinq both tear down the entire connection
-                // when any service socket fails.
+                // when any service socket fails.  A socket counts as dead once
+                // a read on it has failed or found the device's close: the
+                // readers close it then (tcpReadAvailable, drainMainSocket),
+                // because JUCE's isConnected() stays true after a FIN or RST
+                // and this test never fired before (AUDIT SLQ-5).
                 {
                     std::lock_guard<std::mutex> lock(sockMutex);
+                    bool mainLost = !mainSocket || !mainSocket->isConnected();
                     bool stateMapLost = stateMapPort > 0
                         && (!stateSocket || !stateSocket->isConnected());
                     bool beatInfoLost = beatInfoPort > 0
                         && (!beatSocket || !beatSocket->isConnected());
+
+                    if (mainLost)
+                    {
+                        DBG("StageLinQ: Main connection lost on " + deviceName
+                            + " -- disconnecting for reconnect");
+                        break;
+                    }
 
                     if (stateMapLost)
                     {
@@ -2653,6 +2753,7 @@ private:
         StageLinQInput& owner;
         juce::String deviceIp;
         int devicePort;
+        uint32_t connectionId = 0;   // StageLinQDeviceInfo::connectionId; marks the decks this connection feeds
         uint8_t deviceToken[StageLinQ::kTokenLen] = {};
         juce::String deviceName;
 
@@ -2679,11 +2780,18 @@ private:
         double lastDeviceRefTime = 0.0;
 
         //----------------------------------------------------------------------
+        // The connection is over (every exit of run()): its decks are
+        // cleared (AUDIT SLQ-7), and the device may be connected again --
+        // unless a newer connection to it has been launched meanwhile (a
+        // stale thread ending after an EXIT and a quick re-announce marked
+        // the new connection's device as disconnected, and a third thread
+        // was launched over it).
         void markDisconnected()
         {
+            owner.clearDecksOf(connectionId);
             std::lock_guard<std::mutex> lock(owner.devicesMutex);
             auto it = owner.discoveredDevices.find(deviceIp.toStdString());
-            if (it != owner.discoveredDevices.end())
+            if (it != owner.discoveredDevices.end() && it->second.connectionId == connectionId)
                 it->second.connected = false;
         }
 
@@ -2810,11 +2918,16 @@ private:
         void drainMainSocket()
         {
             if (!mainSocket || !mainSocket->isConnected()) return;
-            if (!mainSocket->waitUntilReady(true, 1)) return;
+            const int ready = mainSocket->waitUntilReady(true, 1);
+            if (ready == 0) return;
 
             uint8_t tmp[4096];
-            int bytesRead = mainSocket->read(tmp, sizeof(tmp), false);
-            if (bytesRead <= 0) return;
+            int bytesRead = ready > 0 ? mainSocket->read(tmp, sizeof(tmp), false) : -1;
+            if (bytesRead <= 0)
+            {
+                mainSocket->close();   // ready but nothing: the device closed it (or an error)
+                return;
+            }
 
             // Any data at all means the device is alive
             lastDeviceRefTime = juce::Time::getMillisecondCounterHiRes();
@@ -2868,17 +2981,24 @@ private:
         //----------------------------------------------------------------------
         // Read bytes from TCP socket into a vector (non-blocking check)
         //----------------------------------------------------------------------
+        // A failed read, or the device's close (ready, nothing to read),
+        // closes the socket so that the dead-socket test in run() sees it
+        // (AUDIT SLQ-5).
         bool tcpReadAvailable(juce::StreamingSocket* sock, std::vector<uint8_t>& buf)
         {
             if (!sock || !sock->isConnected()) return false;
 
-            if (!sock->waitUntilReady(true, 5))
+            const int ready = sock->waitUntilReady(true, 5);
+            if (ready == 0)
                 return true;  // no data, but no error
 
             uint8_t tmp[8192];
-            int bytesRead = sock->read(tmp, sizeof(tmp), false);
+            int bytesRead = ready > 0 ? sock->read(tmp, sizeof(tmp), false) : -1;
             if (bytesRead <= 0)
+            {
+                sock->close();
                 return false;  // connection closed or error
+            }
 
             buf.insert(buf.end(), tmp, tmp + bytesRead);
             return true;
@@ -3010,7 +3130,7 @@ private:
                                     }
                                 }
 
-                                owner.handleStateMapValue(path, val, deckOffset);
+                                owner.handleStateMapValue(path, val, deckOffset, connectionId);
                             }
                         }
                     }
@@ -3104,7 +3224,7 @@ private:
                         }
 
                         owner.handleBeatInfo(clock, players, timelines, deckOffset,
-                                             juce::Time::getMillisecondCounterHiRes());
+                                             juce::Time::getMillisecondCounterHiRes(), connectionId);
                     }
                 }
 #if JUCE_DEBUG
@@ -3144,6 +3264,7 @@ private:
     // Per-device connection threads
     std::vector<std::unique_ptr<DeviceConnectionThread>> connectionThreads;
     std::mutex connThreadsMutex;
+    uint32_t nextConnectionId = 1;      // guarded by devicesMutex
 
     // Deck state (decks 1-4 mapped to index 0-3)
     mutable std::array<StageLinQDeckState, StageLinQ::kMaxDecks> decks;

@@ -451,7 +451,15 @@ private:
             }
         }
 
-        juce::Thread::sleep(500);  // per chrisle/StageLinq: delay before requests
+        // Per chrisle/StageLinq: 500 ms before the first request.  Waited to
+        // a deadline, not with one wait(): this Thread object serves every
+        // session, and JUCE's startThread() does not reset its event, so a
+        // notify() the last session left unconsumed (stopThread's) would end
+        // a single wait() at once.  stopThread() still cuts it short.
+        const double requestsAt = juce::Time::getMillisecondCounterHiRes() + 500.0;
+        for (double left; !threadShouldExit()
+                          && (left = requestsAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
+            wait((int)std::ceil(left));
 
         // --- Get source locations ---
         juce::StringArray sources = fetchSources();
@@ -508,7 +516,7 @@ private:
                 processTrackRequest(networkPath);
             }
 
-            juce::Thread::sleep(100);
+            wait(100);   // cut short by stopThread()
         }
 
         closeDatabase();
