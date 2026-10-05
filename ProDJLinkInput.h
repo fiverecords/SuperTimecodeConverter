@@ -1283,8 +1283,11 @@ public:
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return;
-        // Only write if not already set by absolute position packets (CDJ-3000)
-        if (!players[idx].hasAbsolutePosition.load(std::memory_order_relaxed))
+        // Not for a player whose CDJ-3000-format 0x0b carries the length.
+        // The NXS2-format 0x0b has none, so keying this on
+        // hasAbsolutePosition (set by both) refused dbserver's length for an
+        // NXS2 streaming 0x0b and left it at 0 (AUDIT PDL-6).
+        if (!players[idx].absPosIs3000Format.load(std::memory_order_relaxed))
             players[idx].trackLenSec.store(sec, std::memory_order_relaxed);
     }
 
@@ -2520,7 +2523,14 @@ private:
         // Discriminator: int32_BE(data+40) < 0 -> NXS2 format.  A genuine
         // CDJ-3000 playhead would need to exceed 2^31 ms (~596 hours) to read
         // negative, which cannot happen; the NXS2 value observed in the
-        // capture is always <= -48 while a track is loaded.
+        // capture is always <= -48 while a track is loaded.  At exactly 0
+        // (not in the capture; nothing is known of an NXS2 without a track)
+        // there is no sign to go by, so the NXS2 format is also recognised
+        // by its constant at [36], 0x27ffff50: as a CDJ-3000 track length
+        // that is 21 years.  Without this, a 0 from an NXS2 whose counter
+        // byte equalled its own player number passed the address check
+        // below, set absPosIs3000Format for good and read the constants as
+        // a 671-million-second track and a 429-million BPM (AUDIT PDL-5).
         //
         // Attribution MUST be by source IP for this format: byte[33] cycles
         // 0x00-0xFF, so routing it through the player-number gate below would
@@ -2530,7 +2540,9 @@ private:
         if (type == ProDJLink::kBeatTypeAbsPosition && len >= 60)
         {
             int32_t rawPos = (int32_t) ProDJLink::readU32BE(data + 40);
-            if (rawPos < 0)
+            static constexpr uint32_t kNxs2Constant24 = 0x27ffff50u;   // [36..39] of the NXS2 format
+            if (rawPos < 0
+                || (rawPos == 0 && ProDJLink::readU32BE(data + 36) == kNxs2Constant24))
             {
                 int idx = findPlayerIndexByIp(senderIp);
                 if (idx < 0)
@@ -2596,7 +2608,7 @@ private:
                 p.cntAbsPosPkts.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            // rawPos >= 0: fall through to the classic player-number-addressed
+            // Otherwise: fall through to the classic player-number-addressed
             // CDJ-3000 parse below.
         }
 
@@ -2609,16 +2621,13 @@ private:
         if (type == ProDJLink::kBeatTypeAbsPosition && len >= 60)
         {
             // Source-IP cross-check (v1.9.11-beta15): a 0x0b claiming player N
-            // must arrive from player N's registered IP.  This closes the
-            // residual misattribution vector left by the sign discriminator
-            // above: a rolling-counter-format 0x0b whose int32 at [40] reads
-            // exactly 0 (e.g. an NXS2 with no track loaded -- the capture only
-            // proves <= -48 WITH a track) would fall through to here, and if
-            // its counter byte happens to land on 1-6 it would write the
-            // constant at [36] (0x27ffff50 = 671M "seconds") into a random
-            // player's trackLen plus garbage bpm.  A genuine CDJ-3000-format
-            // 0x0b always comes from the player it names, so this check is
-            // free for the working path.  (Pre-discovery packets are dropped
+            // must arrive from player N's registered IP.  A rolling-counter-
+            // format 0x0b reading exactly 0 at [40] whose counter byte lands
+            // on 1-6 is stopped here when the number is another player's --
+            // but not when it is the sender's own, which the NXS2-format test
+            // above now catches by its constant (AUDIT PDL-5).  A genuine
+            // CDJ-3000-format 0x0b always comes from the player it names, so
+            // this check is free for the working path.  (Pre-discovery packets are dropped
             // too: ipStr is empty until the player's first keepalive, but a
             // CDJ only starts unicasting 0x0b after it has registered US,
             // which is always after we have registered IT.)
