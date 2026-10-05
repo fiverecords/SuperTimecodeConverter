@@ -2427,7 +2427,8 @@ private:
                 claimingNumber = data[0x24];
 
             // Collision here means another peer is claiming one of our bridge
-            // identities (player 5 on the 95B, 0xC0/0xC1/0xF9 on the 54B).
+            // identities (player 5 on the 95B, 0xC0/0xC1/0xE4/0xF9 on the
+            // 54B; 0xE4 is the E4 and AUTO profiles' number, AUDIT C20).
             // The 54 B numbers are outside the player range, so a claim on
             // one is two STC instances or another bridge.  5 is a legal CDJ
             // number (CDJ-3000s use 5 and 6, AUDIT A18): a claim on it is a
@@ -2439,6 +2440,7 @@ private:
                 && (claimingNumber == uint8_t(vCDJPlayerNumber)
                     || claimingNumber == 0xC0
                     || claimingNumber == 0xC1
+                    || claimingNumber == 0xE4
                     || claimingNumber == 0xF9);
             (void)collidesWithUs;
 
