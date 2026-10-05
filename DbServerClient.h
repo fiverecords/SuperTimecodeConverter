@@ -51,7 +51,6 @@ struct TrackMetadata
     juce::String key;
     juce::String comment;
     juce::String dateAdded;        // "yyyy-mm-dd"
-    juce::String anlzPath;         // ANLZ file path from dbserver (e.g. "PIONEER/USBANLZ/P053/0000/ANLZ0006.DAT")
     int durationSeconds = 0;
     int bpmTimes100 = 0;           // e.g. 12800 = 128.00 BPM
     int rating = 0;                // 0-5 stars
@@ -1532,12 +1531,9 @@ private:
                 case 0x002E:  // Date Added
                     meta.dateAdded = item.strArgs[3];
                     break;
-                case 0x000E:  // Analysis path (ANLZ file)
-                    meta.anlzPath = item.strArgs[3];
-#if JUCE_DEBUG
-                    if (meta.anlzPath.isNotEmpty())
-                        DBG("DbServerClient: anlzPath=" + meta.anlzPath);
-#endif
+                case 0x000E:  // Label (record label; beat-link MenuItemType LABEL).
+                    // Not kept.  It is not the ANLZ path (AUDIT META-1): that
+                    // comes only from export.pdb, on the NFS route.
                     break;
                 default:
 #if JUCE_DEBUG
@@ -2687,8 +2683,7 @@ private:
                     cacheMetadata(req.playerIP, meta);
                     DBG("DbServerClient: cached metadata for track "
                         + juce::String(req.trackId) + " -- \""
-                        + meta.artist + " - " + meta.title + "\""
-                        + (meta.anlzPath.isNotEmpty() ? " anlz=" + meta.anlzPath : " (no anlzPath)"));
+                        + meta.artist + " - " + meta.title + "\"");
                 }
                 else
                 {
@@ -2965,7 +2960,6 @@ private:
             // cues, or song structure, download via NFS from CDJ USB/SD.
             {
                 bool needsNfs = false;
-                juce::String anlzPath;
                 uint32_t trackIdForNfs = 0;
                 std::string diskCacheKey;
                 {
@@ -2978,7 +2972,6 @@ private:
                             || !it->second.hasDetailWaveform()))
                     {
                         needsNfs = true;
-                        anlzPath = it->second.anlzPath;
                         trackIdForNfs = req.trackId;
 
                         if (it->second.title.isNotEmpty())
@@ -2991,7 +2984,6 @@ private:
                 if (needsNfs)
                 {
                     DBG("DbServerClient: NFS LAUNCH trackId=" + juce::String(trackIdForNfs)
-                        + " anlzPath=" + anlzPath
                         + " diskKey=" + juce::String(diskCacheKey.substr(0, 40)));
                     {
                         const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3003,7 +2995,7 @@ private:
                     juce::String nfsPlayerIP = req.playerIP;
                     uint8_t nfsSlot = req.slot;
                     launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot,
-                                   trackIdForNfs, anlzPath, diskCacheKey);
+                                   trackIdForNfs, diskCacheKey);
                 }
             }
         }
@@ -3058,9 +3050,14 @@ private:
     std::atomic<uint32_t> dbPortInboundCount { 0 };  // TCP 12523 accepts (diagnostic)
     std::atomic<uint32_t> errorCount { 0 };
 
-    // NFS ANLZ fetcher -- downloads .EXT files directly from CDJ USB/SD
-    // Used as fallback when dbserver ANLZ tag queries fail (CDJ-3000).
-    // Runs on its own thread to avoid blocking metadata requests.
+    // NFS ANLZ fetcher -- reads the media's export.pdb for the track's ANLZ
+    // path, then downloads and parses its analysis files straight from the
+    // player's USB/SD.  Runs in phase 2 for any player whose entry still lacks
+    // beat grid, cues, phrases or detail: the only route for non-3000 players
+    // (their dbserver analysis queries are skipped), a fallback for CDJ-3000s.
+    // Runs on its own thread (nfsThread), one download at a time: before
+    // launching the next, the worker waits for the previous download to
+    // finish, and handles no other request meanwhile.
     NfsAnlzFetcher nfsAnlzFetcher;
     std::thread nfsThread;
 
@@ -3137,10 +3134,8 @@ private:
         }
     }
 
-    /// Launch NFS download on a separate thread.
-    /// Only one NFS download at a time (joins previous if still running).
-    /// Run NFS fallback only (used when dbserver connection fails).
-    /// Ensures a cache entry exists and launches NFS async download.
+    /// Run the NFS route only (used when there is no dbserver connection).
+    /// Ensures a cache entry exists and launches the NFS download.
     void processNfsFallback(const MetadataRequest& req, uint64_t cacheKey)
     {
         // Ensure cache entry exists (may have been created by a previous failed attempt)
@@ -3157,7 +3152,6 @@ private:
         }
 
         bool needsNfs = false;
-        juce::String anlzPath;
         std::string diskCacheKey;
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3169,7 +3163,6 @@ private:
                     || !it->second.hasDetailWaveform()))
             {
                 needsNfs = true;
-                anlzPath = it->second.anlzPath;
                 it->second.nfsAttempted = true;
 
                 if (it->second.title.isNotEmpty())
@@ -3183,33 +3176,25 @@ private:
         {
             DBG("DbServerClient: NFS LAUNCH (no conn) trackId=" + juce::String(req.trackId));
             launchNfsAsync(cacheKey, req.playerIP, req.slot,
-                           req.trackId, anlzPath, diskCacheKey);
+                           req.trackId, diskCacheKey);
         }
     }
 
+    /// Launch the NFS download on its own thread.  One download at a time:
+    /// waits for the previous one to finish first.
     void launchNfsAsync(uint64_t cacheKey, const juce::String& playerIP,
                         uint8_t slot, uint32_t trackId,
-                        const juce::String& anlzPath,
                         const std::string& diskCacheKey)
     {
         // Join previous NFS thread if still running
         if (nfsThread.joinable())
             nfsThread.join();
 
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, anlzPath, diskCacheKey]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey]()
         {
-            NfsAnlzFetcher::AnlzResult anlz;
-
-            if (anlzPath.isNotEmpty())
-            {
-                DBG("DbServerClient: NFS async (with path) -- " + anlzPath);
-                anlz = nfsAnlzFetcher.fetchAndParse(playerIP, slot, anlzPath);
-            }
-            else
-            {
-                DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
-                anlz = nfsAnlzFetcher.fetchByTrackId(playerIP, slot, trackId);
-            }
+            // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
+            DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
+            NfsAnlzFetcher::AnlzResult anlz = nfsAnlzFetcher.fetchByTrackId(playerIP, slot, trackId);
 
             if (anlz.ok && isRunningFlag.load(std::memory_order_relaxed))
             {
