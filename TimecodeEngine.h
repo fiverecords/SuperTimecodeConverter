@@ -574,7 +574,9 @@ public:
         // Binary group flags say what the groups carry (12M-1 sec. 8.4.1):
         // NAME declares an eight-bit character set (BGF0), DATE declares
         // ST 309 date and time zone (BGF2, ST 309 Table 3, unspecified clock
-        // reference); the other modes are free-form data, BGF 0/0/0.
+        // reference); FROM LTC IN takes the input's from the next tick on
+        // (refreshDynamicUserBits); the other modes are free-form data,
+        // BGF 0/0/0.
         ltcOutput.setBinaryGroupFlags(ltcUserBitsMode == kUserBitsName       ? 0x1
                                     : ltcUserBitsMode == kUserBitsSystemDate ? 0x4
                                     : 0x0);
@@ -3267,7 +3269,17 @@ private:
             // output HOLDS rather than dropping to zeros -- a receiver
             // gating on user bits should not see them vanish during a
             // brief dropout.  Stays 0 if the LTC input never ran.
-            ltcOutput.setUserBits(ltcInput.getUserBits());
+            //
+            // With them go the flags that say what they carry, BGF0 and
+            // BGF2 (12M-1 sec. 8.4.1: eight-bit characters, ST 309 date and
+            // zone, page/line): a passed-through date or text used to go out
+            // declared as free-form data, BGF 0/0/0 (AUDIT ENG-11).  BGF1
+            // stays 0: it describes the time address, which here is STC's,
+            // not the input's.  Both are read as one record, from the same
+            // frame (AUDIT LTC-8).
+            const auto frame = ltcInput.getLastFrame();
+            ltcOutput.setUserBits(frame.userBits);
+            ltcOutput.setBinaryGroupFlags((uint8_t)(frame.binaryGroupFlags & 0x5));
         }
         else if (ltcUserBitsMode == kUserBitsName)
         {
