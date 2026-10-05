@@ -10,14 +10,16 @@
 // specific TrackMapEntry.
 //
 // LIFETIME CONTRACT: This class holds a mutable reference to a
-// TrackMapEntry that lives inside TrackMap's unordered_map.  Any
-// mutation of the TrackMap (add/remove/import) can rehash the map
-// and invalidate this reference.  MainComponent MUST close this
-// editor before or immediately after any TrackMap mutation.  The
-// current architecture guarantees this because both TrackMapEditor
-// and CuePointEditor callbacks run synchronously on the message
-// thread, and TrackMapEditor::onChange closes this editor before
-// proceeding.
+// TrackMapEntry that lives inside TrackMap's unordered_map.  A rehash
+// (adding entries) moves no element, so the reference survives it; it
+// dangles once that entry is erased (TrackMap::remove: Delete in the
+// Track Map editor) or the map is cleared -- TrackMap::clear, fromVar, and
+// load(), which AppSettings::load() runs on a configuration restore.
+// addOrUpdate() of the same key keeps the reference but replaces the
+// entry's contents.  MainComponent closes this editor in the Track Map
+// editor's onChange, which runs synchronously on the message thread right
+// after each Track Map mutation, before anything touches the reference;
+// a restore must close it before AppSettings::load().
 //
 // Key feature: "Capture" button reads the current playhead from the
 // active engine and creates a cue at that position.  This is the
@@ -436,8 +438,10 @@ public:
     /// Caller should persist TrackMap and refresh engine cue state.
     std::function<void()> onChange;
 
-    /// Called by Capture button to get current playhead in ms.
-    /// Returns 0 if no playhead available.
+    /// Called by Capture button (and the ~30 Hz cursor timer) to get the
+    /// current playhead in ms.  Returns UINT32_MAX when the track playing
+    /// is not the one being edited: Capture then does nothing and the red
+    /// cursor is hidden.
     std::function<uint32_t()> onCapturePlayhead;
 
     /// Refresh table (e.g. after external changes)

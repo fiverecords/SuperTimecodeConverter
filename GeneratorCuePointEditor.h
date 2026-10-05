@@ -11,9 +11,15 @@
 //      TC space (Start TC + Stop TC) regardless of whether it has an audio
 //      file attached.  A cue at "01:00:30:00" fires when the generated TC
 //      reaches that mark.
-//   2. There is no waveform strip / playhead capture.  The audio in a
-//      preset is optional and the cue position is independent of the
-//      audio anyway -- it's tied to the generated TC.
+//   2. There is no Capture-the-playhead button.  The waveform strip shows
+//      the preset's own audio file, when it has one, as a guide: a click
+//      or drag on it puts a candidate position in the form.  A red cursor
+//      shows the selected engine's generator position, measured from that
+//      engine's Start TC, while its generator plays (MainComponent's
+//      getter does not check which preset is loaded, so the cursor also
+//      moves while the engine plays another preset).  The audio is
+//      optional and the cue position is independent of it anyway -- it is
+//      tied to the generated TC.
 //
 // The class is intentionally a separate copy rather than a refactor of
 // CuePointEditor: the TrackMap one is field-tested, and reusing it would
@@ -26,9 +32,10 @@
 //==============================================================================
 // GeneratorAudioWaveformStrip -- horizontal mono waveform of the preset's
 // attached audio file, with cue and edit-cursor overlays.  Built on top of
-// JUCE's AudioThumbnail so we don't have to load the file ourselves; the
-// editor reuses the thumbnail that GeneratorAudioPlayer already maintains
-// for the engine's runtime use.
+// JUCE's AudioThumbnail; the editor owns the thumbnail and loads it from
+// the preset's file (GeneratorCuePointEditor::loadOwnAudio), independent of
+// the engine's GeneratorAudioPlayer, so it shows the preset being edited
+// whatever the engine is playing.
 //
 // Coordinate semantics:
 //   - X axis is "ms from the start of the audio file" (0..audioLengthMs).

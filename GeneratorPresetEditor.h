@@ -10,7 +10,8 @@
 //==============================================================================
 // GeneratorPresetEditor -- Table editor for named timecode generator presets.
 //
-// Each preset has a Name, Start TC, and Stop TC.  The editor mirrors the
+// Each preset has a Name, Start TC, Stop TC, an optional audio file, and cue
+// points (edited in their own window, Cues...).  The editor mirrors the
 // TrackMapEditor UX: table + form at the bottom for add/edit.
 // Calls onChange() whenever the preset map is modified.
 //==============================================================================
@@ -392,8 +393,11 @@ private:
     double currentFpsForCueEditor = 30.0;
 
     // Playhead getter forwarded to the cue editor when opened.  Set by
-    // MainComponent so the waveform strip can show a live red cursor
-    // whenever the engine is playing the preset that's being edited.
+    // MainComponent: the waveform strip's red cursor shows the selected
+    // engine's generator position, measured from that engine's Start TC,
+    // while its generator plays.  The getter does not check which preset
+    // the engine has loaded, so the cursor also moves while it plays
+    // another preset.
     std::function<int64_t()> playheadGetter;
 
     // Colors
@@ -509,9 +513,10 @@ private:
         if (uniqueName != edName.getText())
             edName.setText(uniqueName, juce::dontSendNotification);
 
-        // Close any open cue window: addOrUpdate on an unordered_map can
-        // trigger a rehash that invalidates pointers to existing values,
-        // which is what the cue window is holding internally.
+        // Close any open cue window.  Not for its reference: an
+        // unordered_map rehash moves no element, so a new preset leaves it
+        // valid.  The selection moves to the new preset below, and a cue
+        // window left open would edit another one than the table shows.
         closeCueEditorWindow();
         presetMap.addOrUpdate(p);
         notifyChange();
@@ -632,9 +637,13 @@ private:
     }
 
     /// Close any open cue editor window.  Called before any operation
-    /// that mutates the preset map (delete, rename, clearAll, import) to
-    /// avoid leaving the cue window with a dangling reference into a
-    /// preset entry that may be moved or destroyed by std::map ops.
+    /// that mutates the preset map (add, save/rename, delete, clearAll,
+    /// import).  The window holds a reference into the map's
+    /// unordered_map: remove() and clear() destroy the preset it points to
+    /// (so does GeneratorPresetMap::load(), which AppSettings::load() runs
+    /// on a configuration restore -- MainComponent must close this editor
+    /// first), and addOrUpdate() of the same name replaces its contents.
+    /// A rehash moves no element and leaves the reference valid.
     void closeCueEditorWindow()
     {
         if (cueWindow != nullptr)
@@ -824,9 +833,9 @@ private:
                 auto* arr = obj->getProperty("presets").getArray();
                 if (!arr) return;
 
-                // Close any cue window: the bulk addOrUpdate calls below
-                // can rehash the underlying unordered_map and invalidate
-                // pointers held by the cue window.
+                // Close any cue window: an imported preset with the name of
+                // the one it edits replaces that preset's contents (a
+                // rehash alone would leave its reference valid).
                 closeCueEditorWindow();
 
                 int imported = 0;

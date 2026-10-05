@@ -166,8 +166,6 @@ struct SafeJsonFile
 // TrackMap -- maps tracks (by artist|title) to timecode offsets and triggers
 //==============================================================================
 
-/// A single entry mapping a track (identified by artist + title) to a
-/// timecode offset that will be applied when that track is detected as playing.
 //==============================================================================
 // CuePoint -- trigger at a specific playhead position within a track
 //==============================================================================
@@ -399,6 +397,10 @@ inline std::vector<int> sortCuesByPosition(std::vector<Cue>& cues, PositionOf po
 //==============================================================================
 // TrackMapEntry -- per-track config: offset, triggers, cue points
 //==============================================================================
+/// A single entry mapping a track (identified by artist + title, and its
+/// duration when one is known) to a timecode offset that will be applied
+/// when that track is detected as playing, plus the triggers fired when it
+/// loads and the cue points fired as it plays.
 struct TrackMapEntry
 {
     juce::String artist;
@@ -753,7 +755,8 @@ public:
 
     TrackMap() = default;
     // Copies (the per-engine override layer copies its map into the settings
-    // block) share the entries but not the async-save state or the token.
+    // block) copy the entries -- each copy has its own -- but not the
+    // async-save state or the token.
     TrackMap(const TrackMap& other)
         : persistsToFile(other.persistsToFile), entries(other.entries), generation(other.generation) {}
     TrackMap& operator=(const TrackMap& other)
@@ -1541,7 +1544,7 @@ struct EngineSettings
 
     // On-air gate: engine only active when CDJ is flagged on-air by the DJM
     bool onAirGateEnabled = false;
-    // ON AIR on StageLinQ, OFF AIR AT (D34): 0 = SILENCE, 1 = -80 dB,
+    // ON AIR on StageLinQ, OFF AIR AT (DESIGN D34): 0 = SILENCE, 1 = -80 dB,
     // 2 = -60 dB, 3 = -40 dB
     int onAirQuiet = 0;
     juce::String midiOutputDevice = "";
@@ -1591,10 +1594,12 @@ struct EngineSettings
     // text so leading zeros and the operator's exact entry are preserved.
     // Empty or unparseable -> 0 (all-zero user bits, the prior behaviour).
     juce::String ltcUserBitsHex;
-    // LTC user-bits source: 0 = manual value, 1 = passthrough from LTC in,
-    // 2 = system date (BCD YYYYMMDD).
+    // LTC user-bits source (TimecodeEngine::kUserBits*): 0 = manual value,
+    // 1 = passthrough from LTC in, 2 = system date and time zone (SMPTE ST
+    // 309), 3 = NAME (four characters, ltcUserBitsName), 4 = debug buffer
+    // counter.
     int ltcUserBitsMode = 0;
-    int inputFreewheelMs = 150;   // D10: signal inputs stay "present" this long after the last frame
+    int inputFreewheelMs = 150;   // AUDIT D10: signal inputs stay "present" this long after the last frame
     bool ltcUserBitsReversed = false;   // MANUAL mode: reverse digit order for the reader
     // 4-character label for the NAME user-bits mode ("" = STC<engine>).
     juce::String ltcUserBitsName;
@@ -1954,7 +1959,7 @@ struct AppSettings
     // Show Mode lock -- prevents accidental changes during live shows
     bool showModeLocked = false;
 
-    // Track map (Track ID -> timecode offset mapping)
+    // Track map (artist|title[|duration] -> timecode offset, triggers, cue points)
     TrackMap trackMap;
 
     // Generator presets (named timecode ranges for the internal generator)

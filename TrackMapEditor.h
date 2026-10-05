@@ -11,12 +11,13 @@
 #include "CustomLookAndFeel.h"
 
 //==============================================================================
-// TrackMapEditor -- Table editor for Track ID -> Timecode Offset mapping.
+// TrackMapEditor -- Table editor for the Track Map: artist|title[|duration]
+// -> timecode offset, triggers and cue points.
 //
-// Designed to be shown in a DialogWindow from MainComponent.
-// Receives a TrackMap* (owned by AppSettings) and a ProDJLinkInput* (for Learn).
-// Calls onChange() whenever the map is modified so the caller can persist
-// settings and refresh engine lookups.
+// Shown in a window of its own by MainComponent.  Receives a TrackMap& --
+// the global map (owned by AppSettings) or one engine's override set -- and
+// a ProDJLinkInput* (for Learn).  Calls onChange() whenever the map is
+// modified so the caller can persist settings and refresh engine lookups.
 //==============================================================================
 class TrackMapEditor : public juce::Component,
                        public juce::TableListBoxModel
@@ -271,7 +272,9 @@ public:
     std::function<void(int)> onScopeChange;
 
     /// Called when user clicks the Cues column to open the cue editor for a track.
-    /// Receives a mutable pointer to the TrackMapEntry (valid as long as TrackMap is unchanged).
+    /// Receives a mutable pointer to the TrackMapEntry: valid until that
+    /// entry is erased or the map cleared (see CuePointEditor's lifetime
+    /// contract).
     std::function<void(TrackMapEntry*)> onOpenCueEditor;
 
     /// Callback to get active track info from the current engine.

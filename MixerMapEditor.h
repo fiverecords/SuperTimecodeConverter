@@ -10,8 +10,8 @@
 //==============================================================================
 // MixerMapEditor -- Table editor for DJM mixer parameter -> MIDI CC / OSC mapping.
 //
-// Designed to be shown in a DialogWindow from MainComponent.
-// Receives a MixerMap& (owned by AppSettings or MainComponent) and allows
+// Shown in a window of its own by MainComponent.
+// Receives a MixerMap& (one of MainComponent's two, Pioneer or Denon) and allows
 // editing OSC addresses, MIDI CCs, and enable/disable per parameter.
 // Calls onChange() whenever the map is modified.
 //==============================================================================
