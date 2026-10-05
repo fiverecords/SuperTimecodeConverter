@@ -720,6 +720,16 @@ namespace StageLinQ
     // stalled stream or a clock in other units, the last a jump in position
     // (cue, hot cue, track load).  Those return false and the caller keeps
     // the last estimate.
+    //
+    // A shorter jump -- under about 0.1 s forward or 0.18 s back at 1x, with
+    // messages 35 ms apart -- is not caught and reads as one wrong speed for
+    // 35 ms: a short loop or a roll going
+    // back (around -0.7 for a 1/8-beat roll), a small beat jump forward
+    // (2-3x).  Left so (AUDIT SLQ-8): the #23 capture has none of those,
+    // and its real changes are as abrupt -- play 0 -> 0.33 -> 0.99, SYNC
+    // -0.15 and -0.20 per message, pause 0.99 -> 0 -- so a stricter filter
+    // would delay them by a message or more, with nothing to weigh it
+    // against.  A capture with loops, rolls and beat jumps would settle it.
     //==========================================================================
     struct BeatSpeedTracker
     {
