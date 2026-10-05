@@ -41,6 +41,8 @@
 #include <atomic>
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <utility>
 
 class NfsAnlzFetcher
 {
@@ -117,7 +119,20 @@ public:
         DBG("NfsAnlzFetcher: found ANLZ path: " + anlzPath);
 
         // Steps 2-3: .DAT and .EXT
-        return fetchAnalysisFiles(playerIP, mountPath, anlzPath);
+        bool sawStale = false;
+        result = fetchAnalysisFiles(playerIP, mountPath, anlzPath, &sawStale);
+        if (sawStale)
+        {
+            // A handle went stale during the download: the slot's filesystem
+            // changed (new media), so the cached index the path came from is
+            // gone (forgetSlot).  Look the track up in the new export.pdb.
+            const juce::String freshPath = findAnlzPathFromPdb(playerIP, mountPath, trackId);
+            if (freshPath.isEmpty())
+                return {};
+            if (freshPath != anlzPath)
+                result = fetchAnalysisFiles(playerIP, mountPath, freshPath, nullptr);
+        }
+        return result;
     }
 
     //==========================================================================
@@ -197,12 +212,48 @@ public:
     /// before it joins the NFS thread.
     void cancel() noexcept { cancelGeneration.fetch_add(1, std::memory_order_relaxed); }
 
-    /// Clear cached NFS mount handles for a player (call when player disappears).
+    //==========================================================================
+    // Cache invalidation.  What the fetcher learns is cached per player IP
+    // (RPC ports) and per player IP + slot (the mount handle, and the
+    // export.pdb index of track ID -> ANLZ path).  rekordbox IDs are per
+    // export, so a cached index is only right for the media it came from.
+    // All three may be called from any thread while a fetch runs; a fetch
+    // that started before the call does not store what it learnt.
+    //==========================================================================
+
+    /// Forget everything learnt from one player: its RPC ports, its mount
+    /// handles and the export.pdb index of each of its slots.  Call when the
+    /// player leaves the network (or changes IP).
     void removePlayer(const juce::String& playerIP)
     {
+        const std::lock_guard<std::mutex> lock(cacheMutex);
         mountCache.erase(playerIP);
         portCache.erase(playerIP);
+        for (auto it = pdbAnlzCache.begin(); it != pdbAnlzCache.end();)
+            it = (it->first.first == playerIP) ? pdbAnlzCache.erase(it) : std::next(it);
+        ++cacheEpoch;
+    }
+
+    /// Forget the export.pdb index and the mount handle of one slot of one
+    /// player (2 = SD, 3 = USB).  Call when the media in that slot changes.
+    void clearPdbCache(const juce::String& playerIP, uint8_t slot)
+    {
+        const juce::String mountPath = slotToMountPath(slot);
+        const std::lock_guard<std::mutex> lock(cacheMutex);
+        auto m = mountCache.find(playerIP);
+        if (m != mountCache.end())
+            m->second.erase(mountPath);
+        pdbAnlzCache.erase(SlotKey { playerIP, mountPath });
+        ++cacheEpoch;
+    }
+
+    /// Forget every export.pdb index and mount handle, for all players.
+    void clearPdbCache()
+    {
+        const std::lock_guard<std::mutex> lock(cacheMutex);
         pdbAnlzCache.clear();
+        mountCache.clear();
+        ++cacheEpoch;
     }
 
 private:
@@ -442,9 +493,34 @@ private:
     // Portmapper -- discover actual ports for Mount and NFS services
     //==========================================================================
 
-    /// Cache of discovered ports: playerIP -> {mountPort, nfsPort}
     struct PlayerPorts { int mountPort = 0; int nfsPort = 0; };
+
+    //==========================================================================
+    // Caches (see removePlayer).  cacheMutex guards the three maps and
+    // cacheEpoch; nothing is sent or received while it is held.
+    //==========================================================================
+    std::mutex cacheMutex;
+    uint32_t cacheEpoch = 0;   // bumped by removePlayer / clearPdbCache
+    /// playerIP -> {mountPort, nfsPort}
     std::map<juce::String, PlayerPorts> portCache;
+    struct FHandle { uint8_t data[kFHandleSize] = {}; };
+    /// playerIP -> (mountPath -> root FHandle)
+    std::map<juce::String, std::map<juce::String, FHandle>> mountCache;
+    /// (playerIP, mountPath) -> (track ID -> ANLZ path), from that slot's export.pdb
+    using SlotKey = std::pair<juce::String, juce::String>;
+    std::map<SlotKey, std::map<uint32_t, juce::String>> pdbAnlzCache;
+
+    /// After NFSERR_STALE (on the NFS thread): drop the slot's mount handle
+    /// and export.pdb index.  Not an invalidation in the cacheEpoch sense --
+    /// the fetch that saw it learns the new state itself.
+    void forgetSlot(const juce::String& playerIP, const juce::String& mountPath)
+    {
+        const std::lock_guard<std::mutex> lock(cacheMutex);
+        auto m = mountCache.find(playerIP);
+        if (m != mountCache.end())
+            m->second.erase(mountPath);
+        pdbAnlzCache.erase(SlotKey { playerIP, mountPath });
+    }
 
     /// Query the portmapper (RFC 1057) on port 111 for the port of a given program.
     /// Returns 0 on failure.
@@ -469,9 +545,14 @@ private:
     /// Get (or discover) the mount and NFS ports for a player.
     PlayerPorts getPlayerPorts(const juce::String& playerIP)
     {
-        auto it = portCache.find(playerIP);
-        if (it != portCache.end() && it->second.mountPort > 0 && it->second.nfsPort > 0)
-            return it->second;
+        uint32_t epoch = 0;
+        {
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            auto it = portCache.find(playerIP);
+            if (it != portCache.end() && it->second.mountPort > 0 && it->second.nfsPort > 0)
+                return it->second;
+            epoch = cacheEpoch;
+        }
 
         PlayerPorts ports;
         ports.mountPort = portmapperGetPort(playerIP, kMountProgram, kMountVersion);
@@ -482,7 +563,9 @@ private:
             DBG("NfsAnlzFetcher: discovered ports on " + playerIP
                 + " -- mount=" + juce::String(ports.mountPort)
                 + " nfs=" + juce::String(ports.nfsPort));
-            portCache[playerIP] = ports;
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            if (cacheEpoch == epoch)
+                portCache[playerIP] = ports;
         }
         else
         {
@@ -496,11 +579,6 @@ private:
     //==========================================================================
     // Mount protocol
     //==========================================================================
-
-    struct FHandle { uint8_t data[kFHandleSize] = {}; };
-
-    /// Cache of mounted filesystem handles: playerIP -> (mountPath -> FHandle)
-    std::map<juce::String, std::map<juce::String, FHandle>> mountCache;
 
     /// Encode a path as UTF-16LE for Pioneer NFS.  Characters outside the
     /// BMP become surrogate pairs (they were cut to their low 16 bits).
@@ -566,12 +644,20 @@ private:
     bool nfsMount(const juce::String& playerIP, const juce::String& mountPath, FHandle& outHandle)
     {
         // Check cache first
-        auto& playerMounts = mountCache[playerIP];
-        auto it = playerMounts.find(mountPath);
-        if (it != playerMounts.end())
+        uint32_t epoch = 0;
         {
-            outHandle = it->second;
-            return true;
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            auto pm = mountCache.find(playerIP);
+            if (pm != mountCache.end())
+            {
+                auto it = pm->second.find(mountPath);
+                if (it != pm->second.end())
+                {
+                    outHandle = it->second;
+                    return true;
+                }
+            }
+            epoch = cacheEpoch;
         }
 
         // Build MOUNTPROC_MNT args: DirPath (variable-length opaque, UTF-16LE)
@@ -610,7 +696,11 @@ private:
         }
 
         std::memcpy(outHandle.data, r + 4, kFHandleSize);
-        playerMounts[mountPath] = outHandle;
+        {
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            if (cacheEpoch == epoch)
+                mountCache[playerIP][mountPath] = outHandle;
+        }
         DBG("NfsAnlzFetcher: mounted " + mountPath + " on " + playerIP);
         return true;
     }
@@ -619,9 +709,13 @@ private:
     // NFS v2 LOOKUP
     //==========================================================================
 
+    static constexpr uint32_t kNoReply       = 0xFFFFFFFF;  // no (usable) RPC reply
+    static constexpr uint32_t kNfsErrStale   = 70;          // NFSERR_STALE (RFC 1094 2.3.1)
+
     struct LookupResult
     {
         bool ok = false;
+        uint32_t status = kNoReply;  // NFS status of the reply
         FHandle handle;
         uint32_t fileSize = 0;
         uint32_t fileType = 0;  // 1=regular, 2=directory
@@ -646,6 +740,7 @@ private:
 
         const uint8_t* r = static_cast<const uint8_t*>(reply.getData());
         uint32_t status = xdrRead32(r);
+        lr.status = status;
         if (status != 0)
         {
             DBG("NfsAnlzFetcher: lookup failed for '" + name + "', status=" + juce::String(status));
@@ -666,10 +761,12 @@ private:
     // NFS v2 READ
     //==========================================================================
 
-    /// Read a chunk of a file. Returns data read, empty on failure.
+    /// Read a chunk of a file. Returns data read, empty on failure (@p status:
+    /// the NFS status of the reply, kNoReply without one).
     juce::MemoryBlock nfsRead(const juce::String& playerIP, const FHandle& fileHandle,
-                              uint32_t offset, uint32_t count)
+                              uint32_t offset, uint32_t count, uint32_t& status)
     {
+        status = kNoReply;
         // Build NFSPROC_READ args: FHandle(32) + offset(4) + count(4) + totalcount(4)
         juce::MemoryOutputStream args;
         xdrWriteOpaqueFixed(args, fileHandle.data, kFHandleSize);
@@ -683,7 +780,7 @@ private:
         if (reply.getSize() < 4) return {};
 
         const uint8_t* r = static_cast<const uint8_t*>(reply.getData());
-        uint32_t status = xdrRead32(r);
+        status = xdrRead32(r);
         if (status != 0) return {};
 
         // ReadResBody: FAttr(68) + data(opaque variable: len(4) + bytes)
@@ -701,8 +798,32 @@ private:
     // NFS high-level: download a complete file
     //==========================================================================
 
+    /// Download a file.  If a handle turns out stale (NFSERR_STALE: the slot's
+    /// filesystem changed, as when new media goes in), what was cached for the
+    /// slot is dropped and the download starts again once from MOUNT;
+    /// @p sawStale (optional) is then set.
     bool nfsDownloadFile(const juce::String& playerIP, const juce::String& mountPath,
-                         const juce::String& filePath, juce::MemoryBlock& outData)
+                         const juce::String& filePath, juce::MemoryBlock& outData,
+                         bool* sawStale = nullptr)
+    {
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            uint32_t nfsStatus = kNoReply;
+            if (nfsDownloadOnce(playerIP, mountPath, filePath, outData, nfsStatus))
+                return true;
+            if (nfsStatus != kNfsErrStale || isCancelled())
+                return false;
+            DBG("NfsAnlzFetcher: stale handle on " + playerIP + mountPath + " -- remounting");
+            forgetSlot(playerIP, mountPath);
+            if (sawStale != nullptr)
+                *sawStale = true;
+        }
+        return false;
+    }
+
+    bool nfsDownloadOnce(const juce::String& playerIP, const juce::String& mountPath,
+                         const juce::String& filePath, juce::MemoryBlock& outData,
+                         uint32_t& nfsStatus)
     {
         // Step 1: Mount
         FHandle rootHandle;
@@ -723,6 +844,7 @@ private:
             if (!lr.ok)
             {
                 DBG("NfsAnlzFetcher: lookup failed at element '" + elements[i] + "'");
+                nfsStatus = lr.status;
                 return false;
             }
             currentHandle = lr.handle;
@@ -756,7 +878,7 @@ private:
                 return false;
             }
             uint32_t chunkSize = std::min((uint32_t)kNfsReadChunk, totalSize - offset);
-            auto chunk = nfsRead(playerIP, currentHandle, offset, chunkSize);
+            auto chunk = nfsRead(playerIP, currentHandle, offset, chunkSize, nfsStatus);
             if (chunk.getSize() == 0)
             {
                 DBG("NfsAnlzFetcher: read failed at offset " + juce::String(offset));
@@ -780,7 +902,7 @@ private:
     /// live in which file; beat-link's CrateDigger opens the .DAT for the beat
     /// grid and the .EXT first for cues and waveforms.
     AnlzResult fetchAnalysisFiles(const juce::String& playerIP, const juce::String& mountPath,
-                                  const juce::String& anlzPath)
+                                  const juce::String& anlzPath, bool* sawStale = nullptr)
     {
         juce::String basePath = anlzPath;
         if (basePath.endsWithIgnoreCase(".DAT") || basePath.endsWithIgnoreCase(".EXT")
@@ -793,7 +915,7 @@ private:
 
         // .DAT: beat grid (PQTZ), standard cues (PCOB)
         juce::MemoryBlock datData;
-        if (nfsDownloadFile(playerIP, mountPath, datPath, datData))
+        if (nfsDownloadFile(playerIP, mountPath, datPath, datData, sawStale))
         {
             DBG("NfsAnlzFetcher: .DAT downloaded " + juce::String((int)datData.getSize()) + " bytes");
             dat = parseAnlzFile(datData);
@@ -805,7 +927,7 @@ private:
 
         // .EXT: cues (PCO2/PCOB), song structure (PSSI), waveforms (PWV4, PWV5)
         juce::MemoryBlock extData;
-        if (nfsDownloadFile(playerIP, mountPath, extPath, extData))
+        if (nfsDownloadFile(playerIP, mountPath, extPath, extData, sawStale))
         {
             DBG("NfsAnlzFetcher: .EXT downloaded " + juce::String((int)extData.getSize()) + " bytes");
             ext = parseAnlzFile(extData);
@@ -836,12 +958,22 @@ private:
                                      const juce::String& mountPath,
                                      uint32_t targetTrackId)
     {
-        // Check cache first
-        auto cacheIt = pdbAnlzCache.find(targetTrackId);
-        if (cacheIt != pdbAnlzCache.end())
-            return cacheIt->second;
+        // Check this slot's index first
+        const SlotKey key { playerIP, mountPath };
+        uint32_t epoch = 0;
+        {
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            auto idx = pdbAnlzCache.find(key);
+            if (idx != pdbAnlzCache.end())
+            {
+                auto t = idx->second.find(targetTrackId);
+                if (t != idx->second.end())
+                    return t->second;
+            }
+            epoch = cacheEpoch;
+        }
 
-        // Download export.pdb
+        // Not there (or no index yet): download export.pdb
         juce::MemoryBlock pdb;
         if (!nfsDownloadFile(playerIP, mountPath, "PIONEER/rekordbox/export.pdb", pdb))
         {
@@ -851,22 +983,24 @@ private:
 
         DBG("NfsAnlzFetcher: downloaded export.pdb -- " + juce::String((int)pdb.getSize()) + " bytes");
 
-        // Parse all tracks and cache their ANLZ paths
-        parsePdbTrackPaths(pdb);
+        // Index all tracks of this export; it replaces the slot's old index
+        auto index = parsePdbTrackPaths(pdb);
+        juce::String path;
+        auto t = index.find(targetTrackId);
+        if (t != index.end())
+            path = t->second;
+        {
+            const std::lock_guard<std::mutex> lock(cacheMutex);
+            if (cacheEpoch == epoch)
+                pdbAnlzCache[key] = std::move(index);
+        }
 
-        cacheIt = pdbAnlzCache.find(targetTrackId);
-        if (cacheIt != pdbAnlzCache.end())
-            return cacheIt->second;
-
-        DBG("NfsAnlzFetcher: track " + juce::String(targetTrackId) + " not found in PDB");
-        return {};
+        if (path.isEmpty())
+        {
+            DBG("NfsAnlzFetcher: track " + juce::String(targetTrackId) + " not found in PDB");
+        }
+        return path;
     }
-
-    /// Cache of trackId -> anlzPath (populated from export.pdb)
-    std::map<uint32_t, juce::String> pdbAnlzCache;
-
-    /// Clear PDB cache (call on media unmount or player disconnect)
-    void clearPdbCache() { pdbAnlzCache.clear(); }
 
     static uint32_t readLE32(const uint8_t* p)
     {
@@ -909,17 +1043,19 @@ private:
         }
     }
 
-    void parsePdbTrackPaths(const juce::MemoryBlock& pdb)
+    /// Index the tracks table of an export.pdb: track ID -> ANLZ path.
+    static std::map<uint32_t, juce::String> parsePdbTrackPaths(const juce::MemoryBlock& pdb)
     {
+        std::map<uint32_t, juce::String> index;
         const uint8_t* d = static_cast<const uint8_t*>(pdb.getData());
         int fileSize = (int)pdb.getSize();
 
-        if (fileSize < 28) return;
+        if (fileSize < 28) return index;
 
         uint32_t lenPage   = readLE32(d + 4);
         uint32_t numTables = readLE32(d + 8);
 
-        if (lenPage < 256 || lenPage > 65536 || numTables > 100) return;
+        if (lenPage < 256 || lenPage > 65536 || numTables > 100) return index;
 
         // Find the tracks table (type=0)
         uint32_t tracksFirstPage = 0, tracksLastPage = 0;
@@ -947,7 +1083,7 @@ private:
         if (!foundTracks)
         {
             DBG("NfsAnlzFetcher: tracks table not found in PDB");
-            return;
+            return index;
         }
 
         DBG("NfsAnlzFetcher: tracks table pages " + juce::String(tracksFirstPage)
@@ -1023,7 +1159,7 @@ private:
 
                         juce::String anlzPath = readDeviceSqlString(page, (int)lenPage, stringAbsOff);
                         if (anlzPath.isNotEmpty())
-                            pdbAnlzCache[trackId] = anlzPath;
+                            index[trackId] = anlzPath;
                     }
                 }
             }
@@ -1034,7 +1170,8 @@ private:
             pageIdx = nextPageIdx;
         }
 
-        DBG("NfsAnlzFetcher: indexed " + juce::String((int)pdbAnlzCache.size()) + " track ANLZ paths from PDB");
+        DBG("NfsAnlzFetcher: indexed " + juce::String((int)index.size()) + " track ANLZ paths from PDB");
+        return index;
     }
 
     //==========================================================================
