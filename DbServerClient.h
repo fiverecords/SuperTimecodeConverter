@@ -280,7 +280,7 @@ public:
         // Use isFullyCached() so that entries with metadata but no waveform
         // (partial cache from an early query before CDJ was fully ready)
         // are re-requested to fetch the missing waveform data.
-        uint64_t cacheKey = makeCacheKey(playerIP, trackId);
+        const CacheKey cacheKey = makeCacheKey(playerIP, slot, trackId);
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             auto it = metadataCache.find(cacheKey);
@@ -311,63 +311,89 @@ public:
 
     //==========================================================================
     // Retrieve cached metadata (called from UI/engine thread)
+    //
+    // rekordbox IDs are per export: the same ID on another player, or in the
+    // other slot of the same player, is another track.  An entry is therefore
+    // keyed by the player that holds the media (the IP requestMetadata was
+    // given), the slot and the ID (AUDIT META-5).  The (playerIP, slot, id)
+    // lookups below are exact; use them.  The older lookups without the slot,
+    // or by ID alone, answer only when every entry they match is the same
+    // track (same artist, title and duration, title not empty) and return
+    // nothing when the ID is cached for different tracks -- they never guess.
     //==========================================================================
-    TrackMetadata getCachedMetadata(const juce::String& playerIP, uint32_t trackId) const
+    TrackMetadata getCachedMetadata(const juce::String& playerIP, uint8_t slot, uint32_t trackId) const
     {
-        uint64_t key = makeCacheKey(playerIP, trackId);
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        auto it = metadataCache.find(key);
+        auto it = metadataCache.find(makeCacheKey(playerIP, slot, trackId));
         if (it != metadataCache.end())
             return it->second;
         return {};
     }
 
-    /// Convenience: look up by trackId alone (searches all players)
+    /// Without the slot: the entry for this player and ID, unless its two
+    /// slots hold different tracks under that ID.
+    TrackMetadata getCachedMetadata(const juce::String& playerIP, uint32_t trackId) const
+    {
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto* m = findUniqueLocked(ipToUint32(playerIP), false, trackId);
+        return m != nullptr ? *m : TrackMetadata{};
+    }
+
+    /// By ID alone (all players): nothing when the ID is ambiguous.
     TrackMetadata getCachedMetadataByTrackId(uint32_t trackId) const
     {
         if (trackId == 0) return {};
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        for (auto& [key, meta] : metadataCache)
-        {
-            if (meta.trackId == trackId)
-                return meta;
-        }
-        return {};
+        auto* m = findUniqueLocked(0, true, trackId);
+        return m != nullptr ? *m : TrackMetadata{};
     }
 
     /// Lightweight version check -- returns the cache version counter for a
     /// track without copying any data.  Use to skip expensive getCachedMetadata
     /// calls when nothing has changed in the background thread.
-    uint32_t getMetadataVersion(const juce::String& playerIP, uint32_t trackId) const
+    uint32_t getMetadataVersion(const juce::String& playerIP, uint8_t slot, uint32_t trackId) const
     {
-        uint64_t key = makeCacheKey(playerIP, trackId);
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        auto it = metadataCache.find(key);
+        auto it = metadataCache.find(makeCacheKey(playerIP, slot, trackId));
         return (it != metadataCache.end()) ? it->second.cacheVersion : 0;
     }
 
-    /// Same as getMetadataVersion but by trackId only (searches all players).
+    /// Without the slot (see getCachedMetadata above).
+    uint32_t getMetadataVersion(const juce::String& playerIP, uint32_t trackId) const
+    {
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto* m = findUniqueLocked(ipToUint32(playerIP), false, trackId);
+        return m != nullptr ? m->cacheVersion : 0;
+    }
+
+    /// By ID alone (all players): 0 when the ID is ambiguous.
     uint32_t getMetadataVersionByTrackId(uint32_t trackId) const
     {
         if (trackId == 0) return 0;
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        for (auto& [key, meta] : metadataCache)
-            if (meta.trackId == trackId) return meta.cacheVersion;
-        return 0;
+        auto* m = findUniqueLocked(0, true, trackId);
+        return m != nullptr ? m->cacheVersion : 0;
     }
 
     /// Lightweight check: does the cached metadata have detail waveform data?
     /// Used by the UI timer to avoid expensive full-copy getCachedMetadata()
     /// when only checking if detail data has arrived yet.
+    bool hasDetailWaveformCached(const juce::String& playerIP, uint8_t slot, uint32_t trackId) const
+    {
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto it = metadataCache.find(makeCacheKey(playerIP, slot, trackId));
+        return it != metadataCache.end() && it->second.hasDetailWaveform();
+    }
+
+    /// Without the slot: this player's entry, else the ID alone (both
+    /// subject to the same-track rule above).
     bool hasDetailWaveformCached(const juce::String& playerIP, uint32_t trackId) const
     {
-        uint64_t key = makeCacheKey(playerIP, trackId);
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        auto it = metadataCache.find(key);
-        if (it != metadataCache.end()) return it->second.hasDetailWaveform();
-        for (auto& [k, m] : metadataCache)
-            if (m.trackId == trackId) return m.hasDetailWaveform();
-        return false;
+        auto* m = findUniqueLocked(ipToUint32(playerIP), false, trackId);
+        if (m == nullptr)
+            m = findUniqueLocked(0, true, trackId);
+        return m != nullptr && m->hasDetailWaveform();
     }
 
     /// Lightweight metadata lookup -- returns text fields and IDs only,
@@ -384,57 +410,78 @@ public:
         bool isValid() const { return valid; }
     };
 
+    MetadataLight getCachedMetadataLight(const juce::String& playerIP, uint8_t slot, uint32_t trackId) const
+    {
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        auto it = metadataCache.find(makeCacheKey(playerIP, slot, trackId));
+        return it != metadataCache.end() ? makeLight(it->second) : MetadataLight{};
+    }
+
+    /// By ID alone (all players): nothing when the ID is ambiguous.
     MetadataLight getCachedMetadataLightById(uint32_t trackId) const
     {
         if (trackId == 0) return {};
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-        for (auto& [key, meta] : metadataCache)
-        {
-            if (meta.trackId == trackId && meta.isValid())
-            {
-                MetadataLight m;
-                m.trackId         = meta.trackId;
-                m.title           = meta.title;
-                m.artist          = meta.artist;
-                m.album           = meta.album;
-                m.genre           = meta.genre;
-                m.key             = meta.key;
-                m.bpmTimes100     = meta.bpmTimes100;
-                m.artworkId       = meta.artworkId;
-                m.durationSeconds = meta.durationSeconds;
-                m.valid           = true;
-                return m;
-            }
-        }
-        return {};
+        auto* m = findUniqueLocked(0, true, trackId);
+        return m != nullptr ? makeLight(*m) : MetadataLight{};
     }
 
     //==========================================================================
-    // Retrieve cached artwork (returns null Image if not cached)
+    // Retrieve cached artwork (returns null Image if not cached).  Artwork IDs
+    // are per export too, so artwork is keyed like metadata (AUDIT META-5).
     //==========================================================================
-    juce::Image getCachedArtwork(uint32_t artworkId) const
+    juce::Image getCachedArtwork(const juce::String& playerIP, uint8_t slot, uint32_t artworkId) const
     {
         if (artworkId == 0) return {};
         const juce::SpinLock::ScopedLockType lock(artCacheLock);
-        auto it = artworkCache.find(artworkId);
+        auto it = artworkCache.find(makeCacheKey(playerIP, slot, artworkId));
         if (it != artworkCache.end())
             return it->second;
         return {};
     }
 
+    /// By artwork ID alone: only when exactly one medium has art under that
+    /// ID.  With two, nothing tells whether the ID names the same art on both
+    /// (two copies of one export) or different art, so nothing is returned:
+    /// two identical USBs show no artwork here until the callers use the
+    /// lookup above with the player and slot (AUDIT META-5).
+    juce::Image getCachedArtwork(uint32_t artworkId) const
+    {
+        if (artworkId == 0) return {};
+        const juce::SpinLock::ScopedLockType lock(artCacheLock);
+        const juce::Image* found = nullptr;
+        for (auto& [k, img] : artworkCache)
+        {
+            if (k.id != artworkId) continue;
+            if (found != nullptr) return {};
+            found = &img;
+        }
+        return found != nullptr ? *found : juce::Image();
+    }
+
     //==========================================================================
-    // Invalidate cache for a player (call on media eject / player disconnect)
+    // Invalidate cache for a player (called when ProDJLinkInput reports the
+    // player lost; nothing calls it on a media eject)
     //==========================================================================
     void invalidatePlayer(const juce::String& playerIP)
     {
-        uint64_t prefix = ipToUint32(playerIP);
-        prefix <<= 32;
+        const uint32_t ip = ipToUint32(playerIP);
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             for (auto it = metadataCache.begin(); it != metadataCache.end(); )
             {
-                if ((it->first & 0xFFFFFFFF00000000ULL) == prefix)
+                if (it->first.ip == ip)
                     it = metadataCache.erase(it);
+                else
+                    ++it;
+            }
+        }
+        {
+            const juce::SpinLock::ScopedLockType lock(artCacheLock);
+            for (auto it = artworkCache.begin(); it != artworkCache.end(); )
+            {
+                if (it->first.ip == ip)
+                    it = artworkCache.erase(it);
                 else
                     ++it;
             }
@@ -667,11 +714,76 @@ private:
     };
 
     //==========================================================================
-    // Cache key: high 32 bits = IP, low 32 bits = trackId
+    // Cache key: the player holding the media (IPv4 as a number), the slot,
+    // and the rekordbox ID -- a track ID for metadata, an artwork ID for
+    // artwork (AUDIT META-5)
     //==========================================================================
-    static uint64_t makeCacheKey(const juce::String& ip, uint32_t trackId)
+    struct CacheKey
     {
-        return (static_cast<uint64_t>(ipToUint32(ip)) << 32) | trackId;
+        uint32_t ip = 0;
+        uint32_t id = 0;
+        uint8_t  slot = 0;
+        bool operator==(const CacheKey& o) const noexcept
+        {
+            return ip == o.ip && id == o.id && slot == o.slot;
+        }
+    };
+    struct CacheKeyHash
+    {
+        size_t operator()(const CacheKey& k) const noexcept
+        {
+            return std::hash<uint64_t>{}(((uint64_t(k.ip) << 32) | k.id) ^ (uint64_t(k.slot) << 61));
+        }
+    };
+
+    static CacheKey makeCacheKey(const juce::String& ip, uint8_t slot, uint32_t id)
+    {
+        return { ipToUint32(ip), id, slot };
+    }
+
+    /// Two entries describe the same track: same artist, title (not empty)
+    /// and duration.  Copies of one export on two sticks pass; two exports
+    /// that gave one ID to different tracks do not.
+    static bool isSameTrack(const TrackMetadata& a, const TrackMetadata& b)
+    {
+        return a.title.isNotEmpty() && a.title == b.title && a.artist == b.artist
+            && a.durationSeconds == b.durationSeconds;
+    }
+
+    /// Caller holds cacheLock.  The entry for trackId -- on player `ip`, or on
+    /// any player when anyPlayer is true -- when every entry cached under that
+    /// ID is the same track; nullptr when none is, or when they differ.
+    const TrackMetadata* findUniqueLocked(uint32_t ip, bool anyPlayer, uint32_t trackId) const
+    {
+        const TrackMetadata* found = nullptr;
+        for (auto& [k, m] : metadataCache)
+        {
+            if (k.id != trackId || (!anyPlayer && k.ip != ip))
+                continue;
+            if (found == nullptr)
+                found = &m;
+            else if (!isSameTrack(*found, m))
+                return nullptr;
+        }
+        return found;
+    }
+
+    static MetadataLight makeLight(const TrackMetadata& meta)
+    {
+        MetadataLight m;
+        if (!meta.isValid())
+            return m;
+        m.trackId         = meta.trackId;
+        m.title           = meta.title;
+        m.artist          = meta.artist;
+        m.album           = meta.album;
+        m.genre           = meta.genre;
+        m.key             = meta.key;
+        m.bpmTimes100     = meta.bpmTimes100;
+        m.artworkId       = meta.artworkId;
+        m.durationSeconds = meta.durationSeconds;
+        m.valid           = true;
+        return m;
     }
 
     static uint32_t ipToUint32(const juce::String& ip)
@@ -2448,46 +2560,42 @@ private:
     // CACHE MANAGEMENT
     //==========================================================================
 
-    void cacheMetadata(const juce::String& playerIP, const TrackMetadata& meta)
+    void cacheMetadata(const CacheKey& key, const TrackMetadata& meta)
     {
         if (!meta.isValid()) return;
 
-        uint64_t key = makeCacheKey(playerIP, meta.trackId);
         const juce::SpinLock::ScopedLockType lock(cacheLock);
 
-        // Evict oldest if cache is full
-        if ((int)metadataCache.size() >= kMaxCacheEntries)
+        // Evict the entry fetched longest ago (smallest cacheTime) if the
+        // cache is full and this is a new key
+        if ((int)metadataCache.size() >= kMaxCacheEntries
+            && metadataCache.find(key) == metadataCache.end())
         {
-            uint64_t oldestKey = 0;
-            double oldestTime = std::numeric_limits<double>::max();
-            for (auto& [k, m] : metadataCache)
-            {
-                if (m.cacheTime < oldestTime)
-                {
-                    oldestTime = m.cacheTime;
-                    oldestKey = k;
-                }
-            }
-            if (oldestKey != 0)
-                metadataCache.erase(oldestKey);
+            auto oldest = metadataCache.end();
+            for (auto it = metadataCache.begin(); it != metadataCache.end(); ++it)
+                if (oldest == metadataCache.end() || it->second.cacheTime < oldest->second.cacheTime)
+                    oldest = it;
+            if (oldest != metadataCache.end())
+                metadataCache.erase(oldest);
         }
 
         metadataCache[key] = meta;
     }
 
-    void cacheArtwork(uint32_t artworkId, const juce::Image& img)
+    void cacheArtwork(const CacheKey& key, const juce::Image& img)
     {
-        if (artworkId == 0 || !img.isValid()) return;
+        if (key.id == 0 || !img.isValid()) return;
 
         const juce::SpinLock::ScopedLockType lock(artCacheLock);
 
-        if ((int)artworkCache.size() >= kMaxArtCacheEntries)
+        if ((int)artworkCache.size() >= kMaxArtCacheEntries
+            && artworkCache.find(key) == artworkCache.end())
         {
-            // Simple eviction: remove first entry
+            // Simple eviction: remove the first entry in hash order (arbitrary)
             artworkCache.erase(artworkCache.begin());
         }
 
-        artworkCache[artworkId] = img;
+        artworkCache[key] = img;
     }
 
     //==========================================================================
@@ -2575,7 +2683,7 @@ private:
             if (req.phase == 2 && req.trackId != 0)
             {
                 DBG("DbServerClient: no connection for phase 2 -- trying NFS only");
-                uint64_t cacheKey = makeCacheKey(req.playerIP, req.trackId);
+                const CacheKey cacheKey = makeCacheKey(req.playerIP, req.slot, req.trackId);
                 processNfsFallback(req, cacheKey);
                 return;
             }
@@ -2589,7 +2697,7 @@ private:
             // Check if metadata text is already cached (partial cache --
             // metadata succeeded on a previous request but waveform or
             // artwork may still be missing).
-            uint64_t cacheKey = makeCacheKey(req.playerIP, req.trackId);
+            const CacheKey cacheKey = makeCacheKey(req.playerIP, req.slot, req.trackId);
             bool metaAlreadyCached = false;
             TrackMetadata meta;
             {
@@ -2609,7 +2717,7 @@ private:
                                           req.trackId, req.ourPlayer);
                 if (meta.isValid())
                 {
-                    cacheMetadata(req.playerIP, meta);
+                    cacheMetadata(cacheKey, meta);
                     DBG("DbServerClient: cached metadata for track "
                         + juce::String(req.trackId) + " -- \""
                         + meta.artist + " - " + meta.title + "\"");
@@ -2625,7 +2733,7 @@ private:
                     // Create a minimal cache entry so phase 2 (disk cache + NFS)
                     // can still run.  NFS uses trackId to find ANLZ path in PDB.
                     meta.trackId = req.trackId;
-                    cacheMetadata(req.playerIP, meta);
+                    cacheMetadata(cacheKey, meta);
                 }
             }
 
@@ -2636,17 +2744,18 @@ private:
                 // Artwork: fetch if not yet cached
                 if (req.wantArt && meta.artworkId != 0)
                 {
+                    const CacheKey artKey = makeCacheKey(req.playerIP, req.slot, meta.artworkId);
                     bool artCached;
                     {
                         const juce::SpinLock::ScopedLockType lock(artCacheLock);
-                        artCached = artworkCache.count(meta.artworkId) > 0;
+                        artCached = artworkCache.count(artKey) > 0;
                     }
                     if (!artCached)
                     {
                         auto img = queryArtwork(*conn, req.slot, req.trackType,
                                                  meta.artworkId, req.ourPlayer);
                         if (img.isValid())
-                            cacheArtwork(meta.artworkId, img);
+                            cacheArtwork(artKey, img);
                     }
                 }
 
@@ -2960,11 +3069,11 @@ private:
 
     // Metadata cache (protected by SpinLock)
     mutable juce::SpinLock cacheLock;
-    std::unordered_map<uint64_t, TrackMetadata> metadataCache;
+    std::unordered_map<CacheKey, TrackMetadata, CacheKeyHash> metadataCache;
 
     // Artwork cache (separate lock for independent access)
     mutable juce::SpinLock artCacheLock;
-    std::unordered_map<uint32_t, juce::Image> artworkCache;
+    std::unordered_map<CacheKey, juce::Image, CacheKeyHash> artworkCache;   // key.id = artwork ID
 
     // Stats
     std::atomic<uint32_t> dbPortInboundCount { 0 };  // TCP 12523 accepts (diagnostic)
@@ -3056,7 +3165,7 @@ private:
 
     /// Run the NFS route only (used when there is no dbserver connection).
     /// Ensures a cache entry exists and launches the NFS download.
-    void processNfsFallback(const MetadataRequest& req, uint64_t cacheKey)
+    void processNfsFallback(const MetadataRequest& req, const CacheKey& cacheKey)
     {
         // Ensure cache entry exists (may have been created by a previous failed attempt)
         {
@@ -3102,7 +3211,7 @@ private:
 
     /// Launch the NFS download on its own thread.  One download at a time:
     /// waits for the previous one to finish first.
-    void launchNfsAsync(uint64_t cacheKey, const juce::String& playerIP,
+    void launchNfsAsync(const CacheKey& cacheKey, const juce::String& playerIP,
                         uint8_t slot, uint32_t trackId,
                         const std::string& diskCacheKey)
     {
@@ -3144,7 +3253,7 @@ private:
     }
 
     /// Build a CachedAnlz from in-memory TrackMetadata and save to disk.
-    void saveAnlzToDisk(uint64_t cacheKey, const std::string& diskKey)
+    void saveAnlzToDisk(const CacheKey& cacheKey, const std::string& diskKey)
     {
         WaveformCache::CachedAnlz ca;
 
