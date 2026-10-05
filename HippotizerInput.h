@@ -101,6 +101,14 @@ public:
 #endif
         }
 
+        // The interface's own address, on every platform: unlike Art-Net
+        // and LA-Net (bindInputSocket, AUDIT NET-2) HippoNet timecode is
+        // unicast to it (6091->6091 above), so there is no broadcast to
+        // miss.  This socket also sends the announcements, which so leave
+        // from that address and not from one the routing table picks; and
+        // on macOS, by the BSD bind rules, a wildcard bind would keep a
+        // program that binds 6091 on all interfaces after STC (a Hippotizer
+        // PLAY on this machine) off the port.
         bool bound = false;
         bool fellBack = false;
         if (bindIp != "0.0.0.0")

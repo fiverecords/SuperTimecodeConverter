@@ -16,6 +16,9 @@
     #include <ifaddrs.h>
     #include <net/if.h>
     #include <arpa/inet.h>
+    #include <netinet/in.h>
+    #include <sys/socket.h>
+    #include <cstring>
 #endif
 
 struct NetworkInterface
@@ -167,4 +170,217 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
 
     appendLoopback();
     return interfaces;
+}
+
+//==============================================================================
+// Inputs listening on one interface (Art-Net, LA-Net, OSC).
+//
+// Windows delivers broadcasts to a UDP socket bound to the interface's
+// unicast address; macOS and Linux do not -- such a socket gets only what is
+// sent to that address, and Art-Net and LA-Net timecode are broadcast (the
+// same reason ProDJLinkInput binds its broadcast ports to INADDR_ANY outside
+// Windows).  The bind succeeded, so nothing told the operator: silence.  On
+// macOS and Linux an input therefore binds INADDR_ANY, has the kernel report
+// each datagram's destination address (IP_RECVDSTADDR on macOS, IP_PKTINFO
+// on Linux), and keeps a datagram that was sent to the interface's own
+// address, from any sender as before (a controller behind a router or a
+// VPN), or whose sender is on the interface's subnet, which is where its
+// broadcasts come from (AUDIT NET-2).  Localhost has no broadcast to miss
+// and keeps its own address; so does HippoNet, whose timecode is unicast
+// (HippotizerInput.h).
+//
+// What it costs (Linux by the delivery rule measured on loopback, macOS by
+// the BSD bind rules; neither tried with two interfaces; BENCH):
+//  - Two inputs on one port on two different interfaces (two engines) both
+//    want INADDR_ANY.  Linux gives it to both: a broadcast reaches both, a
+//    unicast only the one bound last, which drops it if it was sent to the
+//    other.  macOS refuses the second wildcard bind (SO_REUSEPORT would be
+//    needed on both), so the second input binds its own address as before:
+//    it gets its unicast and no broadcasts.
+//  - macOS: while STC holds INADDR_ANY:port, another program that binds the
+//    same port on INADDR_ANY after it fails; before, STC held only
+//    <interface>:port and the other program could bind.  Started before
+//    STC, the other program keeps the port and STC's input binds its own
+//    address as before.  SO_REUSEPORT is not set: it helps only a program
+//    that sets it too, and then the kernel hands each unicast to one of the
+//    sockets, so the other program could take STC's (ProDJLinkInput keeps
+//    it off its status socket for that reason).
+//  - The input now also hears STC's own broadcasts on that interface and
+//    port -- Art-Net or LA-Net out of another engine, or of the same engine
+//    -- as it already did on Windows and with ALL INTERFACES.  It cannot
+//    tell them from another sender's (AUDIT NET-14: StreamId not checked).
+//==============================================================================
+
+/// A dotted-quad IPv4 address as a host-order integer; false if `text` is
+/// not one.  Used when an input starts, not per datagram.
+inline bool parseIPv4(const juce::String& text, uint32_t& out)
+{
+    juce::StringArray parts;
+    parts.addTokens(text, ".", "");
+    if (parts.size() != 4)
+        return false;
+    uint32_t value = 0;
+    for (auto& part : parts)
+    {
+        if (part.isEmpty() || part.length() > 3 || ! part.containsOnly("0123456789"))
+            return false;
+        const int byte = part.getIntValue();
+        if (byte > 255)
+            return false;
+        value = (value << 8) | (uint32_t) byte;
+    }
+    out = value;
+    return true;
+}
+
+/// Keeps the datagrams sent to one interface's own address, or sent from its
+/// subnet.  Inactive (accepts everything) until set() succeeds.  Set before
+/// the receive thread starts and read only by it.
+struct SubnetFilter
+{
+    /// False, leaving the filter inactive, when the interface has no subnet
+    /// to match: an address or mask that does not parse, a 0.0.0.0 mask, or
+    /// a /32 (a point-to-point link, whose peer is outside its own
+    /// "subnet").
+    bool set(const NetworkInterface& ni)
+    {
+        clear();
+        uint32_t ip = 0, m = 0;
+        if (! parseIPv4(ni.ip, ip) || ! parseIPv4(ni.subnet, m) || m == 0u || m == 0xFFFFFFFFu)
+            return false;
+        address = ip;
+        mask = m;
+        network = ip & m;
+        return true;
+    }
+
+    void clear() { address = 0; network = 0; mask = 0; }
+    bool isActive() const { return mask != 0; }
+
+    /// Host-order addresses; `destination` is 0 when the socket did not
+    /// report it, and then only the sender's subnet counts.
+    bool accepts(uint32_t source, uint32_t destination) const
+    {
+        return ! isActive() || destination == address || (source & mask) == network;
+    }
+
+    uint32_t address = 0, network = 0, mask = 0;   // mask 0 = inactive
+};
+
+#ifndef _WIN32
+/// Asks the kernel to report each datagram's destination address on this
+/// socket (readInputDatagram reads it).  False if it cannot.
+inline bool reportDestinationAddress(juce::DatagramSocket& socket)
+{
+    const int on = 1;
+   #if defined(IP_RECVDSTADDR)     // macOS, BSD
+    return setsockopt(socket.getRawSocketHandle(), IPPROTO_IP, IP_RECVDSTADDR, &on, sizeof(on)) == 0;
+   #elif defined(IP_PKTINFO)       // Linux
+    return setsockopt(socket.getRawSocketHandle(), IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) == 0;
+   #else
+    juce::ignoreUnused(socket, on);
+    return false;
+   #endif
+}
+#endif
+
+/// Binds an input's socket to `port` on `ni` (nullptr: all interfaces), as
+/// the block above describes.  Windows: the interface's address, falling
+/// back to all interfaces if `allowFallback`.  macOS/Linux: all interfaces
+/// with `filter` set to the interface; if the destination address cannot be
+/// reported or that bind fails, or the interface has no subnet to filter on,
+/// or it is Localhost (127.x.x.x), the interface's address as on Windows
+/// (unicast to it still arrives).  `filter` is left inactive unless it is in
+/// use.  Returns whether the socket is bound; `fellBack` says it is on all
+/// interfaces after `ni`'s own address failed.  Called from the inputs'
+/// start(), before their receive thread runs.
+inline bool bindInputSocket(juce::DatagramSocket& socket, int port, const NetworkInterface* ni,
+                            bool allowFallback, SubnetFilter& filter, bool& fellBack)
+{
+    filter.clear();
+    fellBack = false;
+    if (ni == nullptr)
+        return socket.bindToPort(port);
+
+   #ifndef _WIN32
+    // Localhost keeps 127.0.0.1, as before: there is no broadcast to miss,
+    // and on INADDR_ANY it would lose its unicast to another input on the
+    // port (another engine on a network interface) bound after it.
+    uint32_t address = 0;
+    const bool loopback = parseIPv4(ni->ip, address) && (address >> 24) == 127u;
+    if (! loopback && filter.set(*ni))
+    {
+        if (reportDestinationAddress(socket) && socket.bindToPort(port))
+            return true;
+        filter.clear();
+    }
+   #endif
+
+    if (socket.bindToPort(port, ni->ip))
+        return true;
+    if (allowFallback && socket.bindToPort(port))
+    {
+        fellBack = true;
+        return true;
+    }
+    return false;
+}
+
+/// Reads one waiting datagram from a socket bound by bindInputSocket, as
+/// juce::DatagramSocket::read(buffer, size, false) does, and returns 0 for
+/// one that `filter` drops.  With the filter inactive (Windows, ALL
+/// INTERFACES, Localhost, a fallback) it is that call.  Otherwise it reads
+/// with recvmsg to get the destination address, the one thing
+/// DatagramSocket::read cannot give.  Receive thread, after waitUntilReady.
+inline int readInputDatagram(juce::DatagramSocket& socket, void* buffer, int size,
+                             const SubnetFilter& filter)
+{
+   #ifndef _WIN32
+    if (filter.isActive())
+    {
+        const int fd = socket.getRawSocketHandle();
+        if (fd < 0)
+            return -1;   // shut down, as read() says
+
+        sockaddr_in from {};
+        iovec iov {};
+        iov.iov_base = buffer;
+        iov.iov_len = (size_t) size;
+        union { cmsghdr align; unsigned char bytes[64]; } control {};
+        msghdr msg {};
+        msg.msg_name = &from;
+        msg.msg_namelen = (socklen_t) sizeof(from);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.bytes;
+        msg.msg_controllen = (decltype(msg.msg_controllen)) sizeof(control.bytes);
+
+        const auto received = ::recvmsg(fd, &msg, MSG_DONTWAIT);
+        if (received <= 0)
+            return 0;
+
+        uint32_t destination = 0;
+        for (auto* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c))
+        {
+           #if defined(IP_RECVDSTADDR)
+            if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVDSTADDR)
+            {
+                in_addr dst {};
+                std::memcpy(&dst, CMSG_DATA(c), sizeof(dst));
+                destination = ntohl(dst.s_addr);
+            }
+           #elif defined(IP_PKTINFO)
+            if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO)
+            {
+                in_pktinfo info {};
+                std::memcpy(&info, CMSG_DATA(c), sizeof(info));
+                destination = ntohl(info.ipi_addr.s_addr);
+            }
+           #endif
+        }
+
+        return filter.accepts(ntohl(from.sin_addr.s_addr), destination) ? (int) received : 0;
+    }
+   #endif
+    return socket.read(buffer, size, false);
 }

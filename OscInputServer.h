@@ -110,18 +110,24 @@ public:
         listenPort = port;
         socket = std::make_unique<juce::DatagramSocket>(false);
 
+        // On macOS and Linux a selected interface is all interfaces plus a
+        // filter -- sent to its address, or from its subnet -- so its
+        // broadcasts arrive (bindInputSocket, AUDIT NET-2); Windows binds
+        // the interface's address, with no fallback.
         bool bound = false;
+        bool fellBack = false;
         if (interfaceIndex > 0 && (interfaceIndex - 1) < availableInterfaces.size())
         {
             selectedInterface = interfaceIndex;
             bindIp = availableInterfaces[interfaceIndex - 1].ip;
-            bound = socket->bindToPort(port, bindIp);
+            bound = bindInputSocket(*socket, port, &availableInterfaces.getReference(interfaceIndex - 1),
+                                    false, sourceFilter, fellBack);
         }
         else
         {
             selectedInterface = 0;
             bindIp = "0.0.0.0";
-            bound = socket->bindToPort(port);
+            bound = bindInputSocket(*socket, port, nullptr, false, sourceFilter, fellBack);
         }
 
         if (!bound)
@@ -161,9 +167,9 @@ private:
             if (!sock->waitUntilReady(true, 100))
                 continue;
 
-            juce::String senderIp;
-            int senderPort = 0;
-            int bytesRead = sock->read(buf, sizeof(buf), false, senderIp, senderPort);
+            // A datagram the interface filter drops reads as 0 bytes
+            // (readInputDatagram, AUDIT NET-2).
+            int bytesRead = readInputDatagram(*sock, buf, sizeof(buf), sourceFilter);
 
             if (bytesRead > 0)
             {
@@ -270,6 +276,7 @@ private:
     int selectedInterface = 0;
     juce::String bindIp { "0.0.0.0" };
     juce::Array<NetworkInterface> availableInterfaces;
+    SubnetFilter sourceFilter;   // set in start(), read by run() (macOS/Linux, AUDIT NET-2)
     std::atomic<bool> running { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OscInputServer)

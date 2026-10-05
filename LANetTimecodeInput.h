@@ -82,23 +82,16 @@ public:
         }
 
 
-        bool bound = false;
+        // On macOS and Linux a selected interface is all interfaces plus a
+        // filter -- sent to its address, or from its subnet -- so its
+        // broadcasts arrive (bindInputSocket, AUDIT NET-2); Windows binds
+        // the interface's address.
         bool fellBack = false;
-
-        if (bindIp != "0.0.0.0")
-        {
-            bound = socket->bindToPort(listenPort, bindIp);
-        }
-
-        if (!bound)
-        {
-            bound = socket->bindToPort(listenPort);
-            if (bound)
-            {
-                fellBack = (bindIp != "0.0.0.0");  // only a fallback if we tried a specific IP
-                bindIp = "0.0.0.0";   // reflect actual bind address
-            }
-        }
+        const bool bound = bindInputSocket(*socket, listenPort,
+                                           selectedInterface > 0 ? &availableInterfaces.getReference(selectedInterface - 1) : nullptr,
+                                           true, sourceFilter, fellBack);
+        if (fellBack)
+            bindIp = "0.0.0.0";   // reflect actual bind address
 
         bindFellBack.store(fellBack, std::memory_order_relaxed);
 
@@ -222,7 +215,9 @@ private:
             if (!sock->waitUntilReady(true, 100))
                 continue;
 
-            int bytesRead = sock->read(buffer, sizeof(buffer), false);
+            // A datagram the interface filter drops reads as 0 bytes
+            // (readInputDatagram, AUDIT NET-2).
+            int bytesRead = readInputDatagram(*sock, buffer, sizeof(buffer), sourceFilter);
 
             if (bytesRead == 28)
                 parseLANetTimecodePacket(buffer, bytesRead);
@@ -340,6 +335,7 @@ private:
     std::atomic<bool> bindFellBack { false };
 
     juce::Array<NetworkInterface> availableInterfaces;
+    SubnetFilter sourceFilter;   // set in start(), read by run() (macOS/Linux, AUDIT NET-2)
     std::atomic<double> lastPacketTime { 0.0 };
 
     std::atomic<uint64_t> packedTimecode { 0 };
