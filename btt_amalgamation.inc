@@ -1,10 +1,13 @@
 // ==========================================================================
-// btt_amalgamation.c -- Beat-and-Tempo-Tracking library
+// btt_amalgamation.inc -- Beat-and-Tempo-Tracking library
 // Copyright (c) 2021 Michael Krzyzaniak -- MIT License
 // https://github.com/michaelkrzyzaniak/Beat-and-Tempo-Tracking
 //
-// Single-file build.  Add ONLY this file to your JUCE/Projucer project.
-// Same pattern as sqlite3.c -- no external .c dependencies at build time.
+// The whole library in one file, like sqlite3.c -- no external .c
+// dependencies at build time.  Not compiled on its own: btt_build.cpp
+// includes it, and btt_build.cpp is the BTT file the project compiles.
+// btt_amalgamation.c is this same file without the #undef real / imag block
+// below, and is not compiled.
 // ==========================================================================
 
 // --- Platform compatibility ---
@@ -37,7 +40,8 @@
   #define random() rand()
 #endif
 
-// VLA replacement (MSVC does not support C99 VLAs)
+// VLA replacement (MSVC does not support C99 VLAs).  btt_set_num_tempo_candidates
+// does not clamp to this; STC never calls it (btt_init sets 10).
 #define BTT_MAX_TEMPO_CANDIDATES 64
 
 // Neutralize macros from Windows/JUCE headers that clash with BTT identifiers.
@@ -3606,6 +3610,14 @@ void btt_tempo_tracking              (BTT* self)
   //this is way more likely to be because there were no peaks in the autocorrelation
   //(i.e. during silence) than because it was the the true tempo, so reject it.
   //in the future we might need to explicitely count non-zero samples in the OSS
+  //STC note: index_of_max_score is a candidate index (0..num_tempo_candidates-1)
+  //and min_lag a lag (103 / 112 at 44.1 / 48 kHz with STC's 200 BPM ceiling),
+  //so this never fires.  Comparing candidate_tempo_lags[index_of_max_score],
+  //as the comment means, was measured on click tracks at 48 kHz (AUDIT DEP-2):
+  //same BPM and certainty for 70-199 BPM and under hiss, certainty 0.44 ->
+  //0.68 at 100 BPM, but a 200 BPM click (its lag is min_lag) goes from 200.89
+  //at 0.29 to 199.12 at 0.09, below AudioBpmInput's threshold.  No measured
+  //gain, one loss: left as upstream has it.
   if(index_of_max_score == self->min_lag)
     return;
   

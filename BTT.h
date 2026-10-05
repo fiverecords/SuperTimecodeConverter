@@ -2,8 +2,8 @@
 // Copyright (c) 2021 Michael Krzyzaniak -- MIT License
 // https://github.com/michaelkrzyzaniak/Beat-and-Tempo-Tracking
 //
-// Standalone header for use with btt_amalgamation.c.
-// No btt/ subfolder needed at build time.
+// Standalone header for the library compiled through btt_build.cpp (which
+// includes btt_amalgamation.inc).  No btt/ subfolder needed at build time.
 
 #ifndef __BTT__
 #define __BTT__ 1

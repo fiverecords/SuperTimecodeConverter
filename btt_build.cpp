@@ -1,8 +1,11 @@
 // btt_build.cpp -- BTT library build unit for JUCE/MSVC
 // Copyright (c) 2021 Michael Krzyzaniak -- MIT License
 //
-// This is the ONLY file to add to your Projucer project for BTT.
-// Same pattern as how JUCE internally includes sqlite3.
+// This is the BTT file the project compiles (compile="1" in the .jucer; a
+// CMake build must list it too).  It includes btt_amalgamation.inc, the
+// library itself.  btt_amalgamation.c is the same library as a plain C file,
+// kept in the tree but not compiled (compile="0"); compiling it as well as
+// this file would define every BTT symbol twice.
 
 #ifdef _MSC_VER
   #pragma warning(push, 0)    // Suppress most warnings for third-party C code
