@@ -1210,6 +1210,19 @@ public:
         return 1.0;
     }
 
+    /// The pitch in percent as the device states it (/Engine/DeckN/SpeedState:
+    /// -19.66 for a deck synced to 0.803x, -0.59 at 0.9941x, #23 captures).
+    /// False when the device has not sent it.  Exact where the speed measured
+    /// from BeatInfo scatters by 0.3 % a message.
+    bool getPitchPercent(int deckNum, double& percentOut) const
+    {
+        int idx = deckNum - 1;
+        if (idx < 0 || idx >= StageLinQ::kMaxDecks) return false;
+        if (!decks[idx].speedStateReceived.load(std::memory_order_acquire)) return false;
+        percentOut = decks[idx].speedState.load(std::memory_order_relaxed);
+        return std::isfinite(percentOut);
+    }
+
     /// Track length in seconds: Track/TrackLength (samples) over
     /// Track/SampleRate (AUDIT SLQ-2; it was stored as seconds, so a 1123 s
     /// track read 49.5 million seconds).

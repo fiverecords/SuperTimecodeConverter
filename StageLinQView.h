@@ -15,7 +15,9 @@
 //
 // Architecture: Owns its own 30Hz Timer, reads data from shared objects
 // (StageLinQInput, TrackMap, engines) via const getters.
-// No artwork or waveform (requires FileTransfer service, planned for future).
+// Artwork, overview waveform, cue and loop markers and the key come from the
+// device's Engine database (StageLinQDbClient, over the FileTransfer
+// service) when it has the track.
 
 #pragma once
 #include <JuceHeader.h>
@@ -107,6 +109,8 @@ private:
         juce::String playState;
         double bpm = 0.0;
         double speed = 0.0;           // pitch multiplier (1.0 = 0%)
+        bool   hasPitch = false;      // the device's own pitch (SpeedState) came
+        double pitchPct = 0.0;
         bool isPlaying = false;
         uint8_t beatInBar = 1;
         uint32_t playheadMs = 0;
@@ -131,6 +135,7 @@ private:
         // Artwork (from StageLinQDbClient)
         juce::Image artwork;
         juce::String lastNetworkPath;  // to detect changes
+        bool dbLoaded = false;         // the database has answered for lastNetworkPath
 
         // Waveform (from StageLinQDbClient)
         DenonWaveformData waveform;
@@ -138,7 +143,8 @@ private:
 
         // Performance data (from StageLinQDbClient)
         DenonPerformanceData perfData;
-        juce::String keyStr;   // musical key string (DB or live)
+        juce::String dbKey;    // musical key from the database
+        juce::String keyStr;   // musical key shown: live (StateMap) or else dbKey
 
         // Live state from StateMap (real-time, not from DB)
         bool loopEnabled = false;
@@ -170,6 +176,7 @@ private:
             ds.playState   = stageLinQ.getPlayStateString(dn);
             ds.bpm         = stageLinQ.getBPM(dn);
             ds.speed       = stageLinQ.getActualSpeed(dn);
+            ds.hasPitch    = stageLinQ.getPitchPercent(dn, ds.pitchPct);
             ds.isPlaying   = stageLinQ.isPlayerPlaying(dn);
             ds.beatInBar   = stageLinQ.getBeatInBar(dn);
             ds.playheadMs  = stageLinQ.getPlayheadMs(dn);
@@ -181,38 +188,44 @@ private:
             ds.artist      = tinfo.artist;
             ds.title       = tinfo.title;
 
-            // Artwork + waveform from database (if available)
-            if (dbClient.isDatabaseReady())
+            // Artwork + waveform from database (if available).  A new track
+            // drops the previous one's at once (AUDIT SLQ-12: a track the
+            // database had not -- or not yet -- answered for kept the last
+            // track's artwork, waveform, cues and key on screen), then the
+            // cache is asked each tick until the database thread has it.
             {
                 auto netPath = stageLinQ.getTrackNetworkPath(dn);
-                if (netPath.isNotEmpty() && netPath != ds.lastNetworkPath)
+                if (netPath != ds.lastNetworkPath)
                 {
-                    // Try to fetch from cache -- DB thread may not have
-                    // processed requestMetadata() yet, so data may be empty.
-                    auto art = dbClient.getArtworkForTrack(netPath);
-                    auto wf  = dbClient.getWaveformForTrack(netPath);
-                    auto perf = dbClient.getPerformanceData(netPath);
+                    ds.lastNetworkPath = netPath;
+                    ds.dbLoaded = false;
+                    ds.artwork = {};
+                    ds.waveform = {};
+                    ds.waveformLoaded = false;
+                    ds.perfData = {};
+                    ds.dbKey.clear();
+                }
+                if (!ds.dbLoaded && netPath.isNotEmpty() && dbClient.isDatabaseReady())
+                {
                     auto dbMeta = dbClient.getTrackByNetworkPath(netPath);
 
-                    // Only commit path once we have at least metadata cached
-                    // (artwork/waveform may be NULL for some tracks).
-                    // If nothing is cached yet, we'll retry next timer tick.
+                    // Only once the metadata is cached (artwork/waveform may
+                    // be NULL for some tracks); until then, retry next tick.
                     if (dbMeta.valid)
                     {
-                        ds.lastNetworkPath = netPath;
-                        ds.artwork = art;
-                        ds.waveform = wf;
-                        ds.waveformLoaded = wf.valid;
-                        ds.perfData = perf;
-                        ds.keyStr = dbMeta.key;
+                        ds.dbLoaded = true;
+                        ds.artwork = dbClient.getArtworkForTrack(netPath);
+                        ds.waveform = dbClient.getWaveformForTrack(netPath);
+                        ds.waveformLoaded = ds.waveform.valid;
+                        ds.perfData = dbClient.getPerformanceData(netPath);
+                        ds.dbKey = dbMeta.key;
                     }
                 }
             }
 
             // Live key from StateMap (overrides DB key when available -- updates with key shift)
             auto liveKey = stageLinQ.getCurrentKeyString(dn);
-            if (liveKey.isNotEmpty())
-                ds.keyStr = liveKey;
+            ds.keyStr = liveKey.isNotEmpty() ? liveKey : ds.dbKey;
 
             // Live loop state from StateMap (real-time active loop, not stored in DB)
             ds.loopEnabled    = stageLinQ.isLoopEnabled(dn);
@@ -491,10 +504,12 @@ private:
                            juce::Justification::centredLeft);
             }
 
-            // Pitch
+            // Pitch: the device's own figure (SpeedState) when it sends one;
+            // the speed measured from BeatInfo scatters by 0.3 % a message
+            // and made the figure flicker (AUDIT SLQ-13)
             if (ds.speed > 0.01)
             {
-                double pitchPct = (ds.speed - 1.0) * 100.0;
+                double pitchPct = ds.hasPitch ? ds.pitchPct : (ds.speed - 1.0) * 100.0;
                 g.setFont(juce::Font(juce::FontOptions(10.0f)));
                 g.setColour(std::abs(pitchPct) > 0.05 ? accentCyan : textMid);
                 juce::String pitchStr = (pitchPct >= 0.0 ? "+" : "") + juce::String(pitchPct, 2) + "%";
