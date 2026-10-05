@@ -156,6 +156,10 @@ namespace ProDJLink
     static constexpr double  kKeepaliveInterval = 1.5;   // seconds
     static constexpr double  kAutoListenMs      = 3500.0; // AUTO profile: listen-before-announce window (>= 1 full peer keepalive cycle)
     static constexpr double  kBridgeSubInterval = 1.0;   // seconds between 0x57 re-subscriptions (real bridge: exactly 1.0s, Prueba_prodjlink_bridge.pcapng)
+    // A player number moves to a new address only once its current address
+    // has been silent this long (AUDIT PDL-3): more than two CDJ keepalive
+    // gaps (about 2.0 s, dysentery startup.adoc), half the 10 s timeout.
+    static constexpr double  kReaddressQuietMs  = 5000.0;
 
     // Bridge subscription
     static constexpr uint8_t kBridgeSubType     = 0x57;  // mixer subscribe packet type
@@ -270,12 +274,41 @@ namespace ProDJLink
 //==============================================================================
 struct ProDJLinkPlayerState
 {
-    // Identity (set once on discovery, read-only after)
+    // Identity: written by the network thread when the player is discovered
+    // or moves to a new address (readdressPlayer, AUDIT PDL-3), and cleared
+    // by reset().  model / ipStr / macAddr are plain chars: the network
+    // thread reads them freely (it is their only writer); any other thread
+    // copies them under identityLock, which the network thread holds while
+    // it writes them.  The discovered flag alone could not do it: a reader
+    // past its acquire load still raced reset()'s memset and the next
+    // discovery's copy (AUDIT PDL-13).
     std::atomic<bool>     discovered { false };
     std::atomic<uint8_t>  playerNumber { 0 };
-    char                  model[21] {};          // null-terminated, written once
-    char                  ipStr[16] {};          // "x.x.x.x", written once
-    uint8_t               macAddr[6] {};         // written once
+    char                  model[21] {};          // null-terminated
+    char                  ipStr[16] {};          // "x.x.x.x"
+    uint8_t               macAddr[6] {};
+    mutable juce::SpinLock identityLock;
+    // Discovered from its status stream, not a keepalive (a multi-deck
+    // unit's second deck): status packets then re-address it.  Network
+    // thread only.
+    bool                  statusDiscovered = false;
+    // When this number was last heard (keepalive or status) from ipStr.
+    // Another address takes the slot only once this is older than
+    // ProDJLink::kReaddressQuietMs (AUDIT PDL-3).  Network thread only.
+    double                addrHeardMs = 0.0;
+
+    /// Copy of model or ipStr for a thread other than the network thread.
+    template <size_t N>
+    juce::String copyIdentityField(const char (&field)[N]) const
+    {
+        char buf[N];
+        {
+            const juce::SpinLock::ScopedLockType sl(identityLock);
+            std::memcpy(buf, field, N);
+        }
+        buf[N - 1] = '\0';
+        return juce::String(buf);
+    }
 
     // Timing -- from Absolute Position packets (CDJ-3000, every 30ms)
     // or beat-derived (NXS2: beatCount * 60000 / BPM, from status packets ~5Hz)
@@ -343,16 +376,19 @@ struct ProDJLinkPlayerState
 
     void reset()
     {
-        // Store discovered=false FIRST with release ordering.
-        // UI-thread getters check discovered with acquire ordering --
-        // release guarantees they see discovered=false before we zero
-        // the non-atomic fields (model, ipStr, macAddr).
+        // discovered=false first, so getters that test it stop reading;
+        // the identity is cleared under identityLock, because a getter that
+        // already passed the test may be copying it right now (PDL-13).
         discovered.store(false, std::memory_order_release);
 
         playerNumber.store(0, std::memory_order_relaxed);
-        std::memset(model, 0, sizeof(model));
-        std::memset(ipStr, 0, sizeof(ipStr));
-        std::memset(macAddr, 0, sizeof(macAddr));
+        {
+            const juce::SpinLock::ScopedLockType sl(identityLock);
+            std::memset(model, 0, sizeof(model));
+            std::memset(ipStr, 0, sizeof(ipStr));
+            std::memset(macAddr, 0, sizeof(macAddr));
+        }
+        statusDiscovered = false;
         playheadMs.store(0, std::memory_order_relaxed);
         trackLenSec.store(0, std::memory_order_relaxed);
         hasAbsolutePosition.store(false, std::memory_order_relaxed);
@@ -376,6 +412,7 @@ struct ProDJLinkPlayerState
         prevAbsPosMs = 0;
         trackVersion.store(0, std::memory_order_relaxed);
         lastPacketTime.store(0.0, std::memory_order_relaxed);
+        addrHeardMs = 0.0;
         statusSeenCount = 0;
         statusSeenIp[0] = '\0';
         absPositionTs.store(0.0, std::memory_order_relaxed);
@@ -617,7 +654,8 @@ public:
     //==========================================================================
     int  getVCDJPlayerNumber() const    { return vCDJPlayerNumber; }
 
-    /// Called when a player disappears from the network (10s keepalive timeout).
+    /// Called when a player disappears from the network (10s keepalive timeout),
+    /// and with its old address when a player moves to a new one (AUDIT PDL-3).
     /// Wire this to DbServerClient::invalidatePlayer() to close stale connections.
     std::function<void(const juce::String& playerIP)> onPlayerLost;
     void setVCDJPlayerNumber(int n)     { vCDJPlayerNumber = juce::jlimit(1, 127, n); }
@@ -719,7 +757,7 @@ public:
             if (players[i].discovered.load(std::memory_order_acquire)
                 && players[i].isMaster.load(std::memory_order_relaxed))
             {
-                return juce::String(players[i].model) + " #"
+                return players[i].copyIdentityField(players[i].model) + " #"
                      + juce::String((int)players[i].playerNumber.load(std::memory_order_relaxed));
             }
         }
@@ -1280,7 +1318,7 @@ public:
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return {};
         if (!players[idx].discovered.load(std::memory_order_acquire)) return {};
-        return juce::String(players[idx].model);
+        return players[idx].copyIdentityField(players[idx].model);
     }
 
     /// Get IP address string for a player (Phase 2: needed by DbServerClient)
@@ -1289,7 +1327,7 @@ public:
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return {};
         if (!players[idx].discovered.load(std::memory_order_acquire)) return {};
-        return juce::String(players[idx].ipStr);
+        return players[idx].copyIdentityField(players[idx].ipStr);
     }
 
     /// Get loaded media slot for a player (0=empty, 2=SD, 3=USB, 4=CD)
@@ -1364,10 +1402,13 @@ public:
     /// NXS2 dbserver only accepts player numbers 1-4 that are actually present
     /// on the network.  Returns a discovered player (1-4) that is not
     /// `excludePlayer`, or 0 if none found (query will fail).
+    /// Called from the message thread: addresses are copied under
+    /// identityLock (AUDIT PDL-13).
     int suggestDbPlayerNumber(int excludePlayer) const
     {
-        const char* srcIp = (excludePlayer >= 1 && excludePlayer <= ProDJLink::kMaxPlayers)
-                                ? players[excludePlayer - 1].ipStr : "";
+        const juce::String srcIp = (excludePlayer >= 1 && excludePlayer <= ProDJLink::kMaxPlayers)
+            ? players[excludePlayer - 1].copyIdentityField(players[excludePlayer - 1].ipStr)
+            : juce::String();
 
         // Prefer another discovered player (ideal: the CDJ knows it exists)
         // -- but NEVER one that shares the source player's IP.  Multi-deck
@@ -1381,8 +1422,8 @@ public:
             if (pn == excludePlayer) continue;
             int idx = pn - 1;
             if (!players[idx].discovered.load(std::memory_order_relaxed)) continue;
-            if (srcIp[0] != '\0'
-                && std::strncmp(players[idx].ipStr, srcIp, 15) == 0) continue;
+            if (srcIp.isNotEmpty()
+                && players[idx].copyIdentityField(players[idx].ipStr) == srcIp) continue;
             return pn;
         }
         // No usable discovered player.  Pick the highest number 4->1 that is
@@ -2339,12 +2380,38 @@ private:
         int idx = pn - 1;
         auto& p = players[idx];
 
+        // A known number from a new address (DHCP renewal, link-local
+        // re-assignment after a replug): once the old address has been
+        // silent for kReaddressQuietMs, the slot moves to the new one.
+        // Kept, the slot stayed alive on these keepalives while every 0x0b
+        // was dropped by the address checks, and the 95 B, 0x55 and
+        // dbserver kept going to the old address (AUDIT PDL-3).  The same
+        // model is taken as the same player and moved in place
+        // (readdressPlayer); another model is another player, and its slot
+        // starts again from this keepalive, as after the 10 s timeout.
+        // While the old address is still heard, two live devices use this
+        // number (dysentery startup.adoc: a device on an XDJ-XZ's laptop
+        // port may be let use 1 or 2), and the slot stays where it is, as
+        // before; moving it on every keepalive made it flap between the two.
+        const double heardNow = juce::Time::getMillisecondCounterHiRes();
+        if (p.discovered.load(std::memory_order_relaxed) && sender != p.ipStr
+            && heardNow - p.addrHeardMs > ProDJLink::kReaddressQuietMs)
+        {
+            DBG("ProDJLink: Player " << (int)pn << " moved from " << p.ipStr << " to " << sender);
+            if (hasSameModel(p, data, len, 12))
+                readdressPlayer(idx, sender, len >= 44 ? data + 38 : nullptr);
+            else
+                losePlayer(idx);
+        }
+
         if (!p.discovered.load(std::memory_order_relaxed))
         {
             p.playerNumber.store(pn, std::memory_order_relaxed);
-            // Copy model name -- sanitize to pure ASCII for safe String construction
-            std::memset(p.model, 0, sizeof(p.model));
+            const auto ipStr = sender.toStdString();
             {
+                const juce::SpinLock::ScopedLockType sl(p.identityLock);   // PDL-13
+                // Copy model name -- sanitize to pure ASCII for safe String construction
+                std::memset(p.model, 0, sizeof(p.model));
                 int copyLen = std::min(20, len - 12);
                 if (copyLen > 0)
                     std::memcpy(p.model, data + 12, copyLen);
@@ -2353,17 +2420,21 @@ private:
                 for (int c = 0; c < 20 && p.model[c] != '\0'; ++c)
                     if (static_cast<unsigned char>(p.model[c]) > 127)
                         p.model[c] = '?';
+                // Store IP string
+                std::strncpy(p.ipStr, ipStr.c_str(), 15);
+                p.ipStr[15] = '\0';
+                // MAC (only in type_status)
+                if (type == ProDJLink::kKeepAliveTypeStatus && len >= 44)
+                    std::memcpy(p.macAddr, data + 38, 6);
             }
-            // Store IP string
-            auto ipStr = sender.toStdString();
-            std::strncpy(p.ipStr, ipStr.c_str(), 15);
-            p.ipStr[15] = '\0';
-            // MAC (only in type_status)
-            if (type == ProDJLink::kKeepAliveTypeStatus && len >= 44)
-                std::memcpy(p.macAddr, data + 38, 6);
 
             p.discovered.store(true, std::memory_order_release);
             DBG("ProDJLink: Discovered Player " << (int)pn << " (" << p.model << ") at " << sender);
+        }
+        if (sender == p.ipStr)
+        {
+            p.statusDiscovered = false;   // a keepalive addresses it from now on
+            p.addrHeardMs = heardNow;
         }
 
         p.lastPacketTime.store(juce::Time::getMillisecondCounterHiRes(),
@@ -2730,6 +2801,27 @@ private:
         // keeps one corrupted datagram from creating a ghost, and at ~5Hz
         // status cadence adds <1s of discovery latency.  Liveness is
         // already status-driven (lastPacketTime below), so no flapping.
+        //
+        // A deck found this way moves to a new address when its status comes
+        // from there and the old one has been silent for kReaddressQuietMs
+        // (the unit's address changed).  With the same model it is moved in
+        // place (readdressPlayer); with another, its slot starts again and
+        // is counted again from the new address.  The keepalive handler
+        // does the same for keepalive-discovered players; status alone kept
+        // the slot alive at the old address (AUDIT PDL-3).
+        // A keepalive-discovered player is re-addressed by its keepalives
+        // only.  Status from the current address keeps it there.
+        const double heardNow = juce::Time::getMillisecondCounterHiRes();
+        if (p.statusDiscovered && p.discovered.load(std::memory_order_relaxed)
+            && sender != p.ipStr
+            && heardNow - p.addrHeardMs > ProDJLink::kReaddressQuietMs)
+        {
+            DBG("ProDJLink: Player " << (int)pn << " (status) moved from " << p.ipStr << " to " << sender);
+            if (hasSameModel(p, data, len, 11))
+                readdressPlayer(idx, sender, nullptr);
+            else
+                losePlayer(idx);
+        }
         if (!p.discovered.load(std::memory_order_relaxed))
         {
             const auto senderStd = sender.toStdString();
@@ -2744,10 +2836,11 @@ private:
             if (++p.statusSeenCount >= 3)
             {
                 p.playerNumber.store(pn, std::memory_order_relaxed);
-                // Device name travels in the status packet too (bytes 11-30,
-                // one byte earlier than in keepalives: no subtype byte).
-                std::memset(p.model, 0, sizeof(p.model));
                 {
+                    const juce::SpinLock::ScopedLockType sl(p.identityLock);   // PDL-13
+                    // Device name travels in the status packet too (bytes 11-30,
+                    // one byte earlier than in keepalives: no subtype byte).
+                    std::memset(p.model, 0, sizeof(p.model));
                     int copyLen = std::min(20, len - 11);
                     if (copyLen > 0)
                         std::memcpy(p.model, data + 11, copyLen);
@@ -2755,15 +2848,18 @@ private:
                     for (int c = 0; c < 20 && p.model[c] != '\0'; ++c)
                         if (static_cast<unsigned char>(p.model[c]) > 127)
                             p.model[c] = '?';
+                    std::strncpy(p.ipStr, senderStd.c_str(), 15);
+                    p.ipStr[15] = '\0';
                 }
-                std::strncpy(p.ipStr, senderStd.c_str(), 15);
-                p.ipStr[15] = '\0';
+                p.statusDiscovered = true;
                 p.discovered.store(true, std::memory_order_release);
                 DBG("ProDJLink: Player " << (int)pn << " STATUS-discovered ("
                     << p.model << ") at " << sender
                     << " -- multi-deck device, this deck sends no keepalive");
             }
         }
+        if (sender == p.ipStr)
+            p.addrHeardMs = heardNow;
 
         pktCountStatus.fetch_add(1, std::memory_order_relaxed);
         p.cntStatusPkts.fetch_add(1, std::memory_order_relaxed);
@@ -2962,6 +3058,63 @@ private:
                                std::memory_order_relaxed);
     }
 
+    /// Forget player slot i (0-based) and tell onPlayerLost its old address,
+    /// so DbServerClient closes stale TCP connections and clears cached
+    /// metadata for it.  Network thread: the 10 s timeout (gcPlayers), and
+    /// another model on a known number at a new address (AUDIT PDL-3).
+    void losePlayer(int i)
+    {
+        const juce::String lostIp(players[(size_t) i].ipStr);
+        players[(size_t) i].reset();
+        if (onPlayerLost && lostIp.isNotEmpty())
+            onPlayerLost(lostIp);
+    }
+
+    /// Network thread: whether the model name in a packet (the 20 bytes at
+    /// `at`, cleaned as discovery cleans them) is the one slot p has.
+    static bool hasSameModel(const ProDJLinkPlayerState& p, const uint8_t* data, int len, int at)
+    {
+        char name[21] = {};
+        const int copyLen = std::min(20, len - at);
+        if (copyLen > 0)
+            std::memcpy(name, data + at, (size_t) copyLen);
+        for (int c = 0; c < 20 && name[c] != '\0'; ++c)
+            if (static_cast<unsigned char>(name[c]) > 127)
+                name[c] = '?';
+        return std::strncmp(name, p.model, sizeof(name)) == 0;
+    }
+
+    /// Network thread: player slot i (0-based), silent at its address for
+    /// kReaddressQuietMs, is heard with the same model at newIp: the same
+    /// player has moved (AUDIT PDL-3).  Only the address changes, and the
+    /// MAC when a keepalive gives one.  Its play state, on-air, master and
+    /// track fields stay: the status handler does not check the address of
+    /// a keepalive-discovered player, so the new address's status has kept
+    /// them current, and clearing them (reset()) showed the deck stopped
+    /// and off air until its next status, long enough for ON AIR and XF
+    /// follow to switch to another deck and stay there.  Its position, the
+    /// 0x0b format and the BPM stay too; the 0x0b from the new address,
+    /// accepted from now on, refreshes them.  Only the reverse-play
+    /// reference is dropped, so the jump across the silence does not read
+    /// as reverse.  onPlayerLost gets the old address, so DbServerClient
+    /// closes its connections there.
+    void readdressPlayer(int i, const juce::String& newIp, const uint8_t* mac)
+    {
+        auto& p = players[(size_t) i];
+        const juce::String oldIp(p.ipStr);
+        const auto ipStd = newIp.toStdString();
+        {
+            const juce::SpinLock::ScopedLockType sl(p.identityLock);   // AUDIT PDL-13
+            std::strncpy(p.ipStr, ipStd.c_str(), 15);
+            p.ipStr[15] = '\0';
+            if (mac != nullptr)
+                std::memcpy(p.macAddr, mac, 6);
+        }
+        p.prevAbsPosMs = 0;
+        if (onPlayerLost && oldIp.isNotEmpty())
+            onPlayerLost(oldIp);
+    }
+
     //==========================================================================
     // Garbage collection -- drop stale players and DJMs
     //==========================================================================
@@ -2975,14 +3128,8 @@ private:
                 double last = players[i].lastPacketTime.load(std::memory_order_relaxed);
                 if ((now - last) > 10000.0)
                 {
-                    juce::String lostIp(players[i].ipStr);
-                    DBG("ProDJLink: Player " << (i + 1) << " timed out (" << lostIp << ")");
-                    players[i].reset();
-
-                    // Notify DbServerClient to close stale TCP connections
-                    // and clear cached metadata for this player
-                    if (onPlayerLost && lostIp.isNotEmpty())
-                        onPlayerLost(lostIp);
+                    DBG("ProDJLink: Player " << (i + 1) << " timed out (" << players[i].ipStr << ")");
+                    losePlayer(i);
                 }
             }
         }
