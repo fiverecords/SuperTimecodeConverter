@@ -542,12 +542,14 @@ struct TrackMapEntry
                 title = "Track #" + juce::String((juce::int64)idVal);
         }
 
-        // Validate timecodeOffset: must parse as valid HH:MM:SS:FF
+        // timecodeOffset: parsed and stored as the shared parser reads it
+        // (parseTimecodeString), so the table shows what the engine applies.
+        // Text with no number in it resets to zero.
         {
             juce::String rawOffset = getString("timecodeOffset", "00:00:00:00");
             int h, m, s, f;
             if (parseTimecodeString(rawOffset, h, m, s, f))
-                timecodeOffset = rawOffset;
+                timecodeOffset = formatTimecodeString(h, m, s, f);
             else
                 timecodeOffset = "00:00:00:00";  // reset malformed offsets
         }
@@ -614,35 +616,41 @@ struct TrackMapEntry
     // Timecode offset parsing/formatting utilities
     //------------------------------------------------------------------
 
-    /// Parse "HH:MM:SS:FF" or "HH:MM:SS.FF" -> individual fields.
-    /// Returns false if format is invalid.
+    /// Parse an offset -> individual fields, through TimecodeCore's shared
+    /// text parser (AUDIT C1, AUDIT SET-8): ':' '.' or ';' between fields,
+    /// missing fields read as 0, each field clamped to its range.  An offset
+    /// is shared by every engine that follows the track, at whatever rate
+    /// each runs, so it is read without one: frames up to 29 and no
+    /// drop-frame correction.  Each engine converts it at its own rate when
+    /// it applies it (TimecodeEngine, applyTimecodeOffset), where frames
+    /// past that rate carry into the seconds.  Returns false only for text
+    /// with no digit in it.  The private parser this replaces refused ';'
+    /// (an offset typed with it could not be saved, and one loaded with it
+    /// was reset to zero) and any value out of range.
     static bool parseTimecodeString(const juce::String& s,
                                     int& h, int& m, int& sec, int& f)
     {
-        // Accept both ':' and '.' as separators for the frame field
-        auto normalized = s.replace(".", ":");
-        auto parts = juce::StringArray::fromTokens(normalized, ":", "");
-        if (parts.size() != 4) return false;
+        if (! s.containsAnyOf("0123456789"))
+            return false;
 
-        h   = parts[0].getIntValue();
-        m   = parts[1].getIntValue();
-        sec = parts[2].getIntValue();
-        f   = parts[3].getIntValue();
-
-        return h >= 0 && h <= 23
-            && m >= 0 && m <= 59
-            && sec >= 0 && sec <= 59
-            && f >= 0 && f <= 29;
+        const Timecode tc = parseTimecodeText(s, FrameRate::FPS_30);
+        h   = tc.hours;
+        m   = tc.minutes;
+        sec = tc.seconds;
+        f   = tc.frames;
+        return true;
     }
 
-    /// Format fields -> "HH:MM:SS:FF"
+    /// Format fields -> "HH:MM:SS:FF" (TimecodeCore's formatter), clamped
+    /// to the ranges the parser gives.
     static juce::String formatTimecodeString(int h, int m, int s, int f)
     {
-        return juce::String::formatted("%02d:%02d:%02d:%02d",
-                                       juce::jlimit(0, 23, h),
-                                       juce::jlimit(0, 59, m),
-                                       juce::jlimit(0, 59, s),
-                                       juce::jlimit(0, 29, f));
+        Timecode tc;
+        tc.hours   = juce::jlimit(0, 23, h);
+        tc.minutes = juce::jlimit(0, 59, m);
+        tc.seconds = juce::jlimit(0, 59, s);
+        tc.frames  = juce::jlimit(0, 29, f);
+        return formatTimecodeText(tc);
     }
 };
 

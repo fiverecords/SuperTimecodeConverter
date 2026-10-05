@@ -479,6 +479,18 @@ public:
         }
     }
 
+    /// Change the rate typed positions are normalised at and cues are
+    /// projected onto the strip with (the selected engine's, passed on by
+    /// GeneratorPresetEditor::setCurrentFpsForCueEditor).  A call with the
+    /// rate already in use does nothing.  Message thread.
+    void setFps(double fpsValue)
+    {
+        if (fpsValue <= 0.0 || frameRateFromDouble(fpsValue) == frameRateFromDouble(fps))
+            return;
+        fps = fpsValue;
+        refreshStripCues();
+    }
+
     //--------------------------------------------------------------------------
     // TableListBoxModel
     //--------------------------------------------------------------------------
@@ -658,39 +670,26 @@ private:
                          juce::dontSendNotification);
     }
 
-    /// Normalise a TC string by carrying overflow.  Mirrors the helper in
-    /// GeneratorPresetEditor so cues round-trip consistently.
-    static juce::String normalizeTC(const juce::String& tc)
+    /// Normalise a typed cue position through TimecodeCore's shared text
+    /// parser (AUDIT C1, AUDIT SET-8) at `fpsValue` -- the editor's fps, the
+    /// rate the preset editor last passed on: ':' '.' or ';' between fields,
+    /// each field clamped to its range (frames to the rate), at 29.97 a
+    /// drop-frame number that does not exist moved to the first that does.
+    /// It is the parse GeneratorCuePoint::positionMs applies when an engine
+    /// arms the cue, at that engine's rate: the preset is shared, so an
+    /// engine at another rate may clamp or move the frames once more.  The
+    /// private copy this replaces lost the frames after a ';', carried
+    /// frames at 30 whatever the rate, and wrapped hours past 23 to 0.
+    static juce::String normalizeTC(const juce::String& tc, double fpsValue)
     {
-        auto parts = juce::StringArray::fromTokens(tc, ":.", "");
-        int h = 0, m = 0, s = 0, f = 0;
-        if (parts.size() >= 1) h = juce::jmax(0, parts[0].getIntValue());
-        if (parts.size() >= 2) m = juce::jmax(0, parts[1].getIntValue());
-        if (parts.size() >= 3) s = juce::jmax(0, parts[2].getIntValue());
-        if (parts.size() >= 4) f = juce::jmax(0, parts[3].getIntValue());
-        s += f / 30; f %= 30;  // assume max 30fps for frame carry
-        m += s / 60; s %= 60;
-        h += m / 60; m %= 60;
-        h %= 24;
-        return juce::String(h).paddedLeft('0', 2) + ":"
-             + juce::String(m).paddedLeft('0', 2) + ":"
-             + juce::String(s).paddedLeft('0', 2) + ":"
-             + juce::String(f).paddedLeft('0', 2);
+        return formatTimecodeText(parseTimecodeText(tc, frameRateFromDouble(fpsValue)));
     }
 
-    /// Convert a SMPTE TC string to absolute milliseconds.  Frame fps
-    /// rounding goes via the supplied fps so this and the engine's
-    /// armedCues stay coherent.  Defensive against malformed input.
-    ///
-    /// Note: this uses non-drop-frame counting even at 29.97fps.  The
-    /// engine's `GeneratorCuePoint::positionMs` does the same, so the
-    /// editor's display and the engine's runtime arming agree on cue
-    /// positions -- they're internally consistent, just non-DF-accurate
-    /// for the 29.97 case.  If we ever switch to true DF math here, the
-    /// engine helper has to switch in lockstep.
-    /// Both delegate to TimecodeCore's shared text conversion (drop-frame
-    /// aware, same arithmetic as the engine display).  fps is the engine's
-    /// rate as a double, as the rest of this editor carries it.
+    /// Convert a SMPTE TC string to absolute milliseconds, and back.  Both
+    /// delegate to TimecodeCore's shared text conversion (drop-frame aware,
+    /// the arithmetic of GeneratorCuePoint::positionMs and the engine
+    /// display), so the strip and the engine's armed cues agree.  fps is
+    /// the engine's rate as a double, as the rest of this editor carries it.
     static double parseTcToMs(const juce::String& tc, double fps)
     {
         return parseTimecodeTextToMs(tc, frameRateFromDouble(fps));
@@ -779,7 +778,14 @@ private:
         if (selectedCue < 0 || selectedCue >= (int) preset.cuePoints.size()) return;
         auto& cue = preset.cuePoints[(size_t) selectedCue];
 
-        cue.positionTC = normalizeTC(edPosition.getText().trim());
+        // A position the operator did not change is kept as stored, as the
+        // preset editor keeps an untouched Start/Stop TC: normalised at
+        // this window's rate it would re-clamp a cue made for an engine at
+        // another rate (presets are shared), on an Apply meant for its
+        // name or triggers.  A typed position is normalised.
+        const juce::String typedPosition = edPosition.getText().trim();
+        if (typedPosition.isEmpty() || typedPosition != cue.positionTC)
+            cue.positionTC = normalizeTC(typedPosition, fps);
         edPosition.setText(cue.positionTC, false);
 
         cue.name = edName.getText().trim();

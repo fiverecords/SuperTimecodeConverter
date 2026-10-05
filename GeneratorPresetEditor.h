@@ -157,12 +157,18 @@ public:
 
     std::function<void()> onChange;
 
-    /// Set the engine's current fps so the cue editor can convert cue TC
-    /// to ms (and back) consistently.  Called by MainComponent whenever
-    /// the editor is opened or the engine's fps changes.
+    /// Set the selected engine's fps: the rate the Start/Stop TC fields are
+    /// normalised at, and the one the cue editor converts cue TC to ms (and
+    /// back) with.  Called by MainComponent when it opens the editor; a call
+    /// while the editor is open (the selected engine, or its rate, changed)
+    /// is forwarded to the cue window if one is open.  Message thread.
     void setCurrentFpsForCueEditor(double fpsValue)
     {
-        if (fpsValue > 0.0) currentFpsForCueEditor = fpsValue;
+        if (fpsValue <= 0.0) return;
+        currentFpsForCueEditor = fpsValue;
+        if (cueWindow != nullptr)
+            if (auto* ed = cueWindow->getEditor())
+                ed->setFps(fpsValue);
     }
 
     /// Install a playhead getter that the cue editor (when opened) will
@@ -378,10 +384,11 @@ private:
 
     // Cue editor window (lazy-created on first Cues click; reused after)
     std::unique_ptr<GeneratorCuePointEditorWindow> cueWindow;
-    // Frame rate in fps used by the cue editor when projecting cue TC
-    // onto the audio waveform strip.  Pushed by MainComponent (the only
-    // thing that knows the engine's current fps) before opening the
-    // window via setCurrentFpsForCueEditor.  Default 30 if never set.
+    // Frame rate in fps the Start/Stop TC fields are normalised at, and the
+    // one the cue editor uses when projecting cue TC onto the audio
+    // waveform strip.  Pushed by MainComponent (the only thing that knows
+    // the selected engine's current fps) via setCurrentFpsForCueEditor.
+    // Default 30 if never set.
     double currentFpsForCueEditor = 30.0;
 
     // Playhead getter forwarded to the cue editor when opened.  Set by
@@ -412,47 +419,47 @@ private:
         if (onChange) onChange();
     }
 
-    /// Normalize a timecode string (HH:MM:SS:FF) by carrying overflow.
-    static juce::String normalizeTC(const juce::String& tc)
+    /// Normalise a typed Start/Stop TC through TimecodeCore's shared text
+    /// parser (AUDIT C1, AUDIT SET-8) at currentFpsForCueEditor, the rate
+    /// MainComponent last pushed: ':' '.' or ';' between fields, each field
+    /// clamped to its range (frames to the rate), at 29.97 a drop-frame
+    /// number that does not exist moved to the first that does.  The field
+    /// then shows what an engine at that rate runs.  Presets are shared by
+    /// every engine, and an engine parses the stored text again at its own
+    /// rate when it loads one (MainComponent::loadGenPresetToFields), so an
+    /// engine at another rate may clamp or move the frames once more.  The
+    /// private copy this replaces lost the frames after a ';', carried
+    /// frames at 30 whatever the rate, and wrapped hours past 23 to 0.
+    juce::String normalizeTC(const juce::String& tc) const
     {
-        auto parts = juce::StringArray::fromTokens(tc, ":.", "");
-        int h = 0, m = 0, s = 0, f = 0;
-        if (parts.size() >= 1) h = parts[0].getIntValue();
-        if (parts.size() >= 2) m = parts[1].getIntValue();
-        if (parts.size() >= 3) s = parts[2].getIntValue();
-        if (parts.size() >= 4) f = parts[3].getIntValue();
-        if (f < 0) f = 0;
-        if (s < 0) s = 0;
-        if (m < 0) m = 0;
-        if (h < 0) h = 0;
-        // Carry overflow
-        s += f / 30; f %= 30;  // assume max 30fps for frame carry
-        m += s / 60; s %= 60;
-        h += m / 60; m %= 60;
-        h %= 24;
-        return juce::String(h).paddedLeft('0', 2) + ":"
-             + juce::String(m).paddedLeft('0', 2) + ":"
-             + juce::String(s).paddedLeft('0', 2) + ":"
-             + juce::String(f).paddedLeft('0', 2);
+        return formatTimecodeText(parseTimecodeText(tc, frameRateFromDouble(currentFpsForCueEditor)));
     }
 
     /// Put the form fields (name, Start/Stop TC, audio file, loop) into
     /// `p` and return it; whatever the form does not show -- the cue
     /// points -- is left as `p` has it.  ADD passes a blank preset, SAVE
     /// the stored one (AUDIT SET-2).
-    /// Normalises Start TC / Stop TC and writes the normalised values back
-    /// to the editors so what the user sees matches what gets saved.
+    /// A Start/Stop TC field that still holds `p`'s text is kept as it is;
+    /// any other is normalised (normalizeTC), and the values are written
+    /// back to the editors so what the user sees matches what gets saved.
+    /// An untouched field is not normalised because presets are shared: at
+    /// this window's rate it would re-clamp a value made for an engine at
+    /// another one (a SAVE for the audio file, from a 25 fps engine, would
+    /// move a 30 fps preset's Start TC from :29 to :24).
     GeneratorPreset readFormToPreset(const juce::String& name, GeneratorPreset p = {})
     {
+        auto formTC = [this](const juce::TextEditor& ed, const juce::String& stored)
+        {
+            const juce::String typed = ed.getText().trim();
+            if (typed.isNotEmpty() && typed == stored)
+                return stored;
+            return normalizeTC(typed.isEmpty() ? juce::String("00:00:00:00") : typed);
+        };
         p.name    = name;
-        p.startTC = edStartTC.getText().trim();
-        p.stopTC  = edStopTC.getText().trim();
+        p.startTC = formTC(edStartTC, p.startTC);
+        p.stopTC  = formTC(edStopTC, p.stopTC);
         p.audioFilePath = edAudio.getText().trim();
         p.audioLoop     = btnLoopAudio.getToggleState();
-        if (p.startTC.isEmpty()) p.startTC = "00:00:00:00";
-        if (p.stopTC.isEmpty())  p.stopTC  = "00:00:00:00";
-        p.startTC = normalizeTC(p.startTC);
-        p.stopTC  = normalizeTC(p.stopTC);
         edStartTC.setText(p.startTC, false);
         edStopTC.setText(p.stopTC, false);
         return p;
