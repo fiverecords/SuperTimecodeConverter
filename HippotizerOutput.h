@@ -169,7 +169,8 @@ public:
 
     bool isPaused() const { return paused.load(std::memory_order_relaxed); }
 
-    /// Force immediate packet send (e.g. on seek).
+    /// Force immediate packet send (e.g. on seek).  Message thread; the
+    /// packet goes out here, beside the timer thread's (socketWriteLock).
     void forceResync()
     {
         if (!isRunningFlag.load(std::memory_order_relaxed)
@@ -289,7 +290,11 @@ private:
         packet[40] = (uint8_t)((msInt >> 16) & 0xFF);
         packet[41] = (uint8_t)((msInt >> 24) & 0xFF);
 
-        int written = socket->write(destIp, destPort, packet, 42);
+        int written = 0;
+        {
+            const juce::SpinLock::ScopedLockType sl(socketWriteLock);
+            written = socket->write(destIp, destPort, packet, 42);
+        }
         if (written < 0)
             sendErrors.fetch_add(1, std::memory_order_relaxed);
     }
@@ -310,6 +315,12 @@ private:
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
+
+    // sendHippoPacket runs on the timer thread and, through forceResync, on
+    // the message thread.  juce::DatagramSocket::write keeps the resolved
+    // destination in the socket and stores it, unlocked, on its first send:
+    // the two never write at once (as ArtnetOutput, AUDIT LTC-7).
+    juce::SpinLock socketWriteLock;
 
     uint8_t packetTemplate[42] {};
 
