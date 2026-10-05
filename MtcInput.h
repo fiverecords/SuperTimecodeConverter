@@ -14,6 +14,9 @@ public:
 
     ~MtcInput() override
     {
+        // stop() stops the device, so nothing calls this object once it
+        // returns.  The retired devices are then destroyed with the members,
+        // at once: there is no later tick to defer them to (see stop()).
         stop();
     }
 
@@ -52,11 +55,18 @@ public:
 
         if (device != nullptr)
         {
-            midiInput = std::move(device);
-            midiInput->start();
-            currentDeviceIndex = deviceIndex;
-            isRunningFlag.store(true, std::memory_order_relaxed);
+            // Clear the decoder BEFORE the device delivers anything.  A
+            // MidiInput calls back only between its start() and stop() (JUCE
+            // drops what arrives while it is not started), and the previous
+            // device was stopped by stop() above, so nothing runs
+            // handleIncomingMidiMessage while resetState() writes the
+            // MIDI-thread state; the release store and the device's start()
+            // publish it to the MIDI thread.
             resetState();
+            midiInput = std::move(device);
+            currentDeviceIndex = deviceIndex;
+            isRunningFlag.store(true, std::memory_order_release);
+            midiInput->start();
             return true;
         }
 
@@ -68,22 +78,36 @@ public:
         isRunningFlag.store(false, std::memory_order_release);
         if (midiInput != nullptr)
         {
-            // Do NOT call midiInput->stop() or destroy it here.  On macOS,
-            // CoreMIDI's MIDI thread may be mid-callback inside JUCE's UMP
-            // dispatcher.  Both stop() and ~MidiInput() can deadlock or crash.
+            // Stop the device, then retire it -- do NOT destroy it here.
             //
-            // Move the device to a retirement list.  It stays alive until
-            // drainRetiredDevices() is called from the message thread timer
-            // (16ms later), by which time any in-flight callback has returned.
+            // Stopping is safe and is what makes a restart clean: in JUCE 9,
+            // MidiInput::stop() only clears the input's "active" flag under
+            // the spin lock its dispatcher holds (try-lock) while it calls us,
+            // so when it returns no callback from this device is in flight and
+            // none will start.  Without it a retired device kept delivering
+            // into this object until it was destroyed, and a start() right
+            // after (a device change) set isRunningFlag again and let those
+            // messages in, from another device and possibly another thread,
+            // while resetState() and the new device's messages ran.
+            //
+            // Destroying is what crashed on macOS (1.8.0): CoreMIDI's
+            // MIDIPortDisconnectSource does not wait for an in-flight read
+            // callback, and the platform MIDI thread could still be inside
+            // JUCE's UMP dispatcher.  So the device goes to a retirement list
+            // and is destroyed by drainRetiredDevices() on a later tick.
+            midiInput->stop();
             retiredDevices.push_back(std::move(midiInput));
         }
         currentDeviceIndex = -1;
     }
 
-    /// Call periodically from the message thread (e.g. timerCallback at 60Hz)
-    /// to safely destroy MidiInput devices that were retired by stop().
-    /// By the time this runs (~16ms after stop()), CoreMIDI callbacks have
-    /// finished and the destructors are safe to call.
+    /// Call periodically from the message thread (the engine's tick, 60 Hz)
+    /// to destroy the MidiInput devices retired by stop().  They are already
+    /// stopped; deferring their destruction to the next tick gives an
+    /// in-flight platform MIDI callback time to return.  The next tick
+    /// normally comes within ~16 ms of stop() (a 60 Hz juce::Timer); it can
+    /// come much sooner, since stop() runs from UI handlers between ticks,
+    /// or later if the message thread is busy.
     void drainRetiredDevices()
     {
         if (!retiredDevices.empty())
@@ -215,8 +239,8 @@ public:
     //==============================================================================
     void handleIncomingMidiMessage(juce::MidiInput*, const juce::MidiMessage& message) override
     {
-        // Guard: after stop(), the device may still deliver a queued message
-        // before CoreMIDI fully disconnects.  Ignore it.
+        // Guard: stop() clears the flag before it stops the device, so a
+        // message already being dispatched in between is ignored.
         if (!isRunningFlag.load(std::memory_order_acquire)) return;
 
         auto rawData = message.getRawData();
@@ -570,11 +594,12 @@ private:
     std::atomic<bool> isRunningFlag { false };
     std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
 
-    // Quarter-frame accumulator -- MIDI-callback-thread-only
+    // Quarter-frame accumulator -- MIDI-callback-thread-only (resetState()
+    // writes it on the message thread, but only while no device is started)
     int mtcData[8] = {};
     uint8_t nibbleMask = 0;          // which pieces arrived since the last reconstruction
 
-    // Quarter-frame continuity state -- MIDI-callback-thread-only.
+    // Quarter-frame continuity state -- MIDI-callback-thread-only, as above.
     // prevAssembled is the piece-0-time value of the last accepted sequence;
     // pendingAssembled holds a rejected value awaiting confirmation.
     Timecode prevAssembled;
