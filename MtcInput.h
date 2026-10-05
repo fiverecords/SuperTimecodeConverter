@@ -553,11 +553,12 @@ private:
         switch (rateCode)
         {
             case 0:
-                // MTC rate code 0 means "24fps". SMPTE MTC has no code for
-                // 23.976, so if the user has selected FPS_2398 we preserve
-                // it rather than silently overwriting with FPS_24.
-                if (detectedFps != FrameRate::FPS_2398)
-                    detectedFps = FrameRate::FPS_24;
+                // Rate code 0 is 24 fps.  MTC has no code for 23.976 -- a
+                // 23.976 sender uses 0 too -- so this reports 24 and cannot
+                // tell the two apart.  Keeping a 23.976 the user selected is
+                // the engine's job (as userOverrodeLtcFps does for LTC), not
+                // the decoder's: nothing here knows the selection (AUDIT NET-4).
+                detectedFps = FrameRate::FPS_24;
                 break;
             case 1: detectedFps = FrameRate::FPS_25;   break;
             case 2: detectedFps = FrameRate::FPS_2997; break;
