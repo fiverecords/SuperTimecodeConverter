@@ -436,12 +436,14 @@ private:
              + juce::String(f).paddedLeft('0', 2);
     }
 
-    /// Build a GeneratorPreset from the current form fields.
+    /// Put the form fields (name, Start/Stop TC, audio file, loop) into
+    /// `p` and return it; whatever the form does not show -- the cue
+    /// points -- is left as `p` has it.  ADD passes a blank preset, SAVE
+    /// the stored one (AUDIT SET-2).
     /// Normalises Start TC / Stop TC and writes the normalised values back
     /// to the editors so what the user sees matches what gets saved.
-    GeneratorPreset readFormToPreset(const juce::String& name)
+    GeneratorPreset readFormToPreset(const juce::String& name, GeneratorPreset p = {})
     {
-        GeneratorPreset p;
         p.name    = name;
         p.startTC = edStartTC.getText().trim();
         p.stopTC  = edStopTC.getText().trim();
@@ -563,19 +565,29 @@ private:
             return;
         }
 
+        // Start from the stored preset, copied before the map is touched:
+        // the form holds name, Start/Stop TC and the audio file, and the
+        // rest -- the cue points -- must survive SAVE and rename.  Built
+        // from a blank preset, SAVE deleted every cue of the preset
+        // without a word (AUDIT SET-2).
+        GeneratorPreset stored;
+        if (const auto* live = presetMap.find(oldName))
+            stored = *live;
+
+        // Close the cue window before the map changes: it edits the stored
+        // preset through a reference, which a rename's remove() destroys
+        // and SAVE's addOrUpdate() overwrites.  Re-opening Cues from the
+        // table picks up the saved entry.
+        closeCueEditorWindow();
+
         if (nameChanged)
             presetMap.remove(oldName);
 
-        auto p = readFormToPreset(name);
+        auto p = readFormToPreset(name, std::move(stored));
         // Mirror the trimmed name back if the user's input had surrounding
         // whitespace (matches what addNewPreset does).
         if (name != edName.getText())
             edName.setText(name, juce::dontSendNotification);
-        // Close any cue window for safety: even if the user is editing the
-        // same preset, the rename / overwrite flow goes through remove +
-        // addOrUpdate which can rehash and invalidate the cue window's
-        // pointer.  Re-opening Cues from the table picks up the new entry.
-        closeCueEditorWindow();
         presetMap.addOrUpdate(p);
         notifyChange();
 
