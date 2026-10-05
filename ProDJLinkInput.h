@@ -4,34 +4,42 @@
 //
 // ProDJLinkInput -- Direct Pro DJ Link protocol implementation.
 //
-// Connects natively to Pioneer CDJ/XDJ/DJM hardware without requiring
-// PRO DJ LINK Bridge or third-party software.  Creates a Virtual CDJ on the
-// network and receives player state, beat, and position data directly
-// from the players.
+// Connects natively to Pioneer CDJ/XDJ/DJM hardware without the PRO DJ LINK
+// Bridge program or any other software: on the wire STC announces itself as
+// that bridge (DESIGN D33), not as a virtual CDJ, and receives player state,
+// beat, position and mixer data directly from the devices.
 //
 // Position sources:
-//   CDJ-3000:   Absolute Position packets (type 0x0b, 30Hz, ms precision)
-//   NXS2/older: Beat-derived from status (beatCount x 60000/BPM, ~5Hz)
+//   CDJ-3000:   Absolute Position packets (type 0x0b, ~30 Hz, ms precision)
+//   NXS2:       its own 0x0b format (negated position, rolling counter),
+//               streamed to a bridge identity it accepts
+//   Otherwise:  beat-derived from status (beatCount x 60000/BPM, ~5 Hz)
 //
-// Phase 1: UDP monitoring + Dual-keepalive bridge
-//   - Bridge join sequence: hello 0x0A (player=5) -> IP claim 0x02 (player=5)
-//   - Two keepalives sent in parallel:
-//     1) 54B BROADCAST (player=0xF9) -- DJM discovers bridge, activates fader delivery
-//     2) 95B UNICAST to each CDJ (player=5, PIONEER DJ CORP strings) -- CDJ registers
-//        us as a valid peer and sends AbsPos/Status unicast data
-//   - The DJM NEVER receives the 95B (it's unicast to CDJ IPs only)
-//     -> DJM sees single identity (0xF9) -> faders work
-//   - The CDJ sees both, but both are from the same bridge -> no conflict
-//   - Sends type-0x57 subscribe to each DJM (port 50001)
-//     -> triggers DJM to send type-0x39 mixer fader packets
-//   - Sends type-0x55 bridge notify to each CDJ (port 50002)
+// Sent, modelled on captures of the official bridge (STC_PRODJLINK_AUDIT.md):
+//   - No hello / number-claim join (removed in v1.9.11-beta16).  With the
+//     0xF9, 0xC0 and 0xE4 profiles the first packet is the 54 B keepalive.
+//     With AUTO, a player other than a CDJ-3000 (an NXS2) discovered
+//     during the listen window gets the 0x55 first (see run(); AUDIT PDL-4).
+//   - Two keepalives:
+//     1) 54 B BROADCAST, device number from the identity profile (0xF9,
+//        0xC0, 0xE4 or AUTO) -- the DJM registers the bridge and unicasts
+//        its mixer status (0x39)
+//     2) 95 B UNICAST to CDJs (player 5, PIONEER DJ CORP strings), scope
+//        set by dbKeepaliveMode -- the reference bridge sends none
+//   - The DJM never receives the 95 B (unicast to CDJ addresses only), so
+//     it sees one identity.
+//   - 0x57 subscribe to each DJM (port 50001) -> the DJM sends its VU
+//     meters (0x58); the 0x39 comes with the keepalive identity alone
+//   - 0x55 to each CDJ that is not a CDJ-3000 (port 50002; see run())
+// Received:
 //   - Player discovery via keepalive packets  (port 50000)
 //   - Beat packets with BPM/pitch/beat info   (port 50001)
-//   - Absolute Position from CDJ-3000         (port 50001, type 0x0b)
+//   - Absolute Position, CDJ-3000 and NXS2    (port 50001, type 0x0b)
 //   - CDJ status: track ID, play state, pitch (port 50002)
 //   - DJM on-air broadcast                    (port 50001, type 0x03)
 //   - Mixer status                            (type 0x29, counted only -- no channel flags)
 //   - DJM mixer fader data                    (type 0x39, handled on both 50001 & 50002)
+//   - DJM VU meters                           (type 0x58, port 50001)
 //   - Timecode derived from playhead position in ms
 //
 // Protocol analysis: DJ Link Ecosystem Analysis
@@ -143,18 +151,23 @@ namespace ProDJLink
     static constexpr int kVuMasterR = kMaxMixerChannels + 1;  // index 7
     static constexpr int kVuSlots   = kMaxMixerChannels + 2;  // 8 total
 
-    // Device type bytes (byte [33] in keepalive packets) -- confirmed from captures:
-    //   0x01 = bridge / lighting controller
-    //   0x02 = DJM mixer  (player_number >= 0x21)
-    //   0x03 = CDJ / XDJ player (player_number 1-6)
+    // Byte [33] (0x21) of keepalive packets, which STC reads as a device
+    // type.  It is not one: the CDJs and the DJM in dysentery's captures
+    // (to-virtual, S06, S13) all carry 0x02 there, and STC's own bridge
+    // keepalive 0x01; dysentery's device-type byte is 0x34 (01 player,
+    // 02 mixer, 03 a newer mixer such as the DJM-A9, 05 Stagehand).  The
+    // mixer test works because a DJM also has a number >= 0x21 (AUDIT C20,
+    // left as is).
     static constexpr uint8_t kDeviceTypeBridge  = 0x01;
     static constexpr uint8_t kDeviceTypeMixer   = 0x02;  // DJM: device_type=0x02, pn >= 0x21
     static constexpr uint8_t kMixerPlayerNumMin = 0x21;  // DJM player numbers start at 33
 
-    // Virtual CDJ defaults
-    // Player 5 is used as bridge slot -- does NOT occupy CDJ slots 1-4.
-    // The CDJ-3000 grants dbserver access to player 5 when the 95-byte
-    // keepalive includes the Pioneer bridge identification strings.
+    // Bridge defaults
+    // Player 5 is the number the 95 B keepalive and the 0x55 carry.  It is
+    // a legal CDJ number -- CDJ-3000s use 5 and 6 -- so the 95 B is never
+    // sent to a real player 5 (AUDIT A18).  The CDJ-3000 grants dbserver
+    // access to player 5 when the 95-byte keepalive includes the Pioneer
+    // bridge identification strings.
     static constexpr int     kDefaultVCDJNumber = 5;
     static constexpr double  kKeepaliveInterval = 1.5;   // seconds
     static constexpr double  kAutoListenMs      = 3500.0; // AUTO profile: listen-before-announce window (>= 1 full peer keepalive cycle)
@@ -217,7 +230,7 @@ namespace ProDJLink
     static constexpr int kDbKeepalive3000    = 1; // CDJ-3000 models only (v1.9.10 behaviour)
     static constexpr int kDbKeepaliveOff     = 2; // never (reference-bridge behaviour)
 
-    // NOTE (v1.9.11-beta15): the dual CDJ identity (B21=02, self-assigned
+    // NOTE (v1.9.11-beta15): the dual CDJ identity (byte 0x21 = 02, self-assigned
     // player 7-15, added in beta4) has been REMOVED.  It never ran against
     // hardware, its claim packets were malformed (sendCdjJoinHello had an
     // out-of-bounds stack write), and the reference capture proves a single
@@ -238,7 +251,8 @@ namespace ProDJLink
     //==========================================================================
     // Convert pitch field from protocol value to multiplier
     // Status packets: pitch / 0x100000 (e.g. 0x100000 = 1.0 = 0%)
-    // Abs position:   pitch / 100      (e.g. 100 = 1.0 = 0%)
+    // Abs position:   signed percent x100 (326 = +3.26 %), converted where
+    //                 the 0x0b is parsed, not here
     //==========================================================================
     inline double pitchFromStatus(uint32_t raw) { return double(raw) / double(0x100000); }
 
@@ -331,11 +345,15 @@ struct ProDJLinkPlayerState
     // From beat packets
     std::atomic<uint32_t> bpmRaw       { 0 };    // track BPM x100 (beat/status) or effective
                                                     // BPM x10 (CDJ-3000 0x0b, absPosIs3000Format)
-    std::atomic<uint32_t> pitchRaw     { 0x100000 }; // fader pitch multiplier raw (offset 140)
-    std::atomic<uint32_t> actualSpeedRaw { 0 };   // real playback speed raw (offset 152)
-                                                    // Includes motor ramp -- 0 when stopped,
-                                                    // ramps 0->0x100000 during play start,
-                                                    // ramps 0x100000->0 during pause.
+    std::atomic<uint32_t> pitchRaw     { 0x100000 }; // Pitch1 (status offset 140, 0x8c): the pitch
+                                                    // in effect, sync included, as the BPM display
+                                                    // shows it (dysentery vcdj.adoc); also the beat
+                                                    // packet's pitch and a non-zero 0x0b pitch
+    std::atomic<uint32_t> actualSpeedRaw { 0 };   // Pitch2 (status offset 152, 0x98): the LOCAL
+                                                    // pitch fader with the motor ramp -- 0 when
+                                                    // stopped or the jog is held, ramps 0->fader
+                                                    // on play, fader->0 on pause.  Not the
+                                                    // effective speed under sync (AUDIT B13).
     std::atomic<uint8_t>  beatInBar    { 1 };    // 1-4
 
     // From status packets
@@ -421,7 +439,7 @@ struct ProDJLinkPlayerState
     {
         // discovered=false first, so getters that test it stop reading;
         // the identity is cleared under identityLock, because a getter that
-        // already passed the test may be copying it right now (PDL-13).
+        // already passed the test may be copying it right now (AUDIT PDL-13).
         discovered.store(false, std::memory_order_release);
 
         playerNumber.store(0, std::memory_order_relaxed);
@@ -706,11 +724,12 @@ public:
 
     /// Bridge identity profile for the 54B keepalive (see constants above).
     /// kBridgeIdentityF9 / C0 / E4 = the three as-captured byte pairs;
-    /// kBridgeIdentityAuto = dev 0xE4 + b30 computed as the discovered device
-    /// count including ourselves (experimental "count" hypothesis).
+    /// kBridgeIdentityAuto = dev 0xE4 + b30 = max(the network's b30 mark,
+    /// discovered devices + 1 for ourselves), clamped 2-7, computed once
+    /// after the listen window and then frozen for the session (see run()).
     /// Applied on the next keepalive tick; for a clean protocol A/B the caller
-    /// should stop() + start() so the join replays under the new identity and
-    /// peers re-register us from scratch.
+    /// should stop() + start(), so AUTO listens again and peers see the new
+    /// identity from its first keepalive (there is no join sequence).
     void setBridgeIdentityProfile(int p)
     {
         bridgeIdentityProfile.store(juce::jlimit((int)ProDJLink::kBridgeIdentityF9,
@@ -993,7 +1012,7 @@ public:
     /// Unknown tempo reads 0.0 in both formats: ffffffff in the 0x0b ("tracks
     /// with unknown BPM", dysentery beats.adoc) -- it used to come out as
     /// 429,496,729.5 BPM (AUDIT PDL-1) -- and ffff in status and beat
-    /// packets.  With no track loaded the status handler clears it (PDL-9).
+    /// packets.  With no track loaded the status handler clears it (AUDIT PDL-9).
     double getBPM(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1007,8 +1026,11 @@ public:
              * ProDJLink::pitchFromStatus(p.pitchRaw.load(std::memory_order_relaxed));
     }
 
-    /// Fader pitch multiplier (1.0 = 0%, from status offset 140)
-    /// This is the DJ's physical fader setting -- does NOT include motor ramp.
+    /// Pitch multiplier (1.0 = 0 %) from status Pitch1, offset 140 (0x8c):
+    /// the pitch actually in effect, whether from the local fader or a synced
+    /// tempo master, as the player's BPM display shows it (dysentery
+    /// vcdj.adoc).  Despite the name, under sync it is not the fader's
+    /// position.  No motor ramp.
     double getFaderPitch(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1017,9 +1039,12 @@ public:
             players[idx].pitchRaw.load(std::memory_order_relaxed));
     }
 
-    /// Actual playback speed (0.0 = stopped, 1.0 = full speed at fader, from status offset 152)
-    /// Includes motor ramp: ramps 0->target on play, target->0 on pause.
-    /// This is what the CDJ is ACTUALLY doing right now.
+    /// Speed multiplier from status Pitch2, offset 152 (0x98): the LOCAL
+    /// pitch fader with the motor ramp -- 0 -> fader on play, fader -> 0 on
+    /// pause, 0 while paused or the jog is held (dysentery vcdj.adoc).  Under
+    /// sync, with the fader away from the master's pitch, it is not the
+    /// effective speed; which copy the engine should use waits for a synced
+    /// capture (AUDIT B13).
     double getActualSpeed(int playerNum) const
     {
         int idx = playerNum - 1;
@@ -1188,7 +1213,6 @@ public:
     uint8_t getHpMixing()      const { return mixerHpMixing.load(std::memory_order_relaxed); }
     /// Headphone level (0-255).
     uint8_t getHpLevel()       const { return mixerHpLevel.load(std::memory_order_relaxed); }
-    /// HP A Pre EQ button (0=off, 1=on).  V10 only; always 0 on 900NXS2.
     /// Booth EQ button (0=off, 1=on).  A9 and V10; always 0 on 900NXS2.
     uint8_t getBoothEq()    const { return mixerBoothEq.load(std::memory_order_relaxed); }
     /// Headphone B Cue Link (0=off, 1=on).  A9 and V10; always 0 on 900NXS2.
@@ -1551,7 +1575,7 @@ public:
         return players[idx].isOnAir.load(std::memory_order_relaxed);
     }
 
-    /// ON AIR follow (D34): how loud the player's channel is among the
+    /// ON AIR follow (DESIGN D34): how loud the player's channel is among the
     /// players on air -- its channel fader (0-1) while the DJM's mixer
     /// status arrives, 0 when only the on-air flags do (the lowest player
     /// number then wins a tie).  Negative when the player is off air.
@@ -1871,7 +1895,7 @@ private:
     // Two keepalives are sent in parallel, each serving a different device:
     //
     //   1) sendBridgeKeepalive()       -- 54B BROADCAST (device number from the
-    //      active bridge identity profile: 0xF9 or 0xC0, see that function)
+    //      active bridge identity profile: 0xF9, 0xC0 or 0xE4, see that function)
     //      -> DJM discovers us as bridge -> activates fader (0x39) delivery
     //      -> Standard bridge broadcast keepalive
     //
@@ -1985,7 +2009,7 @@ private:
     /// and never a real player on our own 95 B number: before AUDIT A18 a
     /// real player 5 was never discovered from its keepalives, so it never
     /// received our claim to its number, and it must not start now (the
-    /// reference bridge sends no 95 B at all -- D33).  Network thread only:
+    /// reference bridge sends no 95 B at all -- DESIGN D33).  Network thread only:
     /// model[] and ipStr are written by this thread at discovery.
     juce::StringArray dbKeepaliveTargets() const
     {
@@ -2053,10 +2077,12 @@ private:
         // prime suspect for peers refusing STC as a bridge.  See the profile
         // constants in namespace ProDJLink for the full provenance table and
         // the falsification of the old "A9 requires 0xF9" claim.
-        // AUTO implements the "count" hypothesis: b30 = discovered devices
-        // (CDJs + DJMs) + 1 for ourselves, which matches both fully
-        // enumerable reference captures (3 on the 2-NXS2 rig, 5 on the
-        // 3x3000+A9 rig).  Clamped [2,7] defensively.
+        // AUTO: b30 = max(the network's high-water mark, discovered devices
+        // (CDJs + DJMs) + 1 for ourselves), clamped [2,7], computed once
+        // after the listen window and frozen for the session (see run(); the
+        // mark is the beta16 refinement of the "count" hypothesis, which
+        // matched both fully enumerable reference captures: 3 on the 2-NXS2
+        // rig, 5 on the 3x3000+A9 rig).
         uint8_t dev = 0xF9, b30 = 0x04;
         switch (bridgeIdentityProfile.load(std::memory_order_acquire))
         {
@@ -2149,8 +2175,9 @@ private:
         pkt[42] = 0x03;
         pkt[43] = 0x01;
 
-        // Send from bridgeSock (ephemeral port) if available, matching Pioneer Bridge
-        // behavior (~port 50006). Fallback to statusSock if bridgeSock unavailable.
+        // Send from bridgeSock (UDP 50006, as the bridge; an ephemeral port
+        // only if 50006 was taken -- see start()).  Fallback to statusSock if
+        // bridgeSock unavailable.
         // CRITICAL: do NOT send from both -- CDJ registers each source port as a
         // separate subscriber, doubling (or worse) the status traffic it sends back.
         auto* sock = bridgeSock ? bridgeSock.get() : statusSock.get();
@@ -2225,8 +2252,10 @@ private:
             << " ch5=" << (int)chOnAir[4] << " ch6=" << (int)chOnAir[5]);
     }
 
-    /// Register a DJM IP + model for bridge subscription.
-    /// Thread-safe: called from handleKeepalivePacket (network thread).
+    /// Register a DJM IP + model (the 0x57 re-subscribe in run() goes to
+    /// every registered DJM; this function sends nothing).
+    /// Called from handleKeepalivePacket (network thread); the list is
+    /// changed under djmIpLock for getDJMModel's sake.
     void registerDJM(const std::string& ip, const std::string& model)
     {
         bool isNew = false;
@@ -2243,14 +2272,13 @@ private:
                 }
             }
 
-            // New DJM -- add to list (subscribe outside the lock)
+            // New DJM -- add to list
             djmIps.push_back(ip);
             djmModels.push_back(model);
             djmLastSeen.push_back(juce::Time::getMillisecondCounterHiRes());
             isNew = true;
             updatePrimaryDjm();
         }
-        // Socket write OUTSIDE the lock -- avoids blocking UI thread on getDJMModel()
         if (isNew)
         {
             DBG("ProDJLink: Registered DJM [" << juce::String(model) << "] at " << juce::String(ip));
@@ -2400,8 +2428,10 @@ private:
 
             // Collision here means another peer is claiming one of our bridge
             // identities (player 5 on the 95B, 0xC0/0xC1/0xF9 on the 54B).
-            // Those are not standard CDJ numbers, so a collision is operator
-            // error (two STC instances, or another bridge on the network) --
+            // The 54 B numbers are outside the player range, so a claim on
+            // one is two STC instances or another bridge.  5 is a legal CDJ
+            // number (CDJ-3000s use 5 and 6, AUDIT A18): a claim on it is a
+            // real player, the case the 95 B already avoids.  Either way
             // silent recovery is not the right behaviour, so we only surface
             // it in the log.
             const bool collidesWithUs =
@@ -2542,7 +2572,7 @@ private:
             p.playerNumber.store(pn, std::memory_order_relaxed);
             const auto ipStr = sender.toStdString();
             {
-                const juce::SpinLock::ScopedLockType sl(p.identityLock);   // PDL-13
+                const juce::SpinLock::ScopedLockType sl(p.identityLock);   // AUDIT PDL-13
                 // Copy model name -- sanitize to pure ASCII for safe String construction
                 std::memset(p.model, 0, sizeof(p.model));
                 int copyLen = std::min(20, len - 12);
@@ -2629,7 +2659,7 @@ private:
         // peak-level segments for CH1-4 (mono) and Master L/R (stereo).
         if (type == ProDJLink::kStatusTypeVU)
         {
-            if (isPrimaryDjm(senderIp))   // the registered DJM only (PDL-11)
+            if (isPrimaryDjm(senderIp))   // the registered DJM only (AUDIT PDL-11)
                 handleVuMeterPacket(data, len);
             return;
         }
@@ -2794,11 +2824,13 @@ private:
 
             p.trackLenSec.store(trackLen, std::memory_order_relaxed);
             p.bpmRaw.store(bpm, std::memory_order_relaxed);
-            // NOTE: The pitch field in abs position packets (0x0b) reports the
-            // fader SETTING, which is always 0 on CDJ-3000 regardless of actual
-            // fader position. The real fader pitch comes from status packets (0x0a)
-            // at offset 140/152. Do NOT overwrite pitchRaw here -- it would clobber
-            // the correct value from status packets (which arrive 6x less often).
+            // Pitch at [44]: dysentery documents it as the pitch slider value
+            // shown on the player's screen, x100, signed.  An earlier note here
+            // said it is always 0 on the CDJ-3000 whatever the fader; no
+            // capture on record settles that.  It goes into pitchRaw only when
+            // non-zero, so a 0 never overwrites status Pitch1 (offset 140),
+            // which arrives about 6x less often.  getBPM does not use it for
+            // this format: the 0x0b BPM is already effective.
             if (pitchPct != 0)
             {
                 double multiplier = 1.0 + double(pitchPct) / 10000.0;
@@ -2980,7 +3012,7 @@ private:
             {
                 p.playerNumber.store(pn, std::memory_order_relaxed);
                 {
-                    const juce::SpinLock::ScopedLockType sl(p.identityLock);   // PDL-13
+                    const juce::SpinLock::ScopedLockType sl(p.identityLock);   // AUDIT PDL-13
                     // Device name travels in the status packet too (bytes 11-30,
                     // one byte earlier than in keepalives: no subtype byte).
                     std::memset(p.model, 0, sizeof(p.model));
@@ -3010,13 +3042,16 @@ private:
         // --- Parse key fields ---
         // Byte offsets determined from python-prodj-link Construct struct:
         //   [38-39] activity
-        //   [40]    loaded_player_number
-        //   [41]    loaded_slot
+        //   [40]    loaded_player_number (dysentery: Dr)
+        //   [41]    loaded_slot          (Sr)
+        //   [42]    track type           (Tr)
         //   [44-47] track_id  (uint32be)
         //   [120-123] play_state (uint32be)
         //   [136-137] state flags (uint16be: bit3=on_air, bit5=master, bit6=play)
+        //   [140-143] Pitch1, the pitch in effect (uint32be / 0x100000)
         //   [146-147] bpm (uint16be / 100)
-        //   [152-155] actual_pitch (uint32be / 0x100000)
+        //   [152-155] Pitch2, the local fader with ramp ("actual_pitch" in
+        //             python-prodj-link; see the pitch block below)
         //   [160-163] beat_count (uint32be)
         //   [166]     beat (1-4)
 
@@ -3293,7 +3328,8 @@ private:
         //   - hasMixerFaderData() goes stale (5s timeout on lastMixerPacketTime)
         //   - DJM IP is removed from subscribe list (this GC, 10s)
         // When the DJM comes back:
-        //   - Its keepalive triggers registerDJM() -> re-adds IP + immediate subscribe
+        //   - Its keepalive triggers registerDJM() -> re-adds the IP; registerDJM
+        //     does not subscribe: the 1 s re-subscribe in run() sends it the 0x57
         //   - Our 54B broadcast keepalive is still going -> DJM rediscovers us
         //   - Fader delivery reactivates automatically
         {
@@ -3595,7 +3631,7 @@ private:
     //==========================================================================
     void handleMixerPacket(const uint8_t* data, int len)
     {
-        if (len < 0xe6) return;  // need up to HP A Pre EQ at 0x0e5
+        if (len < 0xe6) return;  // need up to Booth EQ at 0x0e5
 
         // --- Per-channel block (24 bytes each) ---
         // Confirmed offsets for 4-channel and 6-channel DJMs.
@@ -3669,7 +3705,7 @@ private:
             mixerFxFreqMid.store    (data[0x0c7], std::memory_order_relaxed);
             mixerFxFreqHi.store     (data[0x0c8], std::memory_order_relaxed);
             mixerBeatFxSel.store    (data[0x0c9], std::memory_order_relaxed);
-            mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);  // Beat FX Assign's byte: Color FX Assign's offset unknown (PDL-12)
+            mixerColorFxAssign.store(data[0x0ca], std::memory_order_relaxed);  // Beat FX Assign's byte: Color FX Assign's offset unknown (AUDIT PDL-12)
             mixerBeatFxLevel.store  (data[0x0cb], std::memory_order_relaxed);
             mixerBeatFxOn.store     (data[0x0cc], std::memory_order_relaxed);
             mixerBeatFxAssign.store (data[0x0ca], std::memory_order_relaxed);  // 900NXS2: same as 0x0ce; A9/V10: 0x0ce is Multi I/O
@@ -3833,7 +3869,7 @@ private:
     std::unique_ptr<juce::DatagramSocket> keepaliveSock;
     std::unique_ptr<juce::DatagramSocket> beatSock;
     std::unique_ptr<juce::DatagramSocket> statusSock;
-    std::unique_ptr<juce::DatagramSocket> bridgeSock;   // ephemeral port for 0x57/0x55 (macOS compat)
+    std::unique_ptr<juce::DatagramSocket> bridgeSock;   // UDP 50006 (ephemeral if taken) for 0x57/0x55
 
     // Network config
     juce::Array<NetworkInterface> availableInterfaces;
@@ -3854,7 +3890,8 @@ private:
     std::atomic<int> bridgeIdentityProfile { ProDJLink::kBridgeIdentityF9 };
     std::atomic<int> dbKeepaliveMode       { ProDJLink::kDbKeepaliveAll };
     // Last identity bytes actually emitted in the 54B keepalive (for the PDL
-    // View diagnostics line; with AUTO these are computed per tick).
+    // View diagnostics line; with AUTO b30 = max(mark, devices + 1), frozen
+    // for the session after the listen window).
     std::atomic<uint8_t> lastKaDev { 0xF9 };
     std::atomic<uint8_t> lastKaB30 { 0x04 };
     // AUTO profile: b30 computed ONCE per session after the listen window,
@@ -3947,7 +3984,7 @@ private:
     std::atomic<uint8_t> mixerBeatFxLevel  { 0 };
     std::atomic<uint8_t> mixerBeatFxOn     { 0 };
     std::atomic<uint8_t> mixerBeatFxAssign { 9 };     // 0=Mic..9=Master
-    std::atomic<uint8_t> mixerColorFxAssign{ 9 };     // a copy of Beat FX Assign (PDL-12)
+    std::atomic<uint8_t> mixerColorFxAssign{ 9 };     // a copy of Beat FX Assign (AUDIT PDL-12)
     std::atomic<uint8_t> mixerSendReturn   { 0 };
     // --- Multi I/O (A9/V10; on 900NXS2 these offsets are Beat FX Assign / Send Return) ---
     std::atomic<uint8_t> mixerMultiIoSelect { 0 };    // 0=Mic,1-6=CH1-CH6,7=Master

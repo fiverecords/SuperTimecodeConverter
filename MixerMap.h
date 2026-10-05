@@ -26,7 +26,7 @@
 /// Parameters are visible in the MixerMap editor when the detected (or selected)
 /// DJM model meets or exceeds the minimum level.
 ///   All     = present on all DJMs (900NXS2, A9, V10)
-///   A9Plus  = A9 and V10 only (dual CUE, HP B, HP Pre EQ)
+///   A9Plus  = A9 and V10 only (dual CUE, HP B, Booth EQ)
 ///   V10Only = V10 only (6ch, 4-band EQ, compressor, send, isolator, filter, master mix, multi I/O)
 enum class DjmModel : int { All = 0, A9Plus = 1, V10Only = 2 };
 
