@@ -6,7 +6,16 @@
 //
 // Renders the high-resolution waveform (PWV5/PWV7) centered on the current
 // playback position, with beat grid ticks, cue point markers, active loop
-// overlay, and song structure phrase bars.
+// overlay, and song structure phrase bars.  Each pixel column averages the
+// entries under it and is drawn as a bar mirrored about the centre line,
+// scaled to the track's highest entry:
+//   - PWV5 (NXS2 colour, 2 bytes): a big-endian word with red, green and blue
+//     (3 bits each) in bits 15-7 and the height (5 bits) in bits 6-2, as
+//     crate-digger's anlz doc and beat-link's WaveformDetail read it; the
+//     bar is drawn in that colour.
+//   - PWV7 (CDJ-3000 3-band, 3 bytes {mid, high, low}): the bar is the tallest
+//     of beat-link's band heights (low x0.4, mid x0.3, high x0.06, drawn on
+//     one axis), in blue turning whiter with the share of highs.
 //
 // Data sources:
 //   - Detail waveform: TrackMetadata::detailData (150 entries/sec)
@@ -43,22 +52,24 @@ public:
         detailEntryCount = entryCount;
         detailBytesPerEntry = bytesPerEntry;
         durationMs = trackDurationMs;
-        hasData = (entryCount > 0 && bytesPerEntry > 0
-                   && (int)data.size() >= entryCount * bytesPerEntry);
+        // The sizes come from the wire: multiply in size_t (an int product of
+        // 0x40000001 x 4 wrapped to 4 and passed the check).
+        hasData = (entryCount > 0 && (bytesPerEntry == 2 || bytesPerEntry == 3)
+                   && data.size() >= (size_t)entryCount * (size_t)bytesPerEntry);
 
         // Compute global peak once for stable normalization (avoids "breathing"
         // effect from recalculating peak per visible window every frame).
-        globalPeak = 1;
+        // It is the highest bar height, in the units paintWaveform draws.
+        globalPeak = 1.0f;
         if (hasData)
         {
             const uint8_t* d = data.data();
-            int totalBytes = (int)data.size();
             for (int e = 0; e < entryCount; ++e)
             {
-                int off = e * bytesPerEntry;
-                if (off + bytesPerEntry > totalBytes) break;
-                for (int b = 0; b < bytesPerEntry && b < 3; ++b)
-                    globalPeak = std::max(globalPeak, d[off + b]);
+                const uint8_t* entry = d + (size_t)e * (size_t)bytesPerEntry;
+                const float h = (bytesPerEntry == 2) ? (float)decodePwv5(entry).height
+                                                     : threeBandDetailHeight(entry[0], entry[1], entry[2]);
+                globalPeak = std::max(globalPeak, h);
             }
         }
         invalidateStaticCache();
@@ -206,7 +217,7 @@ public:
         hasData = false;
         detailEntryCount = 0;
         detailBytesPerEntry = 0;
-        globalPeak = 1;
+        globalPeak = 1.0f;
         beatGrid.clear();
         songStructure.clear();
         rekordboxCues.clear();
@@ -314,7 +325,6 @@ public:
         int physCacheW = (int)(logicalCacheW * dpiScale);
         int physCacheH = (int)(logicalCacheH * dpiScale);
         int cacheHalfVisible = (int)(logicalCacheW * 0.5f) * scale;
-        int cacheCenterEntry = centerEntry;
 
         // Check if we need to re-render the cache
         bool needsRender = !staticCache.isValid()
@@ -325,7 +335,7 @@ public:
 
         if (needsRender)
         {
-            cacheCenterEntry = centerEntry;
+            const int cacheCenterEntry = centerEntry;
             cacheStartEntry = cacheCenterEntry - cacheHalfVisible;
             cacheEndEntry   = cacheCenterEntry + cacheHalfVisible;
 
@@ -418,14 +428,13 @@ private:
                        float drawW, float waveMidY, float halfH,
                        int startEntry)
     {
-        if (detailData.empty()) return;
+        if (!hasData) return;
 
         const uint8_t* data = detailData.data();
-        int totalBytes = (int)detailData.size();
-        int bpe = detailBytesPerEntry;
+        const int bpe = detailBytesPerEntry;   // 2 or 3 (setDetailData)
 
         // Use pre-computed global peak for stable normalization
-        float hScale = halfH / (float)globalPeak;
+        float hScale = halfH / globalPeak;
 
         // Draw one column per pixel
         for (int px = 0; px < (int)drawW; ++px)
@@ -433,32 +442,43 @@ private:
             int eStart = startEntry + px * scale;
             int eEnd   = eStart + scale - 1;
 
-            // Average entries in this pixel
-            float sums[3] = {};
+            // Average entries in this pixel.
+            // PWV5: red, green, blue, height.  PWV7: mid, high, low.
+            float sums[4] = {};
             int count = 0;
             for (int e = eStart; e <= eEnd; ++e)
             {
                 if (e < 0 || e >= detailEntryCount) continue;
-                int off = e * bpe;
-                if (off + bpe > totalBytes) break;
-                for (int b = 0; b < bpe && b < 3; ++b)
-                    sums[b] += data[off + b];
+                const uint8_t* entry = data + (size_t)e * (size_t)bpe;
+                if (bpe == 2)
+                {
+                    const auto c = decodePwv5(entry);
+                    sums[0] += (float)c.red;
+                    sums[1] += (float)c.green;
+                    sums[2] += (float)c.blue;
+                    sums[3] += (float)c.height;
+                }
+                else
+                {
+                    for (int b = 0; b < 3; ++b)
+                        sums[b] += entry[b];
+                }
                 count++;
             }
             if (count == 0) continue;
+            const float n = (float)count;
+            const float xp = x0 + (float)px;
 
-            float amplitude = sums[0] / (float)count;
             if (bpe == 3)
             {
                 // PWV7: mid + high + low
-                float mid  = sums[0] / (float)count;
-                float high = sums[1] / (float)count;
-                float low  = sums[2] / (float)count;
-                amplitude = mid;  // primary amplitude
+                float mid  = sums[0] / n;
+                float high = sums[1] / n;
+                float low  = sums[2] / n;
+                float amplitude = threeBandDetailHeight(mid, high, low);
                 if (amplitude < 0.5f) continue;
 
                 float barH = amplitude * hScale;
-                float xp = x0 + (float)px;
 
                 // Color from frequency distribution
                 float total = low + mid + high + 0.001f;
@@ -472,18 +492,37 @@ private:
             }
             else
             {
-                // PWV5: 2 bytes -- height + color
-                float height = sums[0] / (float)count;
+                // PWV5: height and colour decoded from the entry bits
+                float height = sums[3] / n;
                 if (height < 0.5f) continue;
                 float barH = height * hScale;
-                float xp = x0 + (float)px;
 
-                // Blue with brightness from second byte
-                float bright = (bpe >= 2) ? sums[1] / ((float)count * 255.0f) : 0.5f;
-                g.setColour(juce::Colour::fromFloatRGBA(bright * 0.5f, bright * 0.7f, 1.0f, 0.9f));
+                g.setColour(juce::Colour::fromFloatRGBA(sums[0] / (n * 7.0f), sums[1] / (n * 7.0f),
+                                                        sums[2] / (n * 7.0f), 0.9f));
                 g.fillRect(xp, waveMidY - barH, 1.0f, barH * 2.0f);
             }
         }
+    }
+
+    /// One PWV5 (NXS2 colour detail) entry: a big-endian u16 with red, green
+    /// and blue in bits 15-13, 12-10 and 9-7 (0-7 each) and the height in
+    /// bits 6-2 (0-31); bits 1-0 unused.  crate-digger's anlz doc and
+    /// beat-link's WaveformDetail.  (beat-link's segmentColor then builds
+    /// its java.awt.Color as (red, blue, green); STC uses the documented
+    /// order.)
+    struct Pwv5Entry { int red = 0, green = 0, blue = 0, height = 0; };
+    static Pwv5Entry decodePwv5(const uint8_t* e) noexcept
+    {
+        const int bits = (e[0] << 8) | e[1];
+        return { (bits >> 13) & 7, (bits >> 10) & 7, (bits >> 7) & 7, (bits >> 2) & 0x1F };
+    }
+
+    /// Bar height of a PWV7 (CDJ-3000 3-band detail) entry {mid, high, low}:
+    /// the tallest of the band heights beat-link's WaveformDetail draws on one
+    /// axis (low x0.4, mid x0.3, high x0.06).
+    static float threeBandDetailHeight(float mid, float high, float low) noexcept
+    {
+        return std::max({ low * 0.4f, mid * 0.3f, high * 0.06f });
     }
 
     //==========================================================================
@@ -882,7 +921,7 @@ private:
     int detailEntryCount = 0;
     int detailBytesPerEntry = 0;
     uint32_t durationMs = 0;
-    uint8_t globalPeak = 1;  // pre-computed peak for stable normalization
+    float globalPeak = 1.0f;  // pre-computed peak bar height for stable normalization
     bool hasData = false;
 
     std::vector<TrackMetadata::BeatEntry> beatGrid;

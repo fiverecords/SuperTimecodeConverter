@@ -4,9 +4,17 @@
 //
 // MediaDisplay -- Visual display components for waveform and artwork data.
 //
-// WaveformDisplay: Renders CDJ waveform preview in two formats:
-//   - CDJ-3000 3-band (PWV6): 1200 entries x 3 bytes = {mid, high, low} heights
-//   - NXS2 Color (PWV4): 1200 entries x 6 bytes = {d0, d1, d2, d3(R), d4(G), d5(B)}
+// WaveformDisplay: Renders CDJ waveform preview in two formats, each column a
+// bar mirrored about the centre line, scaled to the track's highest column:
+//   - CDJ-3000 3-band (PWV6): 1200 entries x 3 bytes = {mid, high, low} heights.
+//     The bar is the top of beat-link's stacked bands (WaveformPreview:
+//     low x0.49 + mid x0.32 + high x0.25), in blue turning whiter with the
+//     share of highs.
+//   - NXS2 Color (PWV4): 1200 entries x 6 bytes = {d0, d1, d2, d3, d4, d5};
+//     d3/d4/d5 are the low/mid/high energies (dysentery's analysis) and
+//     colour the bar red/green/blue.  As beat-link's WaveformPreview draws
+//     it: a back bar max(d3, d4, d5) high at 3/4 brightness, and a front bar
+//     d5 high at full brightness.  d0-d2 are not used.
 //
 // ArtworkDisplay: Renders a decoded JPEG album art image.
 
@@ -21,7 +29,7 @@
 // WaveformDisplay -- Paints CDJ waveform preview bars
 //
 // Supports CDJ-3000 3-band (PWV6) and NXS2 color (PWV4) formats,
-// sourced from dbserver ANLZ queries via DbServerClient.
+// from TrackMetadata::waveformData (DbServerClient) or the waveform cache.
 //==============================================================================
 
 class WaveformDisplay : public juce::Component
@@ -39,7 +47,10 @@ public:
         colorWaveformData = data;
         colorEntryCount = entryCount;
         colorBytesPerEntry = bytesPerEntry;
-        hasColorData = (entryCount > 0 && (int)data.size() >= entryCount * bytesPerEntry);
+        // The sizes come from the wire: multiply in size_t (an int product of
+        // 0x2AAAAAAB x 6 wrapped and passed the check).
+        hasColorData = (entryCount > 0 && (bytesPerEntry == 3 || bytesPerEntry == 6)
+                        && data.size() >= (size_t)entryCount * (size_t)bytesPerEntry);
         invalidateCache();
         repaint();
     }
@@ -303,14 +314,14 @@ private:
         int totalBytes = (int)colorWaveformData.size();
 
         // Find global peak amplitude for height normalization
-        uint8_t globalPeak = 1;
+        float globalPeak = 1.0f;
         for (int i = 0; i < colorEntryCount; ++i)
         {
             int off = i * 3;
             if (off + 2 >= totalBytes) break;
-            globalPeak = std::max({ globalPeak, data[off], data[off + 1], data[off + 2] });
+            globalPeak = std::max(globalPeak, threeBandPreviewHeight(data[off], data[off + 1], data[off + 2]));
         }
-        float hScale = halfH / (float)globalPeak;
+        float hScale = halfH / globalPeak;
 
         for (int px = 0; px < (int)drawW; ++px)
         {
@@ -335,7 +346,7 @@ private:
             float avgHigh = sumHigh / (float)count;
             float avgLow  = sumLow  / (float)count;
 
-            float amplitude = avgMid;
+            float amplitude = threeBandPreviewHeight(avgMid, avgHigh, avgLow);
             if (amplitude < 1.0f) continue;
 
             float barH = amplitude * hScale;
@@ -367,12 +378,12 @@ private:
         const uint8_t* data = colorWaveformData.data();
         int totalBytes = (int)colorWaveformData.size();
 
-        uint8_t globalPeak = 1;
+        uint8_t globalPeak = 1;   // highest back bar, max(d3, d4, d5)
         for (int i = 0; i < colorEntryCount; ++i)
         {
             int off = i * 6;
             if (off + 5 >= totalBytes) break;
-            globalPeak = std::max(globalPeak, data[off + 5]);
+            globalPeak = std::max({ globalPeak, data[off + 3], data[off + 4], data[off + 5] });
         }
         float hScale = halfH / (float)globalPeak;
 
@@ -399,22 +410,54 @@ private:
             float avgD4 = sumD4 / (float)count;
             float avgD5 = sumD5 / (float)count;
 
-            float amplitude = avgD5;
-            if (amplitude < 1.0f) continue;
+            const auto column = colorPreviewColumn(avgD3, avgD4, avgD5);
+            if (column.backHeight < 1.0f) continue;
 
-            float barH = amplitude * hScale;
             float x = inset + (float)px;
 
-            float total = avgD3 + avgD4 + avgD5 + 0.001f;
-            float highRatio = avgD3 / total;
-            float blueR = 0.0f  + highRatio * 1.0f;
-            float blueG = 0.45f + highRatio * 0.55f;
-            float blueB = 1.0f;
+            // Back bar, then the brighter front bar over it
+            float barH = column.backHeight * hScale;
+            g.setColour(column.back);
+            g.fillRect(x, midY - barH, barW, barH);
+            g.fillRect(x, midY, barW, barH);
 
-            g.setColour(juce::Colour::fromFloatRGBA(blueR, blueG, blueB, 1.0f));
+            barH = column.frontHeight * hScale;
+            g.setColour(column.front);
             g.fillRect(x, midY - barH, barW, barH);
             g.fillRect(x, midY, barW, barH);
         }
+    }
+
+    /// Bar height of a PWV6 (3-band preview) entry {mid, high, low}: the top
+    /// of the three bands beat-link's WaveformPreview stacks (low x0.49, then
+    /// mid x0.32, then high x0.25).
+    static float threeBandPreviewHeight(float mid, float high, float low) noexcept
+    {
+        return low * 0.49f + mid * 0.32f + high * 0.25f;
+    }
+
+    /// A PWV4 (NXS2 colour preview) column from its d3/d4/d5 bytes, as
+    /// beat-link's WaveformPreview draws it: the back bar is max(d3, d4, d5)
+    /// high, the front bar d5 high; both take the colour (d3, d4, d5) scaled
+    /// so the largest component is 191 (back) or 255 (front).
+    struct ColorPreviewColumn
+    {
+        float backHeight = 0.0f, frontHeight = 0.0f;
+        juce::Colour back, front;
+    };
+    static ColorPreviewColumn colorPreviewColumn(float d3, float d4, float d5)
+    {
+        ColorPreviewColumn c;
+        c.backHeight  = std::max({ d3, d4, d5 });
+        c.frontHeight = d5;
+        if (c.backHeight <= 0.0f) return c;
+        auto level = [&c](float v, float maxLevel)
+        {
+            return (uint8_t)juce::jlimit(0.0f, 255.0f, v * maxLevel / c.backHeight);
+        };
+        c.back  = juce::Colour(level(d3, 191.0f), level(d4, 191.0f), level(d5, 191.0f));
+        c.front = juce::Colour(level(d3, 255.0f), level(d4, 255.0f), level(d5, 255.0f));
+        return c;
     }
 
     /// Paint cursor and labels (lightweight -- called every frame over cached image)
