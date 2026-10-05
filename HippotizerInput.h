@@ -653,6 +653,12 @@ private:
         if (data[0] != 0xC6 || data[1] != 0x5E || data[2] != 0xE5 || data[3] != 0x00)
             return;
 
+        // Known and left (AUDIT WIRE-8, deferred with HippoNet's removal):
+        // any datagram with the magic keeps the source "receiving", before
+        // a timecode is found in it; and a channel is its position after
+        // the de-duplication and reversal below, so when two channels carry
+        // the same value the later ones shift down a place.  Bounds are
+        // checked throughout (no crash or hang found; fuzzed).
         lastPacketTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
 
         // HippoNet packet: 24-byte header + variable-length TC blocks.
