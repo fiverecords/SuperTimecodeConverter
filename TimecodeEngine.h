@@ -1605,10 +1605,14 @@ public:
             case InputSource::ArtNet:
                 if (artnetInput.getIsRunning())
                 {
-                    currentTimecode = artnetInput.getCurrentTimecode();
+                    // Value and arrival as one record (AUDIT LTC-8): with two
+                    // getters a packet stored in between paired a new value
+                    // with the previous arrival.
+                    const auto frame = artnetInput.getLastFrame();
+                    currentTimecode = frame.tc;
                     // ArtTimeCode goes out once per frame at the sender's frame
                     // boundary, so the packet's arrival is this frame's start.
-                    setFramePhaseFromArrival(artnetInput.getLastFrameArrivalMs(), currentFps);
+                    setFramePhaseFromArrival(frame.arrivalMs, currentFps);
                     bool rx = artnetInput.isReceiving();
                     if (rx)
                     {
@@ -1627,8 +1631,10 @@ public:
             case InputSource::LANetTC:
                 if (laNetTCInput.getIsRunning())
                 {
-                    currentTimecode = laNetTCInput.getCurrentTimecode();
-                    setFramePhaseFromArrival(laNetTCInput.getLastFrameArrivalMs(), currentFps);
+                    // Value and arrival as one record (AUDIT LTC-8), as for Art-Net.
+                    const auto frame = laNetTCInput.getLastFrame();
+                    currentTimecode = frame.tc;
+                    setFramePhaseFromArrival(frame.arrivalMs, currentFps);
                     bool rx = laNetTCInput.isReceiving();
                     if (rx)
                     {
@@ -1650,12 +1656,21 @@ public:
                     // The decoder delivers a frame when its sync word -- the
                     // last 16 bits -- has gone by, i.e. at the instant the NEXT
                     // frame begins on the wire.  The live value is therefore
-                    // the frame after the one decoded, and the arrival instant
-                    // is that frame's start; publishing the decoded value put
-                    // every LTC -> anything conversion one frame late.
-                    currentTimecode = incrementFrame(ltcInput.getCurrentTimecode(), currentFps);
-                    setFramePhaseFromArrival(ltcInput.getLastFrameArrivalMs(), currentFps);
-                    bool rx = ltcInput.isReceiving();
+                    // the frame after the one decoded (DESIGN D19), aged by
+                    // the source's whole frames since it arrived -- a device
+                    // period plus the input latency can be several frames --
+                    // with the phase the remainder and the receive verdict
+                    // from the same snapshot and clock reading (AUDIT LTC-10;
+                    // DESIGN D29's principle, there for MTC).  A source
+                    // holding a static frame is not aged.
+                    const auto live = ltcInput.getLiveTimecode(juce::Time::getMillisecondCounterHiRes(), currentFps);
+                    currentTimecode = live.tc;
+                    if (live.phaseValid)
+                    {
+                        framePhaseMs = live.phaseMs;
+                        framePhaseValid = true;
+                    }
+                    bool rx = live.receiving;
                     if (rx)
                     {
                         auto d = ltcInput.getDetectedFrameRate();
