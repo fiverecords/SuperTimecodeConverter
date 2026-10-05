@@ -2564,26 +2564,70 @@ private:
     // CACHE MANAGEMENT
     //==========================================================================
 
+    /// Worker thread.  Store what queryTrackMetadata found for key.  An
+    /// entry already there has no title -- ensureEntry made it when the
+    /// dbserver gave none -- but may hold what the NFS route or the disk
+    /// cache found since: its beat grid, cues, phrases, waveforms and
+    /// nfsAttempted are kept, and the dbserver's fields replace the rest,
+    /// waveformQueried included (artwork and the preview are still to be
+    /// fetched) (AUDIT META-7).  Replacing the whole entry dropped that data
+    /// until a second NFS download brought it back.
     void cacheMetadata(const CacheKey& key, const TrackMetadata& meta)
     {
         if (!meta.isValid()) return;
 
         const juce::SpinLock::ScopedLockType lock(cacheLock);
-
-        // Evict the entry fetched longest ago (smallest cacheTime) if the
-        // cache is full and this is a new key
-        if ((int)metadataCache.size() >= kMaxCacheEntries
-            && metadataCache.find(key) == metadataCache.end())
+        auto it = metadataCache.find(key);
+        if (it == metadataCache.end())
         {
-            auto oldest = metadataCache.end();
-            for (auto it = metadataCache.begin(); it != metadataCache.end(); ++it)
-                if (oldest == metadataCache.end() || it->second.cacheTime < oldest->second.cacheTime)
-                    oldest = it;
-            if (oldest != metadataCache.end())
-                metadataCache.erase(oldest);
+            evictOldestIfFullLocked();
+            metadataCache[key] = meta;
+            return;
         }
+        TrackMetadata merged = meta;
+        auto& old = it->second;
+        merged.waveformData          = std::move(old.waveformData);
+        merged.waveformEntryCount    = old.waveformEntryCount;
+        merged.waveformBytesPerEntry = old.waveformBytesPerEntry;
+        merged.detailData            = std::move(old.detailData);
+        merged.detailEntryCount      = old.detailEntryCount;
+        merged.detailBytesPerEntry   = old.detailBytesPerEntry;
+        merged.beatGrid              = std::move(old.beatGrid);
+        merged.phraseMood            = old.phraseMood;
+        merged.songStructure         = std::move(old.songStructure);
+        merged.cueList               = std::move(old.cueList);
+        merged.nfsAttempted          = old.nfsAttempted;
+        merged.cacheVersion          = old.cacheVersion + 1;
+        old = std::move(merged);
+    }
 
-        metadataCache[key] = meta;
+    /// Make sure an entry exists for key -- one with no metadata when the
+    /// dbserver gave none -- so the NFS route has somewhere to put what it
+    /// finds.  An existing entry is left as it is.
+    void ensureEntry(const CacheKey& key)
+    {
+        const juce::SpinLock::ScopedLockType lock(cacheLock);
+        if (metadataCache.find(key) != metadataCache.end())
+            return;
+        evictOldestIfFullLocked();
+        TrackMetadata meta;
+        meta.trackId = key.id;
+        meta.cacheTime = juce::Time::getMillisecondCounterHiRes();
+        metadataCache[key] = std::move(meta);
+    }
+
+    /// Caller holds cacheLock and is about to add a key: if the cache is
+    /// full, evict the entry fetched longest ago (smallest cacheTime).
+    void evictOldestIfFullLocked()
+    {
+        if ((int)metadataCache.size() < kMaxCacheEntries)
+            return;
+        auto oldest = metadataCache.end();
+        for (auto it = metadataCache.begin(); it != metadataCache.end(); ++it)
+            if (oldest == metadataCache.end() || it->second.cacheTime < oldest->second.cacheTime)
+                oldest = it;
+        if (oldest != metadataCache.end())
+            metadataCache.erase(oldest);
     }
 
     void cacheArtwork(const CacheKey& key, const juce::Image& img)
@@ -2683,16 +2727,15 @@ private:
         auto* conn = getConnection(req.playerIP, req.ourPlayer);
         if (!conn)
         {
-            // Phase 2 can still run NFS (direct UDP, no dbserver connection needed)
-            if (req.phase == 2 && req.trackId != 0)
-            {
-                DBG("DbServerClient: no connection for phase 2 -- trying NFS only");
-                const CacheKey cacheKey = makeCacheKey(req.playerIP, req.slot, req.trackId);
-                processNfsFallback(req, cacheKey);
-                return;
-            }
+            // No dbserver session (refused, silent, or in its failure
+            // cooldown).  The NFS route needs none -- it is stateless and
+            // works whatever player number STC asks as -- so it runs now, in
+            // phase 1 as in phase 2 (AUDIT META-7).
             errorCount.fetch_add(1, std::memory_order_relaxed);
-            DBG("DbServerClient: failed to get connection to " + req.playerIP);
+            DBG("DbServerClient: no dbserver connection to " + req.playerIP
+                + " (phase " + juce::String(req.phase) + ") -- trying NFS only");
+            if (req.trackId != 0)
+                processNfsFallback(req, makeCacheKey(req.playerIP, req.slot, req.trackId));
             return;
         }
 
@@ -2734,10 +2777,11 @@ private:
                     if (!conn->isConnected())
                         conn->close();
 
-                    // Create a minimal cache entry so phase 2 (disk cache + NFS)
-                    // can still run.  NFS uses trackId to find ANLZ path in PDB.
-                    meta.trackId = req.trackId;
-                    cacheMetadata(cacheKey, meta);
+                    // Keep an entry with no metadata so that phase 2's NFS
+                    // route has one to fill (it finds the ANLZ path in the
+                    // PDB from the track ID).  cacheMetadata() keeps only
+                    // entries with a title, so it cannot make this one.
+                    ensureEntry(cacheKey);
                 }
             }
 
@@ -3085,12 +3129,14 @@ private:
 
     // NFS ANLZ fetcher -- reads the media's export.pdb for the track's ANLZ
     // path, then downloads and parses its analysis files straight from the
-    // player's USB/SD.  Runs in phase 2 for any player whose entry still lacks
-    // beat grid, cues, phrases or detail: the only route for non-3000 players
-    // (their dbserver analysis queries are skipped), a fallback for CDJ-3000s.
-    // Runs on its own thread (nfsThread), one download at a time: before
-    // launching the next, the worker waits for the previous download to
-    // finish, and handles no other request meanwhile.
+    // player's USB/SD.  Runs, once per entry (nfsAttempted), whenever an
+    // entry still lacks beat grid, cues, phrases or detail: in phase 2, or
+    // at once when there is no dbserver session (AUDIT META-7).  The only
+    // route for non-3000 players (their dbserver analysis queries are
+    // skipped), a fallback for CDJ-3000s.  Runs on its own thread
+    // (nfsThread), one download at a time: before launching the next, the
+    // worker waits for the previous download to finish, and handles no
+    // other request meanwhile.
     NfsAnlzFetcher nfsAnlzFetcher;
     std::thread nfsThread;
 
@@ -3172,17 +3218,7 @@ private:
     void processNfsFallback(const MetadataRequest& req, const CacheKey& cacheKey)
     {
         // Ensure cache entry exists (may have been created by a previous failed attempt)
-        {
-            const juce::SpinLock::ScopedLockType lock(cacheLock);
-            auto it = metadataCache.find(cacheKey);
-            if (it == metadataCache.end())
-            {
-                TrackMetadata meta;
-                meta.trackId = req.trackId;
-                meta.waveformQueried = true;
-                metadataCache[cacheKey] = std::move(meta);
-            }
-        }
+        ensureEntry(cacheKey);
 
         bool needsNfs = false;
         std::string diskCacheKey;
