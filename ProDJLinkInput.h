@@ -1641,9 +1641,17 @@ private:
                 }
             }
 
-            // --- Send 0x55 bridge notify to all known CDJs ---
-            // The bridge sends this to CDJs on port 50002 periodically.
-            // May be required to maintain the bridge session.
+            // --- Send 0x55 to the known CDJs (not CDJ-3000s) every 2 s ---
+            // What the real bridge sends as 0x55 are data requests (analysis
+            // data, answered with 0x56), its first one about 3 s after its
+            // first keepalive.  The NXS2 starts streaming status and 0x0b to
+            // it before that, so the 0x55 is not needed to start the session;
+            // whether it is needed to keep it is not known (BENCH B9;
+            // STC_PRODJLINK_AUDIT.md sections 2 and 5).  STC's is one static
+            // packet that matches none of the bridge's requests.  It is not
+            // gated on readyToAnnounce: with the AUTO profile an NXS2 gets it
+            // before STC's first 54 B keepalive.  Left as it is until the AUTO
+            // test on an NXS2 rig (BENCH B9; AUDIT PDL-4, DESIGN D33).
             if ((now - lastBridgeNotify) >= 2000.0)
             {
                 sendBridgeNotifyToAll();
@@ -1664,8 +1672,15 @@ private:
 
             // Block up to 5ms waiting for a beat/abspos/mixer packet.
             // Falls through immediately if a packet is already waiting.
+            // Without the beat socket (50001 held by rekordbox, Beat Link
+            // Trigger or ShowKontrol on this computer -- start() goes on
+            // without it) the wait is on the status socket, which start()
+            // always has: nothing else in this loop blocks, and it spun a
+            // core at 100 % (AUDIT PDL-2).
             if (beatSock)
                 beatSock->waitUntilReady(true, 5);
+            else if (statusSock)
+                statusSock->waitUntilReady(true, 5);
 
             // Keepalive (port 50000) -- ~1Hz per player
             if (keepaliveSock && keepaliveSock->waitUntilReady(true, 0))
@@ -1958,9 +1973,13 @@ private:
     //==========================================================================
 
     //==========================================================================
-    // Bridge notify (0x55) -- sent to each CDJ on port 50002.
+    // 0x55 -- sent to each CDJ (not CDJ-3000) on port 50002, every 2 s.
     //
-    // The bridge sends this periodically to maintain the session.
+    // Not what the real bridge does: its 0x55 are analysis-data requests
+    // with varying content, and an NXS2 starts streaming status and 0x0b
+    // to it before its first one; whether a session lasts without them is
+    // not known (STC_PRODJLINK_AUDIT.md sections 2 and 5; see run()).
+    // This one is static.  Kept, unchanged, until BENCH B9 (AUDIT PDL-4).
     // Packet format (44 bytes) from capture:
     //   [0-9]   Magic "Qspt1WmJOL"
     //   [10]    0x55 (type)
