@@ -2,22 +2,36 @@
 // Copyright (c) 2026 Fiverecords -- MIT License
 // https://github.com/fiverecords/SuperTimecodeConverter
 //
-// DbServerClient -- TCP client for Pioneer dbserver protocol (port 12523).
-// Queries CDJ internal databases to retrieve track metadata (title, artist,
-// album, key, genre, artwork) for rekordbox tracks loaded on the decks.
+// DbServerClient -- TCP client for the Pioneer dbserver protocol (its port
+// is found by asking TCP 12523).  Queries the players' databases for track
+// metadata (title, artist, album, key, genre, artwork) of rekordbox tracks
+// loaded on the decks, and the analysis data (preview and detail waveform,
+// beat grid, cues, phrases) from the dbserver (CDJ-3000 class) or over NFS
+// (NfsAnlzFetcher), with a disk cache (WaveformCache).  Also answers other
+// devices' queries on TCP 12523 with "port 0" (dbPortListenerLoop).
 //
 // Protocol reference: DJ Link Ecosystem Analysis
 //   https://djl-analysis.deepsymmetry.org/djl-analysis/track_metadata.html
 //
 // Thread model:
-//   - UI thread calls requestMetadata() / getCachedMetadata() / getCachedArtwork()
-//   - Background thread (juce::Thread) processes requests via SPSC queue
-//   - Results stored in SpinLock-protected LRU cache
+//   - The message thread (TimecodeEngine::tick, the PDL View, MainComponent)
+//     calls requestMetadata() and the getCached*() lookups; requestMetadata
+//     may be called from any thread.
+//   - A worker thread (this juce::Thread) consumes the requests from a
+//     32-entry ring: many producers, serialised by queueProducerLock, one
+//     consumer.  It owns the dbserver connections.
+//   - One NFS thread at a time (nfsThread) downloads analysis files.
+//   - A listener thread answers TCP 12523.
+//   - Results go to a metadata cache (cacheLock, 256 entries, the one
+//     fetched longest ago is evicted -- not LRU) and an artwork cache
+//     (artCacheLock, 64 entries, an arbitrary one is evicted).
 //
-// Player number constraint:
-//   The dbserver only responds to queries from player numbers 1-4.
-//   If the VCDJ is using number >=5, metadata queries will fail gracefully
-//   (returns empty metadata, UI falls back to "Track #12345").
+// Player number constraint (AUDIT A20, AUDIT C19):
+//   A CDJ-3000 or XDJ-AZ answers queries from any player number; older
+//   players answer only a number 1-4 that is on the network.  The caller
+//   chooses it (TimecodeEngine::requestDbMetadata, ProDJLinkView).  A refused
+//   query leaves the track with no title (the UI shows "Track #12345"); the
+//   NFS route still runs (AUDIT META-7).
 
 #pragma once
 #include <JuceHeader.h>
@@ -56,11 +70,14 @@ struct TrackMetadata
     int bpmTimes100 = 0;           // e.g. 12800 = 128.00 BPM
     int rating = 0;                // 0-5 stars
     uint32_t artworkId = 0;        // for separate artwork request
-    double cacheTime = 0.0;        // when this entry was cached (for LRU)
+    double cacheTime = 0.0;        // when this entry was fetched (eviction drops the oldest)
 
     // Color preview waveform data from CDJ
     //   ThreeBand (PWV6): 3 bytes/entry = {mid, high, low} frequency heights
-    //   ColorNxs2 (PWV4): 6 bytes/entry = {d0, d1, d2, d3(R), d4(G), d5(B)}
+    //   ColorNxs2 (PWV4): 6 bytes/entry = {d0, d1, d2, d3, d4, d5}: d0-d1
+    //     "whiteness", d2 energy below ~10 kHz, d3/d4/d5 low/mid/high energy,
+    //     which beat-link combines into a colour (dysentery, "Track metadata",
+    //     colour preview analysis) -- they are not R, G, B
     std::vector<uint8_t> waveformData;
     int waveformEntryCount = 0;
     int waveformBytesPerEntry = 0;  // 3 = ThreeBand, 6 = ColorNxs2
@@ -90,8 +107,8 @@ struct TrackMetadata
     {
         uint16_t index;          // phrase sequential index
         uint16_t beatNumber;     // first beat of this phrase
-        uint16_t kind;           // phrase type (see kPhrase* constants)
-        uint8_t  fill;           // fill-in type (0-3)
+        uint16_t kind;           // phrase kind; its meaning depends on the mood (rekordbox_anlz.ksy mood_*_phrase)
+        uint8_t  fill;           // nonzero: the phrase ends with a fill-in
         uint16_t beatCount;      // number of beats in this phrase
         uint16_t beatFill;       // beat number at which fill starts
     };
@@ -260,11 +277,14 @@ public:
     //==========================================================================
     // Request metadata (called from UI/engine thread)
     //
-    //   playerIP:  IP address of the CDJ that loaded the track
+    //   playerIP:  IP of the player whose media holds the track (the source
+    //              player when another deck loaded it over Link); with slot
+    //              and trackId it is the cache key (AUDIT META-5)
     //   slot:      media slot (2=SD, 3=USB)
     //   trackType: 1=rekordbox, 2=non-rekordbox, 5=CD
     //   trackId:   rekordbox database ID (from CDJ Status packet)
-    //   ourPlayer: our VCDJ player number (MUST be 1-4 for queries to work)
+    //   ourPlayer: the player number to query as (see "Player number
+    //              constraint" at the top of this file)
     //==========================================================================
     void requestMetadata(const juce::String& playerIP, uint8_t slot,
                          uint8_t trackType, uint32_t trackId, int ourPlayer,
@@ -577,18 +597,18 @@ private:
     // setupQueryContext, all before any payload moves.  In Joren2087's
     // capture this produced 72 separate dbserver TCP sessions to the
     // USB-holder NXS2 in 124 s.  The old comment justifying the 1 s value
-    // claimed it freed "CDJ NFS slots", but the NFSv2 server runs on UDP/2049
-    // and is independent of the dbserver TCP slot count, so the 1 s value was
-    // free pressure on the player with no corresponding benefit.
+    // claimed it freed "CDJ NFS slots", but the NFSv2 server runs over UDP
+    // (its port from the player's portmapper) and is independent of the
+    // dbserver TCP slot count, so the 1 s value was free pressure on the
+    // player with no corresponding benefit.  A session that stops answering
+    // ("mute but TCP alive", seen on NXS2s) is not kept by this timeout: the
+    // first read that fails closes it (readMessageOrInvalidate).
     static constexpr double kIdleTimeoutMs   = 30000.0;
-                                                         // Holding dbserver sessions open for
-                                                         // longer correlates (per packet captures)
-                                                         // with NXS2 firmware entering its
-                                                         // "mute but TCP alive" state.
 
-    // NXS2 extension constants for color waveform
+    // Analysis-tag request (beat-link ANLZ_TAG_REQ), used here for every
+    // ANLZ tag: waveforms, beat grid, cues, phrases.  Its reply (ANLZ_TAG,
+    // 0x4f02) is matched by txId, not by type.
     static constexpr uint32_t kNxs2ExtRequest  = 0x2c04;
-    static constexpr uint32_t kNxs2ExtResponse = 0x4f02;
     // NXS2 color preview waveform (PWV4 from .EXT file)
     static constexpr uint32_t kMagic4VWP = 0x34565750;  // "PWV4" reversed
     static constexpr uint32_t kMagic5VWP = 0x35565750;  // "PWV5" reversed
@@ -597,9 +617,6 @@ private:
     static constexpr uint32_t kMagic6VWP = 0x36565750;  // "PWV6" reversed -- 3-band preview
     static constexpr uint32_t kMagic7VWP = 0x37565750;  // "PWV7" reversed -- 3-band detail
     static constexpr uint32_t kMagicXE2  = 0x00584532;  // "2EX" reversed
-
-    // Beat grid query (standard dbserver request type)
-    static constexpr uint16_t kBeatGridRequest = 0x2204;
 
     // ANLZ tag magic values for 0x2c04 ext requests (little-endian uint32 of ASCII)
     // Same reversed convention as PWV4 etc.: "PQTZ" -> Z=5A T=54 Q=51 P=50
@@ -669,7 +686,7 @@ private:
                 // Format: magic | TxID=0xfffffffe | type=0x0100 | argc=0 | 12 zero tag bytes.
                 // Documented in the published Pro DJ Link protocol analysis.
                 static const uint8_t teardown[] = {
-                    0x11, 0x87,0x23,0x49,0xae,        // magic field (0f-prefixed 4-byte)
+                    0x11, 0x87,0x23,0x49,0xae,        // magic field (0x11-prefixed 4-byte number)
                     0x11, 0xff,0xff,0xff,0xfe,        // TxID = 0xfffffffe
                     0x10, 0x01,0x00,                  // type = 0x0100 (2-byte)
                     0x0f, 0x00,                       // argc = 0
@@ -1560,7 +1577,7 @@ private:
         if (port <= 0 || port >= 65535)
         {
             DBG("DbServerClient: invalid port " + juce::String(port)
-                + " (0xFFFF = no service available)");
+                + " (0xFFFF: no database offered, \"not yet ready?\" in beat-link)");
             return 0;
         }
 
@@ -1821,7 +1838,7 @@ private:
     /// that uses PWV6/PWV7 3-band waveforms from .2EX files.
     static bool isThreeBandPlayer(const juce::String& model)
     {
-        // CDJ-3000, CDJ-3000NXS2, or any future model with "3000" in the name
+        // CDJ-3000, CDJ-3000X, or any future model with "3000" in the name
         return model.contains("3000");
     }
 
@@ -2004,10 +2021,20 @@ private:
     }
 
     //==========================================================================
-    // BEAT GRID QUERY (PQTZ tag from .EXT via 0x2c04)
+    // BEAT GRID QUERY (PQTZ tag, asked for in the .EXT via 0x2c04)
     //==========================================================================
 
     /// Query beat grid from CDJ. Returns vector of BeatEntry.
+    ///
+    /// crate-digger's anlz.adoc puts PWV3-PWV5 in the .EXT and PWV6 in the
+    /// .2EX; its rekordbox_anlz.ksy notes PCO2, PSSI and PWV3-PWV5 as seen in
+    /// the .EXT and PWV6/PWV7 in the .2EX (section_tags).  PQTZ has no such
+    /// note, and beat-link reads the grid from the .DAT
+    /// (CrateDigger.getBeatGrid).  This asks for it in the .EXT, so a player
+    /// may well answer "not found"; beat-link asks the dbserver with its own
+    /// request instead (BEAT_GRID_REQ, 0x2204).  Left as it is: changing it
+    /// changes what STC asks a player for, and needs a capture (DESIGN D2;
+    /// AUDIT META-13, deferred).  The NFS route reads the grid from the .DAT.
     std::vector<TrackMetadata::BeatEntry> queryBeatGrid(
         PlayerConnection& conn, uint8_t slot, uint8_t trackType,
         uint32_t trackId, uint8_t ourPlayer)
@@ -2431,7 +2458,10 @@ private:
             }
         }
 
-        // Fallback: standard (PCOB) -- no colors/comments but has positions
+        // Fallback: standard (PCOB) -- no colors/comments but has positions.
+        // The .EXT can hold PCOB too: beat-link reads basic cues from the
+        // .EXT when there is one ("it can contain both nxs2-style commented
+        // cues and basic cues", CrateDigger.getCueList).
         if (!conn.isConnected()) return {};
         {
             uint32_t dmst = makeDMST(ourPlayer, 0x01, slot, trackType);
@@ -3008,6 +3038,14 @@ private:
 
                 // Disk cache check (instant, ~1ms) -- load beats/cues/phrases/detail
                 // from previous session BEFORE re-enqueueing phase 2.
+                //
+                // The disk key is artist|title|duration (TrackMapEntry::makeKey),
+                // so two versions of a track that share all three share one
+                // file, and once the file holds all four kinds of data phase 2
+                // never runs NFS for the track: a later rekordbox edit of its
+                // grid or cues is not picked up (AUDIT META-9; when to refresh
+                // is not decided yet).  Nothing stable identifies the audio
+                // file here -- track IDs are per export -- so the key stays.
                 std::string diskKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3033,7 +3071,8 @@ private:
                     }
                 }
 
-                // Re-enqueue as phase 2 for NFS refresh + any missing dbserver data
+                // Re-enqueue as phase 2 for whatever is still missing: the
+                // dbserver analysis queries (CDJ-3000 class) and the NFS route
                 enqueueInternal(req.playerIP, req.playerModel, req.slot,
                                 req.trackType, req.trackId, req.ourPlayer, 2);
                 return;
@@ -3042,7 +3081,8 @@ private:
             // --- Phase 2: supplementary queries + NFS ---
             // This runs AFTER phase 1 has published. If a newer track request
             // arrived while we were waiting in queue, skip slow dbserver queries
-            // and only do the essential NFS async refresh.
+            // and go straight to the disk save and the NFS route (which runs
+            // only for data still missing, not as a refresh).
 
             // Re-read meta in case disk cache already filled it in phase 1
             {
@@ -3156,8 +3196,9 @@ private:
             } // end if (!hasNewerRequests)
 
             // Save to disk cache ALWAYS (not gated by hasNewerRequests).
-            // Even if dbserver queries were skipped, save whatever we got
-            // from disk cache + phase 1 + NFS async.
+            // Even if dbserver queries were skipped, save whatever we have
+            // now (disk cache + dbserver).  The NFS thread saves its own
+            // results when it finishes.
             {
                 std::string saveDiskKey;
                 bool hasNewData = false;
@@ -3179,7 +3220,8 @@ private:
 
             // --- NFS ANLZ Fallback ---
             // If dbserver queries AND disk cache both failed to provide beat grid,
-            // cues, or song structure, download via NFS from CDJ USB/SD.
+            // cues, song structure or detail, download via NFS from CDJ USB/SD
+            // (once per entry: nfsAttempted).
             {
                 bool needsNfs = false;
                 uint32_t trackIdForNfs = 0;
@@ -3252,7 +3294,7 @@ private:
     std::vector<CooldownRetry> cooldownRetries;
 
     // Cache of discovered db ports per player IP. Once we know the port
-    // (1051 for NXS2, 1052 for CDJ-3000), reusing it on reconnect avoids
+    // (dysentery has only seen 1051 from CDJs), reusing it on reconnect avoids
     // the 12523 port-discovery TCP dance and saves one round-trip per
     // reconnect. Port doesn't change between reconnects to the same CDJ.
     std::unordered_map<std::string, int> knownDbPorts;
@@ -3300,19 +3342,15 @@ private:
     // STC at a sustained ~25 SYN/s for the entire ~180 s capture: every
     // unanswered SYN got RST from the host TCP stack, the player retried
     // with the next source port (1055, 1056, 1057 ...), and the burst was
-    // heavy enough to congest the link-local segment.  v1.9.10 stops the
-    // 95 B unicast that triggers most of that behaviour, but we cannot rule
-    // out other paths -- firmware revisions, link-load handshakes, or simple
-    // probing -- by which a player decides to ask STC's 12523.
+    // heavy enough to congest the link-local segment.  The trigger is the
+    // 95 B keepalive, which STC still sends to every player by default (see
+    // prodjlink95bMode in AppSettings: it can be limited to CDJ-3000s or
+    // turned off), and other paths -- firmware revisions, link-load
+    // handshakes, simple probing -- cannot be ruled out.
     //
-    // Rather than rely solely on stopping the trigger, STC also now answers
-    // the protocol correctly: accept the TCP connection, read the 19-byte
-    // "RemoteDBServer\0" query, write back 0xFF 0xFF (the protocol's "no
-    // service available" sentinel, which STC's own discoverDbPort() decodes
-    // as "no service" via the `port >= 65535` check at the top of that
-    // function), and close.  This is the same response a player with no
-    // media mounted gives on its own port 12523, so it is on the well-known
-    // side of the protocol.  CDJs that receive 0xFFFF stop retrying.
+    // So STC also answers the query: accept the TCP connection, read the
+    // 19-byte "RemoteDBServer\0" query (best effort), write back a 2-byte
+    // port of 0 -- see dbPortListenerLoop() for why 0 -- and close.
     //
     // If port 12523 is already bound by another DJ Link tool running on the
     // same machine (Beat Link Trigger, the official rekordbox bridge, etc.)
@@ -3345,19 +3383,16 @@ private:
             if (conn->waitUntilReady(true, 1000) == 1)
                 (void) conn->read(buf, (int)sizeof(buf), false);
 
-            // The dbserver port-discovery protocol returns the TCP port
-            // where the dbserver listens, as a 2-byte big-endian integer.
-            // Port 0 = "no dbserver on this peer" -- this is the response
-            // a CDJ-3000 gives because CDJ-3000 doesn't run a dbserver
-            // (it shares analysis files via NFS only).  When the client
-            // (an NXS2 trying to interrogate us as if we were a Bridge
-            // with its own dbserver) gets port = 0 it stops retrying and
-            // falls back to NFS access.  v1.9.10-beta replied 0xFFFF
-            // which the NXS2 interpreted as port 65535 and then opened a
-            // SYN flood at that port instead of the original 12523, just
-            // moving the flood without stopping it.  v1.9.11 returns the
-            // canonical port = 0 sentinel as documented by Deep Symmetry
-            // and observed in CDJ-3000 reference traces.
+            // The reply is the TCP port of the dbserver, a 2-byte
+            // big-endian integer (dysentery, "Track metadata").  STC has no
+            // dbserver and replies port 0.  v1.9.10-beta replied 0xFFFF; in
+            // the field (issue #6) the NXS2 read that as port 65535 and
+            // retried against it, moving the flood instead of stopping it,
+            // so v1.9.11 gives it no port to retry against.  Neither value
+            // is documented by Deep Symmetry as "no dbserver" (beat-link only
+            // logs a 65535 reply as "not yet ready?"), and CDJ-3000s do run a
+            // dbserver -- STC queries theirs -- so port 0 rests on that field
+            // report, not on the protocol analysis.
             const uint8_t noService[2] = { 0x00, 0x00 };
             (void) conn->write(noService, (int)sizeof(noService));
             // unique_ptr will close on destruct
