@@ -243,12 +243,9 @@ public:
         edFormDmxVal.onReturnKey  = returnToSave;
         btnFormCues.onClick   = [this]
         {
-            if (editingRow < 0 || editingRow >= (int)rows.size()) return;
             if (!onOpenCueEditor) return;
-            auto* entry = trackMap.find(rows[(size_t)editingRow]->artist,
-                                         rows[(size_t)editingRow]->title,
-                                         rows[(size_t)editingRow]->durationSec);
-            if (entry) onOpenCueEditor(entry);
+            if (auto* entry = findEditedEntry())
+                onOpenCueEditor(entry);
         };
 
         // --- Status bar ---
@@ -585,7 +582,17 @@ private:
     bool sortForwards     = true;
     uint64_t rowsGeneration = 0;               // generation at which rows were built
     std::string activeTrackKey;  // artist|title key of currently playing track
-    int editingRow = -1;               // -1 = adding new, >= 0 = editing existing
+
+    // The entry the form edits, by identity -- artist, title and duration,
+    // the map's key -- not by row: rows are rebuilt by every refresh(), sort
+    // and auto-fill while the form stays open, and a row index then names
+    // another track.  SAVE used to preserve that track's cues, remove it and
+    // give its cues and duration to the edited one (AUDIT SET-3).
+    // editingExisting false = the form adds a new entry.
+    bool         editingExisting = false;
+    juce::String editingArtist, editingTitle;
+    int          editingDurationSec = 0;
+
     int learnedDurationSec = 0;        // captured from CDJ during Learn (used for new entries)
     bool learnRetryInProgress = false; // a Learn click is awaiting late-arriving duration
 
@@ -713,6 +720,13 @@ private:
                 }
             });
         rowsGeneration = trackMap.getGeneration();
+    }
+
+    /// The entry the form was opened on, looked up by key now; null when
+    /// the form adds a new entry or the entry has gone from the map.
+    TrackMapEntry* findEditedEntry()
+    {
+        return editingExisting ? trackMap.find(editingArtist, editingTitle, editingDurationSec) : nullptr;
     }
 
     void notifyChanged()
@@ -972,7 +986,10 @@ private:
         if (rowIndex < 0 || rowIndex >= (int)rows.size()) return;
         jassert(rowsGeneration == trackMap.getGeneration());  // stale pointers!
         const auto& entry = *rows[(size_t)rowIndex];
-        editingRow = rowIndex;
+        editingExisting    = true;
+        editingArtist      = entry.artist;
+        editingTitle       = entry.title;
+        editingDurationSec = entry.durationSec;
 
         edFormArtist.setText(entry.artist, false);
         edFormArtist.setReadOnly(true);
@@ -993,7 +1010,7 @@ private:
     void openFormForNew(const juce::String& artist = {},
                         const juce::String& title = {})
     {
-        editingRow = -1;
+        editingExisting = false;
 
         edFormArtist.setText(artist, false);
         edFormArtist.setReadOnly(false);
@@ -1041,7 +1058,7 @@ private:
     void closeForm()
     {
         formPanel.setVisible(false);
-        editingRow = -1;
+        editingExisting = false;
         resized();
     }
 
@@ -1070,23 +1087,23 @@ private:
         }
         offset = TrackMapEntry::formatTimecodeString(h, m, s, f);
 
-        // Preserve cuePoints, durationSec, and sortOrder from existing entry BEFORE any removal
+        // Preserve cuePoints, durationSec, and sortOrder from the edited entry
+        // BEFORE any removal.  Found by key (findEditedEntry), not by row.
+        // An entry that has gone from the map meanwhile is saved again under
+        // its own identity, without cues.
         std::vector<CuePoint> preservedCuePoints;
-        int preservedDurationSec = 0;
+        int preservedDurationSec = editingDurationSec;
         int preservedSortOrder = 0;
-        if (editingRow >= 0 && editingRow < (int)rows.size())
+        if (const auto* oldEntry = findEditedEntry())
         {
-            preservedCuePoints = rows[(size_t)editingRow]->cuePoints;
-            preservedDurationSec = rows[(size_t)editingRow]->durationSec;
-            preservedSortOrder = rows[(size_t)editingRow]->sortOrder;
-        }
+            preservedCuePoints   = oldEntry->cuePoints;
+            preservedDurationSec = oldEntry->durationSec;
+            preservedSortOrder   = oldEntry->sortOrder;
 
-        // If editing an existing row whose artist/title changed, remove the old entry
-        if (editingRow >= 0 && editingRow < (int)rows.size())
-        {
-            auto& oldEntry = *rows[(size_t)editingRow];
-            if (TrackMapEntry::makeKey(formArtist, formTitle, oldEntry.durationSec) != oldEntry.key())
-                trackMap.remove(oldEntry.artist, oldEntry.title, oldEntry.durationSec);
+            // If the artist/title changed, remove the old entry (the copies
+            // above are taken; oldEntry is not used after this).
+            if (TrackMapEntry::makeKey(formArtist, formTitle, oldEntry->durationSec) != oldEntry->key())
+                trackMap.remove(editingArtist, editingTitle, editingDurationSec);
         }
 
         TrackMapEntry entry;
@@ -1133,7 +1150,7 @@ private:
         }
 
         // Apply preserved cuePoints, durationSec, and sortOrder
-        if (editingRow >= 0)
+        if (editingExisting)
         {
             entry.cuePoints   = std::move(preservedCuePoints);
             entry.durationSec = preservedDurationSec;
@@ -1153,7 +1170,7 @@ private:
             entry.timecodeOffset = g->timecodeOffset;
             entry.notes          = g->notes;
             if (entry.durationSec == 0) entry.durationSec = g->durationSec;
-            if (editingRow < 0 && entry.cuePoints.empty())
+            if (!editingExisting && entry.cuePoints.empty())
                 entry.cuePoints = g->cuePoints;   // new override starts from the global cues
         }
 
@@ -1165,7 +1182,7 @@ private:
         // Verifies artist/title match to avoid populating wrong cues when the
         // user creates an entry manually (Add button) while a different track
         // is loaded on the CDJ, or if the DJ changed tracks between Learn and Save.
-        if (editingRow < 0 && dbClient != nullptr && proDJLinkInput != nullptr)
+        if (!editingExisting && dbClient != nullptr && proDJLinkInput != nullptr)
         {
             int player = cmbLearnLayer.getSelectedId();
             uint32_t tid = proDJLinkInput->getTrackID(player);
