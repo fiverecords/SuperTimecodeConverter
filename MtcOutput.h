@@ -76,6 +76,7 @@ public:
             paused.store(false, std::memory_order_relaxed);
             currentQFIndex.store(0, std::memory_order_relaxed);
             mtcSeeded = false;
+            resyncRequested.store(false, std::memory_order_relaxed);
 
             // Full Frame is sent after the first setTimecode() call populates
             // pendingTimecode -- avoids transmitting a misleading 00:00:00.00
@@ -146,10 +147,11 @@ public:
         }
         else if (isRunningFlag.load(std::memory_order_relaxed))
         {
-            stopTimer();
+            stopTimer();   // the cycle state is the timer's: reset it with the timer stopped
             currentQFIndex.store(0, std::memory_order_relaxed);
             paused.store(false, std::memory_order_relaxed);
             mtcSeeded = false;
+            resyncRequested.store(false, std::memory_order_relaxed);
 
             // Re-sync receivers after pause with a Full Frame message
             sendFullFrame();
@@ -168,14 +170,18 @@ public:
     /// Force immediate Full Frame re-sync.
     /// Call on seek/hot cue/track change so receivers know the new position
     /// instantly instead of waiting 8 QFs (2 frames) to reconstruct it.
+    /// Message thread, with the timer running.
     void forceResync()
     {
         if (!isRunningFlag.load(std::memory_order_relaxed)
             || paused.load(std::memory_order_relaxed))
             return;
-        // Reset QF cycle to start fresh from the new position
-        currentQFIndex.store(0, std::memory_order_relaxed);
-        mtcSeeded = false;
+        // Restart the QF cycle from the new position at the next quarter
+        // frame.  The timer thread does the reset itself: the cycle state is
+        // its own while it runs, and written from here mtcSeeded was a data
+        // race and the index reset could be lost under the timer's
+        // load-increment-store (AUDIT C5).
+        resyncRequested.store(true, std::memory_order_release);
         sendFullFrame();
     }
 
@@ -250,6 +256,12 @@ private:
             // This prevents 1-frame backward jitter from interpolation overshoot
             // causing a full QF cycle of wrong data → MTC receiver flicker.
             // Same architectural pattern as the LTC encoder's auto-increment.
+            if (resyncRequested.exchange(false, std::memory_order_acquire))
+            {
+                // forceResync(): restart the cycle, seeded from pendingTimecode
+                currentQFIndex.store(0, std::memory_order_relaxed);
+                mtcSeeded = false;
+            }
             int qfIdx = currentQFIndex.load(std::memory_order_relaxed);
             if (qfIdx == 0)
             {
@@ -343,14 +355,18 @@ private:
 
     juce::SpinLock tcLock;
     Timecode pendingTimecode;   // Written by UI thread, read under tcLock
-    Timecode cycleTimecode;     // Timer-thread-only: snapshot taken at QF index 0, read through QF 1-7
-    bool     mtcSeeded = false; // Auto-increment: false until first QF0 seeds cycleTimecode
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
-    // currentQFIndex is primarily accessed from the timer thread, but reset from
-    // the UI thread in start()/setPaused() after stopTimer().  JUCE guarantees
-    // stopTimer() blocks until the current callback completes, but we use atomic
-    // as belt-and-suspenders safety against platform-specific timing.
+
+    // The cycle state -- cycleTimecode, mtcSeeded, currentQFIndex -- belongs
+    // to the timer thread while the timer runs.  The message thread writes it
+    // only with the timer stopped (start(), setPaused(false): stopTimer()
+    // returns after an in-flight callback, under JUCE's callback mutex), and
+    // forceResync() asks the timer thread to reset it through
+    // resyncRequested instead of writing it (AUDIT C5).
+    Timecode cycleTimecode;     // snapshot taken at QF index 0, read through QF 1-7
+    bool     mtcSeeded = false; // Auto-increment: false until first QF0 seeds cycleTimecode
     std::atomic<int> currentQFIndex { 0 };
+    std::atomic<bool> resyncRequested { false };   // set by forceResync(), consumed by the timer
     std::atomic<double> lastQfSendTime { 0.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MtcOutput)
