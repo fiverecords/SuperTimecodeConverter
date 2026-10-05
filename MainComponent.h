@@ -219,7 +219,9 @@ private:
     DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
     TCNetOutput    sharedTcnetOutput;     // shared TCNet timecode broadcast
     juce::String   tcnetArtworkKey[TCNetOutput::kMaxLayers];  // track key per layer for artwork change detection
+    bool           tcnetArtworkPending[TCNetOutput::kMaxLayers] = {};  // Pro DJ Link artwork not cached yet: looked up each tick
     juce::String   tcnetWaveformKey[TCNetOutput::kMaxLayers]; // track key per layer for waveform/beatgrid change detection
+    uint32_t       tcnetWaveformVersion[TCNetOutput::kMaxLayers] = {};  // DbServerClient entry version last fed (Pro DJ Link)
 
     // Per-layer anchor state for synthetic beat counter. See the loop in
     // timerCallback() that feeds TCNet for the rationale.
@@ -434,8 +436,24 @@ private:
     juce::Label lblMixerStatus;  // DJM model + fader values
     ArtworkDisplay artworkDisplay;               // Phase 2c: album art from CDJ
     WaveformDisplay waveformDisplay;             // Phase 3: color waveform from CDJ
-    uint32_t displayedWaveformTrackId = 0;       // currently displayed waveform track
-    uint32_t displayedArtworkId = 0;             // currently displayed artwork ID
+    uint32_t displayedWaveformTrackId = 0;       // Pro DJ Link: rekordbox ID of the displayed waveform
+    uint32_t displayedWaveformVersion = 0;       // Pro DJ Link: its DbServerClient entry version last read
+    uint32_t displayedArtworkId = 0;             // Pro DJ Link: displayed artwork ID
+    juce::String displayedPdlMedia;              // Pro DJ Link: "ip/slot" those IDs belong to (AUDIT META-5)
+    uint32_t displayedSlqTrackVersion = 0;       // StageLinQ: track version on display
+    uint32_t slqPanelClearedFor = 0;             // StageLinQ: track version the panel was cleared for (not in the DB)
+
+    /// The player holding the media of Pro DJ Link player `player`'s track,
+    /// as an address, and the slot it was loaded from: the key of
+    /// DbServerClient's exact lookups (AUDIT META-5), resolved as
+    /// TimecodeEngine::requestDbMetadata resolves it.  Message thread.
+    struct PdlMediaSource { juce::String ip; uint8_t slot = 0; };
+    PdlMediaSource getPdlMediaSource(int player) const
+    {
+        uint8_t src = sharedProDJLinkInput.getLoadedPlayer(player);
+        if (src == 0) src = (uint8_t) player;
+        return { sharedProDJLinkInput.getPlayerIP((int) src), sharedProDJLinkInput.getLoadedSlot(player) };
+    }
 
     // Features: TrackMap, MIDI Clock, OSC BPM, Ableton Link
     juce::ToggleButton btnTrackMap { "TRACK MAP" };

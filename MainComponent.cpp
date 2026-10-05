@@ -27,6 +27,18 @@ static juce::String stripComboMarker(const juce::String& text)
 }
 
 //==============================================================================
+// BPM x 100 for a TCNet layer, as the casts it replaces computed it
+// (truncated), and 0 for a tempo that is unknown, not finite, negative or
+// beyond 1000 BPM: a double -> uint32_t cast of a value out of range is
+// undefined (AUDIT A17).  getBPM's own 0 for an unknown tempo (AUDIT PDL-1)
+// is not relied on.
+//==============================================================================
+static uint32_t bpmToTimes100(double bpm)
+{
+    return (bpm > 0.0 && bpm < 1000.0) ? (uint32_t) (bpm * 100.0) : 0u;
+}
+
+//==============================================================================
 // BACKGROUND AUDIO DEVICE SCANNER
 //==============================================================================
 MainComponent::AudioScanThread::AudioScanThread(MainComponent* owner)
@@ -8050,7 +8062,7 @@ void MainComponent::timerCallback()
                     onAirFader = sharedProDJLinkInput.getChannelFader(ep);
                 beatInBar = sharedProDJLinkInput.getBeatInBar(ep);
                 beatNumber = sharedProDJLinkInput.getBeatCount(ep);
-                bpm100 = (uint32_t)(sharedProDJLinkInput.getBPM(ep) * 100.0);
+                bpm100 = bpmToTimes100(sharedProDJLinkInput.getBPM(ep));
             }
             else if (src == SrcType::StageLinQ && sharedStageLinQInput.getIsRunning())
             {
@@ -8060,7 +8072,7 @@ void MainComponent::timerCallback()
                     onAirFader = (uint8_t)juce::jlimit(0, 255, (int)(faderPos * 255.0));
                 }
                 beatInBar = sharedStageLinQInput.getBeatInBar(ep);
-                bpm100 = (uint32_t)(sharedStageLinQInput.getBPM(ep) * 100.0);
+                bpm100 = bpmToTimes100(sharedStageLinQInput.getBPM(ep));
             }
 
             // Fallback: for non-DJ sources (MTC / Art-Net / LTC / Generator /
@@ -8072,7 +8084,7 @@ void MainComponent::timerCallback()
             // no track) should not be papered over with the audio analyser.
             if (src != SrcType::ProDJLink && src != SrcType::StageLinQ
                 && eng.hasAudioBpm())
-                bpm100 = (uint32_t)(eng.getAudioBpm() * 100.0);
+                bpm100 = bpmToTimes100(eng.getAudioBpm());
 
             // Synthesize beat marker and beat number from playhead + BPM when
             // we don't have native beat info from a CDJ:
@@ -8097,19 +8109,13 @@ void MainComponent::timerCallback()
             {
                 // getSmoothedPlayheadMs() only returns a value for DJ sources.
                 // For Generator / MTC / Art-Net / LTC, fall back to deriving
-                // the playhead from the engine's timecode (H:M:S:F).
-                auto tc  = eng.getOutputTimecode();
-                auto fps = eng.getEffectiveOutputFps();
-                double fms = 1000.0 / 30.0;
-                if      (fps == FrameRate::FPS_2398) fms = 1000.0 / frameRateToDouble(fps);
-                else if (fps == FrameRate::FPS_24)   fms = 1000.0 / 24.0;
-                else if (fps == FrameRate::FPS_25)   fms = 1000.0 / 25.0;
-                else if (fps == FrameRate::FPS_2997) fms = 1000.0 / frameRateToDouble(fps);
-                else if (fps == FrameRate::FPS_30)   fms = 1000.0 / 30.0;
-                playheadForBeat = (uint32_t)(tc.hours * 3600000
-                                           + tc.minutes * 60000
-                                           + tc.seconds * 1000
-                                           + tc.frames * fms);
+                // the playhead from the engine's output timecode, through
+                // TimecodeCore (AUDIT C1, DESIGN D13): drop-frame and 23.976
+                // aware.  The linear H:M:S:F sum it replaces jumped 66 ms
+                // forward at every dropped-frame minute at 29.97 DF, and
+                // mixed nominal seconds with real frames at 23.976.
+                const double ms = timecodeToMs(eng.getOutputTimecode(), eng.getEffectiveOutputFps());
+                playheadForBeat = (uint32_t) juce::jlimit(0.0, 4294967295.0, ms);
             }
             if (bpm100 > 0 && !haveNativeBeat)
             {
@@ -8165,12 +8171,10 @@ void MainComponent::timerCallback()
             // the same layer (without it, MagicQ would hold onto stale data
             // from a previous CDJ track when you switch to Generator).
             uint32_t trackIdToSend = 0;
-            if (src == SrcType::ProDJLink && info.trackId != 0)
+            if ((src == SrcType::ProDJLink || src == SrcType::StageLinQ) && info.trackId != 0)
             {
-                trackIdToSend = info.trackId;
-            }
-            else if (src == SrcType::StageLinQ && info.trackId != 0)
-            {
+                // The engine's track ID for either DJ source (for StageLinQ,
+                // which has no numeric ID, the engine's per-load track count).
                 trackIdToSend = info.trackId;
             }
             else
@@ -8243,44 +8247,63 @@ void MainComponent::timerCallback()
                 juce::String artKey = info.artist + "|" + info.title;
                 if (info.durationSec > 0)
                     artKey += "|" + juce::String(info.durationSec);
-                if (tcnetArtworkKey[layer] != artKey)
+                const bool newTrack = tcnetArtworkKey[layer] != artKey;
+                if (newTrack || tcnetArtworkPending[layer])
                 {
-                    tcnetArtworkKey[layer] = artKey;
                     juce::Image artImg;
 
                     // 1. Try live source (already in memory from metadata fetch)
                     if (src == SrcType::ProDJLink && info.artworkId != 0)
-                        artImg = sharedDbClient.getCachedArtwork(info.artworkId);
-                    else if (src == SrcType::StageLinQ)
+                    {
+                        // Artwork IDs are per export: the art of the medium
+                        // the track was loaded from (AUDIT META-5).
+                        const auto media = getPdlMediaSource(ep);
+                        artImg = sharedDbClient.getCachedArtwork(media.ip, media.slot, info.artworkId);
+                    }
+                    else if (newTrack && src == SrcType::StageLinQ)
                     {
                         auto netPath = sharedStageLinQInput.getTrackNetworkPath(ep);
                         if (netPath.isNotEmpty() && sharedStageLinQDb.isDatabaseReady())
                             artImg = sharedStageLinQDb.getArtworkForTrack(netPath);
                     }
 
-                    // 2. Try disk cache (saved by CuePointEditor)
-                    if (!artImg.isValid())
-                        artImg = WaveformCache::loadArtwork(artKey.toStdString());
-                    if (!artImg.isValid() && info.durationSec > 0)
-                        artImg = WaveformCache::loadArtwork((info.artist + "|" + info.title).toStdString());
-
-                    // 3. Convert to JPEG and send, or fall back to STC logo
-                    if (artImg.isValid())
+                    // DbServerClient caches the metadata, which the track
+                    // key comes from, before it fetches the artwork: until
+                    // the artwork is cached, step 1 runs again each tick (a
+                    // lookup in memory) and its image replaces what steps 2
+                    // and 3 sent, as the waveform is fed when it arrives
+                    // (AUDIT META-16).  Steps 2 and 3 run once per track.
+                    tcnetArtworkPending[layer] = src == SrcType::ProDJLink && info.artworkId != 0
+                                              && ! artImg.isValid();
+                    if (newTrack || artImg.isValid())
                     {
-                        juce::MemoryOutputStream mos;
-                        juce::JPEGImageFormat fmt;
-                        fmt.setQuality(0.7f);
-                        if (fmt.writeImageToStream(artImg, mos))
-                            sharedTcnetOutput.setLayerArtwork(layer, mos.getData(), mos.getDataSize());
+                        tcnetArtworkKey[layer] = artKey;
+
+                        // 2. Try disk cache (saved by CuePointEditor)
+                        if (!artImg.isValid())
+                            artImg = WaveformCache::loadArtwork(artKey.toStdString());
+                        if (!artImg.isValid() && info.durationSec > 0)
+                            artImg = WaveformCache::loadArtwork((info.artist + "|" + info.title).toStdString());
+
+                        // 3. Convert to JPEG and send, or fall back to STC logo
+                        if (artImg.isValid())
+                        {
+                            juce::MemoryOutputStream mos;
+                            juce::JPEGImageFormat fmt;
+                            fmt.setQuality(0.7f);
+                            if (fmt.writeImageToStream(artImg, mos))
+                                sharedTcnetOutput.setLayerArtwork(layer, mos.getData(), mos.getDataSize());
+                            else
+                                sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);
+                        }
                         else
                             sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);
                     }
-                    else
-                        sharedTcnetOutput.setLayerArtwork(layer, nullptr, 0);
                 }
             }
             else
             {
+                tcnetArtworkPending[layer] = false;
                 if (tcnetArtworkKey[layer].isNotEmpty())
                 {
                     tcnetArtworkKey[layer] = {};
@@ -8299,11 +8322,22 @@ void MainComponent::timerCallback()
             {
                 juce::String wfKey = info.artist + "|" + info.title + "|wf";
                 if (info.durationSec > 0) wfKey += "|" + juce::String(info.durationSec);
-                if (tcnetWaveformKey[layer] != wfKey)
+
+                // The cache entry is the one of the player holding the media,
+                // keyed by its address, the slot and the ID (AUDIT META-5);
+                // the deck's own address found nothing for a track loaded
+                // from another player's USB.  The waveform and the beat grid
+                // arrive after the metadata, so the layer is fed again each
+                // time that entry changes -- a version read, no copy, per tick
+                // -- not only once at the track change, when they were
+                // usually not there yet and never sent (AUDIT META-16).
+                const auto media = getPdlMediaSource(ep);
+                const uint32_t mdVersion = sharedDbClient.getMetadataVersion(media.ip, media.slot, info.trackId);
+                if (tcnetWaveformKey[layer] != wfKey || tcnetWaveformVersion[layer] != mdVersion)
                 {
                     tcnetWaveformKey[layer] = wfKey;
-                    auto playerIP = sharedProDJLinkInput.getPlayerIP(ep);
-                    auto md = sharedDbClient.getCachedMetadata(playerIP, info.trackId);
+                    tcnetWaveformVersion[layer] = mdVersion;
+                    auto md = sharedDbClient.getCachedMetadata(media.ip, media.slot, info.trackId);
 
                     // Waveform: prefer preview (hasWaveform).  Fallback to detail.
                     if (md.hasWaveform())
