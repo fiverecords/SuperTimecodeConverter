@@ -363,7 +363,14 @@ MainComponent::MainComponent()
     btnFps2398.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == SrcType::LTC) eng.setUserOverrodeLtcFps(true);
+        // LTC and LA-Net (24, 25 or 30 only), MTC and Art-Net (rate code 0)
+        // carry 23.976 as 24: the choice is marked so that the engine's
+        // input branch keeps 23.976 against a detected 24 (AUDIT NET-4,
+        // TimecodeEngine::followDetectedRate).  The flag is persisted as
+        // ltcFpsUserOverride.
+        const auto src = eng.getActiveInput();
+        if (src == SrcType::LTC || src == SrcType::MTC || src == SrcType::ArtNet || src == SrcType::LANetTC)
+            eng.setUserOverrodeLtcFps(true);
         eng.setFrameRate(FrameRate::FPS_2398); updateFpsButtonStates(); saveSettings();
     };
     btnFps24.onClick = [this] {
@@ -379,7 +386,11 @@ MainComponent::MainComponent()
     btnFps2997.onClick = [this] {
         if (syncing || isShowLocked()) return;
         auto& eng = currentEngine();
-        if (eng.getActiveInput() == SrcType::LTC) eng.setUserOverrodeLtcFps(true);
+        // LTC and LA-Net carry 29.97 as 30 (MTC and Art-Net have a code for
+        // it): marked as for 23.976 above (AUDIT NET-4).
+        const auto src = eng.getActiveInput();
+        if (src == SrcType::LTC || src == SrcType::LANetTC)
+            eng.setUserOverrodeLtcFps(true);
         eng.setFrameRate(FrameRate::FPS_2997); updateFpsButtonStates(); saveSettings();
     };
     btnFps30.onClick = [this] {
@@ -4850,7 +4861,6 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setFrameRate(TimecodeEngine::indexToFps(es.fpsSelection));
         eng.setFpsConvertEnabled(es.fpsConvertEnabled);
         eng.setOutputFrameRate(TimecodeEngine::indexToFps(es.outputFpsSelection));
-        eng.setUserOverrodeLtcFps(es.ltcFpsUserOverride);
 
         eng.setOutputMtcEnabled(es.mtcOutEnabled);
         eng.setOutputArtnetEnabled(es.artnetOutEnabled);
@@ -4949,6 +4959,12 @@ void MainComponent::loadAndApplyNonAudioSettings()
         {
             eng.startLANetTCInput(es.laNetTCInputInterface);
         }
+
+        // The user's 23.976 / 29.97 against a source that cannot tell it from
+        // 24 / 30.  Restored after setInputSource(), which clears it: set
+        // before, as it was, it never survived a restart, and the first
+        // frame put the rate back to 24 or 30 (AUDIT NET-4).
+        eng.setUserOverrodeLtcFps(es.ltcFpsUserOverride);
 
         // Generator start/stop TC (applies regardless of current source)
         eng.setGeneratorClockMode(es.generatorClockMode);
