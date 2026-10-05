@@ -339,6 +339,7 @@ struct ProDJLinkPlayerState
     std::atomic<uint32_t> beatCount    { 0 };    // beat counter
     std::atomic<uint8_t>  loadedPlayer { 0 };    // player where track was loaded from
     std::atomic<uint8_t>  loadedSlot   { 0 };    // 0=empty, 2=SD, 3=USB
+    uint8_t               loadedType = 0;          // Tr, track type (0x2a); network thread only
     std::atomic<bool>     isMaster     { false };
     std::atomic<bool>     isOnAir      { false };
     std::atomic<bool>     isPlaying    { false }; // derived from state flags
@@ -440,6 +441,7 @@ struct ProDJLinkPlayerState
         beatCount.store(0, std::memory_order_relaxed);
         loadedPlayer.store(0, std::memory_order_relaxed);
         loadedSlot.store(0, std::memory_order_relaxed);
+        loadedType = 0;
         isMaster.store(false, std::memory_order_relaxed);
         isOnAir.store(false, std::memory_order_relaxed);
         isPlaying.store(false, std::memory_order_relaxed);
@@ -924,12 +926,15 @@ public:
         return players[idx].trackId.load(std::memory_order_relaxed);
     }
 
-    /// Track version -- incremented each time the track changes
+    /// Track version -- incremented each time the track changes, or the
+    /// player, slot or type it was loaded from (AUDIT PDL-7).  Acquire:
+    /// getTrackID, getLoadedPlayer and getLoadedSlot read after it return
+    /// that change's values or newer ones.
     uint32_t getTrackVersion(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
-        return players[idx].trackVersion.load(std::memory_order_relaxed);
+        return players[idx].trackVersion.load(std::memory_order_acquire);
     }
 
     /// Track info -- Phase 1 only provides what we can extract from status packets.
@@ -2939,22 +2944,35 @@ private:
         //   [160-163] beat_count (uint32be)
         //   [166]     beat (1-4)
 
-        // Track ID
+        // Track ID, and where the track was loaded from: Dr (player), Sr
+        // (slot) and Tr (track type) at 0x28-0x2a (dysentery vcdj.adoc).  A
+        // rekordbox ID is only unique within one medium, so the same ID
+        // loaded from another player, slot or type is another track: the
+        // version is bumped for it too, so metadata, the Track Map and the
+        // beat-derived position start again (AUDIT PDL-7).
         uint32_t trackId = ProDJLink::readU32BE(data + 44);
         uint32_t prevTrackId = p.trackId.load(std::memory_order_relaxed);
+        const bool sourceChanged = data[40] != p.loadedPlayer.load(std::memory_order_relaxed)
+                                || data[41] != p.loadedSlot.load(std::memory_order_relaxed)
+                                || data[42] != p.loadedType;
         p.trackId.store(trackId, std::memory_order_relaxed);
 
-        if (trackId != prevTrackId && trackId != 0)
+        // Loaded info -- stored before the version bump, which publishes it
+        // with the ID (release; getTrackVersion loads with acquire): a reader
+        // that sees the new version and then reads the ID, player and slot
+        // gets this packet's values or newer ones, never the new version
+        // with the old source.
+        p.loadedPlayer.store(data[40], std::memory_order_relaxed);
+        p.loadedSlot.store(data[41], std::memory_order_relaxed);
+        p.loadedType = data[42];
+
+        if (trackId != 0 && (trackId != prevTrackId || sourceChanged))
         {
             // Track changed -- bump version for TrackMap detection
-            p.trackVersion.fetch_add(1, std::memory_order_relaxed);
+            p.trackVersion.fetch_add(1, std::memory_order_release);
             // Reset beat-derived position since beatCount restarts on new track
             p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
         }
-
-        // Loaded info
-        p.loadedPlayer.store(data[40], std::memory_order_relaxed);
-        p.loadedSlot.store(data[41], std::memory_order_relaxed);
 
         // Play state
         if (len > 123)
