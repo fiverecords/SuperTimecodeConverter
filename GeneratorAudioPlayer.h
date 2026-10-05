@@ -501,11 +501,11 @@ public:
         // transport eagerly (either via play() before the LoaderThread
         // runs, or via attachReaderToTransport's auto-start when the load
         // completes) would always start at position 0, producing the
-        // load-duration desync that pause+play used to fix.  Cleared by
-        // the LoaderThread itself after loadFile / unloadFile returns,
-        // so it covers every load path including the same-file early
-        // return inside loadFile().
-        pendingLoad.store(true, std::memory_order_release);
+        // load-duration desync that pause+play used to fix.  Set by
+        // LoaderThread::request under its state lock, and cleared by the
+        // LoaderThread only when no further request is queued after the
+        // load it just finished (AUDIT LTC-4), so it covers every load path
+        // including the same-file early return inside loadFile().
         loaderThread.request(file, shouldLoop);
     }
 
@@ -513,12 +513,15 @@ public:
     juce::AudioThumbnail&       getThumbnail()       { return thumbnail; }
     const juce::AudioThumbnail& getThumbnail() const { return thumbnail; }
 
-    /// Optional callback invoked on the message thread after each successful
-    /// async file load completes.  Set by the owner (TimecodeEngine) once
-    /// during construction; the lambda is expected to capture a
-    /// juce::WeakReference so that a load in flight when the engine is
-    /// destroyed does not produce a use-after-free.  See loadFile() for
-    /// the firing site and the engine's constructor for the wiring.
+    /// Optional callback invoked on the message thread once the LoaderThread
+    /// has finished the last queued request, whatever its outcome (loaded,
+    /// unloaded, same file, failed); a load replaced by a newer request
+    /// before it was done does not fire it.  Set by the owner
+    /// (TimecodeEngine) once during construction; the lambda is expected to
+    /// capture a juce::WeakReference so that a load in flight when the
+    /// engine is destroyed does not produce a use-after-free.  See
+    /// LoaderThread::run for the firing site and the engine's constructor
+    /// for the wiring.
     std::function<void()> onLoadCompleted;
 
 private:
@@ -566,6 +569,9 @@ private:
             stopThread(3000);
         }
 
+        // Message thread (requestLoad).  pendingLoad is set under stateLock,
+        // the lock run() clears it under, so "a request is queued" always
+        // implies pendingLoad.
         void request(const juce::File& file, bool loop)
         {
             {
@@ -573,6 +579,7 @@ private:
                 pendingFile = file;
                 pendingLoop = loop;
                 hasPending  = true;
+                owner.pendingLoad.store(true, std::memory_order_release);
             }
             notify();
         }
@@ -608,17 +615,30 @@ private:
                     // Single chokepoint for "load completed (or unloaded)".
                     // Doing it here, AFTER loadFile / unloadFile returns,
                     // covers every exit path inside loadFile -- success,
-                    // same-file early return (line 187), unsupported
+                    // the same-file early return near its top, unsupported
                     // format, empty / corrupt file -- so subsequent play()
                     // / seekSeconds calls behave consistently and the
                     // onLoadCompleted listener (TimecodeEngine's catch-up
                     // seek) gets to run regardless of which branch the
-                    // load took inside.  Cleared BEFORE the callAsync so
-                    // play() running inside the callback (via seekSeconds)
-                    // sees pendingLoad == false and is allowed to start
-                    // the transport.
-                    owner.pendingLoad.store(false, std::memory_order_release);
-                    if (owner.onLoadCompleted)
+                    // load took inside.
+                    //
+                    // Only when nothing newer is queued (AUDIT LTC-4): with
+                    // another request waiting, pendingLoad stays set and the
+                    // loop goes straight on to it, so a play() in between
+                    // cannot start the file that is about to be replaced.
+                    // Cleared BEFORE the callAsync so play() running inside
+                    // the callback (via seekSeconds) sees pendingLoad ==
+                    // false and is allowed to start the transport.
+                    bool settled = false;
+                    {
+                        const juce::ScopedLock sl(stateLock);
+                        if (! hasPending)
+                        {
+                            owner.pendingLoad.store(false, std::memory_order_release);
+                            settled = true;
+                        }
+                    }
+                    if (settled && owner.onLoadCompleted)
                         juce::MessageManager::callAsync(owner.onLoadCompleted);
                 }
             }
@@ -868,11 +888,12 @@ private:
     std::atomic<bool>   fileLoadedAtomic    { false };
     std::atomic<double> fileLengthAtomic    { 0.0 };
 
-    // Set by requestLoad, cleared by LoaderThread after loadFile/unloadFile
-    // returns.  Read by play() and attachReaderToTransport to defer
-    // transport.start() while a load is in flight -- the onLoadCompleted
-    // callback handles the start with the engine's current playhead so the
-    // audio does not race ahead of the cursor during a hot-swap.
+    // Set by LoaderThread::request (requestLoad), cleared by the
+    // LoaderThread once the last queued request is done.  Read by play() to
+    // defer transport.start() while a load is in flight -- the
+    // onLoadCompleted callback handles the start with the engine's current
+    // playhead so the audio does not race ahead of the cursor during a
+    // hot-swap.
     std::atomic<bool>   pendingLoad         { false };
 
     juce::String currentDeviceName, currentTypeName;
