@@ -741,6 +741,7 @@ private:
     // onPrev / onNext callbacks so all four paths share one definition.
     void cycleGenPreset(int direction);
     void openGeneratorPresetEditor();
+    void pushFpsToGenPresetEditor();   // the selected engine's rate, to an open preset editor
     void openGeneratorWaveformWindow();
     void setupOscInputServer();
     void handleOscMessage(const OscInputServer::Message& msg);   // message thread

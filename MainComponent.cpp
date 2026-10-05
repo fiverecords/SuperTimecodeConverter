@@ -2478,6 +2478,7 @@ void MainComponent::selectEngine(int index)
 
     syncUIFromEngine();
     updateTabAppearance();
+    pushFpsToGenPresetEditor();
     repaint();
 }
 
@@ -3295,13 +3296,13 @@ void MainComponent::openTrackMapEditor(int scopeEngine)
 
     editor->onChange = [this, scopeEngine]
     {
-        // Close CuePointEditor FIRST, before save/refresh.
-        // TrackMapEditor::onFormSave calls addOrUpdate/remove which can
-        // rehash the unordered_map, invalidating the TrackMapEntry&
-        // reference held by CuePointEditor.  The mutation has already
-        // happened by the time this callback fires (synchronous message
-        // thread), so close the editor before any code that might
-        // indirectly touch the dangling reference.
+        // Close CuePointEditor FIRST, before save/refresh.  It holds a
+        // TrackMapEntry& into the map: remove(), clear() and load() destroy
+        // that entry, and addOrUpdate() of the same key replaces its
+        // contents; a rehash moves no element.  The mutation has already
+        // happened when this callback fires (synchronously, message
+        // thread), so the editor is closed before anything can touch the
+        // reference.
         if (cuePointWindow != nullptr)
         {
             cuePointWindow.reset();
@@ -6788,6 +6789,7 @@ void MainComponent::openGeneratorPresetEditor()
 {
     if (genPresetWindow != nullptr)
     {
+        pushFpsToGenPresetEditor();
         genPresetWindow->toFront(true);
         return;
     }
@@ -6796,18 +6798,17 @@ void MainComponent::openGeneratorPresetEditor()
 
     // Push the engine's current fps so the cue-point editor (when opened
     // from inside this window) can project cue TC onto the audio strip
-    // consistently with what the engine's armedCues uses internally.
+    // consistently with what the engine's armedCues uses internally.  It
+    // is pushed again when the selected engine or its rate changes
+    // (pushFpsToGenPresetEditor).
     editor->setCurrentFpsForCueEditor(frameRateToDouble(currentEngine().getCurrentFps()));
 
-    // Live playback cursor: capture the editor pointer so the lambda can
-    // ask "which preset is currently being edited?" via the table; we
-    // don't know that here but the editor will only forward this getter
-    // to its cue window when a row is selected.  The lambda returns
-    // ms-from-audio-start (i.e. corrected for the preset's startTC) or
-    // -1 when no playback is happening on SystemTime.  Only the engine
-    // currently selected in the UI is consulted -- editing cues for a
-    // preset that isn't the one playing right now still works, but no
-    // playhead is drawn (which is correct: there's nothing to follow).
+    // Live playback cursor for the cue window's waveform strip: the
+    // selected engine's generator position in ms from its own Start TC
+    // (getGeneratorStartMs), or -1 unless its input is SystemTime and the
+    // generator is Playing.  The loaded preset is not checked, so the
+    // cursor also moves while the engine plays a preset other than the one
+    // whose cues are open.
     editor->setPlayheadGetter([this]() -> int64_t
     {
         auto& eng = currentEngine();
@@ -6866,6 +6867,17 @@ void MainComponent::openGeneratorPresetEditor()
     };
     win->setVisible(true);
     genPresetWindow = win;
+}
+
+void MainComponent::pushFpsToGenPresetEditor()
+{
+    // The preset editor normalises typed Start/Stop TC and cue positions at
+    // the rate it was given; given only when the window opened, it went
+    // stale on an engine switch or a rate change (AUDIT SET-8).  Message
+    // thread; the cue editor ignores an unchanged rate.
+    if (genPresetWindow != nullptr)
+        if (auto* ed = dynamic_cast<GeneratorPresetEditor*>(genPresetWindow->getContentComponent()))
+            ed->setCurrentFpsForCueEditor(frameRateToDouble(currentEngine().getCurrentFps()));
 }
 
 //==============================================================================
@@ -9022,6 +9034,7 @@ void MainComponent::timerCallback()
         {
             lastDisplayedFps = curFps;
             updateFpsButtonStates();
+            pushFpsToGenPresetEditor();
         }
         if (curOutFps != lastDisplayedOutFps)
         {
