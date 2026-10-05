@@ -10,26 +10,45 @@
 
 //==============================================================================
 // GeneratorAudioPlayer -- Plays a single audio file, transport-controlled,
-// to a dedicated audio output device.  Used by the internal Generator to
-// optionally play a song file synchronised with the generated timecode.
+// to an audio output device.  Used by the internal Generator to optionally
+// play a song file synchronised with the generated timecode.
 //
-// Owns its own AudioDeviceManager so the programme audio does not have to
-// share a device with the LTC bitstream output.  Channel routing matches the
+// The output device is opened through AudioDeviceHub (DESIGN D23), so it may
+// be shared with LTC out, Audio Thru and other engines' players on the same
+// interface; each writes only its own channels.  Channel routing matches the
 // LtcOutput convention: -1 = stereo on channels 0+1, >=0 = mono mix on the
 // named channel.
 //
 // Pipeline:
 //   AudioFormatReader -> AudioFormatReaderSource -> AudioTransportSource
-//     -> our audio callback -> selected device output(s)
+//     (BufferingAudioSource read-ahead on backgroundThread, then
+//      ResamplingAudioSource) -> our audio callback -> selected output(s)
 //
 // Threading:
-//  - openDevice / closeDevice / loadFile / unloadFile / play / pause /
-//    stopAndReset / seekSeconds are intended for the message thread (UI,
-//    OSC handler dispatched via MessageManager::callAsync, engine tick).
-//  - setSource() on the transport is serialised through transportLock so
-//    loadFile and the audio callback never race over the source pointer.
-//  - JUCE's AudioTransportSource handles its own internal locking for
-//    play / stop / setPosition, so those calls are safe from any thread.
+//  - Message thread (UI, OSC handlers dispatched via callAsync, the engine
+//    tick): openDevice / closeDevice / requestLoad / play / pause /
+//    stopAndReset / seekSeconds and the getters.
+//  - LoaderThread ("STC Generator Loader"): loadFile / unloadFile /
+//    setLooping, as requestLoad schedules them.
+//  - Audio thread: audioDeviceIOCallbackWithContext, called by the hub's
+//    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
+//    adds or removes us or the device restarts (message thread, or the
+//    driver's thread for a restart it starts itself).
+//  - sourceLock serialises everything that builds, replaces, prepares,
+//    repositions or starts the transport's source chain (setSource,
+//    prepareToPlay, releaseResources, setPosition, start) between those
+//    threads: AudioTransportSource::setSource is not re-entrant (two calls
+//    at once delete the same BufferingAudioSource), and setPosition and
+//    start read the chain pointers setSource replaces, without a lock.  It
+//    can be held for as long as setSource takes to prefill the read-ahead
+//    buffer from disk, and is never taken on the audio thread.
+//  - transportLock guards our own state (reader source, file, tags, length,
+//    load error) and is only ever held for a few assignments, so UI
+//    accessors never wait on a load.  Order: sourceLock, then transportLock.
+//  - The audio callback takes neither: AudioTransportSource takes its own
+//    callback lock in getNextAudioBlock, which setSource also takes to swap
+//    the chain.  What that costs the audio thread is described there
+//    (AUDIT LTC-3).
 //==============================================================================
 class GeneratorAudioPlayer : private juce::AudioIODeviceCallback
 {
@@ -94,7 +113,7 @@ public:
 
         juce::String err;
         // Follows the global SAMPLE RATE / BUFFER SIZE like every other
-        // audio component (its own per-engine format went with D23).
+        // audio component (its own per-engine format went with DESIGN D23).
         auto* device = AudioDeviceHub::get().acquire(this, typeName, devName, false, sampleRate, bufferSize, err);
         if (device == nullptr) return false;
 
@@ -105,10 +124,15 @@ public:
         if (! backgroundThread.isThreadRunning())
             backgroundThread.startThread();
 
-        // If a file was previously loaded, attach it now that the device SR is known.
-        attachReaderToTransport();
-
-        deviceOpen.store(true, std::memory_order_relaxed);
+        // If a file was previously loaded, attach it now that the device SR
+        // is known.  deviceOpen is set under the same lock, so a load on the
+        // LoaderThread either finishes before this (and is attached here) or
+        // sees the device open and attaches itself after.
+        {
+            const juce::ScopedLock sl(sourceLock);
+            attachReaderToTransport();
+            deviceOpen.store(true, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -116,13 +140,17 @@ public:
     {
         if (deviceOpen.load(std::memory_order_relaxed))
         {
-            transport.stop();
             {
-                const juce::ScopedLock sl(transportLock);
+                // setSource(nullptr) also stops the transport, under its own
+                // callback lock.  No transport.stop() first: stop() waits up
+                // to a second (500 x 2 ms) for getNextAudioBlock to see it,
+                // and our callback no longer calls getNextAudioBlock once the
+                // transport is not playing (nor while paused).
+                const juce::ScopedLock sl(sourceLock);
                 transport.setSource(nullptr);
+                deviceOpen.store(false, std::memory_order_relaxed);
             }
             AudioDeviceHub::get().release(this);   // blocks until any in-flight callback returns
-            deviceOpen.store(false, std::memory_order_relaxed);
         }
         if (backgroundThread.isThreadRunning())
             backgroundThread.stopThread(2000);
@@ -141,14 +169,15 @@ public:
     //==========================================================================
     /// Load an audio file synchronously.  Replaces any previously loaded
     /// file.  Returns true on success.  On failure, getLoadError() returns
-    /// a human-readable description of why.
+    /// a human-readable description of why.  Runs on the LoaderThread
+    /// (requestLoad); it blocks on file I/O, so not for the message thread.
     bool loadFile(const juce::File& file)
     {
-        loadError.clear();
+        setLoadError({});
 
         if (file == juce::File() || ! file.existsAsFile())
         {
-            if (file != juce::File()) loadError = "FILE NOT FOUND";
+            if (file != juce::File()) setLoadError("FILE NOT FOUND");
             unloadFile();
             return false;
         }
@@ -167,7 +196,7 @@ public:
             // the FormatManager.  For .mp3 specifically, this means the
             // Projucer flag JUCE_USE_MP3AUDIOFORMAT was not set when the
             // juce_audio_formats module was compiled.
-            loadError = "UNSUPPORTED FORMAT: " + file.getFileExtension().removeCharacters(".").toUpperCase();
+            setLoadError("UNSUPPORTED FORMAT: " + file.getFileExtension().removeCharacters(".").toUpperCase());
             unloadFile();
             return false;
         }
@@ -195,7 +224,7 @@ public:
 
         if (readerSR <= 0.0 || totalSamples <= 0)
         {
-            loadError = "EMPTY OR CORRUPT FILE";
+            setLoadError("EMPTY OR CORRUPT FILE");
             unloadFile();
             return false;
         }
@@ -205,63 +234,68 @@ public:
             new juce::AudioFormatReaderSource(newReader.release(), true));
         newSource->setLooping(loopFlag.load(std::memory_order_relaxed));
 
-        // The next two calls can briefly block on the audio reader's
-        // background thread (especially with MP3 mid-decode).  Crucially we
-        // do them OUTSIDE the transportLock so the message thread's UI
-        // accessors and any concurrent callbacks never wait on us.  JUCE's
-        // AudioTransportSource has its own internal locking against
-        // getNextAudioBlock(), so these are safe to call without our lock.
-        transport.stop();
-        transport.setSource(nullptr);
-
-        // Now swap our state under the lock.  This is fast; only blocks
-        // anything for the time it takes to move-assign a unique_ptr and
-        // copy a couple of doubles / a juce::File.  After this point the
-        // old reader source is destroyed -- but the transport no longer
-        // points to it (setSource(nullptr) above guarantees that).
+        // Detach, swap and re-attach as one step under sourceLock, so the
+        // message thread's openDevice / closeDevice / seekSeconds cannot run
+        // setSource or setPosition in between (AUDIT LTC-1).  setSource can
+        // wait here for the reader thread (the old BufferingAudioSource
+        // finishing its current read, the new one prefilling); transportLock
+        // is held only for the swap, so the UI accessors never wait on it.
+        // No transport.stop() first: setSource stops it (see closeDevice).
         std::unique_ptr<juce::AudioFormatReaderSource> oldSource;
         {
-            const juce::ScopedLock sl(transportLock);
-            oldSource            = std::move(currentReaderSource);
-            currentReaderSource  = std::move(newSource);
-            currentFile          = file;
-            trackArtist          = tagArtist;
-            trackTitle           = tagTitle;
-            sourceFileSampleRate = readerSR;
-            fileLengthSeconds    = (readerSR > 0.0) ? (double) totalSamples / readerSR : 0.0;
+            const juce::ScopedLock srcSl(sourceLock);
+            transport.setSource(nullptr);
+
+            // From here the transport no longer points at the old reader
+            // source, so it can be destroyed -- after the locks are released.
+            {
+                const juce::ScopedLock sl(transportLock);
+                oldSource            = std::move(currentReaderSource);
+                currentReaderSource  = std::move(newSource);
+                currentFile          = file;
+                trackArtist          = tagArtist;
+                trackTitle           = tagTitle;
+                sourceFileSampleRate = readerSR;
+                fileLengthSeconds    = (readerSR > 0.0) ? (double) totalSamples / readerSR : 0.0;
+            }
+
+            // Update lock-free mirrors AFTER the state is consistent.
+            fileLengthAtomic.store(fileLengthSeconds, std::memory_order_release);
+            fileLoadedAtomic.store(true, std::memory_order_release);
+
+            // Note: the AudioThumbnail is updated separately by requestLoad()
+            // on the caller's thread (typically the message thread) BEFORE
+            // this function runs.  Touching the thumbnail here would force
+            // this background thread to wait for the thumbnail's own internal
+            // decode job to finish, which can take hundreds of ms with MP3 if
+            // the previous file was still being processed.
+
+            if (deviceOpen.load(std::memory_order_relaxed))
+                attachReaderToTransport();
         }
-        // oldSource destroyed here, outside the lock.
-
-        // Update lock-free mirrors AFTER the state is consistent.
-        fileLengthAtomic.store(fileLengthSeconds, std::memory_order_release);
-        fileLoadedAtomic.store(true, std::memory_order_release);
-
-        // Note: the AudioThumbnail is updated separately by requestLoad() on
-        // the caller's thread (typically the message thread) BEFORE this
-        // function runs.  Touching the thumbnail here would force this
-        // background thread to wait for the thumbnail's own internal decode
-        // job to finish, which can take hundreds of ms with MP3 if the
-        // previous file was still being processed.
-
-        if (deviceOpen.load(std::memory_order_relaxed))
-            attachReaderToTransport();
+        // oldSource destroyed here, outside both locks.
 
         return true;
     }
 
     /// Last load failure description, or empty if the last call succeeded
-    /// (or no file has been loaded yet).
-    juce::String getLoadError() const { return loadError; }
+    /// (or no file has been loaded yet).  Written on the LoaderThread, read
+    /// by the views' paint: a copy taken under transportLock.
+    juce::String getLoadError() const
+    {
+        const juce::ScopedLock sl(transportLock);
+        return loadError;
+    }
 
     void unloadFile()
     {
-        // Same pattern as loadFile: do the blocking transport ops outside
-        // the lock so UI accessors don't wait.
-        transport.stop();
-        transport.setSource(nullptr);
-
+        // Same pattern as loadFile: detach and swap under sourceLock, our
+        // state under transportLock only for the assignments.
         std::unique_ptr<juce::AudioFormatReaderSource> oldSource;
         {
+            const juce::ScopedLock srcSl(sourceLock);
+            transport.setSource(nullptr);
+
             const juce::ScopedLock sl(transportLock);
             oldSource            = std::move(currentReaderSource);
             currentFile          = juce::File();
@@ -270,7 +304,7 @@ public:
             sourceFileSampleRate = 0.0;
             fileLengthSeconds    = 0.0;
         }
-        // oldSource destroyed here, outside the lock.
+        // oldSource destroyed here, outside the locks.
 
         fileLengthAtomic.store(0.0, std::memory_order_release);
         fileLoadedAtomic.store(false, std::memory_order_release);
@@ -329,17 +363,17 @@ public:
         // cursor/audio desync the operator reported.
         if (pendingLoad.load(std::memory_order_acquire)) return;
         if (! deviceOpen.load(std::memory_order_relaxed)) return;
+        const juce::ScopedLock sl(sourceLock);
         transport.start();
     }
 
     /// Pauses playback while preserving the current position.
     /// Sets a flag that the audio callback checks before pulling samples,
-    /// so the message thread returns INSTANTLY without waiting for the
-    /// background reader thread to sync.  This matters with MP3 because
-    /// AudioTransportSource::stop() can briefly block on the buffering
-    /// reader, freezing the UI for tens of ms while the decoder finishes
-    /// its current block.  The transport keeps "playing" internally (no
-    /// audio is produced because the callback skips it), so resume is
+    /// so the message thread returns INSTANTLY.  AudioTransportSource::stop()
+    /// would not: it waits up to a second for getNextAudioBlock to see the
+    /// stop, and our callback stops calling getNextAudioBlock as soon as the
+    /// transport is not playing.  The transport keeps "playing" internally
+    /// (no audio is produced because the callback skips it), so resume is
     /// instantaneous when play() flips the flag back.
     void pause()
     {
@@ -351,6 +385,7 @@ public:
     {
         shouldPlay.store(false, std::memory_order_release);
         userPaused.store(true,  std::memory_order_release);
+        const juce::ScopedLock sl(sourceLock);
         transport.setPosition(0.0);
     }
 
@@ -361,13 +396,15 @@ public:
     /// before this seek), the transport is re-engaged so audio resumes from
     /// the new position.  start() is a no-op when the transport is already
     /// playing, so the in-flight seek-while-playing case is unaffected.
+    /// Message thread.  Waits for a load in progress on the LoaderThread to
+    /// finish swapping the transport's source (sourceLock).
     void seekSeconds(double seconds)
     {
         if (! hasFileLoaded()) return;
 
         seconds = juce::jmax(0.0, seconds);
 
-        const double len = fileLengthSeconds;
+        const double len = fileLengthAtomic.load(std::memory_order_acquire);
         if (loopFlag.load(std::memory_order_relaxed) && len > 0.0)
         {
             seconds = std::fmod(seconds, len);
@@ -377,6 +414,7 @@ public:
             seconds = len;
         }
 
+        const juce::ScopedLock sl(sourceLock);
         transport.setPosition(seconds);
 
         if (shouldPlay.load(std::memory_order_acquire)
@@ -488,17 +526,18 @@ private:
     // LoaderThread -- dedicated I/O thread for asynchronous loadFile.
     //
     // Why a thread is needed:
-    //   AudioTransportSource::setSource() (called from loadFile) tears down
-    //   the previous BufferingAudioSource, which synchronises with its
-    //   background reader.  With MP3 files, that reader can be in the middle
-    //   of decoding a frame and the sync may take tens of ms.  Doing the
-    //   load on the message thread freezes the UI.
+    //   loadFile opens and parses the file, and AudioTransportSource::
+    //   setSource() tears down the previous BufferingAudioSource (waiting for
+    //   its background reader to finish the chunk it is decoding) and
+    //   prefills the new one from disk.  With MP3 files that can take tens
+    //   of ms.  Doing the load on the message thread freezes the UI.
     //
     // Why a single coalescing thread is enough:
     //   Multiple rapid preset changes (e.g. holding NEXT) only matter for the
     //   final destination -- intermediate loads are discarded.  Single-thread
     //   model also means we never have two concurrent loads racing on the
-    //   transport.
+    //   transport; the message thread's own transport calls are serialised
+    //   with it by sourceLock.
     //
     // Lifetime:
     //   Stopped explicitly in the GeneratorAudioPlayer destructor before any
@@ -593,15 +632,17 @@ private:
     };
     //==========================================================================
     // Internal: (re)wire the current reader source to the transport using
-    // the file's native SR for resampling correction.  Caller must already
-    // hold a reference to the reader (we do via currentReaderSource).
+    // the file's native SR for resampling correction.  Caller holds
+    // sourceLock (openDevice on the message thread, loadFile on the
+    // LoaderThread), so currentReaderSource cannot be swapped and destroyed
+    // between reading it here and handing it to setSource.
     //==========================================================================
     void attachReaderToTransport()
     {
-        // Read the source pointer + sample rate under the lock, then call
-        // transport.setSource() OUTSIDE the lock.  setSource() can briefly
-        // block while it sets up the BufferingAudioSource and starts its
-        // reader thread; doing it under the lock would block the UI.
+        // Read the source pointer + sample rate under transportLock, then
+        // call transport.setSource() outside it.  setSource() can block
+        // while it prefills the new BufferingAudioSource from disk; doing
+        // that under transportLock would block the UI accessors.
         juce::AudioFormatReaderSource* src = nullptr;
         double sr = 0.0;
         {
@@ -668,19 +709,41 @@ private:
         if (! fileLoadedAtomic.load(std::memory_order_acquire)) return;
 
         // Pull stereo audio from transport into our scratch buffer.  The
-        // buffer was pre-allocated in audioDeviceAboutToStart; if a driver
-        // ever delivers a larger block we skip rather than allocate on the
-        // audio thread.
+        // buffer was pre-allocated in audioDeviceAboutToStart to the
+        // device's buffer size; JUCE's AudioDeviceManager splits a larger
+        // driver block to that size before the hub sees it, so this guard
+        // is a backstop: skip rather than allocate on the audio thread.
         if (numSamples > scratchBuffer.getNumSamples()) return;
         scratchBuffer.clear(0, numSamples);
         juce::AudioSourceChannelInfo info(&scratchBuffer, 0, numSamples);
 
-        // No transportLock here: JUCE's AudioTransportSource synchronises
-        // setSource() against getNextAudioBlock() internally.  Holding our
-        // own lock would compete with the LoaderThread (which now does
-        // setSource() outside the lock too), and there's no extra safety
-        // to gain since the reader source only gets destroyed after
-        // setSource(nullptr) has detached it from the transport.
+        // Neither of our locks here.  The transport's own callback lock,
+        // which setSource() also takes to swap the chain, keeps the chain
+        // alive for this call; the reader source is destroyed only after
+        // setSource(nullptr) has detached it.
+        //
+        // What this call can wait on (JUCE 9 source, AUDIT LTC-3):
+        //  - AudioTransportSource::callbackLock, held for the whole call.
+        //    Elsewhere it is held briefly: setSource's swap, and
+        //    getCurrentPosition() from the message thread (engine tick).
+        //  - ResamplingAudioSource::callbackLock (also taken by
+        //    setPosition's flushBuffers, brief) and its ratio SpinLock
+        //    (brief).
+        //  - BufferingAudioSource::bufferRangeLock, which the read-ahead
+        //    thread takes only for its bookkeeping.
+        //  - BufferingAudioSource::callbackLock, taken here to copy from the
+        //    read-ahead buffer whenever any of the block is buffered.  The
+        //    read-ahead thread (backgroundThread) holds that same lock
+        //    while it reads and decodes the next chunk of the file (up to
+        //    2048 samples).  So a slow read -- a sleeping or network disk, a
+        //    stalled decoder -- blocks this callback for as long as that
+        //    chunk takes.  The hub calls its clients one after the other
+        //    under its fan-out lock, so the stall reaches every client on
+        //    the device, LTC out included; and the message thread's
+        //    getCurrentPosition() then waits behind it.
+        // The lock is inside JUCE's BufferingAudioSource; avoiding it means
+        // replacing the read-ahead with our own lock-free one, a rewrite
+        // rather than a fix.  Deferred (AUDIT LTC-3).
         transport.getNextAudioBlock(info);
 
         const int    selCh   = selectedChannel.load(std::memory_order_relaxed);
@@ -759,7 +822,10 @@ private:
             scratchBuffer.setSize(2, currentBufferSize, false, false, false);
         }
 
-        const juce::ScopedLock sl(transportLock);
+        // sourceLock: setSource reads the prepared rate and block size and
+        // prepares the new chain with them, so it must not run halfway
+        // through this on the LoaderThread.
+        const juce::ScopedLock sl(sourceLock);
         transport.prepareToPlay(currentBufferSize, currentSampleRate);
     }
 
@@ -767,7 +833,7 @@ private:
     {
         if (shuttingDown.load(std::memory_order_acquire)) return;
 
-        const juce::ScopedLock sl(transportLock);
+        const juce::ScopedLock sl(sourceLock);
         transport.releaseResources();
     }
 
@@ -777,7 +843,8 @@ private:
     juce::AudioThumbnail      thumbnail      { 512, formatManager, thumbnailCache };
     juce::TimeSliceThread     backgroundThread { "STC Generator Audio Reader" };
 
-    juce::CriticalSection                          transportLock;
+    juce::CriticalSection                          sourceLock;     // transport chain: setSource / prepare / release / setPosition / start (see the class comment)
+    juce::CriticalSection                          transportLock;  // the state below and loadError; held only for assignments
     std::unique_ptr<juce::AudioFormatReaderSource> currentReaderSource;
     juce::AudioTransportSource                     transport;
     juce::File   currentFile;
@@ -795,11 +862,9 @@ private:
     std::atomic<bool> shouldPlay      { false };  // caller intent across async loads
     std::atomic<int>  fileChannelMode { 0 };      // 0=Stereo, 1=LeftOnly, 2=RightOnly
 
-    // Lock-free mirrors for hot UI accessors.  The waveform view repaints at
-    // 30 Hz and queries hasFileLoaded() / getFileLengthSeconds() each time;
-    // routing those through transportLock would freeze the UI whenever the
-    // LoaderThread is mid-load (transport.stop() / setSource() can block on
-    // the audio reader thread for tens to hundreds of ms with MP3).
+    // Lock-free mirrors for hot accessors.  The waveform views repaint at
+    // 30 Hz and query hasFileLoaded() / getFileLengthSeconds() each time,
+    // and seekSeconds() reads the length; none of them takes a lock for it.
     std::atomic<bool>   fileLoadedAtomic    { false };
     std::atomic<double> fileLengthAtomic    { 0.0 };
 
@@ -815,7 +880,14 @@ private:
     double currentSampleRate    = 0.0;
     int    currentBufferSize    = 0;
 
-    juce::String loadError;          // human-readable last-load-error message
+    juce::String loadError;          // human-readable last-load-error message; under transportLock
+
+    // LoaderThread (loadFile): the message for getLoadError().
+    void setLoadError(const juce::String& message)
+    {
+        const juce::ScopedLock sl(transportLock);
+        loadError = message;
+    }
 
     // Must be the LAST member declared.  Its destructor stops the thread
     // before any other member is torn down, so the thread cannot race
