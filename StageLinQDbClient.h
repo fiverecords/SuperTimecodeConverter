@@ -52,6 +52,7 @@ namespace StageLinQ
     static constexpr uint32_t kFltxRespSourceLocations = 3;
     static constexpr uint32_t kFltxRespTransferId      = 4;
     static constexpr uint32_t kFltxRespChunk           = 5;
+    static constexpr uint32_t kFltxRespUnknown8        = 8;   // unsolicited, the string "1" (see fltxWaitFor)
     static constexpr uint32_t kFltxRespDisconnect      = 9;
 
     static constexpr int kFltxChunkSize = 4096;
@@ -173,6 +174,8 @@ namespace StageLinQ
 //==============================================================================
 struct FltxResponse
 {
+    bool received = false;     // a complete message was read
+    uint32_t code = 0;         // non-zero: the device's periodic message (chrisle: "timecode")
     uint32_t messageId = 0;
 
     // SourceLocations
@@ -455,6 +458,7 @@ private:
         if (sources.isEmpty())
         {
             DBG("StageLinQ DB: No sources found on device");
+            closeFtSocket();
             isRunningFlag.store(false);
             return;
         }
@@ -469,6 +473,7 @@ private:
         if (dbFile == juce::File() || !dbFile.existsAsFile())
         {
             DBG("StageLinQ DB: Failed to download database");
+            closeFtSocket();
             isRunningFlag.store(false);
             return;
         }
@@ -477,6 +482,7 @@ private:
         if (!openDatabase(dbFile))
         {
             DBG("StageLinQ DB: Failed to open database");
+            closeFtSocket();
             isRunningFlag.store(false);
             return;
         }
@@ -487,6 +493,8 @@ private:
         // --- Process metadata requests ---
         while (!threadShouldExit() && isRunningFlag.load())
         {
+            drainFltx();
+
             juce::StringArray requests;
             {
                 std::lock_guard<std::mutex> lock(requestMutex);
@@ -515,12 +523,8 @@ private:
         auto frame = StageLinQ::buildFltxSources();
         if (!fltxWrite(frame)) return {};
 
-        // Read response with timeout
-        auto resp = fltxReadResponse(3000);
-        if (resp.messageId == StageLinQ::kFltxRespSourceLocations)
-            return resp.sources;
-
-        return {};
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespSourceLocations, 3000);
+        return resp.sources;
     }
 
     //==========================================================================
@@ -572,10 +576,8 @@ private:
         auto frame = StageLinQ::buildFltxStat(path);
         if (!fltxWrite(frame)) return 0;
 
-        auto resp = fltxReadResponse(2000);
-        if (resp.messageId == StageLinQ::kFltxRespFileStat)
-            return resp.fileSize;
-        return 0;
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespFileStat, 2000);
+        return resp.fileSize;
     }
 
     //==========================================================================
@@ -588,8 +590,8 @@ private:
         auto frame = StageLinQ::buildFltxTransferId(path);
         if (!fltxWrite(frame)) return {};
 
-        auto resp = fltxReadResponse(3000);
-        if (resp.messageId != StageLinQ::kFltxRespTransferId || resp.txFileSize == 0)
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespTransferId, 3000);
+        if (!resp.received || resp.txFileSize == 0)
             return {};
 
         uint32_t fileSize = resp.txFileSize;
@@ -616,13 +618,22 @@ private:
         catch (const std::bad_alloc&) { return {}; }
         uint32_t bytesReceived = 0;
         double deadline = juce::Time::getMillisecondCounterHiRes() + 30000.0;  // 30s timeout
+        double lastChunkTime = juce::Time::getMillisecondCounterHiRes();
 
+        // Anything but a chunk is skipped, as chrisle's getFile() does: the
+        // device's periodic code != 0 message, which comes every 4 s whatever
+        // STC asks (#23 PRIME 4+ capture), ended the download as a "timeout"
+        // (AUDIT SLQ-1), and so did an end-of-message, which the unit also
+        // sends after a reply (after the source list in the capture).  The
+        // download ends when the file is complete, when no chunk has come for
+        // 5 s, after 30 s, or when the device disconnects.
         while (bytesReceived < fileSize
                && juce::Time::getMillisecondCounterHiRes() < deadline
                && !threadShouldExit())
         {
-            auto chunkResp = fltxReadResponse(5000);
-            if (chunkResp.messageId == StageLinQ::kFltxRespChunk && !chunkResp.chunkData.empty())
+            auto chunkResp = fltxReadResponse(1000);
+            if (chunkResp.received && chunkResp.code == 0
+                && chunkResp.messageId == StageLinQ::kFltxRespChunk && !chunkResp.chunkData.empty())
             {
                 // Placed at the offset the device gives, compared without
                 // the sum overflowing uint32 (AUDIT WIRE-2: offset + size
@@ -638,16 +649,13 @@ private:
                     std::memcpy(fileData.data() + offset, chunkResp.chunkData.data(), n);
                     bytesReceived += n;
                 }
+                lastChunkTime = juce::Time::getMillisecondCounterHiRes();
+                continue;
             }
-            else if (chunkResp.messageId == StageLinQ::kFltxRespEndOfMessage)
-            {
+            if (chunkResp.messageId == StageLinQ::kFltxRespDisconnect || !fltxConnected())
                 break;
-            }
-            else if (chunkResp.messageId == 0)
-            {
-                // Timeout or error
+            if (juce::Time::getMillisecondCounterHiRes() - lastChunkTime > 5000.0)
                 break;
-            }
         }
 
         // Signal transfer complete
@@ -674,28 +682,63 @@ private:
         return written == (int)data.size();
     }
 
+    bool fltxConnected()
+    {
+        std::lock_guard<std::mutex> lock(sockMutex);
+        return ftSocket != nullptr && ftSocket->isConnected();
+    }
+
+    void closeFtSocket()
+    {
+        std::lock_guard<std::mutex> lock(sockMutex);
+        if (ftSocket)
+        {
+            ftSocket->close();
+            ftSocket.reset();
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Wait for the reply to a request: the first message with that ID.
+    // Anything else on the connection is skipped, as chrisle's
+    // waitForMessage() does.  A PRIME 4+ sends message 0x8 (the string "1")
+    // as soon as the connection opens and a code != 0 message every 4 s
+    // (#23 capture); the first of those was taken for the reply to the
+    // source request, so STC concluded "no sources" and never asked for the
+    // database (AUDIT SLQ-1).  Returns an empty response on timeout, on the
+    // device's disconnect message (0x9) and when the socket is gone.
+    //--------------------------------------------------------------------------
+    FltxResponse fltxWaitFor(uint32_t wantedId, int timeoutMs)
+    {
+        const double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
+        while (!threadShouldExit())
+        {
+            const double left = deadline - juce::Time::getMillisecondCounterHiRes();
+            if (left <= 0.0) break;
+            auto resp = fltxReadResponse((int)std::ceil(left));
+            if (!resp.received || resp.messageId == StageLinQ::kFltxRespDisconnect)
+                break;
+            if (resp.code == 0 && resp.messageId == wantedId)
+                return resp;
+        }
+        return {};
+    }
+
+    //--------------------------------------------------------------------------
+    // Read the next complete message (received = false on timeout, or when
+    // the socket is gone).  What is already buffered is parsed before the
+    // socket is waited on.  A failed read or the peer's close closes the
+    // socket: JUCE's isConnected() stays true after a FIN.
+    //--------------------------------------------------------------------------
     FltxResponse fltxReadResponse(int timeoutMs)
     {
         FltxResponse resp;
         double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
 
-        while (juce::Time::getMillisecondCounterHiRes() < deadline && !threadShouldExit())
+        while (!threadShouldExit())
         {
-            {
-                std::lock_guard<std::mutex> lock(sockMutex);
-                if (!ftSocket || !ftSocket->isConnected()) return resp;
-
-                if (ftSocket->waitUntilReady(true, 100))
-                {
-                    uint8_t tmp[8192];
-                    int bytesRead = ftSocket->read(tmp, sizeof(tmp), false);
-                    if (bytesRead <= 0) return resp;
-                    fltxReadBuf.insert(fltxReadBuf.end(), tmp, tmp + bytesRead);
-                }
-            }
-
             // Try to parse a complete message
-            if (fltxReadBuf.size() >= 4)
+            while (fltxReadBuf.size() >= 4)
             {
                 uint32_t bodyLen = StageLinQ::readU32BE(fltxReadBuf.data());
 
@@ -713,29 +756,60 @@ private:
                     continue;
                 }
 
-                if (fltxReadBuf.size() >= bodyLen + 4)
+                if (fltxReadBuf.size() < bodyLen + 4)
+                    break;   // incomplete, read more
+
+                resp = parseFltxBody(fltxReadBuf.data() + 4, bodyLen);
+                resp.received = true;
+                fltxReadBuf.erase(fltxReadBuf.begin(), fltxReadBuf.begin() + 4 + bodyLen);
+
+                // Device sent FileTransfer disconnect -- close socket to
+                // prevent stale reads.  chrisle changelog: "Handle Shutdown
+                // msg (0x9) from FileTransfer svc".
+                if (resp.messageId == StageLinQ::kFltxRespDisconnect)
+                    closeFtSocket();
+
+                return resp;
+            }
+
+            const double left = deadline - juce::Time::getMillisecondCounterHiRes();
+            if (left <= 0.0) break;
+
+            std::lock_guard<std::mutex> lock(sockMutex);
+            if (!ftSocket || !ftSocket->isConnected()) break;
+
+            const int ready = ftSocket->waitUntilReady(true, juce::jmin(100, (int)std::ceil(left)));
+            if (ready != 0)
+            {
+                uint8_t tmp[8192];
+                int bytesRead = ready > 0 ? ftSocket->read(tmp, sizeof(tmp), false) : -1;
+                if (bytesRead <= 0)
                 {
-                    resp = parseFltxBody(fltxReadBuf.data() + 4, bodyLen);
-                    fltxReadBuf.erase(fltxReadBuf.begin(), fltxReadBuf.begin() + 4 + bodyLen);
-
-                    // Device sent FileTransfer disconnect -- close socket to
-                    // prevent stale reads.  chrisle changelog: "Handle Shutdown
-                    // msg (0x9) from FileTransfer svc".
-                    if (resp.messageId == StageLinQ::kFltxRespDisconnect)
-                    {
-                        std::lock_guard<std::mutex> lock2(sockMutex);
-                        if (ftSocket)
-                        {
-                            ftSocket->close();
-                            ftSocket.reset();
-                        }
-                    }
-
-                    return resp;
+                    ftSocket->close();   // closed by the device, or failed
+                    break;
                 }
+                fltxReadBuf.insert(fltxReadBuf.end(), tmp, tmp + bytesRead);
             }
         }
         return resp;
+    }
+
+    //--------------------------------------------------------------------------
+    // Once the database is open nothing more is asked of the device, but it
+    // keeps sending its code != 0 message every 4 s.  Read and drop what
+    // comes so the socket's receive buffer never fills: before, nothing read
+    // the connection again, and in a few hours the device's sends would have
+    // blocked.  A failed read or the device's close closes the socket.
+    //--------------------------------------------------------------------------
+    void drainFltx()
+    {
+        std::lock_guard<std::mutex> lock(sockMutex);
+        if (!ftSocket || !ftSocket->isConnected()) return;
+        const int ready = ftSocket->waitUntilReady(true, 0);
+        if (ready == 0) return;
+        uint8_t tmp[4096];
+        if (ready < 0 || ftSocket->read(tmp, sizeof(tmp), false) <= 0)
+            ftSocket->close();
     }
 
     FltxResponse parseFltxBody(const uint8_t* body, uint32_t bodyLen)
@@ -748,7 +822,10 @@ private:
 
         uint32_t code = StageLinQ::readU32BE(body + 4);
 
-        // If code > 0, it's a timecode message (ignored)
+        // code > 0: the device's periodic message ("timecode" in chrisle's
+        // FileTransfer.ts: fltx, code, 0x7D2, 0), not a reply -- the caller
+        // skips it.  A PRIME 4+ sends one every 4 s (#23 capture).
+        resp.code = code;
         if (code > 0) return resp;
 
         // code == 0: read message ID
@@ -809,15 +886,13 @@ private:
                 break;
             }
 
-            case StageLinQ::kFltxRespEndOfMessage:
+            case StageLinQ::kFltxRespEndOfMessage:  // after a reply (the source list, in the #23 capture)
+            case StageLinQ::kFltxRespUnknown8:      // unsolicited on connect: the string "1"
                 break;
 
-            case StageLinQ::kFltxRespDisconnect:
-                DBG("StageLinQ DB: Device sent FileTransfer disconnect (0x9)");
-                break;
-
-            default:
-                DBG("StageLinQ DB: Unknown fltx response " + juce::String(msgId));
+            default:   // includes kFltxRespDisconnect, which the reader acts on
+                DBG("StageLinQ DB: fltx message " + juce::String(msgId)
+                    + (msgId == StageLinQ::kFltxRespDisconnect ? " (device disconnect)" : " (unknown)"));
                 break;
         }
 
