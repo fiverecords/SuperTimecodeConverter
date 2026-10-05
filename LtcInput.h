@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 class LtcInput : private juce::AudioIODeviceCallback
 {
@@ -118,19 +119,43 @@ public:
     /// Binary group flags of the last decoded frame (BGF0 in bit 0).
     uint8_t getBinaryGroupFlags() const { return binaryGroupFlags.load(std::memory_order_relaxed); }
 
-    /// Freewheel (D10): how long after the last frame/packet the source still
-    /// counts as present.  The senders count on their own through it, so a
-    /// short dropout -- a USB stall, a display wake -- never reaches the
-    /// wire; the price is that a real stop takes this long to reach the
-    /// outputs.  The operator sets it (engine setting), default
+    /// Freewheel (AUDIT D10): how long a frame may be missing before the
+    /// source stops counting as present, counted from when the device could
+    /// have delivered it (see isReceivingAt).  The senders count on their own
+    /// through it, so a short dropout -- a USB stall, a display wake -- never
+    /// reaches the wire; the price is that a real stop takes this long to
+    /// reach the outputs.  The operator sets it (engine setting), default
     /// kSourceTimeoutMs.
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
-    bool isReceiving() const
+    bool isReceiving() const { return isReceivingAt(nowMs()); }
+
+    /// Whether the source counts as present at `atMs` (hi-res ms counter).
+    /// Any thread.
+    ///
+    /// The arrival stamp is the instant the frame crossed the converter:
+    /// dated back from the callback by the samples still to process and the
+    /// input latency.  The engine only learns of a frame when the callback
+    /// carrying it runs, so between two healthy callbacks the stamp ages by
+    /// up to one frame (waiting for the next one to end) plus one device
+    /// period plus the input latency.  Compared with the freewheel alone, at
+    /// 8192 samples (171 ms at 48 kHz) the source read as lost for part of
+    /// every period, or all of it when the driver reports a period of
+    /// latency -- and each flip paused the outputs, re-seeded LTC OUT and
+    /// sent an MTC Full Frame (AUDIT LTC-9).  The window is therefore the
+    /// freewheel PLUS the device period and the input latency: never shorter
+    /// than what a healthy device takes to hand a frame over, and the
+    /// freewheel keeps its meaning at every buffer size.  The margin over the
+    /// healthy worst case is the freewheel itself less one frame: at least
+    /// 8 ms at the 50 ms minimum and 24 fps (a frame is 41.7 ms), 108 ms at
+    /// the default -- callback jitter, or a frame or two the decoder could
+    /// not read.
+    bool isReceivingAt(double atMs) const
     {
-        auto now = juce::Time::getMillisecondCounterHiRes();
-        return (now - lastFrameTime.load(std::memory_order_relaxed)) < timeoutMs.load(std::memory_order_relaxed);
+        const double window = timeoutMs.load(std::memory_order_relaxed)
+                            + deliveryMs.load(std::memory_order_relaxed);
+        return (atMs - lastFrameTime.load(std::memory_order_relaxed)) < window;
     }
 
     //==============================================================================
@@ -259,6 +284,17 @@ private:
     double decodeCallbackStartMs = 0.0;   // audio thread only: timestamp base for lastFrameTime
     int    decodeSamplesRemaining = 0;    // audio thread only: samples after the one being decoded
     double inputLatencyMs = 0.0;          // set in audioDeviceAboutToStart
+    // Device period plus input latency, ms: how long after crossing the
+    // converter a frame can reach the engine (see isReceivingAt).  Set when
+    // the device starts; raised by the callback if the driver hands over
+    // more samples than the buffer it announced.
+    std::atomic<double> deliveryMs { 0.0 };
+
+    /// Wall clock for the arrival stamps and the receive window.  Injectable
+    /// so the decoder can be simulated against a device clock (tools/audit),
+    /// as LtcOutput's is; production uses the high-resolution counter.
+    std::function<double()> timeSource;
+    double nowMs() const { return timeSource ? timeSource() : juce::Time::getMillisecondCounterHiRes(); }
 
     // LTC decoder state -- audio-callback-thread-only (no synchronisation needed)
     bool signalHigh = false;
@@ -517,7 +553,15 @@ private:
         const float effectiveThreshold = kHysteresisThreshold;
 
         float ltcPeak = 0.0f;
-        decodeCallbackStartMs = juce::Time::getMillisecondCounterHiRes();
+        decodeCallbackStartMs = nowMs();
+
+        // The receive window must cover what this device actually hands
+        // over (isReceivingAt): a driver that delivers more than it
+        // announced widens it.
+        const double deliveryNowMs = (double) numSamples * 1000.0 / currentSampleRate + inputLatencyMs;
+        if (deliveryNowMs > deliveryMs.load(std::memory_order_relaxed))
+            deliveryMs.store(deliveryNowMs, std::memory_order_relaxed);
+
         for (int i = 0; i < numSamples; ++i)
         {
             decodeSamplesRemaining = numSamples - i;
@@ -562,7 +606,16 @@ private:
             currentSampleRate = device->getCurrentSampleRate();
             currentBufferSize = device->getCurrentBufferSizeSamples();
             numChannelsAvailable = device->getActiveInputChannels().countNumberOfSetBits();
+            // The input latency the driver reports dates every arrival and
+            // widens the receive window (isReceivingAt).  It is not clamped
+            // the way LtcOutput clamps its output latency (0-100 ms, DESIGN
+            // D6): a driver at 8192 samples can truly report a period of it
+            // (171 ms at 48 kHz), and a 100 ms cap would date every arrival
+            // there 71 ms late, two or three frames.  A driver that
+            // over-reports dates them early by its error instead.
             inputLatencyMs = (double)device->getInputLatencyInSamples() * 1000.0 / currentSampleRate;
+            deliveryMs.store((double) currentBufferSize * 1000.0 / currentSampleRate + inputLatencyMs,
+                             std::memory_order_relaxed);
         }
         resetDecoder();
         resetPassthruBuffer();
