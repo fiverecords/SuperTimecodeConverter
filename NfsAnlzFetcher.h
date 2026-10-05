@@ -5,33 +5,47 @@
 // NfsAnlzFetcher -- Downloads and parses rekordbox ANLZ files from CDJ USB/SD
 // via the non-standard NFSv2 server running on Pioneer players.
 //
-// This replaces the failing dbserver ANLZ tag queries (0x2c04 for PQTZ/PCO2/PSSI)
-// which don't work reliably on CDJ-3000.  Instead, we download the .EXT file
-// directly over NFS and parse the PMAI container locally.
+// DbServerClient runs it on its NFS thread for the analysis data its dbserver
+// queries did not deliver (DbServerClient::launchNfsAsync).  Two entries:
+// fetchByTrackId looks the track up in the slot's export.pdb, as Crate Digger
+// does; fetchAndParse takes the ANLZ path dbserver gave.  Either way the
+// track's .DAT and .EXT are downloaded, parsed and merged (mergeDatExt).  The
+// .2EX (CDJ-3000 3-band waveforms, PWV6/PWV7) is not downloaded.
 //
 // Protocol stack:
-//   ONC RPC v2 over UDP (RFC 1057)
+//   ONC RPC v2 over UDP (RFC 5531, which obsoletes RFC 1057)
+//     -> Portmapper (program 100000, port 111): GETPORT for the two below
 //     -> Mount v1 (program 100005): mount filesystem, get root FHandle
 //     -> NFS v2 (program 100003): LOOKUP path elements, READ file data
 //
 // Data format:
+//   export.pdb (rekordbox_pdb.ksy): tracks table -> analyze_path (string 14)
 //   PMAI container (rekordbox_anlz.ksy from Deep Symmetry / Crate Digger)
-//     -> PQTZ: beat grid
-//     -> PCO2: extended cue list (nxs2+, with colors/comments)
-//     -> PCOB: standard cue list (fallback)
-//     -> PSSI: song structure / phrase analysis (XOR masked)
-//     -> PWV5/PWV7: detail waveform (already fetched via dbserver, but available here too)
+//     .DAT -> PQTZ: beat grid
+//          -> PCOB: standard cue lists (used when the file has no PCO2)
+//     .EXT -> PCO2: extended cue lists (nxs2+, with colors/comments)
+//          -> PCOB: standard cue lists
+//          -> PSSI: song structure / phrase analysis (XOR masked)
+//          -> PWV4: colour preview waveform (6 bytes per column)
+//          -> PWV5: colour detail waveform (2 bytes per half-frame)
+//   PWV7 (3-band detail) is read too if a file has it, but it lives in the
+//   .2EX, which is not fetched.  The other tags are skipped.
 //
 // References:
 //   - Deep Symmetry Crate Digger (EPL-2.0): https://github.com/Deep-Symmetry/crate-digger
-//   - Kaitai Struct rekordbox_anlz.ksy format specification
-//   - IETF RFC 1094 (NFS v2), RFC 1057 (ONC RPC v2)
+//     (rekordbox_anlz.ksy, rekordbox_pdb.ksy, doc/.../anlz.adoc)
+//   - Deep Symmetry beat-link: CrateDigger.java (which file holds what),
+//     CueList.java (PCO2 before PCOB)
+//   - IETF RFC 1094 (NFS v2, Mount v1), RFC 5531 (ONC RPC v2), RFC 4506 (XDR)
 //
 // Pioneer NFS quirks:
 //   - Path components are UTF-16LE encoded (not ASCII)
 //   - Mount paths: /B/ = SD slot, /C/ = USB slot
-//   - Standard NFSv2 port (2049) is used
+//   - The mount and NFS ports are asked of the portmapper, not assumed
 //   - File handles are 32 bytes (standard FHSIZE)
+//
+// Threading: fetches run on DbServerClient's NFS thread, one at a time;
+// cancel(), removePlayer() and clearPdbCache() may be called from any thread.
 
 #pragma once
 #include <JuceHeader.h>
