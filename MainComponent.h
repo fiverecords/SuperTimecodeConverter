@@ -179,6 +179,7 @@ private:
 
     std::unique_ptr<AudioScanThread> scanThread;
     bool settingsLoaded = false;
+    bool audioDevicesApplied = false;   // the first scan's results opened the audio devices
 
     juce::Array<AudioDeviceEntry> scannedAudioInputs;
     juce::Array<AudioDeviceEntry> scannedAudioOutputs;

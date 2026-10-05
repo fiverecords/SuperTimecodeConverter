@@ -2034,7 +2034,15 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblOutputThruStatus); styleLabel(lblOutputThruStatus); lblOutputThruStatus.setColour(juce::Label::textColourId, accentCyan);
 
     rightContent.addAndMakeVisible(btnRefreshDevices);
-    btnRefreshDevices.onClick = [this] { populateMidiAndNetworkCombos(); startAudioDeviceScan(); };
+    // Locked like the device selectors: the rescan ends in applyAudioSettings,
+    // which reopens LTC in and out, Audio Thru and the generators' audio on
+    // every engine -- a gap on every LTC output (AUDIT UI-1).
+    btnRefreshDevices.onClick = [this]
+    {
+        if (isShowLocked()) return;
+        populateMidiAndNetworkCombos();
+        startAudioDeviceScan();
+    };
     btnRefreshDevices.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
     btnRefreshDevices.setColour(juce::TextButton::textColourOffId, textMid);
 
@@ -4085,7 +4093,15 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
     scannedAudioInputs  = inputs;
     scannedAudioOutputs = outputs;
     populateAudioCombos();
-    applyAudioSettings();
+    // The first scan opens the configured audio devices.  A later one
+    // (Refresh Devices) reopens all of them; if Show Lock was engaged while
+    // it ran, only the lists are updated and the running devices are left
+    // alone, as Refresh Devices itself is locked (AUDIT UI-1).
+    if (!audioDevicesApplied || !settings.showModeLocked)
+    {
+        applyAudioSettings();
+        audioDevicesApplied = true;
+    }
     syncUIFromEngine();  // Re-populate Audio BPM device combo now that scan data is available
 }
 
@@ -8939,19 +8955,23 @@ void MainComponent::timerCallback()
 //==============================================================================
 bool MainComponent::keyPressed(const juce::KeyPress& key)
 {
-    // Ctrl+Shift+E (Cmd+Shift+E on Mac): export full configuration backup
+    // Ctrl+Shift+E (Cmd+Shift+E on Mac): export full configuration backup.
+    // Locked like the Backup button.
     if (key.getModifiers().isCommandDown() && key.getModifiers().isShiftDown()
         && key.getKeyCode() == 'E')
     {
-        exportConfig();
+        if (!isShowLocked())
+            exportConfig();
         return true;
     }
 
-    // Ctrl+Shift+I (Cmd+Shift+I on Mac): import full configuration backup
+    // Ctrl+Shift+I (Cmd+Shift+I on Mac): import full configuration backup.
+    // Locked like the Restore button (AUDIT UI-2).
     if (key.getModifiers().isCommandDown() && key.getModifiers().isShiftDown()
         && key.getKeyCode() == 'I')
     {
-        importConfig();
+        if (!isShowLocked())
+            importConfig();
         return true;
     }
 
