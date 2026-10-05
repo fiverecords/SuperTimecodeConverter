@@ -237,12 +237,17 @@ public:
         if (lastRowSelected >= 0 && lastRowSelected < (int)rows.size())
         {
             auto& p = rows[(size_t)lastRowSelected];
+            editingName = p.name;
             edName.setText(p.name, false);
             edStartTC.setText(p.startTC, false);
             edStopTC.setText(p.stopTC, false);
             edAudio.setText(p.audioFilePath, false);
             btnLoopAudio.setToggleState(p.audioLoop, juce::dontSendNotification);
             updateStopTCEnabledState();
+        }
+        else
+        {
+            editingName.clear();
         }
         // If the cue editor window is open on a different preset, close it
         // to avoid showing cues that don't belong to the current selection.
@@ -370,6 +375,14 @@ private:
 
     std::vector<GeneratorPreset> rows;
 
+    // Name of the preset the form was loaded from (the map compares names
+    // case-insensitively): set when a row is selected, cleared when the
+    // selection is.  SAVE updates this preset.  The selected row is only
+    // an index into `rows`, which an Import rebuilds without touching the
+    // selection or the form, so the highlighted row could name another
+    // preset (AUDIT Part 7, the class of AUDIT SET-3).  Message thread.
+    juce::String editingName;
+
     // Buttons
     juce::TextButton btnAdd, btnSave, btnDelete, btnCues, btnClearAll;
     juce::TextButton btnImport, btnExport, btnOscHelp;
@@ -418,9 +431,34 @@ private:
         presetMap.save();
         rebuildRows();
         table.updateContent();
+        reselectEditedPreset();
         table.repaint();
         updateButtonStates();
         if (onChange) onChange();
+    }
+
+    /// Row of the preset called `name` in `rows`, or -1.
+    int rowOfPreset(const juce::String& name) const
+    {
+        for (int i = 0; i < (int)rows.size(); ++i)
+            if (rows[(size_t)i].name.equalsIgnoreCase(name))
+                return i;
+        return -1;
+    }
+
+    /// After the rows were rebuilt, put the highlight back on the preset the
+    /// form edits (editingName), without reloading the form.  When that
+    /// preset is gone (deleted), nothing is selected and the form is no
+    /// longer bound to a preset.
+    void reselectEditedPreset()
+    {
+        const int row = editingName.isNotEmpty() ? rowOfPreset(editingName) : -1;
+        juce::SparseSet<int> sel;
+        if (row >= 0)
+            sel.addRange({ row, row + 1 });
+        else
+            editingName.clear();
+        table.setSelectedRows(sel, juce::dontSendNotification);
     }
 
     /// Normalise a typed Start/Stop TC through TimecodeCore's shared text
@@ -532,12 +570,13 @@ private:
         }
     }
 
-    /// SAVE updates the currently-selected preset in place.  The name field
-    /// can be edited to rename the preset, but only if the new name is not
-    /// already used by a *different* preset -- in that case we refuse and
-    /// tell the user, so SAVE never silently overwrites someone else's
-    /// preset.  When no row is selected, SAVE is a no-op (the button is
-    /// disabled in that state, but we double-check defensively).
+    /// SAVE updates the preset the form was loaded from (editingName) in
+    /// place.  The name field can be edited to rename the preset, but only
+    /// if the new name is not already used by a *different* preset -- in
+    /// that case we refuse and tell the user, so SAVE never silently
+    /// overwrites someone else's preset.  When no row is selected, SAVE is
+    /// a no-op (the button is disabled in that state, but we double-check
+    /// defensively).
     void saveSelectedPreset()
     {
         auto name = edName.getText().trim();
@@ -547,15 +586,13 @@ private:
             return;
         }
 
-        int sel = table.getSelectedRow();
-        if (sel < 0 || sel >= (int)rows.size())
+        // The preset the form shows, by name -- not rows[selected row],
+        // which an Import can have moved -- and by value: notifyChange()
+        // changes editingName.
+        const juce::String oldName = editingName;
+        if (oldName.isEmpty())
             return;  // nothing selected; UI should already prevent this
-
-        // Snapshot the existing name *by value* before any mutation -- the
-        // rows[] vector is rebuilt by notifyChange(), so a reference into
-        // it would dangle the moment we touch the map.
-        const juce::String oldName     = rows[(size_t)sel].name;
-        const bool         nameChanged = ! oldName.equalsIgnoreCase(name);
+        const bool nameChanged = ! oldName.equalsIgnoreCase(name);
 
         // If the user typed a name that belongs to a *different* preset,
         // refuse the rename rather than silently clobber it.  We're already
@@ -601,18 +638,14 @@ private:
         if (name != edName.getText())
             edName.setText(name, juce::dontSendNotification);
         presetMap.addOrUpdate(p);
+        // The form now edits the preset under its (possibly new) name;
+        // notifyChange() keeps it selected, so a subsequent SAVE works
+        // without clicking the row again.  A rename can move it in the
+        // name-sorted list: bring it into view.
+        editingName = name;
         notifyChange();
-
-        // Re-select the (possibly renamed) preset so subsequent SAVE keeps
-        // working without needing to click the row again.
-        for (int i = 0; i < (int)rows.size(); ++i)
-        {
-            if (rows[(size_t)i].name.equalsIgnoreCase(name))
-            {
-                table.selectRow(i);
-                break;
-            }
-        }
+        if (const int row = rowOfPreset(name); row >= 0)
+            table.scrollToEnsureRowIsOnscreen(row);
     }
 
     void deleteSelected()
@@ -625,7 +658,7 @@ private:
         closeCueEditorWindow();
 
         presetMap.remove(rows[(size_t)sel].name);
-        notifyChange();
+        notifyChange();   // the deleted preset was the form's: nothing stays selected
 
         // Clear form
         edName.clear();
