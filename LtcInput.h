@@ -110,9 +110,12 @@ public:
         return userBitsIn.load(std::memory_order_relaxed);
     }
 
-    /// Wall-clock instant (hi-res ms counter) at which the last good LTC
-    /// frame was decoded -- the frame boundary of the incoming signal.
-    /// 0 if nothing has been decoded yet.
+    /// Instant (hi-res ms counter) at which the last good LTC frame ended at
+    /// the converter -- the frame boundary of the incoming signal, dated back
+    /// from its callback by the samples after it and the input latency.
+    /// 0 if nothing has been decoded yet.  For display; the engine should
+    /// take getLiveTimecode(), which reads it together with the value (AUDIT
+    /// LTC-10).
     double getLastFrameArrivalMs() const
     {
         return lastFrameTime.load(std::memory_order_relaxed);
@@ -366,7 +369,7 @@ private:
     juce::String currentDeviceName;
     juce::String currentTypeName;
     std::atomic<bool> isRunningFlag { false };
-    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (D10)
+    std::atomic<double> timeoutMs { kSourceTimeoutMs };   // freewheel window (AUDIT D10)
     std::atomic<int> selectedChannel { 0 };
     std::atomic<int> passthruChannel { -1 };
     int numChannelsAvailable = 0;
@@ -392,8 +395,13 @@ private:
     std::atomic<uint32_t> passthruUnderruns { 0 };
     std::atomic<uint32_t> passthruOverruns  { 0 };
 
-    // Safe to call from audioDeviceAboutToStart(): JUCE guarantees no audio
-    // callbacks are active during device start, so no concurrent reader/writer.
+    // Called from audioDeviceAboutToStart(), when this device's callback (the
+    // writer) is not running.  The reader may be: AudioThru on another device
+    // keeps reading through a restart of this one, and readPassthruSamples
+    // resynchronises when it finds the positions reset under it (AUDIT C12;
+    // at worst a buffer of silence or stale samples).  The ring is allocated
+    // on the first start, before any reader exists: AudioThru starts only
+    // with LTC IN running (TimecodeEngine::startThruOutput).
     void resetPassthruBuffer()
     {
         passthruWritePos.store(0, std::memory_order_relaxed);
@@ -579,7 +587,7 @@ private:
         lastSyncClosedFrame = true;
         samplesSinceLastSync = 0.0;
 
-        // --- Binary group flags (12M-1 Table 2) ---
+        // --- Binary group flags (12M-1 Table 3) ---
         // BGF1 is bit 58 at every rate; BGF0/BGF2 are bits 43/59 at 24 and
         // 30 fps and 27/43 at 25 fps.  Reported alongside the user bits so
         // the reader can decode what the sender declared (ST 309 date, eight-
@@ -616,7 +624,7 @@ private:
         // earlier than the callback start, plus the device's input latency.
         // Stamping with the callback time put the frame boundary up to a
         // buffer late and made it jitter by a buffer, which the phase
-        // published to the LTC encoder (D5) inherited.
+        // published to the LTC encoder (DESIGN D5) inherited.
         const double arrivalMs = decodeCallbackStartMs
                                - (double)(decodeSamplesRemaining) * 1000.0 / currentSampleRate
                                - inputLatencyMs;

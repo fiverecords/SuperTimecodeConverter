@@ -74,7 +74,9 @@ public:
         g.setColour(juce::Colour(0xFF2A2D35));
         g.drawRoundedRectangle(bounds, cornerSize, 0.5f);
 
-        // Tick marks at -12dB (~0.25), -6dB (~0.5), 0dB (~1.0)
+        // Tick marks at a quarter, half and three quarters of full scale.
+        // The level is linear peak amplitude, so they sit at about -12, -6
+        // and -2.5 dBFS; full scale (0 dBFS) is the right edge.
         g.setColour(juce::Colour(0xFF2A2D35).withAlpha(0.6f));
         float tickPositions[] = { 0.25f, 0.5f, 0.75f };
         for (float tp : tickPositions)

@@ -85,9 +85,12 @@ public:
 
     /// Publish where the timecode clock currently sits inside its frame, in
     /// milliseconds, as measured by the source itself (see the phase section
-    /// in TimecodeEngine).  Called once per engine tick; the encoder uses it
-    /// only when it (re)seeds, to start its frame at the matching position
-    /// instead of at bit 0 of whichever audio buffer arrives first.
+    /// in TimecodeEngine).  Called once per engine tick; the encoder ages it
+    /// to the connector at every frame boundary: a (re)seed starts its frame
+    /// at the matching position instead of at bit 0 of whichever audio
+    /// buffer arrives first, the phase lock compares its own boundary with it
+    /// (DESIGN D24), and the value tracking ages the published value by the
+    /// whole frames it contains (DESIGN D25).
     ///
     /// Deriving this from the source rather than from the tick matters: the
     /// engine ticks at 60Hz, which at 30fps is exactly twice the frame rate,
@@ -111,20 +114,26 @@ public:
     /// callback (buffer) count -- see packFrame.  Off in normal use.
     void setBufferCounterUserBits(bool on) { bufferCounterUserBits.store(on, std::memory_order_relaxed); }
 
-    /// Output gaps seen since start (device ran dry between callbacks; the
-    /// encoder re-seeds at the published phase each time).  For the status
-    /// line: an interface that keeps doing this is worth knowing about.
+    /// Late callbacks seen since start (from three quarters of a period).
+    /// The encoder re-seeds at the published phase only for a hole -- a
+    /// callback late by more than a period and by more than half a frame;
+    /// a merely late one is absorbed (DESIGN D30), and getLastGapReseeded
+    /// says which the last one was.
+    /// For the status line: an interface that keeps doing this is worth
+    /// knowing about.
     int    getOutputGapCount() const { return outputGapCount.load(std::memory_order_relaxed); }
     double getLastGapMs() const      { return lastGapMs.load(std::memory_order_relaxed); }
     bool   getLastGapReseeded() const { return lastGapReseeded.load(std::memory_order_relaxed); }
 
     /// Every value correction and re-seed the encoder makes, counted on the
-    /// audio thread so the engine can write each one to ltc_gaps.log next
-    /// to the holes (D30): a logic-analyser capture of a skipped or repeated
-    /// frame can then be lined up with what STC saw at that instant.
-    /// kind: 1 the encoder was ahead (a frame repeated), 2 behind (a frame
-    /// skipped), 3 a seek (snapped), 4 re-seeded after a hole, 5 re-seeded
-    /// after a snap.
+    /// audio thread.  The engine writes the last one, with the running total,
+    /// to ltc_gaps.log next to the holes (DESIGN D30), once per tick: several
+    /// events between two ticks show as one line whose total jumps.  A
+    /// logic-analyser capture of a skipped or repeated frame can then be
+    /// lined up with what STC saw at that instant.
+    /// kind: 1 the encoder was ahead, or the publication stopped past the
+    /// grace (a frame repeated), 2 behind (a frame skipped), 3 a seek
+    /// (snapped), 4 re-seeded after a hole, 5 re-seeded after a snap.
     int      getTrackEventCount() const { return trackEventCount.load(std::memory_order_relaxed); }
     int      getLastTrackKind() const   { return lastTrackKind.load(std::memory_order_relaxed); }
     int64_t  getLastTrackD() const      { return lastTrackD.load(std::memory_order_relaxed); }
@@ -132,8 +141,8 @@ public:
     Timecode getLastTrackRef() const    { return unpackTimecode(lastTrackRef.load(std::memory_order_relaxed)); }
 
     /// Output latency the device reports, in milliseconds (0 if unknown).
-    /// Used by the AUTO compensation mode; ASIO drivers are not always
-    /// truthful about this, which is why a manual trim also exists.
+    /// The compensation applied is this, clamped to 0-100 ms; there is no
+    /// manual trim (DESIGN D6).
     double getDeviceReportedLatencyMs() const
     {
         return deviceLatencyMs.load(std::memory_order_relaxed);
@@ -194,14 +203,14 @@ private:
     // Frame-phase alignment (issue #15): see setFramePhaseMs above.
     // Sub-frame phase published by the engine: how far into the frame the
     // timecode clock was (framePhaseMs) at the instant it was published
-    // (framePhaseAtMs).  The encoder ages it forward to the moment it seeds.
-    // Phase lock (D9), audio thread only except the atomic for the bench.
+    // (framePhaseAtMs).  The encoder ages it forward to every frame boundary.
+    // Phase lock (DESIGN D24), audio thread only except the atomic for the bench.
     bool valueSnapped = false;    // packFrame saw the tracking policy snap (source seek)
-    double lockAdj = 0.0;         // fraction of the bit clock, +/- kLockMaxAdj
+    double lockAdj = 0.0;         // fraction of the bit clock (+/- kLockMaxAdj; kLockSlewMaxAdj slewing)
     double lockIntegral = 0.0;
     double lockErrFilt = 0.0;
-    bool   lockSlewing = false;   // absorbing a step the PI cannot reach (D27)
-    int     trackOffFrames = 0;   // boundaries in a row the reference has disagreed (D30)
+    bool   lockSlewing = false;   // absorbing a step the PI cannot reach (DESIGN D27)
+    int     trackOffFrames = 0;   // boundaries in a row the reference has disagreed (DESIGN D30)
     int64_t trackOffD      = -1;  // the disagreement being counted
     bool    heldPastGrace  = false;  // packFrame is holding a frame past the grace (AUDIT LTC-11)
     std::atomic<double> lastLockErrorMs { 0.0 };
@@ -299,14 +308,15 @@ private:
         double pitch = pitchMultiplier.load(std::memory_order_relaxed);
         if (pitch <= 0.0) pitch = 1.0;
         // Scale bit duration by pitch: faster pitch -> shorter bits -> more
-        // frames/sec.  lockAdj (D9) trims the bit clock by up to +/-200 ppm
-        // to hold the frame phase on the source's clock: positive when the
+        // frames/sec.  lockAdj (DESIGN D24) trims the bit clock to hold the
+        // frame phase on the source's clock -- up to +/-200 ppm in the PI, up
+        // to 2 % while it slews out a step (DESIGN D27): positive when the
         // encoder is late (shorter bits catch up).
         samplesPerHalfBit = currentSampleRate / (fps * pitch * LTC_FRAME_BITS * 2.0) * (1.0 - lockAdj);
     }
 
     //==========================================================================
-    // Phase lock (D9).
+    // Phase lock (DESIGN D24).
     //
     // The bit stream runs on the audio device's clock; the timecode it
     // carries runs on the source's (the CPU for the generator, the deck for
@@ -323,18 +333,23 @@ private:
     // +/-200 ppm limit (a receiver's tolerance, and more than any pair of
     // clocks differs).  Drift is absorbed by the integral, jitter in the
     // publication (MTC arrivals, deck packets) is filtered by the loop's
-    // ~10 s time constant, and a persistent error of more than
-    // kLockSlewEnterMs -- a hole the interface made without delaying the
-    // callback, which the cadence detector cannot see -- is absorbed by
-    // running the bit clock fast or slow until it is gone (D27), rather than
-    // by a 50-second crawl at 200 ppm or by jumping.  Everything here runs on
-    // the audio thread, once per frame.
+    // time constant -- about 20 s: the PI is critically damped, and
+    // 1/sqrt(kLockKi) is 20 s -- and a persistent error of more than
+    // kLockSlewEnterMs -- a step in the source's timeline: a clock
+    // re-anchor, an MTC locate the decoder absorbed, a publication hiccup --
+    // is absorbed by running the bit clock fast or slow until it is gone
+    // (DESIGN D27), rather than by a 50-second crawl at 200 ppm or by
+    // jumping.  What the lock cannot see is a hole the interface makes
+    // without delaying the callback: it moves the boundary on the wire, not
+    // the one the encoder intends, which is what the lock measures
+    // (DESIGN D24; see lockStep).  Everything here runs on the audio
+    // thread, once per frame.
     //==========================================================================
     static constexpr double kLockKp          = 0.1;      // per second
     static constexpr double kLockKi          = 0.0025;   // per second squared (critically damped)
     static constexpr double kLockMaxAdj      = 200e-6;   // +/- fraction of the bit clock
 
-    // Slew, not jump (D27).  A phase error this loop cannot absorb at 200 ppm
+    // Slew, not jump (DESIGN D27).  A phase error this loop cannot absorb at 200 ppm
     // used to re-seed, and a seed starts the codeword part-way through by
     // design (issue #15), so it costs one frame no decoder can read -- which
     // is what @mungewell's captures show as a short unreadable stretch with
@@ -343,7 +358,7 @@ private:
     // moves the boundary just as well and every frame stays whole.  A source
     // that genuinely jumped still re-seeds, through the value snapping, which
     // is a different path.
-    // Persistence gate on value corrections (D30): how many boundaries in a
+    // Persistence gate on value corrections (DESIGN D30): how many boundaries in a
     // row the reference has to disagree with the encoder before the shared
     // policy is consulted.  An engine tick is a fraction of a frame, so a
     // reference that is wrong for one tick can never get here; a real offset
@@ -356,19 +371,22 @@ private:
     static constexpr double kLockSlewMs      = 1000.0;     // clear the error in about a second
 
     // How long the encoder keeps carrying the source's value forward on its
-    // own when the engine's publication stops arriving (D26).  The engine
-    // ticks at 60 Hz, so a publication older than this by any margin means its
-    // thread is not running -- a display wake on Windows costs a quarter of a
-    // second of it.  A deliberate freeze never gets here: the engine marks the
-    // output paused and republishes every tick, which is the branch above.
+    // own when the engine's publication stops arriving (DESIGN D26).  The
+    // engine ticks at 60 Hz, so a publication older than this by any margin
+    // means its thread is not running -- a display wake on Windows costs a
+    // quarter of a second of it.  A deliberate freeze never gets here: the
+    // engine marks the output paused and republishes every tick, which is
+    // packFrame's hold-on-pause branch.
     //
     // The limit is not precision.  Extrapolating on the interface's clock, a
     // clock difference of 50 ppm is 50 microseconds of error in a second.  It
     // is how long the encoder may keep assuming the source is still moving
-    // when nothing has confirmed it.  Past it the value holds, the tracking
-    // repeats frames, and a stalled timecode on the wire is the visible sign
-    // that the application is not running -- which is the failure worth
-    // seeing.
+    // when nothing has confirmed it.  Past it the reference stops; the
+    // encoder runs on alone until it is a seek's distance from it, then
+    // holds -- packFrame repeats the frame until the engine publishes again
+    // and catches up in one step (AUDIT LTC-11) -- and a stalled timecode on
+    // the wire is the visible sign that the application is not running,
+    // which is the failure worth seeing.
     static constexpr double kPublicationGraceMs = 1000.0;
 
     /// Called at a frame boundary that is not a seed.  `boundaryConnectorMs`
@@ -402,7 +420,8 @@ private:
         // whatever rate clears it in about a second, and every frame on the
         // wire stays whole while it happens.  (A DAC-side hole is NOT what
         // this sees: that moves the actual boundary without touching the
-        // encoder's timeline, and nothing inside STC can measure it -- D24.)
+        // encoder's timeline, and nothing inside STC can measure it --
+        // DESIGN D24.)
         lockErrFilt += 0.1 * (eMs - lockErrFilt);
 
         const double absErr = std::abs(lockErrFilt);
@@ -436,10 +455,11 @@ private:
     /// the first frame after a (re)seed: the number of whole frames the
     /// timecode clock has moved since the value in pendingTc was published
     /// (see the phase alignment in the audio callback).
-    /// publishedAheadFrames is that same count for THIS frame, seed or not:
-    /// the frame being packed is the one that reaches the connector that many
-    /// source frames after the publication, and the tracking below has to age
-    /// the published value by it (issue #21).
+    /// publishedAheadFrames is the count for THIS frame, seed or not, taken
+    /// half a frame further back than the seed's (see the callback): the
+    /// frame being packed is the one that reaches the connector about that
+    /// many source frames after the publication, and the tracking below has
+    /// to age the published value by it (issue #21, DESIGN D25).
     /// referenceFrozen: the publication is older than the grace allows
     /// (kPublicationGraceMs), so the aged reference has stopped moving.
     void packFrame(int seedAdvanceFrames = 0, int publishedAheadFrames = 0, bool referenceFrozen = false)
@@ -470,7 +490,7 @@ private:
             // tracking policy (TimecodeCore) correct one frame at a time
             // towards the engine value, or snap on a real seek.  The bit clock
             // already follows pitch (pitchMultiplier) and the phase lock
-            // (D24) holds the phase, so here only what the lock cannot
+            // (DESIGN D24) holds the phase, so here only what the lock cannot
             // absorb shows up.  A snap means the source jumped: the phase
             // has to follow the value, so the boundary is re-seeded too
             // (see valueSnapped in the callback).
@@ -490,7 +510,7 @@ private:
             const Timecode next = incrementFrame(encoderTc, fps);
             const int64_t d = frameDistance(publishedAtConnector, next, fps);   // reference - next
 
-            // Persistence gate (D30).  The reference is a fresh measurement at
+            // Persistence gate (DESIGN D30).  The reference is a fresh measurement at
             // every boundary, and a wrong one for a single engine tick used
             // to cost a frame on the wire: the shared policy corrects at
             // once.  So it is only consulted when the same disagreement has
@@ -730,18 +750,20 @@ private:
         ++callbackCounter;
 
         // --- Output gap detector (issue #19) ---
-        // A callback that arrives much later than one period after the
-        // previous one means the device ran dry in between: it played
-        // silence (or stale data) for the missing time and then resumed our
-        // stream where it left off, so everything after it is late by the
-        // length of the hole.  Seen on a display wake with two USB
-        // interfaces: a 10.0 ms hole on one, a 24.5 ms one on the other --
-        // the hole is the length of the stall, not a whole number of device
-        // periods, so it is not measured and skipped; the encoder re-seeds
-        // at the phase the engine publishes (D5), which is where the frame
-        // boundary should be NOW whatever the hole was.  The frame in
-        // progress is cut short: one glitchy frame on top of the glitch the
-        // hole already was, then the phase is back on the wire.
+        // A callback that arrives more than a period late (and more than half
+        // a frame) means the device ran dry in between: it played silence (or
+        // stale data) for the missing time and then resumed our stream where
+        // it left off, so everything after it is late by the length of the
+        // hole.  Seen on a display wake with two USB interfaces: a 10.0 ms
+        // hole on one, a 24.5 ms one on the other -- the hole is the length
+        // of the stall, not a whole number of device periods, so it is not
+        // measured and skipped; the encoder re-seeds at the phase the engine
+        // publishes (DESIGN D5), which is where the frame boundary should be
+        // NOW whatever the hole was.  The frame in progress is cut short: one
+        // glitchy frame on top of the glitch the hole already was, then the
+        // phase is back on the wire.  A callback late by less -- from three
+        // quarters of a period -- is counted and logged but not re-seeded
+        // (DESIGN D30, below).
         {
             const double expectedMs = (double) numSamples * 1000.0 / currentSampleRate;
             if (lastCallbackMs > 0.0 && expectedMs > 0.0)
@@ -755,14 +777,14 @@ private:
                     outputGapCount.fetch_add(1, std::memory_order_relaxed);
                     lastGapMs.store(gapMs, std::memory_order_relaxed);
 
-                    // Re-seeded only for a hole (D30).  A double-buffered
+                    // Re-seeded only for a hole (DESIGN D30).  A double-buffered
                     // driver has one period of slack, so a callback less
                     // than a period late did not starve the DAC: the
                     // samples on the wire are still contiguous, and a
                     // re-seed would be the only thing to break them -- it
                     // starts the codeword part-way through.  And a hole
                     // under half a frame is one the lock slews out with
-                    // every frame whole (D27); only a longer one is worth
+                    // every frame whole (DESIGN D27); only a longer one is worth
                     // an instant re-alignment.  At a MOTU's 512-sample
                     // period the old three-quarter threshold was 8 ms,
                     // which Windows scheduling reaches on its own.
@@ -867,7 +889,7 @@ private:
                         // source can legitimately have moved is what this
                         // buffer and the output latency hold -- plus, while
                         // the engine's publication is not arriving at all,
-                        // whatever grace D26 allows for carrying it forward.
+                        // whatever grace DESIGN D26 allows for carrying it forward.
                         // The fixed ceiling of 8 frames this replaces was
                         // itself short of an 8192-sample buffer at 30 fps.
                         const double maxAhead =
@@ -913,7 +935,7 @@ private:
 
                 if (! seeding && samplesPerHalfBit > 0.0)
                 {
-                    // Phase lock step at this boundary (D9): where is the
+                    // Phase lock step at this boundary (DESIGN D24): where is the
                     // source's boundary relative to the one we are about to
                     // put on the wire?  Recomputes the bit clock if it trims.
                     lockStep(connectorMs);
@@ -1017,9 +1039,9 @@ private:
         {
             currentSampleRate = device->getCurrentSampleRate();
             currentBufferSize = device->getCurrentBufferSizeSamples();
-            // Latency the driver claims for its output path, in ms.  Offered
-            // to the UI as the AUTO compensation value; ASIO drivers are
-            // often optimistic here, hence the manual trim alongside it.
+            // Latency the driver claims for its output path, in ms.  ASIO
+            // drivers are often optimistic here; there is no manual trim
+            // (DESIGN D6), the value below is what is applied.
             const int latSamples = device->getOutputLatencyInSamples();
             const double latMs = currentSampleRate > 0.0
                                      ? (double)latSamples * 1000.0 / currentSampleRate

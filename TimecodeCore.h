@@ -40,8 +40,9 @@ struct Timecode
         return juce::String::formatted("%02d:%02d:%02d.%02d", hours, minutes, seconds, frames);
     }
 
-    // SMPTE-standard display: uses ';' as frame separator for drop-frame,
-    // ':' for non-drop-frame (broadcast convention per SMPTE ST 12-1)
+    // Display string, HH:MM:SS.FF with '.' before the frames at every rate
+    // (see below: SMPTE ST 12-1's convention is ';' for drop-frame and ':'
+    // otherwise, and STC deliberately does not follow it here).
     // Clamps values to valid SMPTE ranges to prevent garbled display from
     // corrupt or uninitialised data.
     juce::String toDisplayString(FrameRate /*fps*/) const
@@ -142,7 +143,10 @@ inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
 // Source activity timeout: if no data arrives within this window,
 // the source is considered paused.  MTC at 24fps sends QF every ~10ms,
 // Art-Net at 30fps sends a packet every ~33ms, LTC frames arrive every
-// ~33-42ms.  150ms covers several missed frames with margin.
+// ~33-42ms.  150ms covers several missed frames with margin.  This is the
+// default freewheel (AUDIT D10); the operator can set 50-5000 ms per
+// engine, and LTC IN adds its device period and input latency on top
+// (LtcInput::isReceivingAt).
 //==============================================================================
 inline constexpr double kSourceTimeoutMs = 150.0;
 
@@ -327,7 +331,7 @@ inline Timecode wallClockToTimecode(double msSinceMidnight, FrameRate fps)
         // wall clock and fitted 24 numbers into each real second, which put
         // one number too many on the 23.976 carrier every 41.7 s and made a
         // video server counting clip frames drift 3.6 s per hour from the
-        // audio.  D20.)
+        // audio.  DESIGN D20.)
         const double  exactFps    = 24000.0 / 1001.0;
         const int64_t totalFrames = (int64_t)(msSinceMidnight / 1000.0 * exactFps + 1e-9);
         return frameIndexToTimecode(totalFrames, fps);
@@ -412,11 +416,11 @@ inline Timecode applyTimecodeOffset(const Timecode& tc, FrameRate tcFps,
     double totalMs = tcMs + offMs;
 
     // Wrap at 24 hours of THIS rate's time address, which is not 24 real
-    // hours at the fractional rates: a 23.976 day is 86,486,400 ms (DESIGN
-    // D20) and a 29.97 DF day 86,399,913.6 ms.  Wrapped at 86,400,000, any
-    // result past 23:58:33:17 at 23.976 came out near 00:00, and at 29.97 a
-    // result just past midnight came out two or three frames early (AUDIT
-    // ENG-12).
+    // hours at the fractional rates: a 23.976 day is 86,486,400 ms
+    // (DESIGN D20) and a 29.97 DF day 86,399,913.6 ms.  Wrapped at
+    // 86,400,000, any result past 23:58:33:17 at 23.976 came out near 00:00,
+    // and at 29.97 a result just past midnight came out two or three frames
+    // early (AUDIT ENG-12).
     const double msPerDay = (double) framesPerDay(tcFps) / frameRateToDouble(tcFps) * 1000.0;
     totalMs = std::fmod(totalMs, msPerDay);
     if (totalMs < 0.0) totalMs += msPerDay;
@@ -565,7 +569,7 @@ struct AudioDeviceEntry
 };
 
 //==============================================================================
-// Time of day, followed rather than jumped to (D31)
+// Time of day, followed rather than jumped to (DESIGN D31)
 //
 // The Generator's clock mode shows the time of day.  The wall clock is the
 // truth for WHAT time it is, but it moves in system-timer steps (up to
