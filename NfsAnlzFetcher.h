@@ -471,17 +471,64 @@ private:
     /// Cache of mounted filesystem handles: playerIP -> (mountPath -> FHandle)
     std::map<juce::String, std::map<juce::String, FHandle>> mountCache;
 
-    /// Encode a path as UTF-16LE for Pioneer NFS
+    /// Encode a path as UTF-16LE for Pioneer NFS.  Characters outside the
+    /// BMP become surrogate pairs (they were cut to their low 16 bits).
     static std::vector<uint8_t> encodeUtf16LE(const juce::String& str)
     {
         std::vector<uint8_t> result;
-        for (int i = 0; i < str.length(); i++)
+        auto putUnit = [&result](uint32_t u)
         {
-            juce::juce_wchar ch = str[i];
-            result.push_back((uint8_t)(ch & 0xFF));
-            result.push_back((uint8_t)((ch >> 8) & 0xFF));
+            result.push_back((uint8_t)(u & 0xFF));
+            result.push_back((uint8_t)((u >> 8) & 0xFF));
+        };
+        for (auto t = str.getCharPointer(); !t.isEmpty();)
+        {
+            const uint32_t ch = (uint32_t)t.getAndAdvance();
+            if (ch >= 0x10000 && ch <= 0x10FFFF)
+            {
+                putUnit(0xD800 + ((ch - 0x10000) >> 10));
+                putUnit(0xDC00 + ((ch - 0x10000) & 0x3FF));
+            }
+            else
+            {
+                putUnit(ch <= 0xFFFF ? ch : 0xFFFD);
+            }
         }
         return result;
+    }
+
+    /// Decode @p numUnits UTF-16 code units (big- or little-endian), stopping
+    /// at the first NUL.  Surrogate pairs become one character; an unpaired
+    /// surrogate becomes U+FFFD.
+    static juce::String decodeUtf16(const uint8_t* p, int numUnits, bool bigEndian)
+    {
+        std::vector<juce::juce_wchar> chars;
+        chars.reserve((size_t)juce::jmax(0, numUnits) + 1);
+        auto unitAt = [p, bigEndian](int i) -> uint32_t
+        {
+            return bigEndian ? (uint32_t)((p[i * 2] << 8) | p[i * 2 + 1])
+                             : (uint32_t)(p[i * 2] | (p[i * 2 + 1] << 8));
+        };
+        for (int i = 0; i < numUnits; ++i)
+        {
+            uint32_t u = unitAt(i);
+            if (u == 0) break;
+            if (u >= 0xD800 && u <= 0xDBFF && i + 1 < numUnits)
+            {
+                const uint32_t lo = unitAt(i + 1);
+                if (lo >= 0xDC00 && lo <= 0xDFFF)
+                {
+                    chars.push_back((juce::juce_wchar)(0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)));
+                    ++i;
+                    continue;
+                }
+            }
+            if (u >= 0xD800 && u <= 0xDFFF)
+                u = 0xFFFD;
+            chars.push_back((juce::juce_wchar)u);
+        }
+        chars.push_back(0);
+        return juce::String(juce::CharPointer_UTF32(chars.data()));
     }
 
     /// Mount a filesystem on the CDJ. Returns true + sets outHandle on success.
@@ -757,14 +804,7 @@ private:
             uint16_t len = readLE16(pageData + offset + 1);
             if (len < 4 || offset + (int)len > pageSize) return {};   // data is [offset+4, offset+len)
             int numChars = (int)(len - 4) / 2;
-            juce::String result;
-            for (int i = 0; i < numChars; i++)
-            {
-                uint16_t ch = readLE16(pageData + offset + 4 + i * 2);
-                if (ch == 0) break;
-                result += juce::String::charToString((juce::juce_wchar)ch);
-            }
-            return result;
+            return decodeUtf16(pageData + offset + 4, numChars, false);
         }
         else
         {
@@ -1081,14 +1121,7 @@ private:
                     && commentBytes <= entryLen - 0x2C)
                 {
                     int numChars = (int)commentBytes / 2;
-                    juce::String comment;
-                    for (int ci = 0; ci < numChars; ci++)
-                    {
-                        uint16_t ch = readBE16(e + 0x2C + ci * 2);
-                        if (ch == 0) break;
-                        comment += juce::String::charToString((juce::juce_wchar)ch);
-                    }
-                    cue.comment = comment.trimEnd();
+                    cue.comment = decodeUtf16(e + 0x2C, numChars, true).trimEnd();
                 }
             }
 
