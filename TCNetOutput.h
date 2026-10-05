@@ -889,17 +889,16 @@ private:
         uint8_t p[32] = {};
         hdr(p, kMsgTimeSync, 5);
 
-        // Timestamp in microseconds since start. TCNet spec describes this
-        // as "microseconds within a second" (0-999999) but observed traffic
-        // from ChamSys MagicQ uses an accumulating microsecond counter (the
-        // values grow monotonically into the billions). Emit an accumulating
-        // counter to match: use our uptime in microseconds, which fits in
-        // uint32_t for about 71 minutes before wrapping and that's fine for
-        // sync -- both sides just need consistent time bases to compute
-        // relative delay.
-        uint32_t nowUs = (uint32_t)((juce::Time::getHighResolutionTicks()
-                                   * 1000000LL)
-                                  / juce::Time::getHighResolutionTicksPerSecond());
+        // Timestamp: an accumulating microsecond counter. TCNet spec
+        // describes this as "microseconds within a second" (0-999999) but
+        // observed traffic from ChamSys MagicQ uses an accumulating
+        // microsecond counter (the values grow monotonically into the
+        // billions). Emit one to match: the hi-res counter in microseconds
+        // -- the system's uptime on every platform, not STC's -- truncated
+        // to uint32_t, so it wraps every 71.6 minutes; that's fine for sync
+        // -- both sides just need consistent time bases to compute relative
+        // delay.
+        uint32_t nowUs = (uint32_t) hiResMicros();
         w32(p + 20, nowUs);
 
         p[24] = (uint8_t)(step + 1);  // advance step
@@ -1119,15 +1118,32 @@ private:
         w16(p + 18, 0x0007);  // NodeOptions (matches Bridge)
 
         // Timestamp: microseconds within the current second (0-999999) per
-        // spec. This is what receivers use to compute network latency and
-        // to discriminate "live" nodes from stale ones. Was previously 0
-        // which may cause some consoles (ChamSys MagicQ) to treat the node
-        // as not active.
-        uint32_t nowUs = (uint32_t)(((juce::Time::getHighResolutionTicks()
-                                    * 1000000LL)
-                                   / juce::Time::getHighResolutionTicksPerSecond())
-                                  % 1000000);
+        // spec -- of the hi-res counter, whose seconds are not aligned to
+        // any clock a receiver has (AUDIT B11). This is what receivers use
+        // to compute network latency and to discriminate "live" nodes from
+        // stale ones. Was previously 0 which may cause some consoles
+        // (ChamSys MagicQ) to treat the node as not active.
+        uint32_t nowUs = (uint32_t)(hiResMicros() % 1000000);
         w32(p + 20, nowUs);
+    }
+
+    /// The hi-res counter in microseconds.  Computed as ticks * 1000000 /
+    /// ticksPerSecond, the product overflowed int64 once the counter passed
+    /// 9.2e12 ticks: 2.6 hours after boot with a 1 GHz counter (Intel Macs),
+    /// 4.4 days at 24 MHz (Apple Silicon), 10.7 days at 10 MHz (Windows),
+    /// 107 days at 1 MHz (Linux) -- undefined behaviour, and garbage in both
+    /// timestamps from then on (AUDIT NET-1).  Whole seconds and the
+    /// remainder separately give the same value with no overflow.
+    static int64_t hiResMicros()
+    {
+        return ticksToMicros(juce::Time::getHighResolutionTicks(),
+                             juce::Time::getHighResolutionTicksPerSecond());
+    }
+
+    static int64_t ticksToMicros(int64_t ticks, int64_t ticksPerSecond)
+    {
+        return (ticks / ticksPerSecond) * 1000000
+             + ((ticks % ticksPerSecond) * 1000000) / ticksPerSecond;
     }
 
     void sendOptIn()
