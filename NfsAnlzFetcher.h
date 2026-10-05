@@ -1091,7 +1091,8 @@ private:
 
         // Walk the page chain
         uint32_t pageIdx = tracksFirstPage;
-        int maxPages = 5000;  // safety limit
+        // A chain longer than the file has pages is a loop in the links.
+        int maxPages = fileSize / (int)lenPage;
 
         while (maxPages-- > 0)
         {
