@@ -554,18 +554,50 @@ private:
                 auto data = downloadFile(dbPath, fileSize);
                 if (data.empty()) continue;
 
-                // Save to temp file
-                auto tempDir = juce::File::getSpecialLocation(
-                    juce::File::tempDirectory).getChildFile("STC_Denon");
-                tempDir.createDirectory();
-                auto tempFile = tempDir.getChildFile("m.db");
-                tempFile.replaceWithData(data.data(), data.size());
+                // Save to a temp file of its own (it was always STC_Denon/m.db,
+                // shared by every STC instance and never deleted); deleted
+                // again by closeDatabase()
+                removeStaleTempCopies();
+                auto tempFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                                    .getNonexistentChildFile("STC_Denon_m", ".db", false);
+                if (!tempFile.replaceWithData(data.data(), data.size()))
+                {
+                    DBG("StageLinQ DB: Could not write " + tempFile.getFullPathName());
+                    tempFile.deleteFile();
+                    return {};
+                }
 
                 DBG("StageLinQ DB: Downloaded " + juce::String((int)data.size()) + " bytes to " + tempFile.getFullPathName());
                 return tempFile;
             }
         }
         return {};
+    }
+
+    //--------------------------------------------------------------------------
+    // Copies left by a session that never closed its database (STC killed
+    // or crashed, or this thread killed by force): each download has a name
+    // of its own, so nothing else deletes them, and Windows never cleans
+    // its temp directory.  Removed before each download once they are a day
+    // old.  This client's own copy is closed by then (closeDatabase); a copy
+    // another running STC still has open cannot be deleted on Windows, and
+    // on POSIX stays readable through that STC's handle.  The STC_Denon/m.db
+    // of earlier versions (and any -journal/-wal/-shm beside it) goes the
+    // same way, then its folder if that leaves it empty.  On this thread.
+    //--------------------------------------------------------------------------
+    static void removeStaleTempCopies()
+    {
+        const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
+        const auto legacyDir = tempDir.getChildFile("STC_Denon");
+        const auto dayAgo = juce::Time::getCurrentTime() - juce::RelativeTime::days(1.0);
+        auto copies = tempDir.findChildFiles(juce::File::findFiles, false, "STC_Denon_m*.db");
+        if (legacyDir.isDirectory())
+            copies.addArray(legacyDir.findChildFiles(juce::File::findFiles, false, "m.db*"));
+        for (const auto& f : copies)
+            if (f.getLastModificationTime() < dayAgo)
+                f.deleteFile();
+        if (legacyDir.isDirectory())
+            legacyDir.deleteFile();   // removes the folder only when empty
     }
 
     //==========================================================================
@@ -902,18 +934,99 @@ private:
     //==========================================================================
     // SQLite database operations
     //==========================================================================
+    //--------------------------------------------------------------------------
+    // The database comes from the device: it is opened as untrusted input
+    // (SQLite's "defense against the dark arts", AUDIT DEP-1, SLQ-9).
+    //  - Read-only, and immutable: the file is STC's own downloaded copy,
+    //    which nothing changes, so SQLite takes no locks and creates no
+    //    -wal/-shm files beside it.  A database the device keeps in WAL
+    //    mode opens this way without its -wal, which is not downloaded:
+    //    what had not been checkpointed on the device is not seen.  If the
+    //    URI form fails to open, the plain read-only open is tried.
+    //  - SQLITE_DBCONFIG_DEFENSIVE, and no trusted schema (the C API form
+    //    of PRAGMA trusted_schema=OFF): SQL functions with side effects
+    //    cannot run from the database's own schema.
+    //  - Track (and AlbumArt, when present) must be ordinary tables: a view
+    //    or a virtual table of that name would run SQL the device supplied
+    //    whenever STC queries it.  Anything else refuses the database.
+    // The handle is closed on every failure path, and the file deleted.
+    //--------------------------------------------------------------------------
+    static std::string sqliteImmutableUri(const juce::File& f)
+    {
+        juce::String path = f.getFullPathName().replaceCharacter('\\', '/');
+        if (!path.startsWithChar('/')) path = "/" + path;      // Windows: /C:/...
+        std::string uri = "file://";
+        for (const char* p = path.toRawUTF8(); *p != 0; ++p)
+        {
+            const char c = *p;
+            if (c == '%' || c == '?' || c == '#')
+            {
+                static const char* const hexDigits = "0123456789ABCDEF";
+                uri += '%';
+                uri += hexDigits[((unsigned char)c) >> 4];
+                uri += hexDigits[((unsigned char)c) & 15];
+            }
+            else
+            {
+                uri += c;
+            }
+        }
+        return uri + "?immutable=1";
+    }
+
+    static bool queriedObjectsAreTables(sqlite3* handle)
+    {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(handle,
+                "SELECT lower(name), type, coalesce(sql, '') FROM sqlite_master "
+                "WHERE lower(name) IN ('track', 'albumart')", -1, &stmt, nullptr) != SQLITE_OK)
+            return false;
+        bool haveTrack = false, ok = true;
+        while (ok && sqlite3_step(stmt) == SQLITE_ROW)
+        {
+            const char* name = (const char*)sqlite3_column_text(stmt, 0);
+            const char* type = (const char*)sqlite3_column_text(stmt, 1);
+            const char* sql  = (const char*)sqlite3_column_text(stmt, 2);
+            const bool isTable = type != nullptr && std::strcmp(type, "table") == 0
+                && !juce::String(juce::CharPointer_UTF8(sql != nullptr ? sql : ""))
+                        .trimStart().startsWithIgnoreCase("CREATE VIRTUAL");
+            ok = isTable;
+            if (name != nullptr && std::strcmp(name, "track") == 0) haveTrack = true;
+        }
+        sqlite3_finalize(stmt);
+        return ok && haveTrack;
+    }
+
     bool openDatabase(const juce::File& dbFile)
     {
         closeDatabase();
 
-        int rc = sqlite3_open_v2(dbFile.getFullPathName().toRawUTF8(),
-                                  &db, SQLITE_OPEN_READONLY, nullptr);
+        int rc = sqlite3_open_v2(sqliteImmutableUri(dbFile).c_str(), &db,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
         if (rc != SQLITE_OK)
         {
-            DBG("StageLinQ DB: SQLite open error: " + juce::String(sqlite3_errmsg(db)));
+            DBG("StageLinQ DB: SQLite open error (immutable URI): " + juce::String(sqlite3_errmsg(db)));
+            sqlite3_close(db);   // a handle is returned even when the open fails
             db = nullptr;
+            rc = sqlite3_open_v2(dbFile.getFullPathName().toRawUTF8(), &db, SQLITE_OPEN_READONLY, nullptr);
+        }
+
+        if (rc == SQLITE_OK)
+        {
+            sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr);
+            sqlite3_db_config(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, nullptr);
+        }
+
+        if (rc != SQLITE_OK || !queriedObjectsAreTables(db))
+        {
+            DBG("StageLinQ DB: " + (rc != SQLITE_OK ? "SQLite open error: " + juce::String(sqlite3_errmsg(db))
+                                                    : juce::String("Track/AlbumArt are not plain tables -- refused")));
+            sqlite3_close(db);
+            db = nullptr;
+            dbFile.deleteFile();
             return false;
         }
+        dbTempFile = dbFile;
 
         // Count tracks for logging
         sqlite3_stmt* stmt = nullptr;
@@ -935,6 +1048,11 @@ private:
         {
             sqlite3_close(db);
             db = nullptr;
+        }
+        if (dbTempFile != juce::File())
+        {
+            dbTempFile.deleteFile();
+            dbTempFile = juce::File();
         }
         dbReady.store(false);
     }
@@ -1480,8 +1598,9 @@ private:
     std::mutex sockMutex;
     std::vector<uint8_t> fltxReadBuf;
 
-    // SQLite handle
+    // SQLite handle, and the downloaded copy it reads (deleted on close)
     sqlite3* db = nullptr;
+    juce::File dbTempFile;
     std::atomic<bool> dbReady { false };
 
     // Caches (protected by cacheMutex)
