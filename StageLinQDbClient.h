@@ -56,6 +56,18 @@ namespace StageLinQ
 
     static constexpr int kFltxChunkSize = 4096;
 
+    // Caps on sizes that come off the wire or out of the device's database
+    // (AUDIT WIRE-1, WIRE-2).  Each is compared in unsigned arithmetic of the
+    // field's own width before any cast, multiply or add.
+    //  - A downloaded database is held in memory before it is written to a
+    //    temp file: 1 GiB is well above any Engine library seen (and above
+    //    what the 30 s download allows on a LAN), and keeps a corrupt size
+    //    from asking for 4 GiB.
+    //  - An Engine DJ BLOB declares its uncompressed size; nothing decoded
+    //    here (overview waveform, cues, beat grid) comes near 10 MiB.
+    static constexpr uint32_t kMaxDbFileBytes   = 1u << 30;
+    static constexpr int32_t  kMaxBlobBytes     = 10 * 1024 * 1024;
+
     //==========================================================================
     // Build fltx request frames (with length prefix)
     //==========================================================================
@@ -582,6 +594,12 @@ private:
 
         uint32_t fileSize = resp.txFileSize;
         uint32_t txId = resp.txId;
+        if (fileSize > StageLinQ::kMaxDbFileBytes)
+        {
+            DBG("StageLinQ DB: " + path + " is " + juce::String((juce::int64)fileSize)
+                + " bytes, over the " + juce::String((juce::int64)StageLinQ::kMaxDbFileBytes) + " cap -- skipped");
+            return {};
+        }
         uint32_t totalChunks = (fileSize + StageLinQ::kFltxChunkSize - 1) / StageLinQ::kFltxChunkSize;
 
         DBG("StageLinQ DB: Transfer ID " + juce::String(txId) + ", size " + juce::String(fileSize)
@@ -591,8 +609,11 @@ private:
         auto chunkReq = StageLinQ::buildFltxChunkRange(txId, 0, totalChunks > 0 ? totalChunks - 1 : 0);
         if (!fltxWrite(chunkReq)) return {};
 
-        // Receive chunks into buffer
-        std::vector<uint8_t> fileData(fileSize, 0);
+        // Receive chunks into buffer (fileSize is capped above; an allocation
+        // that still fails ends this download, not the thread)
+        std::vector<uint8_t> fileData;
+        try { fileData.assign(fileSize, 0); }
+        catch (const std::bad_alloc&) { return {}; }
         uint32_t bytesReceived = 0;
         double deadline = juce::Time::getMillisecondCounterHiRes() + 30000.0;  // 30s timeout
 
@@ -603,12 +624,19 @@ private:
             auto chunkResp = fltxReadResponse(5000);
             if (chunkResp.messageId == StageLinQ::kFltxRespChunk && !chunkResp.chunkData.empty())
             {
-                uint32_t offset = chunkResp.chunkOffset;
-                uint32_t size = chunkResp.chunkSize;
-                if (offset + size <= fileSize)
+                // Placed at the offset the device gives, compared without
+                // the sum overflowing uint32 (AUDIT WIRE-2: offset + size
+                // wrapped and the memcpy wrote past the buffer).  A chunk
+                // that runs past the declared size keeps the part that fits:
+                // chrisle's FileTransfer.ts has seen devices overrun the
+                // file size on the final chunk.
+                const uint32_t offset = chunkResp.chunkOffset;
+                if (offset < fileSize)
                 {
-                    std::memcpy(fileData.data() + offset, chunkResp.chunkData.data(), size);
-                    bytesReceived += size;
+                    const uint32_t n = (uint32_t)juce::jmin((size_t)(fileSize - offset),
+                                                            chunkResp.chunkData.size());
+                    std::memcpy(fileData.data() + offset, chunkResp.chunkData.data(), n);
+                    bytesReceived += n;
                 }
             }
             else if (chunkResp.messageId == StageLinQ::kFltxRespEndOfMessage)
@@ -772,7 +800,8 @@ private:
                 {
                     resp.chunkOffset = StageLinQ::readU32BE(body + 16);
                     resp.chunkSize = StageLinQ::readU32BE(body + 20);
-                    if (24 + resp.chunkSize <= bodyLen)
+                    // bodyLen >= 24 here; 24 + chunkSize wrapped (AUDIT WIRE-2)
+                    if (resp.chunkSize <= bodyLen - 24)
                     {
                         resp.chunkData.assign(body + 24, body + 24 + resp.chunkSize);
                     }
@@ -1048,15 +1077,19 @@ private:
         // Minimum: 24 bytes header + 3 bytes max = 27 bytes
         if (dataSize < 27) return result;
 
-        // Parse header
-        int64_t numEntries1 = (int64_t)StageLinQ::readU64BE(data);
-        int64_t numEntries2 = (int64_t)StageLinQ::readU64BE(data + 8);
+        // Parse header.  The count is compared with the bytes there are in
+        // its own 64-bit width before any multiply or cast (AUDIT WIRE-1:
+        // (int)(numEntries1 * 3) truncated, so 0x55555556 entries passed the
+        // check and the loop below ran ~1.4 G entries past the buffer).
+        const uint64_t numEntries1 = StageLinQ::readU64BE(data);
+        const uint64_t numEntries2 = StageLinQ::readU64BE(data + 8);
         // double samplesPerPoint = StageLinQ::readF64BE(data + 16);  // not used
 
-        if (numEntries1 != numEntries2 || numEntries1 <= 0) return result;
-        if (dataSize < 24 + (int)(numEntries1 * 3) + 3) return result;
+        if (numEntries1 != numEntries2 || numEntries1 == 0) return result;
+        if (numEntries1 > (uint64_t)(dataSize - 27) / 3) return result;   // dataSize >= 27 here
 
-        int numEntries = (int)numEntries1;
+        // At most (kMaxBlobBytes - 27) / 3 entries: the decompressed size is capped
+        const int numEntries = (int)numEntries1;
 
         // Decode entries, reordering from Denon (low/mid/high) to
         // WaveformDisplay (mid/high/low) to match renderThreeBandBars()
@@ -1262,8 +1295,9 @@ private:
     static std::vector<uint8_t> zlibDecompress(const uint8_t* blob, int blobSize)
     {
         if (blobSize <= 4) return {};
+        // The declared size caps the output (a decompression bomb stops there)
         int32_t expectedSize = (int32_t)StageLinQ::readU32BE(blob);
-        if (expectedSize <= 0 || expectedSize > 10 * 1024 * 1024) return {};
+        if (expectedSize <= 0 || expectedSize > StageLinQ::kMaxBlobBytes) return {};
 
         juce::MemoryInputStream compressedStream(blob + 4, (size_t)(blobSize - 4), false);
         juce::GZIPDecompressorInputStream decompressor(

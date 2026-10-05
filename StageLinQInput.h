@@ -36,7 +36,9 @@
 #include "NetworkUtils.h"
 #include <atomic>
 #include <array>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -97,6 +99,12 @@ namespace StageLinQ
     static constexpr double kReconnectDelay        = 3.0;   // seconds before reconnect attempt
     static constexpr int    kSocketTimeoutMs       = 2000;   // TCP read timeout
     static constexpr double kDeviceTimeoutSec      = 5.0;   // no discovery = device gone
+
+    // Largest StateMap or BeatInfo block accepted from the wire; a longer
+    // length field is taken for corruption (AUDIT WIRE-3).  A StateMap value
+    // is a path and a short JSON string, a BeatInfo block 16 bytes plus 32
+    // per deck: the largest in the #23 PRIME 4+ captures are 322 and 144.
+    static constexpr uint32_t kMaxServiceBlock = 65536;
 
     // Maximum supported decks per device (Prime 4 has 4)
     static constexpr int kMaxDecksPerDevice = 4;
@@ -160,36 +168,65 @@ namespace StageLinQ
     //==========================================================================
     // UTF-16BE string encoding/decoding
     //==========================================================================
-    // Encode ASCII/Latin1 string to UTF-16BE bytes.
-    // Returns a vector of the UTF-16BE encoded bytes (no length prefix).
+    // Encode a string to UTF-16BE bytes (no length prefix).  A character
+    // above U+FFFF becomes a surrogate pair (AUDIT WIRE-9: it was cut to its
+    // low 16 bits).
     inline std::vector<uint8_t> encodeUTF16BE(const juce::String& str)
     {
         std::vector<uint8_t> result;
-        result.reserve(str.length() * 2);
-        for (int i = 0; i < str.length(); ++i)
+        result.reserve(str.getNumBytesAsUTF8() * 2);
+        auto put = [&result](uint32_t unit)
         {
-            auto ch = (uint16_t)str[i];
-            result.push_back(uint8_t(ch >> 8));
-            result.push_back(uint8_t(ch & 0xFF));
+            result.push_back(uint8_t(unit >> 8));
+            result.push_back(uint8_t(unit & 0xFF));
+        };
+        for (auto p = str.getCharPointer(); ! p.isEmpty();)
+        {
+            const uint32_t ch = (uint32_t)p.getAndAdvance();
+            if (ch > 0xFFFF && ch <= 0x10FFFF)
+            {
+                put(0xD800 + ((ch - 0x10000) >> 10));
+                put(0xDC00 + ((ch - 0x10000) & 0x3FF));
+            }
+            else
+            {
+                put(ch <= 0xFFFF ? ch : 0xFFFD);
+            }
         }
         return result;
     }
 
-    // Decode UTF-16BE bytes to a juce::String.
+    // Decode UTF-16BE bytes to a juce::String.  A surrogate pair becomes the
+    // character it encodes, a lone surrogate U+FFFD (AUDIT WIRE-9: each half
+    // was appended as a character of its own).  NUL code units are dropped,
+    // as appending them did before.  The characters are collected first and
+    // converted once: appending to a juce::String one character at a time
+    // looks for its end on every append.
     inline juce::String decodeUTF16BE(const uint8_t* data, int byteLen)
     {
-        int numChars = byteLen / 2;
-        if (numChars <= 0) return {};
+        const int numUnits = byteLen / 2;
+        if (numUnits <= 0) return {};
 
-        // Build into a pre-allocated buffer to avoid O(n^2) appends
-        juce::String result;
-        result.preallocateBytes((size_t)(numChars + 1) * sizeof(juce::juce_wchar));
-        for (int i = 0; i + 1 < byteLen; i += 2)
+        std::vector<juce::juce_wchar> chars;
+        chars.reserve((size_t)numUnits + 1);
+        for (int i = 0; i < numUnits; ++i)
         {
-            juce::juce_wchar ch = (juce::juce_wchar(data[i]) << 8) | data[i + 1];
-            result += ch;
+            const uint32_t unit = (uint32_t(data[2 * i]) << 8) | data[2 * i + 1];
+            uint32_t ch = unit;
+            if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < numUnits)
+            {
+                const uint32_t low = (uint32_t(data[2 * i + 2]) << 8) | data[2 * i + 3];
+                if (low >= 0xDC00 && low <= 0xDFFF)
+                {
+                    ch = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                    ++i;
+                }
+            }
+            if (ch >= 0xD800 && ch <= 0xDFFF) ch = 0xFFFD;   // unpaired half
+            if (ch != 0) chars.push_back((juce::juce_wchar)ch);
         }
-        return result;
+        chars.push_back(0);
+        return juce::String(juce::CharPointer_UTF32(chars.data()));
     }
 
     //==========================================================================
@@ -221,6 +258,23 @@ namespace StageLinQ
     }
 
     //==========================================================================
+    // A number off the wire into an integer: NaN reads 0 and a value out of
+    // range saturates (a JSON value of 1e300 was cast straight to int64_t or
+    // int, which is undefined behaviour).
+    inline int64_t toInt64Saturated(double d)
+    {
+        if (std::isnan(d)) return 0;
+        if (d >= 9.2e18)  return INT64_MAX;
+        if (d <= -9.2e18) return INT64_MIN;
+        return (int64_t)d;
+    }
+    inline int toIntSaturated(double d)
+    {
+        if (std::isnan(d)) return 0;
+        return (int)juce::jlimit((double)INT_MIN, (double)INT_MAX, d);
+    }
+
+    //==========================================================================
     // JSON value parser for StateMap values
     //
     // StageLinQ StateMap values are NOT simple primitives. They are JSON
@@ -243,7 +297,7 @@ namespace StageLinQ
         juce::String stringVal;
 
         bool   asBool()   const { return (type == kBool) ? boolVal : (intVal != 0); }
-        int    asInt()     const { return (type == kInt) ? (int)intVal : (type == kDouble) ? (int)doubleVal : (boolVal ? 1 : 0); }
+        int    asInt()     const { return (type == kInt) ? (int)intVal : (type == kDouble) ? toIntSaturated(doubleVal) : (boolVal ? 1 : 0); }
         double asDouble()  const { return (type == kDouble) ? doubleVal : (type == kInt) ? (double)intVal : 0.0; }
         juce::String asString() const { return stringVal; }
     };
@@ -276,22 +330,24 @@ namespace StageLinQ
                 }
                 else
                 {
-                    // PlayState sends state as integer
+                    // A "state" that is not a boolean, read as a number.  None
+                    // seen: PlayState, like every "state" in the #23 PRIME 4+
+                    // captures, is {"state": true/false}.
                     v.type = JsonValue::kInt;
-                    v.intVal = (int64_t)(int)stateVal;
-                    v.doubleVal = (double)(int)stateVal;
+                    v.intVal = toIntSaturated((double)stateVal);
+                    v.doubleVal = (double)v.intVal;
                 }
             }
             else if (obj->hasProperty("value"))
             {
                 v.type = JsonValue::kDouble;
                 v.doubleVal = (double)obj->getProperty("value");
-                v.intVal = (int64_t)v.doubleVal;
+                v.intVal = toInt64Saturated(v.doubleVal);
             }
             else if (obj->hasProperty("color"))
             {
                 v.type = JsonValue::kInt;
-                v.intVal = (int64_t)(int)obj->getProperty("color");
+                v.intVal = toIntSaturated((double)obj->getProperty("color"));
                 v.doubleVal = (double)v.intVal;
             }
             else
@@ -311,7 +367,7 @@ namespace StageLinQ
         {
             v.type = JsonValue::kDouble;
             v.doubleVal = (double)parsed;
-            v.intVal = (int64_t)v.doubleVal;
+            v.intVal = toInt64Saturated(v.doubleVal);
         }
         else if (parsed.isString())
         {
@@ -1436,8 +1492,8 @@ public:
         int idx = deckNum - 1;
         if (idx < 0 || idx >= StageLinQ::kMaxDecks) return 1;
         double beat = decks[idx].beatInfoBeat.load(std::memory_order_relaxed);
-        if (beat < 0.0) return 1;
-        int beatInBar = ((int)beat % 4) + 1;
+        if (!std::isfinite(beat) || beat < 0.0) return 1;   // off the wire: (int)NaN or 1e300 is undefined
+        int beatInBar = (int)std::fmod(std::floor(beat), 4.0) + 1;
         return (uint8_t)juce::jlimit(1, 4, beatInBar);
     }
 
@@ -2752,21 +2808,24 @@ private:
             while (stateReadBuf.size() >= 4)
             {
                 uint32_t blockLen = StageLinQ::readU32BE(stateReadBuf.data());
-                if (blockLen == 0 || blockLen > 65536)
+                if (blockLen == 0 || blockLen > StageLinQ::kMaxServiceBlock)
                 {
                     // Malformed or corrupt -- scan forward for "smaa" magic to
                     // re-synchronize, instead of blind 4-byte skip which can
-                    // burn CPU if the stream is badly corrupted.
+                    // burn CPU if the stream is badly corrupted.  The scan
+                    // starts past this block's own magic (offset 4), so at
+                    // least one byte is dropped: starting at 4 found that
+                    // magic again, erased nothing and looped for ever under
+                    // sockMutex (AUDIT WIRE-3).
                     bool resynced = false;
-                    for (size_t i = 4; i + 4 <= stateReadBuf.size(); ++i)
+                    for (size_t i = 5; i + 4 <= stateReadBuf.size(); ++i)
                     {
                         if (std::memcmp(stateReadBuf.data() + i, StageLinQ::kSmaaMagic, 4) == 0)
                         {
                             // Found smaa at offset i -- the length field is 4 bytes before it
-                            size_t frameStart = i - 4;
-                            if (frameStart > 0)
-                                stateReadBuf.erase(stateReadBuf.begin(),
-                                                   stateReadBuf.begin() + (int)frameStart);
+                            const size_t frameStart = i - 4;   // >= 1
+                            stateReadBuf.erase(stateReadBuf.begin(),
+                                               stateReadBuf.begin() + (std::ptrdiff_t)frameStart);
                             resynced = true;
                             break;
                         }
@@ -2866,7 +2925,7 @@ private:
             while (beatReadBuf.size() >= 8)
             {
                 uint32_t blockLen = StageLinQ::readU32BE(beatReadBuf.data());
-                if (blockLen == 0 || blockLen > 65536)
+                if (blockLen == 0 || blockLen > StageLinQ::kMaxServiceBlock)
                 {
                     // BeatInfo has no magic bytes for re-sync.  Discard entire
                     // buffer -- beat data is real-time and frame loss is harmless.
