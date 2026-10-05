@@ -101,6 +101,7 @@ public:
         paused.store(false, std::memory_order_relaxed);
         sendErrors.store(0, std::memory_order_relaxed);
         artnetSeeded = false;
+        resyncRequested.store(false, std::memory_order_relaxed);
         updateTimerRate();
         return true;
     }
@@ -143,7 +144,7 @@ public:
         }
     }
 
-    // Pause/resume transmission
+    // Pause/resume transmission.  Message thread.
     void setPaused(bool shouldPause)
     {
         if (paused.load(std::memory_order_relaxed) == shouldPause)
@@ -154,10 +155,23 @@ public:
         if (shouldPause)
         {
             stopTimer();
+            // The timer is stopped (stopTimer() returns after an in-flight
+            // callback), so the encoder state is ours here.  A forceResync()
+            // the timer had not served yet still goes out: the engine's
+            // clean stop calls forceResync() and then this, and that frame
+            // is the stopped position.
+            if (resyncRequested.exchange(false, std::memory_order_acquire)
+                && isRunningFlag.load(std::memory_order_relaxed) && socket != nullptr)
+            {
+                artnetSeeded = false;
+                sendArtTimeCode(currentFps.load(std::memory_order_relaxed));
+            }
         }
         else if (isRunningFlag.load(std::memory_order_relaxed))
         {
+            // Stopped since the pause: the encoder state is ours here too.
             artnetSeeded = false;
+            resyncRequested.store(false, std::memory_order_relaxed);
             lastFrameSendTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
             updateTimerRate();
         }
@@ -165,18 +179,21 @@ public:
 
     bool isPaused() const { return paused.load(std::memory_order_relaxed); }
 
-    /// Force immediate ArtTimeCode frame send.
+    /// Force immediate ArtTimeCode frame send, re-seeded from the last
+    /// setTimecode() value.
     /// Call on seek/hot cue/track change so receivers update instantly
-    /// instead of waiting for the next timer tick (up to 1 frame latency).
+    /// instead of waiting for the next frame (up to 1 frame latency).
+    /// Message thread, with the timer running: the timer thread sends the
+    /// frame at its next callback (1 ms), or setPaused(true) does if it
+    /// comes first.  Sending from here wrote the encoder state the timer
+    /// thread was using -- a data race (AUDIT C5, LTC-7).
     void forceResync()
     {
         if (!isRunningFlag.load(std::memory_order_relaxed)
             || paused.load(std::memory_order_relaxed)
             || socket == nullptr)
             return;
-        artnetSeeded = false;
-        FrameRate fps = currentFps.load(std::memory_order_relaxed);
-        sendArtTimeCode(fps);
+        resyncRequested.store(true, std::memory_order_release);
     }
 
     //==============================================================================
@@ -184,7 +201,8 @@ public:
     //
     // Sends a DMX512 frame using the same socket/interface as timecode output.
     // Can be called independently of timecode pause state -- mixer data flows
-    // regardless of whether timecode is active.
+    // regardless of whether timecode is active.  Message thread (the
+    // engine's tick).
     //
     // dmxData: up to 512 bytes of DMX channel values (channel 1 at index 0)
     // numChannels: how many channels to send (1-512, will be rounded up to even)
@@ -230,7 +248,11 @@ public:
         // DMX data
         std::memcpy(packet + 18, dmxData, (size_t)numChannels);
 
-        int written = socket->write(broadcastIp, destPort, packet, 18 + numChannels);
+        int written = 0;
+        {
+            const juce::SpinLock::ScopedLockType sl(socketWriteLock);
+            written = socket->write(broadcastIp, destPort, packet, 18 + numChannels);
+        }
         if (written < 0)
             sendErrors.fetch_add(1, std::memory_order_relaxed);
     }
@@ -248,6 +270,14 @@ private:
 
         // Single atomic read -- guarantees frame interval and packet rate code are consistent
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
+
+        // forceResync(): the frame at the new position goes out now,
+        // re-seeded, outside the frame cadence, which carries on unchanged.
+        if (resyncRequested.exchange(false, std::memory_order_acquire))
+        {
+            artnetSeeded = false;
+            sendArtTimeCode(fps);
+        }
 
         // Fractional accumulator: compare real elapsed time against ideal frame interval
         // to eliminate drift caused by integer-ms timer resolution
@@ -332,7 +362,11 @@ private:
 
         packet[18] = (uint8_t)fpsToRateCode(fps);
 
-        int written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
+        int written = 0;
+        {
+            const juce::SpinLock::ScopedLockType sl(socketWriteLock);
+            written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
+        }
         if (written < 0)
             sendErrors.fetch_add(1, std::memory_order_relaxed);
     }
@@ -357,12 +391,24 @@ private:
 
     juce::SpinLock tcLock;
     Timecode timecodeToSend;        // Written by UI thread under tcLock, read by timer thread under tcLock
-    Timecode encoderTc;             // Auto-increment: last sent timecode (timer thread only)
+
+    // The encoder state -- encoderTc, artnetSeeded -- belongs to the timer
+    // thread while the timer runs.  The message thread writes it only with
+    // the timer stopped (start(), setPaused(): stopTimer() returns after an
+    // in-flight callback), and forceResync() asks the timer thread through
+    // resyncRequested instead of writing it (AUDIT C5, LTC-7).
+    Timecode encoderTc;             // Auto-increment: last sent timecode
     bool     artnetSeeded = false;  // Auto-increment: false until first frame seeds encoderTc
+    std::atomic<bool> resyncRequested { false };   // set by forceResync(), consumed by the timer or setPaused(true)
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
-    uint8_t dmxSequence = 0;  // incrementing 1-255 for OpDmx sequencing (message-thread-only currently, but atomic-safe for future use)
+    // ArtTimeCode (timer thread) and ArtDmx (message thread) share the
+    // socket.  juce::DatagramSocket::write keeps the resolved destination in
+    // the socket and stores it, unlocked, on its first send: the two never
+    // write at once.
+    juce::SpinLock socketWriteLock;
+    uint8_t dmxSequence = 0;  // incrementing 1-255 for OpDmx sequencing; message thread only (sendDmxFrame), a plain byte
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ArtnetOutput)
 };
