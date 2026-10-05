@@ -41,8 +41,21 @@
 // device buffers, so several outputs (an LTC per engine on different channels
 // of one interface, the generator's music on others) coexist by construction
 // and a client that writes only its own channel cannot leak into another.
-// The client list is protected by a CriticalSection held briefly on both
-// sides, as juce::AudioDeviceManager does for its own list.
+//
+// The client list is protected by a CriticalSection, the way
+// juce::AudioDeviceManager protects its own callback list -- which means it
+// is NOT held briefly on the audio side: the audio callback holds it for the
+// whole fan-out, every client's callback in turn.  The message thread takes
+// it when a client is added, removed or looked up (acquire, release,
+// reconfigureAll) and while it announces a start or stop to the clients.
+// The trade-off, kept until the list is made lock-free (AUDIT LTC-15,
+// deferred): a message-thread call can wait for one fan-out; an audio
+// callback that arrives while the message thread holds the lock waits for
+// it, against CONTRIBUTING's "no locks in the audio callback" -- a priority
+// inversion, short because the message thread does little under the lock,
+// but not bounded; and the clients of one device share its period, so one
+// slow client (the generator reading from disk, AUDIT LTC-3) delays every
+// other client on that device.
 //
 // Message thread only for acquire/release; the callbacks run on the audio
 // thread.
@@ -254,11 +267,13 @@ private:
 
         void audioDeviceAboutToStart(juce::AudioIODevice* device) override
         {
-            // Sized once, off the audio thread.  Generous in samples: a driver
-            // that hands over more than its announced buffer (some WASAPI
-            // configurations do) must not be clamped to a short callback.
+            // Sized once, off the audio thread, and generously: four times
+            // the announced buffer and at least 16384 samples, so a driver
+            // that hands over more than it announced (some WASAPI
+            // configurations do) is served in one piece.  A callback bigger
+            // than this is served in chunks of this size (see the fan-out).
             scratch.setSize(juce::jmax(1, device->getActiveOutputChannels().countNumberOfSetBits()),
-                            juce::jmax(4096, device->getCurrentBufferSizeSamples()), false, false, true);
+                            juce::jmax(16384, 4 * device->getCurrentBufferSizeSamples()), false, false, true);
             const juce::ScopedLock sl(lock);
             for (auto& e : entries) e.cb->audioDeviceAboutToStart(device);
         }
@@ -286,11 +301,26 @@ private:
 
             const juce::ScopedLock sl(lock);
 
-            // Scratch is sized in audioDeviceAboutToStart; a device that hands
-            // us more than it announced gets the size it announced (no
-            // allocation on the audio thread).
+            // Output clients render into the scratch buffer, sized in
+            // audioDeviceAboutToStart (no allocation here).  A device that
+            // hands over more samples than it holds is served in
+            // scratch-sized chunks, in order, within this callback, so every
+            // output client is asked for every sample the device plays.
+            // (Clamping to the scratch length left the rest of the buffer
+            // silent.)  Whether it renders a call longer than the buffer the
+            // device announced is up to the client: LTC out and Audio Thru
+            // do, but the generator's player (GeneratorAudioPlayer) sizes its
+            // own scratch to the announced buffer and plays silence for the
+            // whole of any longer call.  The chunks reach the client back to
+            // back, with the device's context for the whole buffer, so a
+            // client that dates its calls by the clock dates every chunk at
+            // the callback's start.  LTC out does (measured with the real
+            // LtcOutput behind this fan-out): clean for any callback up to
+            // the scratch length, but past it the later chunks are dated a
+            // whole scratch early, its value tracking snaps, and frames are
+            // skipped or repeated every period.  Hence the generous scratch.
             const int scratchChans = juce::jmin(numOutputChannels, scratch.getNumChannels());
-            const int scratchLen   = juce::jmin(numSamples, scratch.getNumSamples());
+            const int chunkMax     = scratch.getNumSamples();
 
             for (auto& e : entries)
             {
@@ -303,12 +333,21 @@ private:
                     continue;
                 }
 
-                scratch.clear(0, scratchLen);   // only the samples in use: the buffer is deliberately oversized
-                float* const* outs = scratch.getArrayOfWritePointers();
-                e.cb->audioDeviceIOCallbackWithContext(ins, numIns, outs, scratchChans, scratchLen, context);
-                for (int ch = 0; ch < scratchChans; ++ch)
-                    if (outputChannelData[ch] != nullptr)
-                        juce::FloatVectorOperations::add(outputChannelData[ch], outs[ch], scratchLen);
+                // An entry is input or output, never both (acquire registers
+                // one direction), so an output client is given no input.
+                for (int offset = 0; offset < numSamples && chunkMax > 0; offset += chunkMax)
+                {
+                    const int len = juce::jmin(chunkMax, numSamples - offset);
+                    scratch.clear(0, len);   // only the samples in use: the buffer is deliberately oversized
+                    // After clear(), every time: a full-length clear() marks the
+                    // buffer clear and only this unmarks it (else the next
+                    // clear() is skipped and old samples are summed again).
+                    float* const* outs = scratch.getArrayOfWritePointers();
+                    e.cb->audioDeviceIOCallbackWithContext(nullptr, 0, outs, scratchChans, len, context);
+                    for (int ch = 0; ch < scratchChans; ++ch)
+                        if (outputChannelData[ch] != nullptr)
+                            juce::FloatVectorOperations::add(outputChannelData[ch] + offset, outs[ch], len);
+                }
             }
         }
 
