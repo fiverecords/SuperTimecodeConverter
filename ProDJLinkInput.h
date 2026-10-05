@@ -673,6 +673,7 @@ public:
 
         vCDJPlayerNumber = ProDJLink::kDefaultVCDJNumber;
         { const juce::ScopedLock sl(djmIpLock); djmIps.clear(); djmModels.clear(); djmLastSeen.clear(); }
+        primaryDjmChannels.store(4, std::memory_order_relaxed);
 
         // Reset mixer state + packet counters for clean restart
         hasMixerData.store(false, std::memory_order_relaxed);
@@ -1290,11 +1291,12 @@ public:
 
     /// Number of mixer channels based on detected DJM model.
     /// DJM-V10 / V10-LF = 6 channels; all others (900NXS2, A9) = 4.
+    /// Worked out when the DJM list changes, not per call: the 0x39 and 0x58
+    /// handlers ask on every packet, and took a lock and built a String on
+    /// the network thread to answer (AUDIT PDL-11).  Any thread.
     int getMixerChannelCount() const
     {
-        juce::String model = getDJMModel();
-        if (model.containsIgnoreCase("V10")) return 6;
-        return 4;
+        return primaryDjmChannels.load(std::memory_order_relaxed);
     }
 
     /// Playhead position in milliseconds
@@ -2244,6 +2246,7 @@ private:
             djmModels.push_back(model);
             djmLastSeen.push_back(juce::Time::getMillisecondCounterHiRes());
             isNew = true;
+            updatePrimaryDjm();
         }
         // Socket write OUTSIDE the lock -- avoids blocking UI thread on getDJMModel()
         if (isNew)
@@ -2255,6 +2258,40 @@ private:
             // identity before receiving the 0x57.  An immediate subscribe
             // here would race against the DJM's keepalive processing.
         }
+    }
+
+    /// The DJM whose mixer data (0x39), on-air flags (0x03) and VU (0x58)
+    /// STC takes is the first one registered, the one getDJMModel names and
+    /// the channel count and MixerMap tier come from.  Taking them from any
+    /// sender put two DJMs' values into one set of atomics, alternating
+    /// (AUDIT PDL-11).  A DJM that moves to a new address is taken from
+    /// there once its old entry times out (10 s).  Network thread: it is the
+    /// only writer of djmIps, so it reads it without the lock.
+    bool isPrimaryDjm(const juce::String& sender) const
+    {
+        return !djmIps.empty() && sender == djmIps.front().c_str();
+    }
+
+    /// 0x39 and 0x03 are taken from the primary DJM, or from any sender
+    /// while no DJM is registered, as before: registration rests on
+    /// registerDJM's keepalive test (byte 0x21 and a number >= 0x21; byte
+    /// 0x21 is not a device type, AUDIT C20), and STC would take no mixer
+    /// data at all from a mixer that test missed.  With no DJM registered
+    /// the channel count is the four-channel default, so a V10's CH5/CH6
+    /// start with its registration (one keepalive).  0x58 needs no such
+    /// case: it answers the 0x57 subscribe, which only registered DJMs get.
+    /// Network thread.
+    bool acceptsMixerStatus(const juce::String& sender) const
+    {
+        return djmIps.empty() || isPrimaryDjm(sender);
+    }
+
+    /// Network thread, with djmIpLock held: the list has changed.
+    void updatePrimaryDjm()
+    {
+        const bool v10 = !djmModels.empty()
+                      && juce::String(djmModels.front()).containsIgnoreCase("V10");
+        primaryDjmChannels.store(v10 ? 6 : 4, std::memory_order_relaxed);
     }
 
     // Bridge subscribe (0x57) -- 40B sent to DJM on beat port (50001).
@@ -2558,10 +2595,12 @@ private:
         uint8_t type = data[10];
 
         // Mixer fader status (0x39) -- sent by DJM unicast when Pioneer bridge is present.
-        // Not player-addressed; route directly to the mixer handler.
+        // Not player-addressed; only from the registered DJM, or from any
+        // sender while none is (acceptsMixerStatus).
         if (type == ProDJLink::kStatusTypeMixer)
         {
-            handleMixerPacket(data, len);
+            if (acceptsMixerStatus(senderIp))
+                handleMixerPacket(data, len);
             return;
         }
 
@@ -2574,10 +2613,13 @@ private:
         }
 
         // DJM on-air broadcast (0x03) -- the mixer broadcasts this on port 50001
-        // always.  Per-channel on-air flags: the mixer's on-air source.
+        // always.  Per-channel on-air flags: the mixer's on-air source.  Taken
+        // as 0x39 is (acceptsMixerStatus): with two DJMs, both sets of flags
+        // went into isOnAir, alternating (AUDIT PDL-11).
         if (type == ProDJLink::kBeatTypeMixer)
         {
-            handleOnAirBroadcast(data, len);
+            if (acceptsMixerStatus(senderIp))
+                handleOnAirBroadcast(data, len);
             return;
         }
 
@@ -2585,7 +2627,8 @@ private:
         // peak-level segments for CH1-4 (mono) and Master L/R (stereo).
         if (type == ProDJLink::kStatusTypeVU)
         {
-            handleVuMeterPacket(data, len);
+            if (isPrimaryDjm(senderIp))   // the registered DJM only (PDL-11)
+                handleVuMeterPacket(data, len);
             return;
         }
 
@@ -2862,7 +2905,8 @@ private:
             uint8_t earlyType = data[10];
             if (earlyType == ProDJLink::kStatusTypeMixer)  // 0x39
             {
-                handleMixerPacket(data, len);
+                if (acceptsMixerStatus(sender))   // AUDIT PDL-11
+                    handleMixerPacket(data, len);
                 return;
             }
             if (earlyType == ProDJLink::kStatusTypeDJM)    // 0x29
@@ -3261,6 +3305,7 @@ private:
                     djmIps.erase(djmIps.begin() + i);
                     djmModels.erase(djmModels.begin() + i);
                     djmLastSeen.erase(djmLastSeen.begin() + i);
+                    updatePrimaryDjm();
                 }
             }
         }
@@ -3821,6 +3866,7 @@ private:
     std::vector<std::string>      djmIps;
     std::vector<std::string>      djmModels;    // model name per DJM, parallel to djmIps
     std::vector<double>           djmLastSeen;  // millisecond timestamp, parallel to djmIps
+    std::atomic<int>              primaryDjmChannels { 4 };   // see updatePrimaryDjm
 
     // Selected player for timecode output (1-based)
     std::atomic<int> selectedPlayer { 1 };
