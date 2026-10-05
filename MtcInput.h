@@ -108,18 +108,23 @@ public:
         if (!synced.load(std::memory_order_acquire))
             return false;
 
-        double now = juce::Time::getMillisecondCounterHiRes();
-        double elapsed = now - lastQfReceiveTime.load(std::memory_order_relaxed);
-
-        // MTC at 24fps sends QF every ~10.4ms, at 30fps ~8.3ms
-        return elapsed < timeoutMs.load(std::memory_order_relaxed);
+        bool locate;
+        double locateUntil;
+        {
+            const juce::SpinLock::ScopedLockType lock(tcLock);
+            locate = syncIsLocate;
+            locateUntil = locatePresentUntilMs;
+        }
+        return presentAt(juce::Time::getMillisecondCounterHiRes(), locate, locateUntil);
     }
 
-    /// Wall-clock instant (hi-res ms counter) at which the last complete
-    /// timecode was reconstructed.  MTC is a frame-based source, so this is
-    /// the frame boundary as far as the rest of STC is concerned -- and it is
-    /// far more precise than watching the value change from the 60Hz tick.
-    /// 0 if nothing has been decoded yet.
+    /// Wall-clock instant (hi-res ms counter) of the current sync point: for
+    /// a quarter-frame sequence, the start of the frame it stands for (a
+    /// quarter frame after piece 7 arrived, see reconstructAndSync); for a
+    /// Full Frame, its arrival -- or, if the transport was parked on it, the
+    /// arrival of the quarter frame that starts it running.  0 if nothing
+    /// has been decoded yet.  The engine no longer uses it (it takes value
+    /// and phase together from getCurrentTimecode(nowMs, phase), DESIGN D29).
     double getLastFrameArrivalMs() const
     {
         const juce::SpinLock::ScopedLockType lock(tcLock);
@@ -148,6 +153,20 @@ public:
     /// LTC encoder's tracking let one through now and then as a skipped frame
     /// with a repeat to come back.  floor() on the same number gives N + 1 at
     /// 30 ms, which is where the stream is.
+    ///
+    /// A Full Frame is a locate (AUDIT LTC-13).  Received while the source
+    /// is absent -- a sender locating while stopped -- it does not make it
+    /// present: the value stays frozen on the located frame, and the first
+    /// quarter frame starts it running from that quarter frame's arrival
+    /// (resumeFromLocate) -- unless it is a piece 0 that names none of the
+    /// located frame and the next two: then the source stays absent until
+    /// the first complete sequence.  Received while the source is present,
+    /// it runs from its arrival like any sync point, but keeps the source
+    /// present for two frames only unless quarter frames follow (presentAt).
+    /// Taken as a source, a locate while stopped counted up through the
+    /// freewheel window and jumped back when it closed, and a locate
+    /// followed by play jumped ahead by the time the transport had been
+    /// parked.
     Timecode getCurrentTimecode(double nowMs, double& phaseMsOut) const
     {
         phaseMsOut = 0.0;
@@ -157,14 +176,21 @@ public:
         Timecode syncTc;
         double syncMs;
         FrameRate fps;
+        bool locate;
+        double locateUntil;
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
             syncTc = lastSyncTimecode;
             syncMs = syncTimeMs;
             fps = detectedFps;
+            locate = syncIsLocate;
+            locateUntil = locatePresentUntilMs;
         }
 
-        if (!isReceiving())
+        // Presence from the same snapshot and the same clock reading: the
+        // quarter frame that ends a locate moves the sync point and clears
+        // the locate in one go.
+        if (!presentAt(nowMs, locate, locateUntil))
             return syncTc;   // frozen: the last value, no phase to speak of
 
         const double msPerFrame = 1000.0 / frameRateToDouble(fps);
@@ -198,7 +224,8 @@ public:
 
         if (rawSize >= 2 && rawData[0] == 0xF1)
         {
-            lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            lastQfReceiveTime.store(now, std::memory_order_relaxed);
 
             int dataByte = rawData[1];
             int index = (dataByte >> 4) & 0x07;  // 0-7 guaranteed by mask
@@ -206,6 +233,14 @@ public:
 
             mtcData[index] = value;
             nibbleMask |= (uint8_t)(1 << index);
+
+            // The first quarter frame after a Full Frame, unless that one
+            // already contradicted it (then the locate ends with the first
+            // complete sequence, in reconstructAndSync).  (syncIsLocate is
+            // written only on this thread while a device is started, so this
+            // thread reads it without the lock.)
+            if (syncIsLocate && !locateContradicted)
+                resumeFromLocate(index, value, now);
 
             if (index == 7)
                 reconstructAndSync();
@@ -220,8 +255,6 @@ public:
                                                          // sysex[1] = device ID (0x00-0x7F, accept any)
                 sysex[2] == 0x01 && sysex[3] == 0x01)   // MTC Full Frame
             {
-                lastQfReceiveTime.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
-
                 int hr = sysex[4];
                 int mn = sysex[5];
                 int sc = sysex[6];
@@ -235,6 +268,21 @@ public:
                 if (hr > 23 || mn > 59 || sc > 59 || fr > 29)
                     return;
 
+                // A Full Frame message is an explicit locate (AUDIT LTC-13).
+                // It is not a quarter frame: it does not refresh
+                // lastQfReceiveTime, and until a quarter frame follows
+                // (syncIsLocate) the source is present only until
+                // locatePresentUntilMs.  Received while the source is absent
+                // -- a locate while stopped -- that is never: the value stays
+                // frozen on the located frame and the outputs paused until
+                // the transport plays.  Received while present, it runs from
+                // here like any sync point for kLocateGraceFrames, or the
+                // freewheel if shorter: a sender playing through it resumes
+                // the quarter frames in that time, and one that has stopped
+                // and located stops the outputs at the located frame instead
+                // of freewheeling past it.
+                const double now = juce::Time::getMillisecondCounterHiRes();
+                const bool wasPresent = isReceiving();
                 {
                     const juce::SpinLock::ScopedLockType lock(tcLock);
                     updateDetectedFps(rateCode);
@@ -243,14 +291,20 @@ public:
                     lastSyncTimecode.minutes = mn;
                     lastSyncTimecode.seconds = sc;
                     lastSyncTimecode.frames  = fr;
-                    syncTimeMs = juce::Time::getMillisecondCounterHiRes();
+                    syncTimeMs = now;
+                    syncIsLocate = true;
+                    locatePresentUntilMs = wasPresent
+                        ? now + juce::jmin(kLocateGraceFrames * 1000.0 / frameRateToDouble(detectedFps),
+                                           timeoutMs.load(std::memory_order_relaxed))
+                        : 0.0;
                 }
-                // A Full Frame message is an explicit locate: drop the
-                // quarter-frame continuity anchor so the next assembled
-                // sequence is accepted at face value wherever it lands.
+                // Drop the quarter-frame continuity anchor so the next
+                // assembled sequence is accepted at face value wherever it
+                // lands.
                 continuityValid = false;
                 pendingValid    = false;
                 nibbleMask      = 0;
+                locateContradicted = false;
 
                 synced.store(true, std::memory_order_release);
             }
@@ -258,6 +312,76 @@ public:
     }
 
 private:
+    /// How long a Full Frame keeps a present source present without quarter
+    /// frames.  Pico-Timecode sends Full Frames during play and resumes the
+    /// quarter frames 1.14-1.17 frames later (the #16 captures, BENCH B5);
+    /// two frames leave room for that and for MIDI jitter.
+    static constexpr double kLocateGraceFrames = 2.0;
+
+    /// Whether the source is present at `now`.  While a Full Frame waits for
+    /// quarter frames (`locate`), until `locateUntil` -- never, if it came
+    /// while the source was absent (AUDIT LTC-13).  Otherwise, while the
+    /// last quarter frame is within the freewheel window.
+    bool presentAt(double now, bool locate, double locateUntil) const
+    {
+        if (locate)
+            return now < locateUntil;
+
+        // MTC at 24fps sends QF every ~10.4ms, at 30fps ~8.3ms
+        return now - lastQfReceiveTime.load(std::memory_order_relaxed)
+             < timeoutMs.load(std::memory_order_relaxed);
+    }
+
+    /// MIDI thread: the first quarter frame after a Full Frame.  If it came
+    /// within the Full Frame's grace, the sender played on through it and
+    /// its value has been running since it arrived: nothing to change.
+    /// Otherwise the transport was parked on the located frame and starts
+    /// running now, at this quarter frame's arrival.  Piece 0 is sent at the
+    /// start of the frame whose low nibble it carries, so when the first
+    /// piece is a 0 naming the located frame or one of the next two, that
+    /// frame is the value here (Pico-Timecode resumes with piece 0 of the
+    /// frame after the one its Full Frame named); any other piece starts
+    /// from the located frame.  The first complete sequence replaces the
+    /// sync point as usual.
+    ///
+    /// A piece 0 naming none of those three contradicts the Full Frame: the
+    /// stream is somewhere else (Pico-Timecode opens mtc_25fps_even with a
+    /// Full Frame of 00:59:30:09 and then streams 00:59:33:20).  The located
+    /// value is then not started: the locate stays (syncIsLocate) and the
+    /// source absent, frozen on that value, until the first complete
+    /// sequence ends the locate in reconstructAndSync, about two frames
+    /// later.  Within the grace nothing changes even then: the value and
+    /// the outputs are already running, and that sequence corrects them, as
+    /// before AUDIT LTC-13.
+    void resumeFromLocate(int piece, int nibble, double nowMs)
+    {
+        const juce::SpinLock::ScopedLockType lock(tcLock);
+        if (nowMs >= locatePresentUntilMs)
+        {
+            if (piece == 0)
+            {
+                const int64_t located = timecodeToFrameIndex(lastSyncTimecode, detectedFps);
+                bool named = false;
+                for (int k = 0; k <= 2 && !named; ++k)
+                {
+                    const Timecode tc = frameIndexToTimecode(located + k, detectedFps);
+                    if ((tc.frames & 0x0F) == nibble)
+                    {
+                        lastSyncTimecode = tc;
+                        named = true;
+                    }
+                }
+                if (!named)
+                {
+                    locateContradicted = true;   // absent: locatePresentUntilMs <= nowMs
+                    return;
+                }
+            }
+            syncTimeMs = nowMs;
+        }
+        syncIsLocate = false;
+    }
+
     void reconstructAndSync()
     {
         // --- Sequence integrity ---
@@ -385,7 +509,13 @@ private:
             // frame early.
             syncTimeMs = juce::Time::getMillisecondCounterHiRes()
                        + 0.25 * 1000.0 / frameRateToDouble(detectedFps);
+
+            // A complete sequence ends a locate its first quarter frame
+            // contradicted (resumeFromLocate): presence is the freewheel
+            // window's again.
+            syncIsLocate = false;
         }
+        locateContradicted = false;
         synced.store(true, std::memory_order_release);
     }
 
@@ -421,11 +551,14 @@ private:
         pendingValid    = false;
         prevAssembled    = Timecode();
         pendingAssembled = Timecode();
+        locateContradicted = false;
         synced.store(false, std::memory_order_relaxed);
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
             syncTimeMs = 0.0;
             lastSyncTimecode = Timecode();
+            syncIsLocate = false;
+            locatePresentUntilMs = 0.0;
         }
         lastQfReceiveTime.store(0.0, std::memory_order_relaxed);
     }
@@ -448,11 +581,14 @@ private:
     Timecode pendingAssembled;
     bool continuityValid = false;
     bool pendingValid    = false;
+    bool locateContradicted = false;   // the locate's first quarter frame was a piece 0 naming another frame
 
     // Protected by tcLock (written from MIDI thread, read from UI thread)
     mutable juce::SpinLock tcLock;
     Timecode lastSyncTimecode;
     double syncTimeMs = 0.0;
+    bool syncIsLocate = false;            // the sync point is a Full Frame not yet started by a quarter frame or replaced by a sequence
+    double locatePresentUntilMs = 0.0;    // while syncIsLocate: present until then (0: absent)
     FrameRate detectedFps = FrameRate::FPS_25;
 
     // Atomic cross-thread fields
