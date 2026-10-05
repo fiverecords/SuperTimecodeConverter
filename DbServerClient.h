@@ -598,6 +598,18 @@ private:
     static constexpr uint32_t kMagicPCO2 = 0x324F4350;  // "PCO2" reversed -- extended cue list (nxs2+)
     static constexpr uint32_t kMagicPCOB = 0x424F4350;  // "PCOB" reversed -- standard cue list
 
+    // Caps on what a reply from a player can make STC allocate or loop over.
+    // Every length or count read from the wire is checked against what is
+    // left of the blob, in unsigned arithmetic, before it is used (AUDIT WIRE-4).
+    static constexpr uint32_t kMaxFieldBlobBytes   = 2 * 1024 * 1024; // one 0x14 field (artwork JPEG, one ANLZ tag)
+    static constexpr uint32_t kMaxFieldStringChars = 0x10000;         // one 0x26 field
+    static constexpr uint32_t kMaxBeats            = 100000;          // PQTZ: 11 h at 150 BPM
+    static constexpr uint32_t kMaxDetailEntries    = 5000000;         // PWV5/PWV7 at 150/s: 9.2 h (the blob cap binds first)
+    static constexpr uint16_t kMaxPhrases          = 1000;            // PSSI
+    static constexpr uint16_t kMaxCuesPerList      = 200;             // PCOB/PCO2
+    static constexpr uint32_t kMaxPcp2EntryBytes   = 4096;            // one PCP2 entry, comment included
+    static constexpr uint32_t kMaxCueCommentBytes  = 512;             // PCP2 comment (UTF-16BE)
+
     static constexpr uint32_t kRequestQueueSize = 32;
     static constexpr uint32_t kRequestQueueMask = kRequestQueueSize - 1;
 
@@ -824,6 +836,55 @@ private:
         return true;
     }
 
+    /// Read and drop exactly N bytes, all within one timeout.  Used for a blob
+    /// field too large to keep, so the stream stays aligned on the next field.
+    static bool skipExact(juce::StreamingSocket& sock, uint32_t numBytes, int timeoutMs)
+    {
+        uint8_t sink[4096];
+        auto deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
+        while (numBytes > 0)
+        {
+            if (juce::Time::getMillisecondCounterHiRes() > deadline)
+                return false;
+            if (!sock.waitUntilReady(true, 100))
+                continue;
+            const int n = sock.read(sink, (int) std::min<uint32_t>(numBytes, (uint32_t) sizeof(sink)), false);
+            if (n <= 0) return false;
+            numBytes -= (uint32_t) n;
+        }
+        return true;
+    }
+
+    /// Decode big-endian UTF-16 code units into a String.  A surrogate pair
+    /// becomes one code point (AUDIT D6, AUDIT WIRE-9); an unpaired surrogate
+    /// becomes U+FFFD; NUL units (the trailing terminator) are skipped.
+    static juce::String decodeUtf16BE(const uint8_t* p, size_t numUnits)
+    {
+        std::vector<juce::juce_wchar> cps;
+        cps.reserve(numUnits + 1);
+        for (size_t k = 0; k < numUnits; ++k)
+        {
+            uint32_t u = readBE16(p + 2 * k);
+            if (u == 0)
+                continue;
+            if (u >= 0xD800 && u <= 0xDBFF && k + 1 < numUnits)
+            {
+                const uint32_t lo = readBE16(p + 2 * (k + 1));
+                if (lo >= 0xDC00 && lo <= 0xDFFF)
+                {
+                    cps.push_back((juce::juce_wchar) (0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)));
+                    ++k;
+                    continue;
+                }
+            }
+            if (u >= 0xD800 && u <= 0xDFFF)
+                u = 0xFFFD;
+            cps.push_back((juce::juce_wchar) u);
+        }
+        cps.push_back(0);
+        return juce::String(juce::CharPointer_UTF32(cps.data()));
+    }
+
     /// Read a single field from the socket.  Returns the numeric value
     /// (for blobs/strings returns the length), and fills `fieldType`.
     /// For blobs, the data is appended to `blobOut`.
@@ -872,15 +933,24 @@ private:
                 result.ok = true;
                 break;
             }
-            case 0x14:  // binary blob -- CAPTURE data for artwork etc.
+            case 0x14:  // binary blob -- artwork JPEG, ANLZ tag, the 12 argument tags
             {
                 uint8_t lenBuf[4];
                 if (!readExact(sock, lenBuf, 4, timeoutMs)) return result;
                 uint32_t len = (uint32_t(lenBuf[0]) << 24) | (uint32_t(lenBuf[1]) << 16)
                              | (uint32_t(lenBuf[2]) << 8)  | lenBuf[3];
                 result.numericValue = len;
-                if (len > 2 * 1024 * 1024)  // over 2MB -- protocol error
-                    return result;
+                if (len > kMaxFieldBlobBytes)
+                {
+                    // Too large to keep (a PWV7 of a track over ~77 min, or a
+                    // misbehaving device): read past it and return the field
+                    // with no data, so the message and the connection survive
+                    // and the caller sees "no blob" (AUDIT WIRE-4).
+                    if (!skipExact(sock, len, timeoutMs))
+                        return result;
+                    result.ok = true;
+                    break;
+                }
                 if (len > 0)
                 {
                     result.blobData.setSize(len);
@@ -897,7 +967,7 @@ private:
                 uint32_t charCount = (uint32_t(lenBuf[0]) << 24) | (uint32_t(lenBuf[1]) << 16)
                                    | (uint32_t(lenBuf[2]) << 8)  | lenBuf[3];
                 result.numericValue = charCount;
-                if (charCount > 0x10000)  // over 64K chars -- protocol error
+                if (charCount > kMaxFieldStringChars)  // protocol error
                     return result;
                 if (charCount > 0)
                 {
@@ -906,14 +976,7 @@ private:
                     if (!readExact(sock, data.data(), (int)byteCount, timeoutMs))
                         return result;
                     // Decode UTF-16BE, skip trailing NUL
-                    juce::String decoded;
-                    for (uint32_t i = 0; i + 1 < byteCount; i += 2)
-                    {
-                        juce::juce_wchar ch = (juce::juce_wchar)((uint16_t(data[i]) << 8) | data[i + 1]);
-                        if (ch != 0)
-                            decoded += juce::String::charToString(ch);
-                    }
-                    result.stringValue = decoded;
+                    result.stringValue = decodeUtf16BE(data.data(), charCount);
                 }
                 result.ok = true;
                 break;
@@ -1685,62 +1748,60 @@ private:
                                             const char* tagName, int expectedWordSize)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
+        const size_t wordSize = (size_t) expectedWordSize;
 
         if (size < 20)
         {
-            DBG("DbServerClient: ANLZ blob too small (" + juce::String(size) + " bytes)");
+            DBG("DbServerClient: ANLZ blob too small (" + juce::String((int) size) + " bytes)");
             return {};
         }
 
         // Search for tag signature (e.g. "PWV6" or "PWV4")
-        for (int i = 0; i <= size - 20; ++i)
+        for (size_t i = 0; i + 20 <= size; ++i)
         {
             if (d[i] == tagName[0] && d[i+1] == tagName[1]
                 && d[i+2] == tagName[2] && d[i+3] == tagName[3])
             {
-                // Tag header: tag(4) + len_header(4) + len_tag(4)
-                int hdrOff = i + 12;
-                if (hdrOff + 8 > size) continue;
+                // Tag header: tag(4) + len_header(4) + len_tag(4), then
+                // len_entry_bytes(4) + len_entries(4) (crate-digger rekordbox_anlz.ksy)
+                const uint32_t lenHeader  = readBE32(d + i + 4);
+                const uint32_t wordSizeW  = readBE32(d + i + 12);
+                const uint32_t entryCount = readBE32(d + i + 16);
 
-                uint32_t wordSize   = readBE32(d + hdrOff);
-                uint32_t entryCount = readBE32(d + hdrOff + 4);
+                if (wordSizeW != wordSize) continue;
 
-                if ((int)wordSize != expectedWordSize) continue;
-
-                // PWV6 has 2 bytes of header after entryCount (len_header=14, so entries at +14)
-                // PWV4 has 4 bytes of unknown after entryCount (word_size+count+unknown = 12)
-                int entriesOff = i + readBE32(d + i + 4);  // use len_header to find data start
-                // Fallback: if len_header seems wrong, try hdrOff + 8 (skip wordSize+entryCount)
-                // then for PWV4 skip 4 more unknown bytes
-                if (entriesOff <= i || entriesOff >= size)
+                // Entries start at len_header: 0x14 for PWV6 (nothing after the
+                // count), 0x18 for PWV4 (one more u4) -- crate-digger anlz.adoc.
+                // If len_header does not point inside the blob, assume that layout.
+                const size_t avail = size - i;
+                size_t entriesRel = lenHeader;
+                if (lenHeader == 0 || lenHeader >= avail)
+                    entriesRel = (wordSize == 6) ? 24 : 20;
+                if (entriesRel > avail || entryCount > (avail - entriesRel) / wordSize)
                 {
-                    entriesOff = hdrOff + 8;
-                    if (expectedWordSize == 6) entriesOff += 4;  // PWV4 has extra unknown field
-                }
-
-                int dataLen = (int)(wordSize * entryCount);
-                if (entriesOff + dataLen > size)
-                {
-                    DBG("DbServerClient: " + juce::String(tagName) + " data overflows blob (need "
-                        + juce::String(entriesOff + dataLen) + ", have " + juce::String(size) + ")");
+                    DBG("DbServerClient: " + juce::String(tagName) + " data overflows blob ("
+                        + juce::String((juce::int64) entryCount) + " entries, "
+                        + juce::String((int) size) + " bytes)");
                     continue;
                 }
 
+                const size_t entriesOff = i + entriesRel;
+                const size_t dataLen = (size_t) entryCount * wordSize;
                 WaveformResult result;
                 result.data.assign(d + entriesOff, d + entriesOff + dataLen);
                 result.entryCount = (int)entryCount;
                 DBG("DbServerClient: parsed " + juce::String(tagName) + " -- "
-                    + juce::String(entryCount) + " entries x " + juce::String(wordSize)
-                    + " bytes = " + juce::String(dataLen) + " bytes");
+                    + juce::String(entryCount) + " entries x " + juce::String((int) wordSize)
+                    + " bytes = " + juce::String((int) dataLen) + " bytes");
                 return result;
             }
         }
 
         // Fallback: try treating blob as raw data
-        if (size >= expectedWordSize * 10 && size % expectedWordSize == 0)
+        if (size >= wordSize * 10 && size % wordSize == 0)
         {
-            int entryCount = size / expectedWordSize;
+            int entryCount = (int) (size / wordSize);
             WaveformResult result;
             result.data.assign(d, d + size);
             result.entryCount = entryCount;
@@ -1750,7 +1811,7 @@ private:
         }
 
         DBG("DbServerClient: " + juce::String(tagName) + " tag not found in "
-            + juce::String(size) + " byte blob");
+            + juce::String((int) size) + " byte blob");
         return {};
     }
     static uint32_t readBE32(const uint8_t* p)
@@ -1833,21 +1894,20 @@ private:
     static std::vector<TrackMetadata::BeatEntry> parseBeatGrid(const juce::MemoryBlock& blob)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
 
-        for (int i = 0; i <= size - 24; ++i)
+        for (size_t i = 0; i + 24 <= size; ++i)
         {
             if (d[i] == 'P' && d[i+1] == 'Q' && d[i+2] == 'T' && d[i+3] == 'Z')
             {
                 uint32_t lenHeader = readBE32(d + i + 4);
-                if (lenHeader < 24 || (int)(i + lenHeader) > size) continue;
+                if (lenHeader < 24 || lenHeader > size - i) continue;
 
                 uint32_t numBeats = readBE32(d + i + 20);
-                if (numBeats == 0 || numBeats > 100000) continue;
+                if (numBeats == 0 || numBeats > kMaxBeats) continue;
 
-                int entriesOff = (int)(i + lenHeader);
-                int dataNeeded = (int)(numBeats * 8);
-                if (entriesOff + dataNeeded > size)
+                const size_t entriesOff = i + lenHeader;
+                if (numBeats > (size - entriesOff) / 8)
                 {
                     DBG("DbServerClient: PQTZ data overflows blob");
                     continue;
@@ -1857,7 +1917,7 @@ private:
                 grid.reserve(numBeats);
                 for (uint32_t b = 0; b < numBeats; ++b)
                 {
-                    const uint8_t* e = d + entriesOff + b * 8;
+                    const uint8_t* e = d + entriesOff + (size_t) b * 8;
                     TrackMetadata::BeatEntry entry;
                     entry.beatNumber  = readBE16(e);
                     entry.bpmTimes100 = readBE16(e + 2);
@@ -1870,7 +1930,7 @@ private:
             }
         }
 
-        DBG("DbServerClient: PQTZ tag not found in " + juce::String(size) + " byte blob");
+        DBG("DbServerClient: PQTZ tag not found in " + juce::String((int) size) + " byte blob");
         return {};
     }
 
@@ -1959,34 +2019,34 @@ private:
         const juce::MemoryBlock& blob, const char* tagName, int expectedWordSize)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
 
-        for (int i = 0; i <= size - 20; ++i)
+        for (size_t i = 0; i + 20 <= size; ++i)
         {
             if (d[i] == tagName[0] && d[i+1] == tagName[1]
                 && d[i+2] == tagName[2] && d[i+3] == tagName[3])
             {
                 uint32_t lenHeader = readBE32(d + i + 4);
-                int hdrOff = i + 12;
-                if (hdrOff + 8 > size) continue;
 
-                uint32_t wordSize   = readBE32(d + hdrOff);
-                uint32_t entryCount = readBE32(d + hdrOff + 4);
+                uint32_t wordSize   = readBE32(d + i + 12);
+                uint32_t entryCount = readBE32(d + i + 16);
 
-                if ((int)wordSize != expectedWordSize) continue;
-                if (entryCount == 0 || entryCount > 5000000) continue;
+                if (wordSize != (uint32_t) expectedWordSize) continue;
+                if (entryCount == 0 || entryCount > kMaxDetailEntries) continue;
 
-                int entriesOff = (int)(i + lenHeader);
-                if (entriesOff <= i || entriesOff >= size)
-                    entriesOff = hdrOff + 8;
+                // Entries at len_header; if it does not point inside the blob,
+                // right after the count.
+                const size_t avail = size - i;
+                const size_t entriesRel = (lenHeader == 0 || lenHeader >= avail) ? 20 : lenHeader;
 
-                int dataLen = (int)(wordSize * entryCount);
-                if (entriesOff + dataLen > size)
+                if (entryCount > (avail - entriesRel) / wordSize)
                 {
                     DBG("DbServerClient: " + juce::String(tagName)
                         + " detail data overflows blob");
                     continue;
                 }
+                const size_t entriesOff = i + entriesRel;
+                const size_t dataLen = (size_t) wordSize * entryCount;
 
                 DetailWaveformResult result;
                 result.data.assign(d + entriesOff, d + entriesOff + dataLen);
@@ -2000,7 +2060,7 @@ private:
         }
 
         DBG("DbServerClient: " + juce::String(tagName) + " detail tag not found in "
-            + juce::String(size) + " byte blob");
+            + juce::String((int) size) + " byte blob");
         return {};
     }
 
@@ -2072,23 +2132,27 @@ private:
     static SongStructureResult parseSongStructure(const juce::MemoryBlock& blob)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
 
-        for (int i = 0; i <= size - 20; ++i)
+        for (size_t i = 0; i + 20 <= size; ++i)
         {
             if (d[i] != 'P' || d[i+1] != 'S' || d[i+2] != 'S' || d[i+3] != 'I')
                 continue;
 
             uint32_t lenHeader = readBE32(d + i + 4);
-            if (lenHeader < 20 || i + 12 + 6 > size) continue;
+            if (lenHeader < 20) continue;
 
             uint32_t entrySize  = readBE32(d + i + 12);  // u4, NOT u2
             uint16_t numEntries = readBE16(d + i + 16);
-            if (entrySize != 24 || numEntries == 0 || numEntries > 1000) continue;
+            if (entrySize != 24 || numEntries == 0 || numEntries > kMaxPhrases) continue;
 
-            // Masked body starts at i + 18
-            int bodyOff = i + 18;
-            int bodyLen = size - bodyOff;
+            // Masked body starts at i + 18 and runs to the end of the tag
+            // (len_tag, rekordbox_anlz.ksy: size-eos), or to the end of the
+            // blob when len_tag does not fit in it.
+            const size_t bodyOff = i + 18;
+            const uint32_t lenTag = readBE32(d + i + 8);
+            const size_t bodyLen = (lenTag >= 18 + 2 && lenTag <= size - i) ? (size_t) lenTag - 18
+                                                                         : size - bodyOff;
             if (bodyLen < 2) continue;
 
             // Check if masked: raw_mood (first u2 of body)
@@ -2149,7 +2213,7 @@ private:
             return result;
         }
 
-        DBG("DbServerClient: PSSI tag not found in " + juce::String(size) + " byte blob");
+        DBG("DbServerClient: PSSI tag not found in " + juce::String((int) size) + " byte blob");
         return {};
     }
 
@@ -2265,11 +2329,11 @@ private:
     static std::vector<TrackMetadata::RekordboxCue> parseCueListExtended(const juce::MemoryBlock& blob)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
         std::vector<TrackMetadata::RekordboxCue> result;
 
         // Search for all PCO2 sections (one for memory points, one for hot cues)
-        for (int i = 0; i <= size - 20; ++i)
+        for (size_t i = 0; i + 20 <= size; ++i)
         {
             if (d[i] != 'P' || d[i+1] != 'C' || d[i+2] != 'O' || d[i+3] != '2')
                 continue;
@@ -2277,13 +2341,14 @@ private:
             uint32_t lenHeader = readBE32(d + i + 4);
             // numCues at offset 16 from tag start (body[4-5] after 12-byte section header + 4-byte type)
             uint16_t numCues   = readBE16(d + i + 16);
-            if (numCues == 0 || numCues > 200) continue;
+            if (numCues == 0 || numCues > kMaxCuesPerList) continue;
+            if (lenHeader > size - i) continue;   // entries would start past the blob
 
-            DBG("DbServerClient: PCO2 section found at " + juce::String(i)
+            DBG("DbServerClient: PCO2 section found at " + juce::String((int) i)
                 + " lenHeader=" + juce::String(lenHeader)
                 + " numCues=" + juce::String(numCues));
 
-            int entryOff = (int)(i + lenHeader);
+            size_t entryOff = i + lenHeader;
 
             for (uint16_t c = 0; c < numCues; ++c)
             {
@@ -2293,7 +2358,7 @@ private:
                     || d[entryOff+2] != 'P' || d[entryOff+3] != '2')
                 {
                     bool found = false;
-                    for (int scan = entryOff; scan <= size - 12 && scan < entryOff + 200; ++scan)
+                    for (size_t scan = entryOff; scan + 12 <= size && scan < entryOff + 200; ++scan)
                     {
                         if (d[scan] == 'P' && d[scan+1] == 'C' && d[scan+2] == 'P' && d[scan+3] == '2')
                             { entryOff = scan; found = true; break; }
@@ -2302,9 +2367,14 @@ private:
                 }
 
                 uint32_t entryLen = readBE32(d + entryOff + 8);  // total PCP2 entry size
-                if (entryLen > 4096 || entryLen < 0x1D
-                    || entryOff + (int)entryLen > size) 
-                    { entryOff += juce::jmax(12, (int)entryLen); continue; }
+                if (entryLen > kMaxPcp2EntryBytes || entryLen < 0x1D
+                    || entryLen > size - entryOff)
+                {
+                    // Skip it by its own length when that is plausible, else by
+                    // the 12-byte header; a skip past the blob ends the list.
+                    entryOff += (entryLen >= 12 && entryLen <= size - entryOff) ? entryLen : 12;
+                    continue;
+                }
 
                 const uint8_t* e = d + entryOff;  // points to "PCP2" magic
                 TrackMetadata::RekordboxCue cue;
@@ -2314,7 +2384,7 @@ private:
                 uint32_t timeMs = readBE32(e + 0x14);    // position ms
                 uint32_t loopMs = readBE32(e + 0x18);    // loop end ms
 
-                if (ctype == 0) { entryOff += (int)entryLen; continue; }
+                if (ctype == 0) { entryOff += entryLen; continue; }
 
                 cue.hotCueNumber = (uint8_t)hotCue;
                 cue.positionMs   = timeMs;
@@ -2338,23 +2408,16 @@ private:
                 if (entryLen >= 0x2C)
                 {
                     commentBytes = readBE32(e + 0x28);  // byte count of UTF-16BE string
-                    if (commentBytes > 0 && commentBytes < 512
-                        && 0x2C + (int)commentBytes <= (int)entryLen)
-                    {
-                        int numChars = (int)commentBytes / 2;
-                        for (int ci = 0; ci < numChars; ++ci)
-                        {
-                            uint16_t ch = readBE16(e + 0x2C + ci * 2);
-                            if (ch != 0)
-                                cue.comment += juce::String::charToString((juce::juce_wchar)ch);
-                        }
-                    }
+                    if (commentBytes > 0 && commentBytes < kMaxCueCommentBytes
+                        && commentBytes <= entryLen - 0x2C)
+                        cue.comment = decodeUtf16BE(e + 0x2C, commentBytes / 2);
                 }
 
-                // Color RGB (after comment)
-                int colorOff = 0x2C + (int)commentBytes;
-                if (colorOff + 4 <= (int)entryLen)
+                // Color RGB (after comment), only when the comment length leaves
+                // room for it inside the entry
+                if ((uint64_t) commentBytes + 0x2C + 4 <= entryLen)
                 {
+                    const size_t colorOff = 0x2C + (size_t) commentBytes;
                     cue.colorCode = e[colorOff];
                     cue.colorR    = e[colorOff + 1];
                     cue.colorG    = e[colorOff + 2];
@@ -2363,7 +2426,7 @@ private:
                 }
 
                 result.push_back(cue);
-                entryOff += (int)entryLen;
+                entryOff += entryLen;
             }
         }
 
@@ -2387,20 +2450,21 @@ private:
     static std::vector<TrackMetadata::RekordboxCue> parseCueListStandard(const juce::MemoryBlock& blob)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
-        int size = (int)blob.getSize();
+        const size_t size = blob.getSize();
         std::vector<TrackMetadata::RekordboxCue> result;
 
-        for (int i = 0; i <= size - 20; ++i)
+        for (size_t i = 0; i + 20 <= size; ++i)
         {
             if (d[i] != 'P' || d[i+1] != 'C' || d[i+2] != 'O' || d[i+3] != 'B')
                 continue;
 
             uint32_t lenHeader = readBE32(d + i + 4);
             uint16_t numCues   = readBE16(d + i + 18);
-            if (numCues == 0 || numCues > 200) continue;
+            if (numCues == 0 || numCues > kMaxCuesPerList) continue;
+            if (lenHeader > size - i) continue;   // entries would start past the blob
 
-            int entryOff = (int)(i + lenHeader);
-            static constexpr int kPcptSize = 0x38;
+            size_t entryOff = i + lenHeader;
+            static constexpr size_t kPcptSize = 0x38;
 
             for (uint16_t c = 0; c < numCues; ++c)
             {
