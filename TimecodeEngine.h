@@ -230,7 +230,8 @@ public:
         // a preset selected.
         armedCues.clear();
         rawGeneratorCues.clear();
-        lastCueCheckMs = 0;
+        lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;
 
         // Note: actual start is deferred to the caller (MainComponent),
         // which gathers device params from UI before calling startXxxInput().
@@ -974,7 +975,8 @@ public:
         cachedTrackTitle.clear();
         cachedTrackDurationSec = 0;
         armedCues.clear();
-        lastCueCheckMs = 0;
+        lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;
         pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         ltcOutput.setPitchMultiplier(1.0);
@@ -1355,17 +1357,10 @@ public:
     {
         if (!trackMapPtr || cachedTrackTitle.isEmpty()) return;
         const auto* entry = lookupTrackInMap();
-        // Reload cue points (user may have added/edited/deleted cues).
-        // Preserve playhead position so cues behind the current playhead
-        // are marked as already fired (don't re-trigger on edit).
-        uint32_t savedPlayhead = lastCueCheckMs;
-        loadCuePointsForTrack(entry);
-        if (savedPlayhead > 0)
-        {
-            for (auto& ac : armedCues)
-                ac.fired = (ac.cue.positionMs < savedPlayhead);
-            lastCueCheckMs = savedPlayhead;
-        }
+        // Reload cue points (user may have added/edited/deleted cues),
+        // armed where the deck's cues were checked up to: cues behind it
+        // stay passed (DESIGN D36), the ones ahead fire when crossed.
+        reloadCuePointsForTrack(entry);
     }
 
     /// Re-request metadata for the current track (used when waveform data
@@ -1944,7 +1939,7 @@ public:
                             // NOW we have real artist+title -- do the TrackMap lookup
                             const auto* entry = lookupTrackInMap();
                             fireTrackTrigger(entry);
-                            loadCuePointsForTrack(entry);
+                            reloadCuePointsForTrack(entry);   // same track: armed where the deck is (DESIGN D36)
                         }
                     }
 
@@ -1975,14 +1970,7 @@ public:
                         {
                             cachedTrackDurationSec = nowDur;
                             const auto* entry = lookupTrackInMap();
-                            uint32_t savedPlayhead = lastCueCheckMs;
-                            loadCuePointsForTrack(entry);
-                            if (savedPlayhead > 0)
-                            {
-                                for (auto& ac : armedCues)
-                                    ac.fired = (ac.cue.positionMs < savedPlayhead);
-                                lastCueCheckMs = savedPlayhead;
-                            }
+                            reloadCuePointsForTrack(entry);   // same track: armed where the deck is (DESIGN D36)
                         }
                     }
 
@@ -2010,14 +1998,11 @@ public:
                         setFramePhaseFromPosition(tcSourceMs, currentFps);
 
                     // --- Fire cue point triggers ---
-                    // Only fire during actual playback.  Scrub/jog/cue-preview
-                    // moves the playhead but should NOT trigger cue points --
-                    // DJs preview constantly and spurious MIDI/OSC/ArtNet
-                    // triggers during preparation would be disruptive.
-                    if (sharedProDJLink->isPlayerPlaying(ep))
-                        tickCuePoints(cuePlayheadMs, pll.seekDetected);
-                    else
-                        lastCueCheckMs = cuePlayheadMs;  // track position so seek detection stays correct
+                    // Only during actual playback: scrub, jog and cue preview
+                    // move the playhead but fire nothing (DJs preview
+                    // constantly), and what they moved past does not fire at
+                    // the next play either (DESIGN D36).
+                    dispatchTrackCues(cuePlayheadMs, rawPlayheadMs, sharedProDJLink->isPlayerPlaying(ep), pll.seekDetected);
 
                     bool pdlRx = sharedProDJLink->isReceiving();
                     if (statusTextVisible)
@@ -2301,14 +2286,7 @@ public:
                         {
                             cachedTrackDurationSec = nowDur;
                             const auto* entry = lookupTrackInMap();
-                            uint32_t savedPlayhead = lastCueCheckMs;
-                            loadCuePointsForTrack(entry);
-                            if (savedPlayhead > 0)
-                            {
-                                for (auto& ac : armedCues)
-                                    ac.fired = (ac.cue.positionMs < savedPlayhead);
-                                lastCueCheckMs = savedPlayhead;
-                            }
+                            reloadCuePointsForTrack(entry);   // same track: armed where the deck is (DESIGN D36)
                         }
                     }
 
@@ -2329,11 +2307,8 @@ public:
                     setFramePhaseFromPosition(tcSourceMs, currentFps);
 
                     // --- Fire cue point triggers ---
-                    // Same guard as ProDJLink: only during playback.
-                    if (sharedStageLinQ->isPlayerPlaying(ep))
-                        tickCuePoints(cuePlayheadMs, pll.seekDetected);
-                    else
-                        lastCueCheckMs = cuePlayheadMs;
+                    // Same rule as ProDJLink: only during playback (DESIGN D36).
+                    dispatchTrackCues(cuePlayheadMs, rawPlayheadMs, sharedStageLinQ->isPlayerPlaying(ep), pll.seekDetected);
 
                     bool slqRx = sharedStageLinQ->isReceiving();
                     if (statusTextVisible)
@@ -2577,19 +2552,16 @@ public:
                                 currentFps);
                         }
 
-                        // Fire cue points only during playback; on pause/stop
-                        // we still update the last-seen position so a subsequent
-                        // resume does not retro-fire cues we already crossed.
+                        // Fire cue points only during playback; what a seek
+                        // while paused or stopped moved past does not fire at
+                        // the next play (DESIGN D36).  No PLL here: Winamp's
+                        // position is continuous (50 ms polls, interpolated),
+                        // so a step of over 500 ms either way can only be a
+                        // seek.
                         const uint32_t playheadMs = (uint32_t) juce::jmax(0, (int)posMs);
-                        if (playing)
-                        {
-                            // No PLL here: Winamp's position is continuous
-                            // (50 ms polls, interpolated), so a forward step
-                            // over 500 ms can only be a seek.
-                            tickCuePoints(playheadMs, playheadMs > lastCueCheckMs + 500);
-                        }
-                        else
-                            lastCueCheckMs = playheadMs;
+                        const bool winSeeked = playheadMs > lastCueCheckMs + 500
+                                            || playheadMs + 500 < lastCueCheckMs;
+                        dispatchTrackCues(playheadMs, playheadMs, playing, winSeeked);
                     }
 
                     sourceActive = playing;
@@ -2860,13 +2832,20 @@ public:
 
 private:
     /// Re-derive armedCues from rawGeneratorCues using currentFps.  Called
-    /// by setGeneratorCuePoints (initial load) and setFrameRate (so a fps
+    /// by setGeneratorCuePoints (initial load, a preset applied again, the
+    /// input switched back to the Generator) and setFrameRate (so a fps
     /// change recomputes the absolute-ms positions, which depend on fps in
     /// the frame component of HH:MM:SS:FF).
+    ///
+    /// The crossing cursor stays at the generator's position, so only the
+    /// cues it crosses from there fire (DESIGN D36).  Setting it to 0, as
+    /// this did, made the next tick fire every cue in (0, now] while the
+    /// generator ran or was paused (AUDIT ENG-3).  From Stop, play moves the
+    /// cursor to the play-from position anyway (generatorPlay).
     void rearmGeneratorCues()
     {
         armedCues.clear();
-        lastCueCheckMs = 0;
+        lastCueCheckMs = (uint32_t) juce::jmax(0.0, genCurrentMs);
         if (rawGeneratorCues.empty()) return;
 
         armedCues.reserve(rawGeneratorCues.size());
@@ -3570,7 +3549,8 @@ private:
         cachedBpmMultiplier = 0;
         lastSeenTrackVersion = 0;
         armedCues.clear();
-        lastCueCheckMs = 0;
+        lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;   // the new deck's list arms at its playhead
         lastSentClockBpm = -1.0f;
         lastSentOscBpm   = -1.0f;
         bpmPlayerOverride = kBpmNoOverride;
@@ -3890,6 +3870,20 @@ private:
     // no Generator preset is active or a TrackMap cue load took over.
     std::vector<GeneratorCuePoint> rawGeneratorCues;
     uint32_t lastCueCheckMs = 0;   // last playhead position used for cue check (seek detection)
+    // TrackMap cue arming (dispatchTrackCues, DESIGN D36).  Message thread.
+    bool cueArmPending = false;    // list (re)loaded: arm it at the next playhead seen
+    bool cueWasPlaying = false;    // the deck played at the last dispatch
+    bool cueRelocated  = false;    // the source reported a seek while the deck did not play
+    uint32_t cueFlagsAtMs = 0;     // the playhead the fired flags stand for: every cue before it
+                                   // is fired or passed, none after it (armCuesAt, tickCuePoints)
+    bool cueFlagsAtIncl = false;   // ... and a cue exactly at it is too (it was checked, not just armed)
+    uint32_t cueStopRawMs = 0;     // the source's own position (not interpolated) at the last
+                                   // dispatch while playing or at the arm, raised to the
+                                   // furthest one seen while the deck does not play
+    // A play position this far or less behind cueStopRawMs is not a move back
+    // (dispatchTrackCues): Winamp's position runs on up to one 50 ms poll past
+    // the pause; the DJ sources' own positions do not move while stopped.
+    static constexpr uint32_t kCueMovedBackMs = 100;
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
     juce::String oscFwdBpmCmd;  // e.g. "Master 3.x at %BPM%" -- if non-empty, sends string instead of float
     float lastSentOscBpm = -1.0f;      // dedup: last sent OSC value
@@ -4248,8 +4242,15 @@ private:
     // Cue point management
     //--------------------------------------------------------------------------
 
-    /// Load cue points from the TrackMap entry for the current track.
-    /// Called on track change after fireTrackTrigger.  Resets all fired flags.
+    /// Load cue points from the TrackMap entry for a new track: a track
+    /// change, including the first track seen after a deck switch or an
+    /// input switch (called after fireTrackTrigger).  The list is armed
+    /// against the playhead the next dispatch sees (dispatchTrackCues): the
+    /// deck may already be anywhere in the track -- a deck switch in XF,
+    /// MASTER or ON AIR, a track loaded at its memory cue -- and the cues
+    /// behind it are passed, not fired (DESIGN D36).  Setting lastCueCheckMs
+    /// to 0 here, as this did, fired every one of them on the next tick.
+    /// The track already followed reloads through reloadCuePointsForTrack.
     void loadCuePointsForTrack(const TrackMapEntry* entry)
     {
         armedCues.clear();
@@ -4258,7 +4259,7 @@ private:
         // cache here so a later setFrameRate() can't rearm leftover
         // Generator cues on top of a TrackMap-driven session.
         rawGeneratorCues.clear();
-        lastCueCheckMs = 0;
+        cueArmPending = true;
 
         if (!entry || entry->cuePoints.empty()) return;
 
@@ -4277,10 +4278,110 @@ private:
                   });
     }
 
-    /// Check playhead against armed cue points and fire triggers.
-    /// Called from tick() with the current playhead in ms.
-    /// Handles forward playback, seek forward, and seek backward.
-    /// Fire the cues crossed since the last call.  `sourceSeeked` is the
+    /// Reload the cue list of the track already followed: the map edited
+    /// (refreshTrackMapLookup), or the track's title or length resolved
+    /// after its track change.  Once the list has been armed, the new list
+    /// gets the flags the old one stood for (cueFlagsAtMs): the cues the deck
+    /// has crossed or passed stay passed, and a cue the playhead crosses in
+    /// the next tick fires.  Arming it at the next playhead, as a new track's
+    /// list is, would pass that cue without firing it.  While the deck plays
+    /// that position is the last playhead checked, a cue exactly on it
+    /// included (it fired there); while the deck is paused it is where the
+    /// deck stopped, not the paused reading, which on the NXS2 beat fallback
+    /// is the beat start, behind cues fired before the pause.  A list still
+    /// waiting to be armed (its track change was this tick) keeps waiting.
+    void reloadCuePointsForTrack(const TrackMapEntry* entry)
+    {
+        const bool wasArmed = ! cueArmPending;
+        loadCuePointsForTrack(entry);
+        if (! wasArmed) return;
+        for (auto& ac : armedCues)
+            ac.fired = ac.cue.positionMs < cueFlagsAtMs
+                    || (cueFlagsAtIncl && ac.cue.positionMs == cueFlagsAtMs);
+        cueArmPending = false;
+    }
+
+    /// Pass the cues behind `playheadMs` without firing them and take it as
+    /// the last position checked (DESIGN D36).  `rearmAhead` also un-fires
+    /// the cues at or ahead of it, as a seek does (DESIGN D17); without it a
+    /// cue ahead keeps its flag, and the flags go on standing for the
+    /// furthest of the two positions (cueFlagsAtMs).
+    void armCuesAt(uint32_t playheadMs, bool rearmAhead)
+    {
+        for (auto& ac : armedCues)
+            ac.fired = (ac.cue.positionMs < playheadMs) || (! rearmAhead && ac.fired);
+        lastCueCheckMs = playheadMs;
+        if (rearmAhead || playheadMs > cueFlagsAtMs)
+        {
+            cueFlagsAtMs   = playheadMs;
+            cueFlagsAtIncl = false;
+        }
+    }
+
+    /// TrackMap cue dispatch for the DJ sources and Winamp, once per tick
+    /// (message thread).  `playheadMs` is the position the cues are checked
+    /// against (interpolated between packets); `rawMs` is the source's own
+    /// position, not interpolated: Pro DJ Link's absolute position, or on
+    /// the NXS2 beat fallback the start of the current beat; StageLinQ's
+    /// last BeatInfo position; for Winamp, playheadMs.  Cues fire only while
+    /// the deck plays, when the playhead crosses them (tickCuePoints, with
+    /// DESIGN D17's rule for a seek while playing).  Whenever the list is
+    /// armed against a playhead that is already somewhere, the cues behind
+    /// it are passed without firing and only the ones crossed from then on
+    /// fire (DESIGN D36, Joaky's answer to AUDIT Q9):
+    ///   - a new track's list (track change, deck switch) is armed at the
+    ///     first playhead seen after it; the track already followed reloads
+    ///     with the flags it had (reloadCuePointsForTrack);
+    ///   - while the deck does not play the playhead is followed and nothing
+    ///     fires; at the next play the cues behind the playhead are passed
+    ///     (what a scrub, jog or cue preview moved past).  The cues ahead are
+    ///     re-armed too, as DESIGN D17 does for a seek while playing, when
+    ///     the source reported a seek meanwhile (a hot cue or a relocation),
+    ///     or when the deck moved back while it did not play: its own
+    ///     position at play is more than kCueMovedBackMs behind the furthest
+    ///     one it reached since it last played or the list was armed.  A jog
+    ///     or scrub back raises no seek verdict.
+    /// The move-back test compares the source's own positions, not the
+    /// playhead: on the NXS2 beat fallback the playhead runs through the beat
+    /// while the deck plays but reads the beat start once it stops, up to a
+    /// whole beat behind cues already fired, and taken for a move back that
+    /// made them fire twice after a plain pause and play below 120 BPM.  On
+    /// that fallback what the deck does within one beat while stopped is not
+    /// seen: a jog back that stays inside the beat keeps the flags.  On any
+    /// source a step back of kCueMovedBackMs or less keeps them.
+    /// Before, the paused position was only followed: a relocation forward
+    /// then play fired every cue in between at once, and one backward left
+    /// the cues ahead marked fired (AUDIT ENG-2).
+    void dispatchTrackCues(uint32_t playheadMs, uint32_t rawMs, bool playing, bool sourceSeeked)
+    {
+        if (cueArmPending)
+        {
+            armCuesAt(playheadMs, true);
+            cueStopRawMs  = rawMs;
+            cueArmPending = false;
+            cueRelocated  = false;
+        }
+        if (! playing)
+        {
+            if (sourceSeeked) cueRelocated = true;
+            cueStopRawMs   = juce::jmax(cueStopRawMs, rawMs);
+            lastCueCheckMs = playheadMs;
+            cueWasPlaying  = false;
+            return;
+        }
+        if (! cueWasPlaying)
+        {
+            const bool movedBack = rawMs + kCueMovedBackMs < cueStopRawMs;
+            armCuesAt(playheadMs, cueRelocated || movedBack);
+            cueRelocated  = false;
+            cueWasPlaying = true;
+        }
+        tickCuePoints(playheadMs, sourceSeeked);
+        cueStopRawMs = rawMs;
+    }
+
+    /// Fire the cues crossed since the last call (forward playback, seek
+    /// forward, seek backward).  `sourceSeeked` is the
     /// source estimator's own verdict (PlayheadPLL::seekDetected): it judges
     /// a jump against the position it predicted, so a source that only
     /// reports once per beat (NXS2 fallback: 500 ms at 120 BPM, more below)
@@ -4290,9 +4391,20 @@ private:
     /// cue fired at all on that path.  A backward step is still a seek.
     void tickCuePoints(uint32_t playheadMs, bool sourceSeeked)
     {
-        if (armedCues.empty()) return;
-
         const bool seekDetected = sourceSeeked || (playheadMs < lastCueCheckMs);
+
+        // After this call every cue up to this playhead is fired or passed,
+        // so the flags stand for it, a cue exactly on it included -- also
+        // with no list, so that a list loaded later for this track is armed
+        // where the deck is (reloadCuePointsForTrack).  Without a seek they
+        // go on standing for a position further on, where a play that did
+        // not move back left them (dispatchTrackCues).
+        if (seekDetected || playheadMs >= cueFlagsAtMs)
+        {
+            cueFlagsAtMs   = playheadMs;
+            cueFlagsAtIncl = true;
+        }
+        if (armedCues.empty()) { lastCueCheckMs = playheadMs; return; }
 
         if (seekDetected)
         {
