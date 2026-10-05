@@ -2625,7 +2625,10 @@ void MainComponent::syncUIFromEngine()
     txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false);
     txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
     populateGenPresetCombo();
-    // Show the preset in use (persisted per engine) without re-applying it.
+    // Show the preset in use (persisted per engine) without re-applying it,
+    // or none: the selection populateGenPresetCombo keeps is the previous
+    // engine's, and GO would apply it to this one.
+    cmbGenPreset.setSelectedId(0, juce::dontSendNotification);
     for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
         if (cmbGenPreset.getItemText(i) == eng.getGeneratorPresetName())
         {
@@ -3809,8 +3812,12 @@ void MainComponent::openStageLinQView()
 //==============================================================================
 void MainComponent::exportConfig()
 {
-    // Save current state to disk first so the export is up-to-date
-    saveSettings();
+    // The bundle is read back from the files on disk (buildExportBundle), so
+    // write the current state first.  saveSettings() only armed the
+    // half-second debounce, and a backup taken right after a change missed
+    // it.  After a restore saves are suspended and nothing is written: the
+    // backup then carries the restored files (AUDIT SET-5).
+    flushSettings();
     sharedMixerMap.save();
     sharedSlqMixerMap.save();
 
@@ -3860,8 +3867,8 @@ void MainComponent::importConfig()
             auto options = juce::MessageBoxOptions()
                 .withIconType(juce::MessageBoxIconType::QuestionIcon)
                 .withTitle("Import Configuration")
-                .withMessage("This will replace ALL current settings, track maps, and mixer maps. "
-                             "The application will need to restart to apply changes.\n\n"
+                .withMessage("This will replace ALL current settings, track maps, generator presets "
+                             "and mixer maps. The application will need to restart to apply changes.\n\n"
                              "Continue?")
                 .withButton("Import")
                 .withButton("Cancel");
@@ -3871,21 +3878,54 @@ void MainComponent::importConfig()
                 {
                     if (result != 1) return;
 
+                    // Close every editor holding a reference into the maps
+                    // the reload below rebuilds: the cue editor a
+                    // TrackMapEntry&, the Track Map editor row pointers into
+                    // its map, the preset editor's cue window a
+                    // GeneratorPreset&, the Mixer Map editor its map's
+                    // entries (AUDIT SET-5).
+                    if (cuePointWindow != nullptr)
+                    {
+                        cuePointWindow.reset();
+                        cuePointTrackKey.clear();
+                        cuePointEditedArtist.clear();
+                        cuePointEditedTitle.clear();
+                    }
+                    if (trackMapWindow != nullptr)  delete trackMapWindow.getComponent();
+                    if (genPresetWindow != nullptr) delete genPresetWindow.getComponent();
+                    if (mixerMapWindow != nullptr)  delete mixerMapWindow.getComponent();
+
                     if (settings.applyImportBundle(parsed))
                     {
-                        // Reload settings into live state
+                        // From here to the restart nothing is saved: the
+                        // running engines keep their configuration, and any
+                        // save -- the debounced one, the exit ones -- would
+                        // write it back over the restored files (AUDIT SET-5;
+                        // why, at SafeJsonFile::writesSuspended).  The message
+                        // below says so.
+                        AppSettings::suspendSavesUntilRestart();
+
+                        // Reload the maps the engines share, so they see the
+                        // restored Track Map, presets and mixer maps.  Show
+                        // Lock keeps its state for this session (the restore
+                        // runs unlocked); the restored one applies at the
+                        // restart.
+                        const bool locked = settings.showModeLocked;
                         settings.load();
+                        settings.showModeLocked = locked;
                         sharedMixerMap.resetToDefaults();
                         sharedMixerMap.load();
                         sharedSlqMixerMap.resetToDefaults();
                         sharedSlqMixerMap.load();
+                        for (auto& e : engines)
+                            e->refreshTrackMapLookup();
+                        populateGenPresetCombo();
 
                         juce::AlertWindow::showMessageBoxAsync(
                             juce::MessageBoxIconType::InfoIcon,
                             "Import Complete",
-                            "Configuration restored successfully.\n\n"
-                            "Please restart STC to fully apply all settings "
-                            "(engine configuration, audio devices, etc.).");
+                            "Configuration restored. Restart STC now to apply it -- "
+                            "until then, changes are not saved.");
                     }
                     else
                     {
@@ -4769,6 +4809,16 @@ void MainComponent::repopulateTcnetLayerCombo()
 //==============================================================================
 void MainComponent::loadAndApplyNonAudioSettings()
 {
+    // Mixer maps (user-editable param -> OSC/MIDI mapping) have files of
+    // their own and load whether or not settings.json exists or parses.
+    // Loaded only after a good settings.json, they stayed at their defaults
+    // when it was missing or quarantined, and the next mixer map edit or
+    // backup wrote those defaults over mixermap.json and slq_mixermap.json
+    // (AUDIT SET-1; AppSettings::load does the same for the Track Map and
+    // the presets).
+    sharedMixerMap.load();
+    sharedSlqMixerMap.load();
+
     if (!settings.load())
     {
         settingsLoaded = true;
@@ -4786,10 +4836,6 @@ void MainComponent::loadAndApplyNonAudioSettings()
         engines.back()->setMixerMap(&sharedMixerMap);
         engines.back()->setSlqMixerMap(&sharedSlqMixerMap);
     }
-
-    // Load mixer maps (user-editable param -> OSC/MIDI mapping)
-    sharedMixerMap.load();
-    sharedSlqMixerMap.load();
 
     // Apply per-engine settings
     for (int i = 0; i < (int)settings.engines.size() && i < (int)engines.size(); i++)
@@ -6403,11 +6449,21 @@ juce::String MainComponent::msToTimecodeString(double ms, FrameRate fps)
 
 void MainComponent::populateGenPresetCombo()
 {
+    // The selected preset stays selected, by name, if it still exists: the
+    // list is rebuilt after every preset edit and after a restore.
+    const juce::String selected = cmbGenPreset.getSelectedId() > 0 ? cmbGenPreset.getText() : juce::String();
     cmbGenPreset.clear(juce::dontSendNotification);
     auto presets = settings.generatorPresets.getAllSorted();
     int id = 1;
     for (auto& p : presets)
         cmbGenPreset.addItem(p.name, id++);
+    if (selected.isNotEmpty())
+        for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
+            if (cmbGenPreset.getItemText(i) == selected)
+            {
+                cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
+                break;
+            }
 }
 
 void MainComponent::cycleGenPreset(int direction)
