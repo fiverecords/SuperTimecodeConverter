@@ -9,6 +9,21 @@
 #include <atomic>
 #include <cstring>
 
+//==============================================================================
+// AudioThru -- plays the LTC input's passthrough channel (LtcInput's ring
+// buffer) on an output device, through AudioDeviceHub.
+//
+// On the LTC input's own device both sides run on one clock.  On another
+// device nothing matches the two clocks (AUDIT LTC-16, deferred): a rate
+// mismatch at start is only flagged on the status line (RATE MISMATCH, in
+// TimecodeEngine::startThruOutput), and there is no resampling, no drift
+// compensation, no prefill or target latency.  The ring
+// (LtcInput::RING_SIZE samples) absorbs the difference until it
+// runs dry -- silence for the missing samples, counted as underruns -- or
+// full -- the newest input dropped, counted as overruns, after the latency
+// has crept up to the ring's length -- so drifting clocks give periodic
+// clicks, and two different sample rates play at the wrong pitch.
+//==============================================================================
 class AudioThru : private juce::AudioIODeviceCallback
 {
 public:
@@ -19,6 +34,8 @@ public:
     // channel: 0+ = specific channel, -1 = Ch 1 + Ch 2
     // sampleRate: preferred sample rate (0 = device default)
     // bufferSize: preferred buffer size (0 = device default)
+    //   Both apply only if this opens the device; on a device already open
+    //   the running rate and buffer are kept (AudioDeviceHub, DESIGN D23).
     //==============================================================================
     bool start(const juce::String& typeName, const juce::String& devName,
                int channel, LtcInput* source,
@@ -58,9 +75,12 @@ public:
     {
         if (isRunningFlag.load(std::memory_order_relaxed))
         {
-            // Null the source pointer BEFORE removing the callback so that
-            // any in-flight callback will see nullptr and exit early.  The
-            // release ordering pairs with the acquire load in the callback.
+            // Null the source pointer first, so a callback that starts from
+            // here on returns early (the release pairs with the acquire load
+            // in the callback).  One already past that load finishes with the
+            // pointer; release() below returns only after it has, because the
+            // hub holds its lock for the whole fan-out -- which is what lets
+            // the caller stop and destroy the LtcInput next.
             sourceInput.store(nullptr, std::memory_order_release);
             AudioDeviceHub::get().release(this);
             isRunningFlag.store(false, std::memory_order_relaxed);
@@ -92,9 +112,12 @@ private:
     int numChannelsAvailable = 0;
     double currentSampleRate = 48000.0;
     int currentBufferSize = 512;
-    // sourceInput points to a LtcInput owned by MainComponent.  Lifetime is
-    // guaranteed because ~MainComponent() calls stopThruOutput() (which nulls
-    // this pointer via stop()) BEFORE destroying LtcInput.
+    // sourceInput points to the LtcInput of the TimecodeEngine that owns this
+    // AudioThru.  stop() returns only when no callback can use it any more
+    // (see stop()), and the engine stops the thru before the LtcInput:
+    // stopLtcInput() calls stopThruOutput() first, ~TimecodeEngine and
+    // ~MainComponent stop the thru before the input, and reindex() stops and
+    // destroys the thru when the engine stops being the primary one.
     std::atomic<LtcInput*> sourceInput { nullptr };
     std::atomic<float> outputGain { 1.0f };
     std::atomic<float> peakLevel { 0.0f };

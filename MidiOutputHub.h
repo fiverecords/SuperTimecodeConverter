@@ -12,7 +12,7 @@
 //==============================================================================
 // MidiOutputHub -- one open MIDI output per physical port, shared by every
 // sender in the application, with every message to a port sent under that
-// port's lock.  (D32, issue #23)
+// port's lock.  (DESIGN D32, issue #23)
 //
 // Three problems, one cause: nothing owned a MIDI port.
 //

@@ -22,11 +22,13 @@
 // The hub opens each interface once.  A component acquires the device for
 // the direction it needs (input or output), gets registered on a fan-out
 // callback, and releases it when it stops; the device closes when the last
-// client leaves.  Sample rate and buffer size are properties of the device:
-// the first request opens it with them, a later request with different
-// values reconfigures it (which every client sees as audioDeviceStopped /
-// audioDeviceAboutToStart, like any device restart), and the actual values
-// the driver settled on are what every client is told.
+// client leaves.  Sample rate and buffer size are properties of the device
+// (DESIGN D23): the request that opens it sets them; a client that joins an
+// open device adapts to what is running, whatever it asked for; the global
+// setting reaches open devices through reconfigureAll(), and adding a
+// direction (ASIO) reopens the device -- both seen by every client as
+// audioDeviceStopped / audioDeviceAboutToStart, like any device restart.
+// The actual values the driver settled on are what every client is told.
 //
 // Identity: (device type, device name).  For ASIO the same name is the
 // interface's input and its output, so a device opened for one direction is
@@ -72,13 +74,13 @@ public:
     /// Open (or share) `deviceName` of `typeName` for `client` in one
     /// direction.  Returns the live device on success (valid until the next
     /// reconfiguration: read what you need in audioDeviceAboutToStart, which
-    /// is called before this returns when the device is already running), or
-    /// nullptr with `error` set.  A client already registered is moved.
+    /// the client is given before this returns), or nullptr with `error`
+    /// set.  A client already registered is moved.
     /// `followsGlobalFormat`: whether this client's device should take part
-    /// in reconfigureAll() (the global SAMPLE RATE / BUFFER SIZE setting).
-    /// The generator player has its own per-engine format combos and passes
-    /// false; a device it shares with a client that follows the global
-    /// setting still follows it.
+    /// in reconfigureAll() (the global SAMPLE RATE / BUFFER SIZE setting); a
+    /// device follows it if any of its clients does.  Every client takes the
+    /// default (true) since the generator lost its own format combos
+    /// (DESIGN D23, 2026-09-13); no client passes false today.
     juce::AudioIODevice* acquire(juce::AudioIODeviceCallback* client,
                                  const juce::String& typeName, const juce::String& deviceName,
                                  bool asInput, double sampleRate, int bufferSize,
