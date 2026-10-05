@@ -396,7 +396,7 @@ private:
     /// What one datagram on the RPC socket is to the call waiting for an xid.
     struct RpcReply
     {
-        enum Status { NotOurs, Rejected, Accepted };
+        enum Status : uint8_t { NotOurs, Rejected, Accepted };
         Status status = NotOurs;
         int bodyOffset = 0;   // Accepted: the procedure's results start here
     };
@@ -606,7 +606,8 @@ private:
         };
         for (auto t = str.getCharPointer(); !t.isEmpty();)
         {
-            const uint32_t ch = (uint32_t)t.getAndAdvance();
+            // A code point: UTF-8 decodes to at most 21 bits
+            const uint32_t ch = (uint32_t)(t.getAndAdvance() & 0x1FFFFF);
             if (ch >= 0x10000 && ch <= 0x10FFFF)
             {
                 putUnit(0xD800 + ((ch - 0x10000) >> 10));
