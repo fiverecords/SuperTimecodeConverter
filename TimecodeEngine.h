@@ -171,6 +171,8 @@ public:
         }
 
         userOverrodeLtcFps = false;
+        mtcParkedValid = false;
+        forwardParkedLocate = false;
         activeInput = source;
         sourceActive = false;
         // Switching the input source is an explicit user transition; any
@@ -1598,8 +1600,23 @@ public:
                         if (statusTextVisible)
                             inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
                     }
-                    else if (statusTextVisible)
-                        inputStatusText = "PAUSED - " + mtcInput.getCurrentDeviceName();
+                    else
+                    {
+                        if (statusTextVisible)
+                            inputStatusText = "PAUSED - " + mtcInput.getCurrentDeviceName();
+                        // A locate while the sender is stopped (a Full Frame)
+                        // moves the frozen value without making the source
+                        // present (AUDIT LTC-13).  Passed on once to the
+                        // digital outputs, which stay paused
+                        // (routeTimecodeToOutputs); the tick that ends a run
+                        // is the clean stop's.  Not without a sync point:
+                        // a device (re)started reads 00:00:00:00 until then.
+                        if (mtcParkedValid && !outputsWereActive && mtcInput.getLastFrameArrivalMs() > 0.0
+                            && !sameTimecode(currentTimecode, mtcParkedTc))
+                            forwardParkedLocate = true;
+                        mtcParkedTc = currentTimecode;
+                        mtcParkedValid = true;
+                    }
                     sourceActive = rx;
                 }
                 else { sourceActive = false; if (statusTextVisible) inputStatusText = "WAITING FOR DEVICE..."; }
@@ -3184,6 +3201,11 @@ private:
     // 24 or 30 (followDetectedRate).  Named for LTC, where it began; MTC,
     // Art-Net and LA-Net honour it too (AUDIT NET-4).
     bool userOverrodeLtcFps = false;
+    // MTC locate while stopped (AUDIT LTC-13): the frozen value of the last
+    // inactive tick, and a one-shot request to pass a new one on.
+    Timecode mtcParkedTc;
+    bool mtcParkedValid = false;
+    bool forwardParkedLocate = false;
 
     // Generator state (internal timecode source)
     GeneratorState genState = GeneratorState::Stopped;
@@ -5021,6 +5043,12 @@ private:
         setFrameRate(d);
     }
 
+    static bool sameTimecode(const Timecode& a, const Timecode& b)
+    {
+        return a.hours == b.hours && a.minutes == b.minutes
+            && a.seconds == b.seconds && a.frames == b.frames;
+    }
+
     void routeTimecodeToOutputs()
     {
         // Keep LTC user bits current for the dynamic modes (passthrough from
@@ -5135,6 +5163,41 @@ private:
                     hippotizerOutput.forceResync();
                 }
             }
+            else if (forwardParkedLocate)
+            {
+                // A locate made while the MTC source was stopped (see the MTC
+                // branch of tick): the outputs stay paused, and receivers get
+                // the new position the way the clean stop gives the stop --
+                // an MTC Full Frame (the MTC spec's locate), one Art-Net and
+                // one LA-Net frame.  Those two send only while not paused, so
+                // each is let out for the one frame and paused again (the
+                // frame goes out at setPaused(true) at the latest).  LTC OUT
+                // stays silent.  HippoNet is not sent: no capture shows what
+                // a Hippotizer does with a position while stopped, and a new
+                // message needs one (DESIGN D2).  Until AUDIT LTC-13 made the
+                // locate a locate, the source ran through the freewheel from
+                // it and the clean stop at the end sent that run-on value.
+                if (outputMtcEnabled && mtcOutput.getIsRunning())
+                {
+                    mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));
+                    mtcOutput.sendFullFrame();
+                }
+                if (outputArtnetEnabled && artnetOutput.getIsRunning())
+                {
+                    artnetOutput.setTimecode(offsetTimecode(baseTc, artnetOutputOffset, outRate));
+                    artnetOutput.setPaused(false);
+                    artnetOutput.forceResync();
+                    artnetOutput.setPaused(true);
+                }
+                if (outputLANetTCEnabled && laNetTCOutput.getIsRunning())
+                {
+                    laNetTCOutput.setTimecode(offsetTimecode(baseTc, laNetTCOutputOffset, outRate));
+                    laNetTCOutput.setPaused(false);
+                    laNetTCOutput.forceResync();
+                    laNetTCOutput.setPaused(true);
+                }
+            }
+            forwardParkedLocate = false;
 
             // Clear seek flag if it was set during transition to inactive
             pll.seekDetected = false;
