@@ -2319,7 +2319,7 @@ private:
     ///     [0x0C] hot_cue (u4be, 0=memory, 1=A, 2=B...)
     ///     [0x10] type (u1, 1=cue, 2=loop)
     ///     [0x14] time (u4be, ms)
-    ///     [0x18] loop_time (u4be, ms, 0xFFFFFFFF if not loop)
+    ///     [0x18] loop_time (u4be, ms; used only when type is 2)
     ///     [0x1C] color_id (u1)
     ///     [0x24] loop_numerator (u2), [0x26] loop_denominator (u2)
     ///     [0x28] len_comment (u4, byte count of UTF-16BE string)
@@ -2389,7 +2389,9 @@ private:
                 cue.hotCueNumber = (uint8_t)hotCue;
                 cue.positionMs   = timeMs;
 
-                if (ctype == 2 || (loopMs != 0 && loopMs != 0xFFFFFFFF))
+                // A loop is type 2 (crate-digger anlz.adoc, beat-link CueList);
+                // loop_time is meaningful only then (AUDIT DEBT-7).
+                if (ctype == 2)
                 {
                     cue.type = TrackMetadata::RekordboxCue::Loop;
                     cue.loopEndMs = loopMs;
@@ -2446,7 +2448,7 @@ private:
     ///   [0x0C-0x0F] hot_cue (u4be)
     ///   [0x1C] type (u1, 1=cue, 2=loop)
     ///   [0x20-0x23] time (u4be, ms)
-    ///   [0x24-0x27] loop_time (u4be, ms)
+    ///   [0x24-0x27] loop_time (u4be, ms; used only when type is 2)
     static std::vector<TrackMetadata::RekordboxCue> parseCueListStandard(const juce::MemoryBlock& blob)
     {
         const uint8_t* d = static_cast<const uint8_t*>(blob.getData());
@@ -2485,7 +2487,10 @@ private:
                 cue.hotCueNumber = (uint8_t)hotCue;
                 cue.positionMs   = timeMs;
 
-                if (ctype == 2 || loopMs > 0)
+                // A loop is type 2 only (crate-digger anlz.adoc, beat-link
+                // CueList; AUDIT DEBT-7).  Testing loop_time > 0 made a cue
+                // point whose loop_time is 0xFFFFFFFF a loop ending at 49 days.
+                if (ctype == 2)
                 {
                     cue.type = TrackMetadata::RekordboxCue::Loop;
                     cue.loopEndMs = loopMs;
