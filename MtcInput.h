@@ -289,9 +289,17 @@ public:
                 int rateCode = (hr >> 5) & 0x03;
                 hr &= 0x1F;
 
-                // Same range sanity as the quarter-frame path: a malformed
-                // Full Frame must not become the sync point.
-                if (hr > 23 || mn > 59 || sc > 59 || fr > 29)
+                // The quarter-frame path's range sanity, frames checked
+                // against the rate this message names (24, 25, 29.97, 30): a
+                // malformed Full Frame must not become the sync point.  Plus
+                // one check the quarter-frame path does not make: at 29.97
+                // drop-frame, frames 00 and 01 do not exist at second 00 of
+                // a minute that is not a multiple of ten, so such an address
+                // is rejected here.
+                static constexpr int kFramesPerRateCode[4] = { 24, 25, 30, 30 };
+                if (hr > 23 || mn > 59 || sc > 59 || fr >= kFramesPerRateCode[rateCode])
+                    return;
+                if (rateCode == 2 && sc == 0 && fr < 2 && mn % 10 != 0)
                     return;
 
                 // A Full Frame message is an explicit locate (AUDIT LTC-13).
