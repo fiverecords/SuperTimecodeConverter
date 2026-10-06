@@ -56,7 +56,7 @@
 #include <cstring>
 
 #ifdef _WIN32
-  // Windows includes pulled in by JuceHeader (iphlpapi etc.)
+  // Windows: winsock2 / ws2tcpip / iphlpapi come from NetworkUtils.h
 #elif defined(__APPLE__)
   #include <ifaddrs.h>
   #include <net/if_dl.h>

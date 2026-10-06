@@ -2107,11 +2107,13 @@ public:
                     }
 
                     // The player holding the track's media moved to another
-                    // address, or was lost and came back: DbServerClient
-                    // dropped what it had cached under the old one
-                    // (onPlayerLost), and nothing else asks again for a track
-                    // that did not change (AUDIT PDL-3).  Asked once per
-                    // address.
+                    // address, or was lost and came back: ask once at the new
+                    // address, as nothing else asks again for a track that
+                    // did not change (AUDIT PDL-3).  A move keeps what
+                    // DbServerClient cached (onPlayerMoved -> movePlayer
+                    // re-keys it to the new address; an entry still missing
+                    // analysis is fetched again there); a player lost and
+                    // found again lost it (onPlayerLost).
                     if (cachedTrackId != 0)
                     {
                         juce::String srcIp;
@@ -2515,7 +2517,7 @@ public:
                     // --- Track change detection ---
                     // StageLinQInput raises the version once per load, when the
                     // identity has settled, and not for the track it last
-                    // published (AUDIT ENG-7, stage A).  The identity is read
+                    // published (AUDIT ENG-7).  The identity is read
                     // live here, so a track loaded between one publication and
                     // the tick that sees it is taken under that version; its
                     // own publication then finds the identity this engine
@@ -2836,8 +2838,14 @@ public:
                         // while paused or stopped moved past does not fire at
                         // the next play (DESIGN D36).  No PLL here: Winamp's
                         // position is continuous (50 ms polls, interpolated),
-                        // so a step of over 500 ms either way can only be a
-                        // seek.
+                        // so a step of over 500 ms either way is taken as a
+                        // seek: a real one, or the end of an IPC stall.
+                        // WinampInput's position runs on at most 1 s past its
+                        // last answer and then holds, so when the answers
+                        // resume it jumps to where the player is: forward by
+                        // over 500 ms after a stall of over about 1.5 s with
+                        // the audio playing on, back by up to 1 s when the
+                        // audio froze too (getPositionMs, AUDIT UI-13).
                         const uint32_t playheadMs = (uint32_t) juce::jmax(0, (int)posMs);
                         const bool winSeeked = playheadMs > lastCueCheckMs + 500
                                             || playheadMs + 500 < lastCueCheckMs;
@@ -4102,10 +4110,12 @@ private:
     double pdlSnapTime = 0.0;         // hi-res timestamp of last CDJ packet
     double pdlSnapSpeed = 1.0;        // actualSpeed at last CDJ packet
 
-    // Beat grid for PLL micro-correction (from rekordbox via DbServerClient).
-    // Between CDJ abspos packets, the PLL interpolates at constant velocity.
-    // Small timing errors accumulate.  When a beat grid is available, the PLL
-    // applies a gentle nudge toward the nearest beat position, reducing drift.
+    // This engine's player's rekordbox beat grid (DbServerClient's cache,
+    // refreshBeatGridFromDb; setBeatGrid).  On the NXS2 beat fallback (no
+    // 0x0b) it gives the position: the time of the beat the beat count
+    // names, which is what goes on the wire, hence one grid per engine
+    // (AUDIT ENG-4).  It also nudges the PLL position (beatGridCorrect),
+    // which changes nothing that is sent (AUDIT ENG-15).
     std::vector<TrackMetadata::BeatEntry> pdlBeatGrid;
     uint32_t pdlBeatGridTrackId = 0;  // track ID for which beat grid is loaded
     uint32_t beatGridCheckedVersion = 0;  // dbserver cache version last looked at (refreshBeatGridFromDb)
