@@ -1158,6 +1158,30 @@ public:
                                         mutableEntry->cuePoints.push_back(std::move(cp));
                                     }
                                     mutableEntry->sortCuePoints();
+
+                                    // Persist the populated cues (in the
+                                    // background: this is the 60 Hz timer), and
+                                    // have the engines following this deck load
+                                    // them.  Without this they reached the file
+                                    // only with the next save made for another
+                                    // reason (at the latest on quit), and the
+                                    // engines' armed cue list stayed empty
+                                    // until their next track change or Track
+                                    // Map refresh.  A refresh keeps the cues
+                                    // behind where the deck's cues were checked
+                                    // up to as passed, so none fires at once or
+                                    // twice (DESIGN D36; AUDIT ENG-18).
+                                    // Message thread.
+                                    if (!mutableEntry->cuePoints.empty())
+                                    {
+                                        trackMap.saveAsync();
+                                        for (auto& eng : engines)
+                                        {
+                                            if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                                                && eng->getEffectivePlayer() == pn)
+                                                eng->refreshTrackMapLookup();
+                                        }
+                                    }
                                 }
                             }
                         }
