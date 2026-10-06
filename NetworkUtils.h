@@ -99,6 +99,12 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
                 char ipStr[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
 
+                // An adapter with a /32 address (WireGuard and other
+                // point-to-point VPN adapters often have one) gets its own
+                // address as broadcast here (mask ~0), so every user of the
+                // field sends to itself on it.  The Windows half of AUDIT
+                // NET-16, not fixed: it changes where STC sends (DESIGN D2;
+                // BENCH B91).
                 ULONG prefixLength = unicast->OnLinkPrefixLength;
                 uint32_t ip = ntohl(addr->sin_addr.s_addr);
                 uint32_t mask = (prefixLength == 0) ? 0u : (prefixLength >= 32) ? ~0u : (~0u << (32 - prefixLength));
@@ -202,7 +208,7 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
 // (HippotizerInput.h).
 //
 // What it costs (Linux by the delivery rule measured on loopback, macOS by
-// the BSD bind rules; neither tried with two interfaces; BENCH):
+// the BSD bind rules; neither tried with two interfaces; BENCH B91):
 //  - Two inputs on one port on two different interfaces (two engines) both
 //    want INADDR_ANY.  Linux gives it to both: a broadcast reaches both, a
 //    unicast only the one bound last, which drops it if it was sent to the
@@ -227,6 +233,17 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
 //  - A sender on another subnet of the same network that broadcasts to
 //    255.255.255.255 is dropped by the filter on macOS and Linux (its
 //    address is not on the interface's subnet); Windows receives it.
+//  - Two interfaces on one subnet (a laptop on one LAN by Ethernet and
+//    Wi-Fi): a broadcast arrives once per interface on the INADDR_ANY
+//    socket on macOS, and on Linux unless rp_filter drops the second copy,
+//    and both copies pass the filter, which reads the destination and the
+//    sender but not the interface a datagram came in on.  Art-Net and
+//    LA-Net take the frame twice and keep the later copy's arrival time
+//    (AUDIT LTC-8), with the slower link's delay and jitter; an OSC
+//    message sent to the broadcast address is handled twice.  Windows
+//    binds the interface's own address and gets only its copy.  Reading
+//    the interface as well (IP_PKTINFO's ipi_ifindex on Linux, IP_RECVIF
+//    on macOS) would drop the other copy; not done.
 //  - The input now also hears STC's own broadcasts on that interface and
 //    port -- Art-Net or LA-Net out of another engine, or of the same engine
 //    -- as it already did on Windows and with ALL INTERFACES.  It cannot
