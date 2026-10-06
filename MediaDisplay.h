@@ -4,7 +4,7 @@
 //
 // MediaDisplay -- Visual display components for waveform and artwork data.
 //
-// WaveformDisplay: Renders CDJ waveform preview in two formats, each column a
+// WaveformDisplay: Renders a waveform preview in three formats, each column a
 // bar mirrored about the centre line, scaled to the track's highest column:
 //   - CDJ-3000 3-band (PWV6): 1200 entries x 3 bytes = {mid, high, low} heights.
 //     The bar is the top of beat-link's stacked bands (WaveformPreview:
@@ -15,6 +15,12 @@
 //     colour the bar red/green/blue.  As beat-link's WaveformPreview draws
 //     it: a back bar max(d3, d4, d5) high at 3/4 brightness, and a front bar
 //     d5 high at full brightness.  d0-d2 are not used.
+//   - Engine DJ overview (StageLinQ, setEngineOverviewData): N entries x 3
+//     bytes, low/mid/high, which StageLinQDbClient reorders to {mid, high,
+//     low}.  The bar is the mid band, scaled to the track's highest band
+//     value, in the PWV6 blue -- as every 3-byte preview was drawn before
+//     AUDIT META-12; beat-link's PWV6 weights are rekordbox's, and nothing
+//     says Engine DJ's bands are scaled the same way.
 //
 // ArtworkDisplay: Renders a decoded JPEG album art image.
 
@@ -28,8 +34,9 @@
 //==============================================================================
 // WaveformDisplay -- Paints CDJ waveform preview bars
 //
-// Supports CDJ-3000 3-band (PWV6) and NXS2 color (PWV4) formats,
-// from TrackMetadata::waveformData (DbServerClient) or the waveform cache.
+// Supports CDJ-3000 3-band (PWV6) and NXS2 color (PWV4) formats, from
+// TrackMetadata::waveformData (DbServerClient) or the waveform cache, and the
+// Engine DJ overview from StageLinQDbClient::getWaveformForTrack.
 //==============================================================================
 
 class WaveformDisplay : public juce::Component
@@ -42,17 +49,18 @@ public:
 
     /// Set color preview waveform data (from CDJ dbserver ANLZ response).
     /// bytesPerEntry: 3 = CDJ-3000 3-band (mid,high,low), 6 = NXS2 color (d0-d5)
+    /// An Engine DJ overview goes to setEngineOverviewData: it is 3 bytes too,
+    /// but not drawn as rekordbox's PWV6.
     void setColorWaveformData(const std::vector<uint8_t>& data, int entryCount, int bytesPerEntry)
     {
-        colorWaveformData = data;
-        colorEntryCount = entryCount;
-        colorBytesPerEntry = bytesPerEntry;
-        // The sizes come from the wire: multiply in size_t (an int product of
-        // 0x2AAAAAAB x 6 wrapped and passed the check).
-        hasColorData = (entryCount > 0 && (bytesPerEntry == 3 || bytesPerEntry == 6)
-                        && data.size() >= (size_t)entryCount * (size_t)bytesPerEntry);
-        invalidateCache();
-        repaint();
+        setWaveformData(data, entryCount, bytesPerEntry, false);
+    }
+
+    /// Set an Engine DJ overview waveform (StageLinQDbClient's
+    /// DenonWaveformData: 3 bytes per entry, reordered to mid, high, low).
+    void setEngineOverviewData(const std::vector<uint8_t>& data, int entryCount)
+    {
+        setWaveformData(data, entryCount, 3, true);
     }
 
     /// Clear all waveform data (e.g. on track change before new data arrives)
@@ -62,6 +70,7 @@ public:
         hasColorData = false;
         colorEntryCount = 0;
         colorBytesPerEntry = 0;
+        engineOverview = false;
         playPosition = 0.0f;
         durationMs = 0;
         previewCues.clear();
@@ -161,6 +170,21 @@ public:
     }
 
 private:
+    void setWaveformData(const std::vector<uint8_t>& data, int entryCount, int bytesPerEntry,
+                         bool engineDjOverview)
+    {
+        colorWaveformData = data;
+        colorEntryCount = entryCount;
+        colorBytesPerEntry = bytesPerEntry;
+        engineOverview = engineDjOverview;
+        // The sizes come from the wire: multiply in size_t (an int product of
+        // 0x2AAAAAAB x 6 wrapped and passed the check).
+        hasColorData = (entryCount > 0 && (bytesPerEntry == 3 || bytesPerEntry == 6)
+                        && data.size() >= (size_t)entryCount * (size_t)bytesPerEntry);
+        invalidateCache();
+        repaint();
+    }
+
     //----------------------------------------------------------------------
     // Cached waveform image -- rendered at physical pixel resolution to
     // avoid HiDPI upscaling blur.  Regenerated only when data, size, or
@@ -299,7 +323,8 @@ private:
         cacheValid = true;
     }
 
-    /// Render CDJ-3000 3-band waveform bars into a Graphics context (cached).
+    /// Render CDJ-3000 3-band waveform bars into a Graphics context (cached),
+    /// or an Engine DJ overview (engineOverview: the mid band's height).
     void renderThreeBandBars(juce::Graphics& g, juce::Rectangle<float> bounds)
     {
         float w = bounds.getWidth();
@@ -313,13 +338,16 @@ private:
         const uint8_t* data = colorWaveformData.data();
         int totalBytes = (int)colorWaveformData.size();
 
-        // Find global peak amplitude for height normalization
+        // Find global peak amplitude for height normalization (an Engine DJ
+        // overview: the highest band value, as before AUDIT META-12)
         float globalPeak = 1.0f;
         for (int i = 0; i < colorEntryCount; ++i)
         {
             int off = i * 3;
             if (off + 2 >= totalBytes) break;
-            globalPeak = std::max(globalPeak, threeBandPreviewHeight(data[off], data[off + 1], data[off + 2]));
+            globalPeak = std::max(globalPeak, engineOverview
+                ? (float)std::max({ data[off], data[off + 1], data[off + 2] })
+                : threeBandPreviewHeight(data[off], data[off + 1], data[off + 2]));
         }
         float hScale = halfH / globalPeak;
 
@@ -346,7 +374,8 @@ private:
             float avgHigh = sumHigh / (float)count;
             float avgLow  = sumLow  / (float)count;
 
-            float amplitude = threeBandPreviewHeight(avgMid, avgHigh, avgLow);
+            float amplitude = engineOverview ? avgMid
+                                             : threeBandPreviewHeight(avgMid, avgHigh, avgLow);
             if (amplitude < 1.0f) continue;
 
             float barH = amplitude * hScale;
@@ -489,6 +518,7 @@ private:
     std::vector<uint8_t> colorWaveformData;
     int colorEntryCount = 0;
     int colorBytesPerEntry = 0;  // 3=ThreeBand(CDJ-3000), 6=ColorNxs2
+    bool engineOverview = false; // 3 bytes from Engine DJ, not rekordbox's PWV6
     bool hasColorData = false;
     float playPosition = 0.0f;   // 0.0 = start, 1.0 = end
     uint32_t durationMs = 0;     // track duration for minute markers
