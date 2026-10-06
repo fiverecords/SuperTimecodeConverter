@@ -396,10 +396,10 @@ public:
     /// load's source swap (sourceLock).  A newly loaded file is attached at
     /// position 0 (attachReaderToTransport); a request for the file already
     /// loaded, an unload, or a load with the device closed attaches nothing
-    /// and leaves the old position.  A start from Stopped does not use it:
-    /// it seeks first (TimecodeEngine's generatorPlay, and its
-    /// onLoadCompleted catch-up while Playing).  A start from Paused after
-    /// a click on the timeline whose seek was dropped does (seekSeconds).
+    /// and leaves the old position.  A start does not use it: from Stopped
+    /// it seeks first (TimecodeEngine's generatorPlay), and the last load's
+    /// onLoadCompleted catch-up seeks to the engine's playhead whenever the
+    /// generator is not Stopped (seekSeconds).
     void stopAndReset()
     {
         shouldPlay.store(false, std::memory_order_release);
@@ -424,15 +424,14 @@ public:
     /// newer requestLoad, started that file until the swap -- and the
     /// message thread would wait for the load's source swap (sourceLock).
     /// The last load's onLoadCompleted catch-up seeks to the engine's
-    /// playhead when the generator is Playing, which also starts the
-    /// transport, and a start from Stopped seeks first (generatorPlay).
-    /// A seek dropped while the generator is Paused is not made up for: a
-    /// click on the timeline while a preset's file loads (the click turns
-    /// Stopped into Paused) leaves the transport where it is -- 0 in a
-    /// newly attached file, the old position otherwise -- and a play from
-    /// Paused does not seek, so the audio starts there while the timecode
-    /// runs from the click.  Made before the load's swap, the seek would
-    /// reach only the file being replaced, with the same result.
+    /// playhead whenever the generator is not Stopped, and a start from
+    /// Stopped seeks first (generatorPlay).  While Playing the catch-up
+    /// also starts the transport; while Paused it only positions it, which
+    /// makes up for a seek dropped here: a click on the timeline while a
+    /// preset's file loads (the click turns Stopped into Paused) used to
+    /// leave the transport where it was -- 0 in a newly attached file, the
+    /// old position otherwise -- and a play from Paused does not seek, so
+    /// the audio started there while the timecode ran from the click.
     void seekSeconds(double seconds)
     {
         if (! hasFileLoaded()) return;
@@ -465,6 +464,17 @@ public:
     bool   isPlaying()                 const
     {
         return transport.isPlaying() && ! userPaused.load(std::memory_order_acquire);
+    }
+
+    /// True from requestLoad until the LoaderThread has settled the last
+    /// queued request (pendingLoad).  Meanwhile the transport holds the file
+    /// being replaced: isPlaying() may say true, but the audio callback no
+    /// longer pulls it, so its position does not move (TimecodeEngine skips
+    /// its audio clock discipline then, AUDIT LTC-4).  Lock-free, any
+    /// thread.
+    bool   isLoadPending()             const
+    {
+        return pendingLoad.load(std::memory_order_acquire);
     }
 
     //==========================================================================

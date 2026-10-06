@@ -68,23 +68,31 @@ public:
         if (index == kPrimaryEngineIndex)
             audioThru = std::make_unique<AudioThru>();
 
-        // Re-sync the audio transport to the engine's current playhead
-        // when an async file load completes during playback.  Without
-        // this, attachReaderToTransport() sets transport.setPosition(0)
-        // the moment the source is wired, but the engine has been
-        // ticking forward for the duration of the load -- the audio
-        // plays "late" until the operator pauses+plays.  Captured by
-        // juce::WeakReference so a load completing after this engine
-        // has been destroyed (engines can be removed at runtime) is a
-        // no-op rather than a use-after-free.  Runs on the message
-        // thread (callAsync dispatch), same context that owns genState
-        // and genCurrentMs, so no atomics or locks needed.
+        // Re-seek the audio transport to the engine's current playhead
+        // after every settled load, unless the generator is Stopped.
+        // While Playing: attachReaderToTransport() sets
+        // transport.setPosition(0) the moment the source is wired, but the
+        // engine has been ticking forward for the duration of the load --
+        // the audio played "late" until the operator paused and played;
+        // the seek also starts the transport.  While Paused it only
+        // positions the transport (seekSeconds does not start a paused
+        // player): a click on the timeline while a load is pending turns
+        // Stopped into Paused, and its own seek was dropped (AUDIT LTC-4),
+        // and a play from Paused does not seek, so the audio started at 0
+        // in the new file, or at the old position, while the timecode ran
+        // from the click.  Stopped needs nothing: a play from Stopped
+        // seeks first (generatorPlay).  Captured by juce::WeakReference so
+        // a load completing after this engine has been destroyed (engines
+        // can be removed at runtime) is a no-op rather than a
+        // use-after-free.  Runs on the message thread (callAsync
+        // dispatch), same context that owns genState and genCurrentMs, so
+        // no atomics or locks needed.
         generatorAudioPlayer.onLoadCompleted =
             [weak = juce::WeakReference<TimecodeEngine>(this)]()
             {
                 auto* self = weak.get();
                 if (self == nullptr) return;
-                if (self->genState != GeneratorState::Playing) return;
+                if (self->genState == GeneratorState::Stopped) return;
                 const double audioPosSec = juce::jmax(0.0,
                     (self->genCurrentMs - self->genStartMs) / 1000.0);
                 self->generatorAudioPlayer.seekSeconds(audioPosSec);
@@ -4926,8 +4934,15 @@ private:
             // first-order pull (tau ~ 0.8 s at 60 Hz) keeps the timecode
             // smooth.  A discrepancy of a second or more is not drift but a
             // loop fold, a seek in flight, or a transport stopped at EOF:
-            // leave it to the code that handles those.
-            if (generatorAudioPlayer.hasFileLoaded() && generatorAudioPlayer.isPlaying())
+            // leave it to the code that handles those.  Not while a file
+            // load is pending: the transport still holds the file being
+            // replaced and no longer moves (the audio callback plays
+            // silence), so following it pulled the timecode back for up to
+            // 200 ms -- ~25 ms late after a preset change from a slow disk
+            // during playback (AUDIT LTC-4); the load's onLoadCompleted
+            // seek brings the new file to the timecode.
+            if (generatorAudioPlayer.hasFileLoaded() && generatorAudioPlayer.isPlaying()
+                && ! generatorAudioPlayer.isLoadPending())
             {
                 const double audioMs = genStartMs + generatorAudioPlayer.getCurrentPositionSeconds() * 1000.0;
                 // Only follow a clock that is running: a device that has
