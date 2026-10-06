@@ -494,7 +494,7 @@ public:
 
     //==========================================================================
     // Invalidate cache for a player (called when ProDJLinkInput reports the
-    // player lost; nothing calls it on a media eject)
+    // player lost; a media change in one slot is mediaChanged below)
     //==========================================================================
     void invalidatePlayer(const juce::String& playerIP)
     {
@@ -520,6 +520,45 @@ public:
             }
         }
         forgetAddress(playerIP);
+    }
+
+    //==========================================================================
+    // The media in a player's SD (2) or USB (3) slot was mounted or
+    // unmounted (ProDJLinkInput::onMediaChanged, AUDIT META-4).  rekordbox
+    // IDs are per export, so the metadata and artwork cached for that player
+    // and slot, and the NFS fetcher's export.pdb index and mount handle for
+    // it, describe the media that was there: they are dropped, and the next
+    // request fetches the new media's.  A track still loaded from the old
+    // media (a deck in emergency loop) loses its metadata as well, as
+    // beat-link's MetadataFinder flushes its cache on an unmount.  An NFS
+    // download already running for that slot does not store its result
+    // (slotMediaGeneration).  Any thread (the Pro DJ Link network thread).
+    //==========================================================================
+    void mediaChanged(const juce::String& playerIP, uint8_t slot)
+    {
+        const uint32_t ip = ipToUint32(playerIP);
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            for (auto it = metadataCache.begin(); it != metadataCache.end(); )
+            {
+                if (it->first.ip == ip && it->first.slot == slot)
+                    it = metadataCache.erase(it);
+                else
+                    ++it;
+            }
+            ++slotMediaGeneration[slotKey(ip, slot)];
+        }
+        {
+            const juce::SpinLock::ScopedLockType lock(artCacheLock);
+            for (auto it = artworkCache.begin(); it != artworkCache.end(); )
+            {
+                if (it->first.ip == ip && it->first.slot == slot)
+                    it = artworkCache.erase(it);
+                else
+                    ++it;
+            }
+        }
+        nfsAnlzFetcher.clearPdbCache(playerIP, slot);   // thread-safe
     }
 
     //==========================================================================
@@ -848,6 +887,19 @@ private:
     static CacheKey makeCacheKey(const juce::String& ip, uint8_t slot, uint32_t id)
     {
         return { ipToUint32(ip), id, slot };
+    }
+
+    /// Key of slotMediaGeneration: a player's IPv4 as a number, and a slot.
+    static uint64_t slotKey(uint32_t ip, uint8_t slot)
+    {
+        return (uint64_t(ip) << 8) | slot;
+    }
+
+    /// Caller holds cacheLock.  Media changes seen so far in this slot.
+    uint32_t slotMediaGenerationLocked(uint32_t ip, uint8_t slot) const
+    {
+        auto it = slotMediaGeneration.find(slotKey(ip, slot));
+        return it != slotMediaGeneration.end() ? it->second : 0u;
     }
 
     /// Two entries describe the same track: same artist, title (not empty)
@@ -3389,6 +3441,13 @@ private:
     mutable juce::SpinLock cacheLock;
     std::unordered_map<CacheKey, TrackMetadata, CacheKeyHash> metadataCache;
 
+    // Media changes seen per player and slot (mediaChanged, AUDIT META-4),
+    // under cacheLock.  An NFS download notes the count at launch and stores
+    // its result only if it has not moved; otherwise a download from the old
+    // media, still running when an entry for the same ID on the new media
+    // was made, would put the old analysis into it.
+    std::unordered_map<uint64_t, uint32_t> slotMediaGeneration;
+
     // Artwork cache (separate lock for independent access)
     mutable juce::SpinLock artCacheLock;
     std::unordered_map<CacheKey, juce::Image, CacheKeyHash> artworkCache;   // key.id = artwork ID
@@ -3536,8 +3595,13 @@ private:
         // Taken here, before the thread exists: stop()'s cancel() ends this
         // download even if it lands before the thread begins (AUDIT WIRE-6).
         const uint32_t cancelToken = nfsAnlzFetcher.cancelToken();
+        uint32_t mediaGeneration = 0;
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            mediaGeneration = slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot);
+        }
         nfsBusy.store(true, std::memory_order_release);
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey, cancelToken]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey, cancelToken, mediaGeneration]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
             DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
@@ -3545,11 +3609,16 @@ private:
 
             if (anlz.ok && isRunningFlag.load(std::memory_order_relaxed))
             {
+                bool applied = false;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
-                    if (it != metadataCache.end())
+                    // Not if the slot's media changed since the launch: the
+                    // entry is then another medium's (AUDIT META-4).
+                    if (it != metadataCache.end()
+                        && slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot) == mediaGeneration)
                     {
+                        applied = true;
                         // NFS data is authoritative (from USB) -- always overwrite
                         applyNfsAnlzResult(it->second, anlz, true);
                         ++it->second.cacheVersion;
@@ -3564,7 +3633,7 @@ private:
                 }
 
                 // Persist to disk cache for next session
-                if (!diskCacheKey.empty())
+                if (applied && !diskCacheKey.empty())
                     saveAnlzToDisk(cacheKey, diskCacheKey);
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
@@ -3573,9 +3642,11 @@ private:
 
     /// Worker thread, with no NFS download running (nfsIdle()).  Tell the
     /// NFS fetcher to forget every player reported lost since the last call:
-    /// NfsAnlzFetcher::removePlayer(ip) for each (AUDIT META-4).  Called only
-    /// here, so the fetcher is never used by two threads at once.  Nothing
-    /// calls clearPdbCache(): no media-change signal reaches DbServerClient.
+    /// NfsAnlzFetcher::removePlayer(ip) for each (AUDIT META-4).  A media
+    /// change in one slot calls clearPdbCache(ip, slot) at once instead
+    /// (mediaChanged): the fetcher's invalidations are thread-safe and only
+    /// make a download running for that player or slot not store what it
+    /// learnt.
     void forgetLostPlayersInNfs()
     {
         for (auto& ip : nfsLostPlayers)

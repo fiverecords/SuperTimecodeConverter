@@ -389,6 +389,11 @@ struct ProDJLinkPlayerState
     // never keepalives (multi-deck all-in-one units).  See handleStatusPacket.
     int  statusSeenCount = 0;
     char statusSeenIp[16] = {0};
+    // Whether media was mounted in this player's own SD and USB slots at its
+    // last status from its address: 1 mounted, 0 not, kMediaUnknown before
+    // the first (AUDIT META-4; see handleStatusPacket).  Network thread only.
+    static constexpr uint8_t kMediaUnknown = 0xFF;
+    uint8_t localMedia[2] = { kMediaUnknown, kMediaUnknown };   // [0] SD (slot 2), [1] USB (slot 3)
     std::atomic<double>   absPositionTs  { 0.0 };  // timestamp of last abs position (for interpolation)
     // playheadMs and absPositionTs are written as a pair, under a sequence
     // count that is odd while the network thread writes them (a seqlock), so
@@ -477,6 +482,7 @@ struct ProDJLinkPlayerState
         addrHeardMs = 0.0;
         statusSeenCount = 0;
         statusSeenIp[0] = '\0';
+        localMedia[0] = localMedia[1] = kMediaUnknown;
         cntStatusPkts.store(0, std::memory_order_relaxed);
         cntAbsPosPkts.store(0, std::memory_order_relaxed);
     }
@@ -730,6 +736,14 @@ public:
     /// address (lookups by track ID alone still find it) and its idle
     /// dbserver connection is closed after its idle timeout.  Network thread.
     std::function<void(const juce::String& oldIp, const juce::String& newIp)> onPlayerMoved;
+
+    /// Called when the media in a player's own SD (slot 2) or USB (slot 3)
+    /// slot is mounted or unmounted, as its status packets report it (AUDIT
+    /// META-4): what was cached for that player and slot -- metadata,
+    /// artwork, the NFS export.pdb index and mount handle -- belongs to the
+    /// media that was there.  Wire this to DbServerClient::mediaChanged().
+    /// Network thread.
+    std::function<void(const juce::String& playerIP, uint8_t slot)> onMediaChanged;
     void setVCDJPlayerNumber(int n)     { vCDJPlayerNumber = juce::jlimit(1, 127, n); }
 
     /// Bridge identity profile for the 54B keepalive (see constants above).
@@ -3098,6 +3112,30 @@ private:
             p.trackVersion.fetch_add(1, std::memory_order_release);
             // Reset beat-derived position since beatCount restarts on new track
             p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
+        }
+
+        // Media in the player's own slots: S_l (0x73) for SD and U_l (0x6f)
+        // for USB read 00 while media is mounted, 04 when the slot is empty
+        // and 02 or 03 while it is being unmounted (dysentery vcdj.adoc;
+        // beat-link CdjStatus.isLocalSdLoaded / isLocalUsbLoaded).  When a
+        // slot goes from mounted to not, or back, the media there changed:
+        // rekordbox IDs are per export, so what is cached for this player and
+        // slot no longer describes it, and onMediaChanged is told (AUDIT
+        // META-4).  The first status seen only sets the state.  Only status
+        // from the player's own address counts, so a second device on the
+        // same number cannot make the state flap.  Parse side only: nothing
+        // is sent (DESIGN D33).
+        if (p.ipStr[0] != '\0' && sender == p.ipStr)
+        {
+            static constexpr int kStateAt[2] = { 0x73, 0x6f };   // [0] SD (slot 2), [1] USB (slot 3)
+            for (int k = 0; k < 2; ++k)
+            {
+                const uint8_t mounted = data[kStateAt[k]] == 0x00 ? 1 : 0;
+                const uint8_t before = p.localMedia[k];
+                p.localMedia[k] = mounted;
+                if (before != ProDJLinkPlayerState::kMediaUnknown && before != mounted && onMediaChanged)
+                    onMediaChanged(sender, uint8_t(k + 2));
+            }
         }
 
         // Play state
