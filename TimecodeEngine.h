@@ -294,7 +294,8 @@ public:
     /// how long the callback was late and what the device period was.  A
     /// logic-analyser capture can then be lined up with STC's own view of
     /// the event -- @mungewell asked for exactly this.  Nothing is written
-    /// while no gaps occur.
+    /// while no gaps occur.  The file is bounded (AUDIT LTC-5, BENCH B32):
+    /// see appendLtcGapLogLine.
     void logLtcOutputGaps()
     {
         const auto stamp = [] {
@@ -314,7 +315,7 @@ public:
                                                            / juce::jmax(1.0, ltcOutput.getActualSampleRate()), 1) + " ms"
                               + (ltcOutput.getLastGapReseeded() ? "  hole, re-seeded" : "  late, absorbed")
                               + "  total " + juce::String(gaps) + "\n";
-            AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+            appendLtcGapLogLine(line);
         }
 
         // Value corrections and re-seeds (D30), same file, so a capture of a
@@ -326,7 +327,7 @@ public:
             const char* what = "?";
             switch (ltcOutput.getLastTrackKind())
             {
-                case 1: what = "ahead: repeated a frame"; break;
+                case 1: what = "ahead or held: repeated a frame"; break;
                 case 2: what = "behind: skipped a frame"; break;
                 case 3: what = "seek: snapped"; break;
                 case 4: what = "re-seed after hole"; break;
@@ -339,10 +340,42 @@ public:
                               + "  next " + ltcOutput.getLastTrackNext().toString()
                               + "  ref " + ltcOutput.getLastTrackRef().toString()
                               + "  total " + juce::String(events) + "\n";
-            AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log").appendText(line);
+            appendLtcGapLogLine(line);
         }
     }
 
+private:
+    /// One line into ltc_gaps.log (logLtcOutputGaps), the same text as
+    /// always.  Every engine writes the same file, so its state is shared:
+    /// message thread only (the audio thread only counts).  The path is
+    /// worked out once -- AppSettings::getSettingsFile() creates the folder
+    /// on every call -- and the size is followed from the bytes written.
+    /// Past kLtcGapLogMaxBytes the file moves to ltc_gaps.log.1, replacing
+    /// the previous one, and a new one starts: the two hold about twice that
+    /// at most.  The "late, absorbed" lines BENCH B32 calls normal used to
+    /// make it grow without bound on every machine (AUDIT LTC-5).  If the
+    /// move fails (the .1 held open elsewhere), writing goes on and the move
+    /// is tried again at the next line.
+    static void appendLtcGapLogLine(const juce::String& line)
+    {
+        struct GapLog { juce::File file; juce::int64 bytes = -1; };
+        static GapLog log;
+        if (log.bytes < 0)
+        {
+            log.file  = AppSettings::getSettingsFile().getSiblingFile("ltc_gaps.log");
+            log.bytes = log.file.getSize();   // 0 when there is none yet
+        }
+        if (log.bytes >= kLtcGapLogMaxBytes)
+        {
+            log.file.moveFileTo(log.file.getSiblingFile("ltc_gaps.log.1"));
+            log.bytes = log.file.getSize();   // 0 unless the move failed
+        }
+        if (log.file.appendText(line))
+            log.bytes += (juce::int64) line.getNumBytesAsUTF8() + 1;   // appendText writes the '\n' as "\r\n"
+    }
+    static constexpr juce::int64 kLtcGapLogMaxBytes = 5 * 1024 * 1024;
+
+public:
     /// Playback speed of the source as a ratio (1.0 = nominal), for
     /// protocols that carry it (TCNet layer speed).  DJ sources: the PLL's
     /// pitch; everything else runs at 1.0.  0.0 while frozen or stopped.
