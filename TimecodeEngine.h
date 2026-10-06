@@ -288,10 +288,6 @@ public:
     FrameRate getOutputFps() const { return outputFps; }
     Timecode getOutputTimecode() const { return outputTimecode; }
 
-    /// Playhead in ms from the active input (for UI cursor / position display).
-    /// Reads directly from the corresponding input class for the source.
-    /// Winamp returns getPositionMs() which is already smoothed by the
-    /// poll-thread IIR filter, so no extra work here.
     /// LTC output holes (#19) are counted on the audio thread; here, once per
     /// tick on the message thread, each new one is written to ltc_gaps.log
     /// next to settings.json: when it happened, on which engine and device,
@@ -357,6 +353,15 @@ public:
         return sourceActive ? 1.0 : 0.0;
     }
 
+    /// Track position in ms of the followed deck, read from the input as it
+    /// stands (UI cursor, cue-point editor, beat synthesis, TCNet layer
+    /// position).  Despite the name, Pro DJ Link and StageLinQ give the
+    /// latest packet's position (on an NXS2 the input's beat-derived
+    /// estimate, not the engine's grid position), without the engine's
+    /// interpolation and without the Track Map offset; Winamp gives its
+    /// position as polled and interpolated by WinampInput.  0 for every
+    /// other source.  So TCNet carries this raw position next to an
+    /// interpolated, offset timecode (AUDIT ENG-14).  Message thread.
     uint32_t getSmoothedPlayheadMs() const
     {
         if (activeInput == InputSource::StageLinQ && sharedStageLinQ != nullptr)
@@ -376,7 +381,8 @@ public:
         return sharedProDJLink->getPlayheadMs(ep);
     }
 
-    /// Play position as 0.0-1.0 ratio (for waveform cursor).
+    /// Play position as 0.0-1.0 ratio (for waveform cursor), from the same
+    /// raw input position as getSmoothedPlayheadMs (AUDIT ENG-14).
     /// For Winamp this is position / duration as reported by the player.
     /// While the duration is still being decoded (very first ~1 s of a
     /// freshly loaded VBR file) the ratio is held at 0 to avoid jumping
@@ -1785,7 +1791,8 @@ public:
                     // This engine's own beat grid for its player (AUDIT ENG-4).
                     refreshBeatGridFromDb();
 
-                    // Beat grid micro-correction: nudge PLL toward nearest beat
+                    // Beat grid nudge of the PLL position (see beatGridCorrect:
+                    // without effect on anything sent).
                     if (!pdlBeatGrid.empty())
                         pll.beatGridCorrect(pdlBeatGrid);
 
@@ -3711,29 +3718,32 @@ private:
     }
 
     //==========================================================================
-    // Playhead PLL -- smooth timecode generation from CDJ data.
+    // Playhead PLL -- the DJ source's speed and seek verdict.
     //
-    // Instead of snapping to each CDJ packet (~30ms), we maintain a free-running
-    // clock that advances at the CDJ's actual motor speed (offset 152). When a
-    // new packet arrives, we gently correct the clock toward the CDJ's real position.
+    // A free-running clock that advances at the deck's actual speed (CDJ
+    // status offset 152; StageLinQ's BeatInfo rate) and is pulled towards
+    // each new position.  What it feeds today (AUDIT D4, ENG-15):
+    //   - `pitch`: the LTC encoder's bit rate (setPitchMultiplier) and the
+    //     speed TCNet carries (getSourceSpeedRatio);
+    //   - `actualSpeed` / `smoothVelocity`: the source-active test;
+    //   - `seekDetected` (an error over 500 ms): cue dispatch's seek rule
+    //     (DESIGN D17, D36) and the outputs' resync.
+    // The timecode does NOT come from it: tick() interpolates the deck's own
+    // position (pdlSnapMs/pdlSnapTime/pdlSnapSpeed), and `positionMs` serves
+    // only the 500 ms seek test.
     //
     // CDJ actual speed (offset 152) is the real playback rate including:
     //   - Motor ramp on play (0 -> target over ~0.5s)
     //   - Motor ramp on pause (target -> 0 over ~4-5s)
     //   - Jog wheel adjustments
     //   - Pitch fader changes
-    //
-    // This means we DON'T need:
-    //   - Dual transient/stable modes (actualSpeed already IS the correct rate)
-    //   - Stability detection (no mode switching = no transition glitches)
-    //   - dp/dt velocity estimation for CDJ-3000 (kept only as NXS2 fallback)
-    //
-    // Result: perfectly smooth timecode at any pitch, including during ramps.
-    // Hard reset only on seek/track change (>500ms error).
+    // so the pitch follows ramps without transient/stable modes; dp/dt
+    // between packets is kept as the fallback for a player that reports no
+    // speed.
     //==========================================================================
     struct PlayheadPLL
     {
-        double positionMs     = 0.0;  // smoothed position (ms)
+        double positionMs     = 0.0;  // the PLL's position (ms): only the seek test reads it
         double lastTickTime   = 0.0;  // timestamp of last tick
         double lastPacketTs   = 0.0;  // to detect new CDJ packets
         double lastCdjPos     = 0.0;  // previous CDJ position (for velocity calc)
@@ -3764,11 +3774,12 @@ private:
             initialized    = false;
         }
 
-        // State-aware PLL driven by CDJ actual speed:
+        // State-aware PLL driven by CDJ actual speed (one call per tick, 60 Hz):
         //
         //   Position input:
         //     CDJ-3000:   absolute playhead at 30Hz (type 0x0b) -- ms precision
         //     NXS2/older: beat-derived at ~5Hz (beatCount x 60000/BPM from status)
+        //     StageLinQ:  each BeatInfo message's position (~35 ms)
         //
         //   Drive velocity: actualSpeed from CDJ status (offset 152).
         //     Includes motor ramp, jog, pitch changes -- everything.
@@ -3886,11 +3897,12 @@ private:
             if (positionMs < 0.0) positionMs = 0.0;
         }
 
-        /// Apply beat grid micro-correction.  Between CDJ abspos packets the
-        /// PLL interpolates at constant velocity and accumulates small drift.
-        /// When a beat grid is available, nudge the PLL position toward the
-        /// nearest beat by a small fraction each tick.  This keeps the LTC
-        /// output phase-locked to the musical grid without sudden jumps.
+        /// Beat grid nudge: within 15 ms of a beat, move the PLL position 3 %
+        /// of the way to it per tick (90 % in about 75 ticks, 1.25 s at
+        /// 60 Hz).  It touches only positionMs, which serves only the 500 ms
+        /// seek test, so it changes nothing that is sent: the LTC output's
+        /// phase comes from the interpolated position in tick() (DESIGN D5),
+        /// not from here (AUDIT ENG-15; it also makes AUDIT B3 moot).
         void beatGridCorrect(const std::vector<TrackMetadata::BeatEntry>& grid)
         {
             if (grid.empty() || !playing || positionMs < 1.0) return;
@@ -3920,14 +3932,12 @@ private:
             double absBeatErr = std::abs(beatErr);
 
             // Only correct if within 15ms of a beat (avoids correcting during
-            // transitions between beats).  Apply 3% per tick -- gentle enough
-            // to not fight the CDJ correction, strong enough to converge in
-            // ~10 ticks (~330ms at 30Hz).
+            // transitions between beats).  3 % per tick.
             if (absBeatErr > 0.5 && absBeatErr < 15.0)
                 positionMs += beatErr * 0.03;
         }
 
-        uint32_t getPositionMs() const { return uint32_t(juce::jmax(0.0, positionMs)); }
+        uint32_t getPositionMs() const { return uint32_t(juce::jmax(0.0, positionMs)); }   // no caller
     };
 
     PlayheadPLL pll;
