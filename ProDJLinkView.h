@@ -172,7 +172,10 @@ private:
         bool detailCuesFed = false, detailBeatGridFed = false, detailSongStructFed = false;
         uint32_t lastMetaVersion = 0;  // tracks DbServerClient cache version to skip redundant copies
         uint32_t lastDetailVersion = 0;  // separate version tracker for detail waveform section
+        bool     metaApplied = false;    // this track's title, artist, key and artwork ID are in
+        int      metaPollTicks = 0;      // ticks since the last preview poll (re-polls once a second)
         uint32_t dbTrackLenSec = 0;      // this track's length from the dbserver (0: not known)
+        std::string artDiskKeyTried;     // disk key the artwork cache was last looked up under
         juce::Rectangle<int> tcLocalBounds;  // timecode row relative to deck (set during paintDeckStatic)
         juce::Rectangle<int> mapLocalBounds; // offset timecode row relative to deck
         juce::Rectangle<int> timeLocalBounds; // track time row relative to deck (for click-to-toggle)
@@ -621,8 +624,11 @@ public:
                 ds.detailSongStructFed = false;
                 ds.lastMetaVersion = 0;
                 ds.lastDetailVersion = 0;
+                ds.metaApplied = false;
+                ds.metaPollTicks = 0;
                 ds.dbTrackLenSec = 0;
                 ds.trackLenSec = protoLenSec;
+                ds.artDiskKeyTried.clear();
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
@@ -693,7 +699,7 @@ public:
             }
 
             // Retry if metadata hasn't arrived after ~3s (180 ticks at 60Hz)
-            if (ds.metadataRequested && ds.artist.isEmpty()
+            if (ds.metadataRequested && !ds.metaApplied
                 && ds.displayedWaveformTrackId != ds.trackId)
             {
                 if (++ds.metadataRequestTick > 180)
@@ -703,17 +709,44 @@ public:
             // --- Metadata from DbServerClient ---
             if (ds.trackId != 0)
             {
-                // Only re-fetch metadata if we still need artist/title or waveform
-                // (artwork image is fetched separately below, doesn't need metadata re-fetch)
-                bool needMeta = ds.artist.isEmpty()
-                             || ds.displayedWaveformTrackId != ds.trackId;
+                // The full metadata (a TrackMetadata copy, detail waveform
+                // included, under DbServerClient's lock) is copied only:
+                // - once its text is in the cache, when the cheap text-only
+                //   lookup first finds it;
+                // - while the preview waveform is still missing, when the
+                //   entry's version has changed, and once a second besides
+                //   (an entry is created at version 0 and a disk-cached
+                //   preview can appear without a version change).
+                // It was copied every tick while the artist was empty, i.e.
+                // for ever for a track without one, and every tick for a
+                // preview that never came (AUDIT UI-9).  The artwork image
+                // is fetched separately below.
+                bool needMeta = false;
+                if (!srcIP.isEmpty())
+                {
+                    if (!ds.metaApplied)
+                    {
+                        needMeta = dbClient.getCachedMetadataLight(srcIP, srcSlot, ds.trackId).isValid();
+                    }
+                    else if (ds.displayedWaveformTrackId != ds.trackId)
+                    {
+                        const uint32_t ver = dbClient.getMetadataVersion(srcIP, srcSlot, ds.trackId);
+                        if (ver != ds.lastMetaVersion || ++ds.metaPollTicks >= 60)
+                        {
+                            ds.lastMetaVersion = ver;
+                            ds.metaPollTicks = 0;
+                            needMeta = true;
+                        }
+                    }
+                }
 
-                if (needMeta && !srcIP.isEmpty())
+                if (needMeta)
                 {
                     auto meta = dbClient.getCachedMetadata(srcIP, srcSlot, ds.trackId);
                     if (meta.isValid())
                     {
                         ds.lastMetaVersion = meta.cacheVersion;
+                        ds.metaApplied = true;
                         if (meta.artist.isNotEmpty()) ds.artist = meta.artist;
                         if (meta.title.isNotEmpty())  ds.title  = meta.title;
                         ds.key       = meta.key;
@@ -865,21 +898,28 @@ public:
                     }
                 }
 
-                // Artwork fallback from disk cache
+                // Artwork fallback from disk cache, looked up once per key:
+                // the title is never empty here ("Track #N" at worst), so the
+                // lookup stat'ed the disk every tick for a track without
+                // artwork (AUDIT UI-9).
                 if (!ds.cachedArtworkImg.isValid() && ds.title.isNotEmpty())
                 {
                     auto diskKey = TrackMapEntry::makeKey(
                         ds.artist, ds.title, (int)ds.trackLenSec);
-                    if (WaveformCache::artworkExists(diskKey))
+                    if (diskKey != ds.artDiskKeyTried)
                     {
-                        auto cachedArt = WaveformCache::loadArtwork(diskKey);
-                        if (cachedArt.isValid())
+                        ds.artDiskKeyTried = diskKey;
+                        if (WaveformCache::artworkExists(diskKey))
                         {
-                            ds.cachedArtworkImg = cachedArt;
-                            ds.displayedArtworkId = ds.artworkId;
-                            ds.invalidateDeckImg();
-                            if (!deckBounds[pn - 1].isEmpty())
-                                repaint(deckBounds[pn - 1]);
+                            auto cachedArt = WaveformCache::loadArtwork(diskKey);
+                            if (cachedArt.isValid())
+                            {
+                                ds.cachedArtworkImg = cachedArt;
+                                ds.displayedArtworkId = ds.artworkId;
+                                ds.invalidateDeckImg();
+                                if (!deckBounds[pn - 1].isEmpty())
+                                    repaint(deckBounds[pn - 1]);
+                            }
                         }
                     }
                 }
@@ -906,7 +946,10 @@ public:
                 ds.detailSongStructFed = false;
                 ds.lastMetaVersion = 0;
                 ds.lastDetailVersion = 0;
+                ds.metaApplied = false;
+                ds.metaPollTicks = 0;
                 ds.dbTrackLenSec = 0;
+                ds.artDiskKeyTried.clear();
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
