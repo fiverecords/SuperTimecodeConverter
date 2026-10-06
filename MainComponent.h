@@ -671,11 +671,20 @@ private:
     // startup may already name another interface than the one configured
     // -- the show NIC not up yet -- and following that one would save it
     // (AUDIT C13).  It changes only when a selector shows something other
-    // than its setting (saveNicSetting), as before.  A component started
-    // from an empty selector starts from the setting's in-session position
-    // (nicIdToStart).  Keyed by the engine (nullptr: the global settings)
-    // and a NicField.  The running components are not touched: each
-    // resolved its interface when it started.  Message thread.
+    // than its setting (saveNicSetting), as before.  In the session, though,
+    // a setting follows the interface it named in the first list: with STC
+    // started before the show NIC was up, that is the interface listed at
+    // its position then, and the selectors and the next starts stay on it
+    // once the show NIC comes up, until the operator picks the show NIC or
+    // STC restarts (1.9.14-beta2 kept the position and moved to the show
+    // NIC; positions alone cannot tell this from a NIC plugged in ahead
+    // during a show).  A component starts on the interface its selector
+    // shows -- with an empty selector, the one at the setting's in-session
+    // position -- looked up by its label in the interface list as it is
+    // when it starts (nicIdToStart).  Keyed by the engine (nullptr: the
+    // global settings) and a NicField.  The running components are not
+    // touched: each resolved its interface when it started.  Message
+    // thread.
     enum NicField : uint8_t { kNicArtnetIn, kNicLANetIn, kNicHippoIn, kNicArtnetOut, kNicLANetOut,
                     kNicArtnetDmx, kNicTcnet, kNicProDJLink, kNicStageLinQ };
     juce::StringArray nicLabels;
@@ -698,7 +707,7 @@ private:
     void saveNicSetting(int& saved, const juce::ComboBox& cmb, int offset, const void* owner, NicField field);
     int nicSettingComboId(NicField field) const;
     void selectNicsFromSettings(bool onlyEmpty);
-    int nicIdToStart(const juce::ComboBox& cmb, NicField field) const;
+    int nicIdToStart(const juce::ComboBox& cmb, NicField field, bool* listed = nullptr) const;
     void populateAudioCombos();
     void repopulateTcnetLayerCombo();
     void populateTypeFilterCombos();

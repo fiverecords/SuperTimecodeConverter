@@ -370,7 +370,7 @@ MainComponent::MainComponent()
         if (anyTcnet && !sharedTcnetOutput.getIsRunning())
         {
             sharedTcnetOutput.refreshNetworkInterfaces();
-            sharedTcnetOutput.start(nicSettingNow(nullptr, kNicTcnet, settings.tcnetInterface));   // in-session position (AUDIT UI-6)
+            sharedTcnetOutput.start(nicIdToStart(cmbTcnetInterface, kNicTcnet) - 2);   // what the selector shows, as listed now (AUDIT UI-6)
         }
         else if (!anyTcnet && sharedTcnetOutput.getIsRunning())
         {
@@ -582,12 +582,15 @@ MainComponent::MainComponent()
         if (isShowLockedRevert()) return;
         if (currentEngine().getActiveInput() == SrcType::ArtNet)
         {
-            int sel = cmbArtnetInputInterface.getSelectedId() - 1;
+            int sel = nicIdToStart(cmbArtnetInputInterface, kNicArtnetIn) - 1;   // as listed now (AUDIT UI-6)
             currentEngine().stopArtnetInput();
             currentEngine().startArtnetInput(sel);
-            // If bind fell back, update combo to actual interface before repopulate
-            int actualId = currentEngine().getArtnetInput().getSelectedInterface() + 1;
-            cmbArtnetInputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            // A bind that fell back to All Interfaces shows it before the
+            // repopulate.  Only then: the selector's IDs are positions in the
+            // list it was filled from, the input's in today's.
+            const int actual = currentEngine().getArtnetInput().getSelectedInterface();
+            if (actual != sel)
+                cmbArtnetInputInterface.setSelectedId(actual + 1, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
         }
@@ -600,12 +603,13 @@ MainComponent::MainComponent()
         if (isShowLockedRevert()) return;
         if (currentEngine().getActiveInput() == SrcType::LANetTC)
         {
-            int sel = cmbLANetTCInputInterface.getSelectedId() - 1;
+            int sel = nicIdToStart(cmbLANetTCInputInterface, kNicLANetIn) - 1;   // as listed now (AUDIT UI-6)
             currentEngine().stopLANetTCInput();
             currentEngine().startLANetTCInput(sel);
-            // If bind fell back, update combo to actual interface before repopulate
-            int actualId = currentEngine().getLANetTCInput().getSelectedInterface() + 1;
-            cmbLANetTCInputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            // A fallback to All Interfaces shows (see the Art-Net input).
+            const int actual = currentEngine().getLANetTCInput().getSelectedInterface();
+            if (actual != sel)
+                cmbLANetTCInputInterface.setSelectedId(actual + 1, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
         }
@@ -618,11 +622,13 @@ MainComponent::MainComponent()
         if (isShowLockedRevert()) return;
         if (currentEngine().getActiveInput() == SrcType::Hippotizer)
         {
-            int sel = cmbHippoInputInterface.getSelectedId() - 1;
+            int sel = nicIdToStart(cmbHippoInputInterface, kNicHippoIn) - 1;   // as listed now (AUDIT UI-6)
             currentEngine().stopHippotizerInput();
             currentEngine().startHippotizerInput(sel);
-            int actualId = currentEngine().getHippotizerInput().getSelectedInterface() + 1;
-            cmbHippoInputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            // A fallback to All Interfaces shows (see the Art-Net input).
+            const int actual = currentEngine().getHippotizerInput().getSelectedInterface();
+            if (actual != sel)
+                cmbHippoInputInterface.setSelectedId(actual + 1, juce::dontSendNotification);
             populateMidiAndNetworkCombos();
             saveSettings();
         }
@@ -1694,7 +1700,7 @@ MainComponent::MainComponent()
         bool needsArtnet = eng.isArtnetMixerForwardEnabled() || eng.isArtnetTriggerEnabled();
         if (needsArtnet)
         {
-            int sel = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
+            int sel = nicIdToStart(cmbArtnetDmxInterface, kNicArtnetDmx) - 2;  // -1=All, 0+=NIC, as listed now (AUDIT UI-6)
             // Restart ArtnetOutput on the new interface (only if timecode output isn't controlling it)
             if (!eng.isOutputArtnetEnabled() || !eng.getArtnetOutput().getIsRunning())
                 eng.startArtnetOutput(sel);
@@ -1832,12 +1838,13 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (eng.isOutputArtnetEnabled())
         {
-            int sel = cmbArtnetOutputInterface.getSelectedId() - 2;
+            int sel = nicIdToStart(cmbArtnetOutputInterface, kNicArtnetOut) - 2;   // as listed now (AUDIT UI-6)
             eng.stopArtnetOutput();
             eng.startArtnetOutput(sel);
-            // Update combo to actual interface before repopulate (handles fallback)
-            int actualId = eng.getArtnetOutput().getSelectedInterface() + 2;
-            cmbArtnetOutputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            // A fallback to All Interfaces shows (see the Art-Net input).
+            const int actual = eng.getArtnetOutput().getSelectedInterface();
+            if (actual != sel)
+                cmbArtnetOutputInterface.setSelectedId(actual + 2, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
         }
@@ -1855,12 +1862,13 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (eng.isOutputLANetTCEnabled())
         {
-            int sel = cmbLANetTCOutputInterface.getSelectedId() - 3;
+            int sel = nicIdToStart(cmbLANetTCOutputInterface, kNicLANetOut) - 3;   // as listed now (AUDIT UI-6)
             eng.stopLANetTCOutput();
             eng.startLANetTCOutput(sel);
-            // Update combo to actual interface before repopulate (handles fallback)
-            int actualId = eng.getLANetTCOutput().getSelectedInterface() + 3;
-            cmbLANetTCOutputInterface.setSelectedId(actualId, juce::dontSendNotification);
+            // A fallback to All Interfaces shows (see the Art-Net input).
+            const int actual = eng.getLANetTCOutput().getSelectedInterface();
+            if (actual != sel)
+                cmbLANetTCOutputInterface.setSelectedId(actual + 3, juce::dontSendNotification);
             populateMidiAndNetworkCombos();  // refresh markers (auto-restores all selections)
             saveSettings();
         }
@@ -1882,7 +1890,7 @@ MainComponent::MainComponent()
         {
             sharedTcnetOutput.stop();
             sharedTcnetOutput.refreshNetworkInterfaces();
-            sharedTcnetOutput.start(settings.tcnetInterface);
+            sharedTcnetOutput.start(nicIdToStart(cmbTcnetInterface, kNicTcnet) - 2);   // as listed now (AUDIT UI-6)
         }
         saveSettings();
     };
@@ -3064,7 +3072,8 @@ void MainComponent::startCurrentLtcInput()
 void MainComponent::startCurrentProDJLinkInput()
 {
     auto& eng = currentEngine();
-    int iface = nicIdToStart(cmbProDJLinkInterface, kNicProDJLink) - 1;
+    bool pdlListed = false;
+    int iface = nicIdToStart(cmbProDJLinkInterface, kNicProDJLink, &pdlListed) - 1;
     int player = cmbProDJLinkPlayer.getSelectedId();
     if (player < 1) player = 1;
     if (iface < 0) iface = 0;
@@ -3073,11 +3082,20 @@ void MainComponent::startCurrentProDJLinkInput()
     // This handles the case where the user changes the network interface
     // combo while ProDJLink is active. Without this, the new interface
     // selection is ignored because start() bails on getIsRunning()==true.
-    if (sharedProDJLinkInput.getIsRunning()
-        && sharedProDJLinkInput.getSelectedInterface() != iface)
+    // Compared by address: the running input's position is one in the list
+    // of its own start, iface one in today's (AUDIT UI-6).  Only when the
+    // interface wanted is listed now (nicIdToStart): one that is not -- a
+    // cable out, no address yet -- leaves iface at a position that names
+    // another interface or none, and the running input stays where it is,
+    // as it did when the positions were compared.
+    const auto pdlNets = getNetworkInterfaces();   // the list ProDJLinkInput::start takes
+    const juce::String pdlWantIp = pdlNets.isEmpty() ? juce::String()
+                                 : pdlNets[juce::jlimit(0, pdlNets.size() - 1, iface)].ip;
+    if (sharedProDJLinkInput.getIsRunning() && pdlListed
+        && sharedProDJLinkInput.getBindInfo() != pdlWantIp)
     {
         DBG("MainComponent: ProDJLink interface changed from "
-            << sharedProDJLinkInput.getSelectedInterface() << " to " << iface
+            << sharedProDJLinkInput.getBindInfo() << " to " << pdlWantIp
             << " -- restarting");
         sharedProDJLinkInput.stop();
         // DbClient also needs restart since it depends on network connectivity
@@ -3119,17 +3137,23 @@ void MainComponent::startCurrentProDJLinkInput()
 void MainComponent::startCurrentStageLinQInput()
 {
     auto& eng = currentEngine();
-    int iface = nicIdToStart(cmbStageLinQInterface, kNicStageLinQ) - 1;
+    bool slqListed = false;
+    int iface = nicIdToStart(cmbStageLinQInterface, kNicStageLinQ, &slqListed) - 1;
     int player = cmbProDJLinkPlayer.getSelectedId();
     if (player < 1) player = 1;
     if (iface < 0) iface = 0;
 
-    // If already running on a DIFFERENT interface, stop and restart.
-    if (sharedStageLinQInput.getIsRunning()
-        && sharedStageLinQInput.getSelectedInterface() != iface)
+    // If already running on a DIFFERENT interface, stop and restart --
+    // compared by address, and only when the interface wanted is listed
+    // now, as for Pro DJ Link (AUDIT UI-6).
+    const auto slqNets = getNetworkInterfaces();   // the list StageLinQInput::start takes
+    const juce::String slqWantIp = slqNets.isEmpty() ? juce::String()
+                                 : slqNets[juce::jlimit(0, slqNets.size() - 1, iface)].ip;
+    if (sharedStageLinQInput.getIsRunning() && slqListed
+        && sharedStageLinQInput.getBindInfo() != slqWantIp)
     {
         DBG("MainComponent: StageLinQ interface changed from "
-            << sharedStageLinQInput.getSelectedInterface() << " to " << iface
+            << sharedStageLinQInput.getBindInfo() << " to " << slqWantIp
             << " -- restarting");
         sharedStageLinQInput.stop();
         sharedStageLinQDb.stop();
@@ -4924,18 +4948,51 @@ void MainComponent::selectNicsFromSettings(bool onlyEmpty)
 }
 
 //==============================================================================
-// The selector item ID a component is started from: the selected item, or,
-// with none -- its interface is gone (AUDIT UI-6) -- the item its setting
-// stands for in this session (nicSettingComboId), as startup starts it from
-// the setting (loadAndApplyNonAudioSettings).  That is the position the
-// interface last had, where another interface may now be listed (AUDIT
-// C13); before, an empty selector started on All Interfaces or the first
-// interface.  Message thread.
+// The selector item ID a component is started from, in the interface list
+// as it is NOW.  The item: the selected one, or, with none -- its interface
+// is gone (AUDIT UI-6) -- the one its setting stands for in this session
+// (nicSettingComboId), as startup starts it from the setting
+// (loadAndApplyNonAudioSettings); before, an empty selector started on All
+// Interfaces or the first interface.  The selector's items are the list as
+// it was when they were filled (nicLabels), and the component enumerates the
+// interfaces again when it starts and takes a position in that new list: an
+// interface plugged in or out since moved the positions, and the component
+// bound another interface than the one shown (a NIC plugged in ahead of it,
+// or one listed ahead of it dropping off).
+// So the item's interface is looked up by its label in a fresh enumeration
+// -- the list the components take, localhost last -- as remapNicSettings
+// finds it, also at a new address.  All Interfaces and Localhost keep their
+// IDs.  An interface no longer listed keeps its position, where another
+// interface may now be listed (AUDIT C13).  `listed`, when given, is set to
+// whether the interface the start stands for is in the list now: the shown
+// item's, or for an empty selector its setting's -- not one marked gone
+// (remapNicSettings), whose position names another interface or none.
+// Message thread.
 //==============================================================================
-int MainComponent::nicIdToStart(const juce::ComboBox& cmb, NicField field) const
+int MainComponent::nicIdToStart(const juce::ComboBox& cmb, NicField field, bool* listed) const
 {
-    const int id = cmb.getSelectedId();
-    return id > 0 ? id : nicSettingComboId(field);
+    if (listed != nullptr)
+        *listed = false;
+    const int selected = cmb.getSelectedId();
+    const int id = selected > 0 ? selected : nicSettingComboId(field);
+    // The ID of each selector's first interface item, after All Interfaces
+    // (and Localhost for LA-Net out); Pro DJ Link and StageLinQ have neither.
+    const int firstId = field == kNicLANetOut ? 3
+                      : (field == kNicProDJLink || field == kNicStageLinQ) ? 1 : 2;
+    const int pos = id - firstId;
+    if (pos < 0 || pos >= nicLabels.size())
+        return id;
+    juce::StringArray now;
+    for (auto& ni : getNetworkInterfaces(true))
+        now.add(ni.name + " (" + ni.ip + ")");
+    const int index = findInterfaceLabel(now, nicLabels[pos]);
+    if (listed != nullptr)
+    {
+        const bool global = field == kNicTcnet || field == kNicProDJLink || field == kNicStageLinQ;
+        *listed = index >= 0
+               && (selected > 0 || ! isNicGone(global ? nullptr : engines[(size_t) selectedEngine].get(), field));
+    }
+    return index >= 0 ? index + firstId : id;
 }
 
 void MainComponent::remapNicSettings(const juce::StringArray& newLabels)
