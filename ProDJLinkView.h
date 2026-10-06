@@ -180,6 +180,9 @@ private:
         uint32_t displayedWaveformTrackId = 0;
         uint32_t displayedArtworkId = 0;
         uint32_t prevTrackId = 0;
+        uint32_t prevTrackVersion = 0;       // ProDJLinkInput::getTrackVersion at the last track change
+        juce::String srcIP;                  // player whose media holds the track (empty: not on the network)
+        uint8_t  srcSlot = 0;                // and its slot: with the ID, the dbserver cache key (AUDIT META-5)
         bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
         int      metadataRequestTick = 0;   // tick counter for retry after ~3s
 
@@ -361,9 +364,9 @@ public:
             newEntry.bpmMultiplier = newValue;
 
             // Auto-populate cue points from rekordbox if available
-            if (ds.trackId != 0)
+            if (ds.trackId != 0 && ds.srcIP.isNotEmpty())
             {
-                auto meta = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                auto meta = dbClient.getCachedMetadata(ds.srcIP, ds.srcSlot, ds.trackId);
                 if (meta.isValid() && !meta.cueList.empty())
                 {
                     for (auto& rc : meta.cueList)
@@ -519,6 +522,9 @@ public:
             int pn = deck + 1; // 1-based player number
             auto& ds = deckState[deck];
 
+            // The version first: getTrackVersion is an acquire, so the ID,
+            // loaded player and slot read after it are that change's or newer.
+            const uint32_t trackVersion = proDJLink.getTrackVersion(pn);
             ds.discovered    = proDJLink.isPlayerDiscovered(pn);
             ds.model         = proDJLink.getPlayerModel(pn);
             ds.ip            = proDJLink.getPlayerIP(pn);
@@ -586,7 +592,11 @@ public:
             }
 
             // --- Track changed? ---
-            bool trackChanged = (ds.trackId != ds.prevTrackId);
+            // The version also moves when the same ID is loaded from another
+            // player, slot or type -- another track, since rekordbox IDs are
+            // per medium (AUDIT PDL-7, META-5).
+            bool trackChanged = (ds.trackId != ds.prevTrackId
+                                 || trackVersion != ds.prevTrackVersion);
             if (trackChanged)
             {
                 ds.waveform.clearWaveform();
@@ -611,6 +621,7 @@ public:
                 ds.cueCount = 0;
                 ds.invalidateDeckImg();
                 ds.prevTrackId = ds.trackId;
+                ds.prevTrackVersion = trackVersion;
                 ds.metadataRequested = false;  // reset so we request for new track
             }
 
@@ -618,17 +629,23 @@ public:
             // ProDJLinkView requests metadata for ALL discovered players,
             // so waveform/artwork/info loads even without an engine assigned.
             // IMPORTANT: resolve SOURCE player IP -- when CDJ 2 loads from
-            // CDJ 1's USB via Link Export, the metadata is on CDJ 1.
+            // CDJ 1's USB via Link Export, the metadata is on CDJ 1, and the
+            // dbserver to ask is CDJ 1's (dysentery track_metadata.adoc,
+            // "Connecting to the Database"; as TimecodeEngine::requestDbMetadata).
+            // When that player is not on the network nothing is asked or
+            // looked up: the deck's own dbserver would answer for its own
+            // media, where the ID may name another track (AUDIT META-5).
             uint8_t srcPlayer = proDJLink.getLoadedPlayer(pn);
             if (srcPlayer == 0) srcPlayer = (uint8_t)pn;
-            juce::String srcIP = proDJLink.getPlayerIP((int)srcPlayer);
-            if (srcIP.isEmpty()) srcIP = ds.ip;
+            const juce::String srcIP = proDJLink.getPlayerIP((int)srcPlayer);
+            const uint8_t srcSlot = proDJLink.getLoadedSlot(pn);
+            ds.srcIP   = srcIP;
+            ds.srcSlot = srcSlot;
 
             if (ds.trackId != 0 && !ds.metadataRequested
                 && !srcIP.isEmpty() && dbClient.getIsRunning())
             {
-                uint8_t slot = proDJLink.getLoadedSlot(pn);
-                if (slot != 0)
+                if (srcSlot != 0)
                 {
                     // Choose dbserver query identity.
                     // CDJ-3000: accepts player 5 (VCDJ). NXS2: requires 1-4.
@@ -649,7 +666,7 @@ public:
                     }
                     juce::String model = proDJLink.getPlayerModel((int)srcPlayer);
                     dbClient.requestMetadata(
-                        srcIP, slot, 1, ds.trackId, dbCtx, model);
+                        srcIP, srcSlot, 1, ds.trackId, dbCtx, model);
                     ds.metadataRequested = true;
                     ds.metadataRequestTick = 0;
                 }
@@ -673,7 +690,7 @@ public:
 
                 if (needMeta && !srcIP.isEmpty())
                 {
-                    auto meta = dbClient.getCachedMetadata(srcIP, ds.trackId);
+                    auto meta = dbClient.getCachedMetadata(srcIP, srcSlot, ds.trackId);
                     if (meta.isValid())
                     {
                         ds.lastMetaVersion = meta.cacheVersion;
@@ -748,39 +765,9 @@ public:
                             }
                         }
                     }
-                    else
-                    {
-                        // Fallback: try by trackId only (cached from another player)
-                        auto metaById = dbClient.getCachedMetadataByTrackId(ds.trackId);
-                        if (metaById.isValid())
-                        {
-                            ds.lastMetaVersion = metaById.cacheVersion;
-                            if (metaById.artist.isNotEmpty()) ds.artist = metaById.artist;
-                            if (metaById.title.isNotEmpty())  ds.title  = metaById.title;
-                            ds.key       = metaById.key;
-                            ds.artworkId = metaById.artworkId;
-                            ds.cueCount  = (int)metaById.cueList.size();
-                            if (metaById.durationSeconds > 0)
-                                ds.trackLenSec = (uint32_t)metaById.durationSeconds;
-
-                            if (metaById.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
-                            {
-                                ds.waveform.setColorWaveformData(metaById.waveformData,
-                                    metaById.waveformEntryCount, metaById.waveformBytesPerEntry);
-                                if (metaById.durationSeconds > 0)
-                                    ds.waveform.setDurationMs((uint32_t)metaById.durationSeconds * 1000);
-                                if (metaById.hasCueList())
-                                    { ds.waveform.setRekordboxCues(metaById.cueList); ds.previewCuesFed = true; }
-                                if (metaById.hasBeatGrid())
-                                    { ds.waveform.setBeatGrid(metaById.beatGrid); ds.previewBeatGridFed = true; }
-                                ds.displayedWaveformTrackId = ds.trackId;
-                                ds.previewRetryTicks = (!ds.previewCuesFed || !ds.previewBeatGridFed) ? 180 : 0;
-                                ds.invalidateDeckImg();
-                                if (!deckBounds[pn - 1].isEmpty())
-                                    repaint(deckBounds[pn - 1]);
-                            }
-                        }
-                    }
+                    // No entry for this player, slot and ID yet: nothing is
+                    // borrowed from another player's entry under the same ID,
+                    // which may be another track (AUDIT META-5).
                 }
 
                 // Preview supplementary retry: cues / beat grid may arrive
@@ -790,15 +777,12 @@ public:
                     && ds.previewRetryTicks > 0
                     && (!ds.previewCuesFed || !ds.previewBeatGridFed))
                 {
-                    uint32_t ver = dbClient.getMetadataVersion(srcIP, ds.trackId);
-                    if (ver == 0) ver = dbClient.getMetadataVersionByTrackId(ds.trackId);
+                    uint32_t ver = dbClient.getMetadataVersion(srcIP, srcSlot, ds.trackId);
 
                     if (ver != ds.lastMetaVersion && !srcIP.isEmpty())
                     {
                         ds.lastMetaVersion = ver;
-                        auto pm = dbClient.getCachedMetadata(srcIP, ds.trackId);
-                        if (!pm.isValid())
-                            pm = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                        auto pm = dbClient.getCachedMetadata(srcIP, srcSlot, ds.trackId);
                         if (pm.isValid())
                         {
                             bool changed = false;
@@ -840,7 +824,7 @@ public:
                 // Artwork update (only when artworkId changes)
                 if (ds.artworkId != 0 && ds.artworkId != ds.displayedArtworkId)
                 {
-                    auto artImg = dbClient.getCachedArtwork(ds.artworkId);
+                    auto artImg = dbClient.getCachedArtwork(srcIP, srcSlot, ds.artworkId);
                     if (artImg.isValid())
                     {
                         ds.cachedArtworkImg = artImg;
@@ -929,7 +913,7 @@ public:
                 bool doFetch = false;
                 if (needsInitial)
                 {
-                    bool hasDetail = dbClient.hasDetailWaveformCached(srcIP, ds.trackId);
+                    bool hasDetail = dbClient.hasDetailWaveformCached(srcIP, srcSlot, ds.trackId);
                     if (hasDetail)
                         doFetch = true;
                     else
@@ -952,17 +936,14 @@ public:
                 }
                 else if (needsSupplementary)
                 {
-                    uint32_t curVer = dbClient.getMetadataVersion(srcIP, ds.trackId);
-                    if (curVer == 0) curVer = dbClient.getMetadataVersionByTrackId(ds.trackId);
+                    uint32_t curVer = dbClient.getMetadataVersion(srcIP, srcSlot, ds.trackId);
                     if (curVer != 0 && curVer != ds.lastDetailVersion)
                         doFetch = true;
                 }
 
                 if (doFetch)
                 {
-                    auto meta = dbClient.getCachedMetadata(srcIP, ds.trackId);
-                    if (!meta.isValid())
-                        meta = dbClient.getCachedMetadataByTrackId(ds.trackId);
+                    auto meta = dbClient.getCachedMetadata(srcIP, srcSlot, ds.trackId);
                     ds.lastDetailVersion = meta.cacheVersion;
 
                     DBG("PDL Detail FETCH P" + juce::String(pn)
