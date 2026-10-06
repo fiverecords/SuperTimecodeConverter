@@ -153,6 +153,19 @@ public:
     void stop()
     {
         running.store(false, std::memory_order_relaxed);
+        // With the interface filter in use the receive thread reads the
+        // socket's descriptor itself (readInputDatagram), outside JUCE's
+        // read/shutdown lock: it is ended before the descriptor is closed,
+        // as ArtnetInput::stop() does (AUDIT NET-2).  ::shutdown() without
+        // the close wakes its wait at once on Linux.  Message thread.
+        if (sourceFilter.isActive() && isThreadRunning())
+        {
+           #ifndef _WIN32
+            if (socket != nullptr && socket->getRawSocketHandle() >= 0)
+                ::shutdown(socket->getRawSocketHandle(), SHUT_RDWR);
+           #endif
+            stopThread(1000);
+        }
         if (socket) socket->shutdown();
         if (isThreadRunning()) stopThread(1000);
         socket = nullptr;
