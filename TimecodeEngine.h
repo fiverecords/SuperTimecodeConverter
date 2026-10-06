@@ -1813,6 +1813,10 @@ public:
                     // new packet at this position".
                     double cdjSpeed = sharedProDJLink->getActualSpeed(ep);
                     const auto pdlPos = sharedProDJLink->getPositionSnapshot(ep);
+                    // The beat count, read right after the snapshot: on the
+                    // beat fallback it is what the position was derived from
+                    // (the grid lookup and the cue dispatch below).
+                    const uint32_t pdlBeatCount = sharedProDJLink->getBeatCount(ep);
                     pll.tick(pdlPos.playheadMs, pdlPos.packetTs, cdjSpeed,
                              sharedProDJLink->isPositionMoving(ep));
 
@@ -1840,7 +1844,7 @@ public:
                     // engines on one NXS2 could send different positions).
                     if (!hasAbs && !pdlBeatGrid.empty())
                     {
-                        uint32_t bc = sharedProDJLink->getBeatCount(ep);
+                        const uint32_t bc = pdlBeatCount;
                         if (bc > 0 && bc <= (uint32_t)pdlBeatGrid.size())
                             rawPlayheadMs = pdlBeatGrid[(size_t)(bc - 1)].timeMs;
                     }
@@ -1928,15 +1932,19 @@ public:
                             // Same grid position with the deck stopped at the
                             // last packet (NXS2 beat fallback): move the anchor
                             // to this packet and to the position shown while
-                            // stopped, the beat start, so that the first advance
-                            // after play starts from there.  Left at the last
-                            // packet before the stop, the second status after
-                            // play advanced it by the whole pause at the new
-                            // speed: the timecode leapt ahead by the pause
-                            // length, the cues in between fired at once, and
-                            // the next beat snapped it back (AUDIT ENG-2).
+                            // stopped -- the beat-derived position: the start
+                            // of the current beat with the rekordbox grid, of
+                            // the next one without it -- so that the first
+                            // advance after play starts from there.  Left at
+                            // the last packet before the stop, the second
+                            // status after play advanced it by the whole pause
+                            // at the new speed: the timecode leapt ahead by the
+                            // pause length, the cues in between fired at once,
+                            // and the next beat snapped it back (AUDIT ENG-2).
                             // Where in the beat the deck stopped is not known
-                            // here; the position catches up at the next beat.
+                            // here; the position is corrected at the next beat,
+                            // and the cues it moves across then fire (the
+                            // one-beat rule at the cue dispatch below).
                             pdlSnapMs = (double)rawPlayheadMs;
                             pdlSnapTime = now;
                         }
@@ -2154,7 +2162,38 @@ public:
                     // move the playhead but fire nothing (DJs preview
                     // constantly), and what they moved past does not fire at
                     // the next play either (DESIGN D36).
-                    dispatchTrackCues(cuePlayheadMs, rawPlayheadMs, sharedProDJLink->isPlayerPlaying(ep), pll.seekDetected);
+                    // On the beat fallback (no 0x0b) a step of exactly one
+                    // beat in the beat count is the next beat, not a seek,
+                    // for the cue dispatch.  After a pause the playhead
+                    // resumes from the beat-derived position, which does not
+                    // move within a beat, so the next beat moves it forward
+                    // by as far as the deck had played into its beat before
+                    // the pause: more than 500 ms late in a beat below
+                    // 120 BPM, which PlayheadPLL reports as a seek, and the
+                    // cues between the pause point and that beat -- which
+                    // the deck plays across -- were passed without firing
+                    // (AUDIT ENG-2).  They fire at that beat, up to a beat
+                    // late, as DESIGN D17 allows on this fallback.  Any
+                    // forward relocation that moves the beat count by
+                    // exactly one is the same step -- a beat jump of one
+                    // beat, or a hot cue, memory cue or needle search into
+                    // the next beat, up to almost two beats ahead: the cues
+                    // jumped over fire at the jump, as they always did at
+                    // 120 BPM and above, where such a step stays within
+                    // the 500 ms seek test.  A step back in the beat
+                    // count is still a seek; but on this fallback
+                    // ProDJLinkInput takes a status beat count below its own
+                    // only when it is more than 4 beats behind, and counts
+                    // its own up at every beat packet, so a jump back, a
+                    // loop or a paused jog of 4 beats or less does not reach
+                    // here as a step back: the beat-derived position then
+                    // stays up to 4 beats ahead of the deck, and the cues
+                    // fire early, twice or not at all.  The outputs' resync
+                    // keeps PlayheadPLL's verdict.
+                    const bool cueSeek = pll.seekDetected
+                        && ! (! hasAbs && pdlBeatCount == pdlPrevBeatCount + 1);
+                    pdlPrevBeatCount = pdlBeatCount;
+                    dispatchTrackCues(cuePlayheadMs, rawPlayheadMs, sharedProDJLink->isPlayerPlaying(ep), cueSeek);
 
                     bool pdlRx = sharedProDJLink->isReceiving();
                     if (statusTextVisible)
@@ -3776,7 +3815,8 @@ private:
     //     speed TCNet carries (getSourceSpeedRatio);
     //   - `actualSpeed` / `smoothVelocity`: the source-active test;
     //   - `seekDetected` (an error over 500 ms): cue dispatch's seek rule
-    //     (DESIGN D17 and D36) and the outputs' resync.
+    //     (DESIGN D17 and D36; on the Pro DJ Link beat fallback not for a
+    //     step of one beat, AUDIT ENG-2) and the outputs' resync.
     // The timecode does NOT come from it: tick() interpolates the deck's own
     // position (pdlSnapMs/pdlSnapTime/pdlSnapSpeed), and `positionMs` serves
     // only the 500 ms seek test.
@@ -4104,6 +4144,8 @@ private:
     // (dispatchTrackCues): Winamp's position runs on up to one 50 ms poll past
     // the pause; the DJ sources' own positions do not move while stopped.
     static constexpr uint32_t kCueMovedBackMs = 100;
+    uint32_t pdlPrevBeatCount = 0; // Pro DJ Link: the followed player's beat count at the last tick
+                                   // (the cue dispatch's one-beat test, AUDIT ENG-2)
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
     juce::String oscFwdBpmCmd;  // e.g. "Master 3.x at %BPM%" -- if non-empty, sends string instead of float
     float lastSentOscBpm = -1.0f;      // dedup: last sent OSC value
@@ -4574,8 +4616,10 @@ private:
     /// that position is the last playhead checked, a cue exactly on it
     /// included (it fired there); while the deck is paused it is where the
     /// deck stopped, not the paused reading, which on the NXS2 beat fallback
-    /// is the beat start, behind cues fired before the pause.  A list still
-    /// waiting to be armed (its track change was this tick) keeps waiting.
+    /// is the beat-derived position (the start of the current beat with the
+    /// rekordbox grid, of the next one without it), with the grid behind
+    /// cues fired before the pause.  A list still waiting to be armed (its
+    /// track change was this tick) keeps waiting.
     void reloadCuePointsForTrack(const TrackMapEntry* entry)
     {
         const bool wasArmed = ! cueArmPending;
@@ -4608,13 +4652,16 @@ private:
     /// (message thread).  `playheadMs` is the position the cues are checked
     /// against (interpolated between packets); `rawMs` is the source's own
     /// position, not interpolated: Pro DJ Link's absolute position, or on
-    /// the NXS2 beat fallback the start of the current beat; StageLinQ's
-    /// last BeatInfo position; for Winamp, playheadMs.  Cues fire only while
-    /// the deck plays, when the playhead crosses them (tickCuePoints, with
-    /// DESIGN D17's rule for a seek while playing).  Whenever the list is
-    /// armed against a playhead that is already somewhere, the cues behind
-    /// it are passed without firing and only the ones crossed from then on
-    /// fire (DESIGN D36, Joaky's answer to AUDIT Q9):
+    /// the NXS2 beat fallback the beat-derived position (the start of the
+    /// current beat with the rekordbox grid, of the next one without it);
+    /// StageLinQ's last BeatInfo position; for Winamp, playheadMs.  Cues
+    /// fire only while the deck plays, when the playhead crosses them
+    /// (tickCuePoints, with DESIGN D17's rule for a seek while playing; on
+    /// the beat fallback a one-beat step is not a seek, see the caller).
+    /// Whenever the list is armed against a playhead that is already
+    /// somewhere, the cues behind it are passed without firing and only the
+    /// ones crossed from then on fire (DESIGN D36, Joaky's answer to AUDIT
+    /// Q9):
     ///   - a new track's list (track change, deck switch) is armed at the
     ///     first playhead seen after it; the track already followed reloads
     ///     with the flags it had (reloadCuePointsForTrack);
@@ -4629,12 +4676,15 @@ private:
     ///     or scrub back raises no seek verdict.
     /// The move-back test compares the source's own positions, not the
     /// playhead: on the NXS2 beat fallback the playhead runs through the beat
-    /// while the deck plays but reads the beat start once it stops, up to a
-    /// whole beat behind cues already fired, and taken for a move back that
-    /// made them fire twice after a plain pause and play below 120 BPM.  On
-    /// that fallback what the deck does within one beat while stopped is not
-    /// seen: a jog back that stays inside the beat keeps the flags.  On any
-    /// source a step back of kCueMovedBackMs or less keeps them.
+    /// while the deck plays but reads the beat-derived position once it
+    /// stops, with the grid up to a whole beat behind cues already fired,
+    /// and taken for a move back that made them fire twice after a plain
+    /// pause and play below 120 BPM.  On that fallback what the deck does
+    /// within one beat while stopped is not seen, nor is a step back of up
+    /// to 4 beats (ProDJLinkInput takes a status beat count below its own
+    /// only when it is more than 4 beats behind): a jog back inside the
+    /// beat, or by 4 beats or less, keeps the flags.  On any source a step
+    /// back of kCueMovedBackMs or less keeps them.
     /// Before, the paused position was only followed: a relocation forward
     /// then play fired every cue in between at once, and one backward left
     /// the cues ahead marked fired (AUDIT ENG-2).
@@ -4671,10 +4721,13 @@ private:
     /// source estimator's own verdict (PlayheadPLL::seekDetected): it judges
     /// a jump against the position it predicted, so a source that only
     /// reports once per beat (NXS2 fallback: 500 ms at 120 BPM, more below)
-    /// is not mistaken for a seek.  The old rule here -- any forward step
-    /// over 500 ms -- did exactly that, and every cue behind the new
-    /// position was marked fired without firing; below 120 BPM no TrackMap
-    /// cue fired at all on that path.  A backward step is still a seek.
+    /// is not mistaken for a seek while it plays on.  The old rule here --
+    /// any forward step over 500 ms -- did exactly that, and every cue
+    /// behind the new position was marked fired without firing; below
+    /// 120 BPM no TrackMap cue fired at all on that path.  The first beat
+    /// after a play from a pause late in a beat can still exceed the PLL's
+    /// 500 ms; the Pro DJ Link caller does not pass that one-beat step as a
+    /// seek (AUDIT ENG-2).  A backward step is still a seek.
     void tickCuePoints(uint32_t playheadMs, bool sourceSeeked)
     {
         const bool seekDetected = sourceSeeked || (playheadMs < lastCueCheckMs);
