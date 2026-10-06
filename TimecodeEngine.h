@@ -823,9 +823,11 @@ public:
         // so the engine isn't silenced just because the DJ unplugged the mixer.
         if (!sharedProDJLink->hasMixerFaderData()) return true;
         int ep = getEffectivePlayer();
-        // If XF mode hasn't resolved yet (ep == 0) or is out of range,
-        // don't block the engine.
-        if (ep < 1 || ep > 4) return true;
+        // If XF mode hasn't resolved yet (ep == 0), or the player has no
+        // channel on this mixer, don't block the engine.  A DJM-V10 reports
+        // channels 5 and 6; they stopped at 4 here while ON AIR follow
+        // scans all six (AUDIT ENG-9).
+        if (ep < 1 || ep > sharedProDJLink->getMixerChannelCount()) return true;
         return sharedProDJLink->isPlayerOnAir(ep);
     }
 
@@ -3498,15 +3500,18 @@ private:
     /// Resolve which physical player to follow in XF-A/XF-B mode.
     /// Sticky: stays on current player while it has on-air flag.
     /// Falls back to another player on the same XF side when current loses on-air.
+    /// Channels 1 to the mixer's count: 6 on a DJM-V10, 4 otherwise (it
+    /// stopped at 4, AUDIT ENG-9).
     void resolveXfPlayer()
     {
         if (!sharedProDJLink || !sharedProDJLink->hasMixerFaderData())
             return;
 
         uint8_t targetSide = (proDJLinkPlayer == kPlayerXfA) ? 1 : 2; // 1=A, 2=B
+        const int channels = sharedProDJLink->getMixerChannelCount();
 
         // Sticky: keep current if still assigned to our side AND on-air
-        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 4)
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= channels)
         {
             uint8_t xf = sharedProDJLink->getChannelXfAssign(resolvedXfPlayer);
             bool onAir = sharedProDJLink->isPlayerOnAir(resolvedXfPlayer);
@@ -3516,7 +3521,7 @@ private:
 
         // Current player lost on-air or wrong side -- find replacement
         // Prefer on-air players on our side
-        for (int ch = 1; ch <= 4; ++ch)
+        for (int ch = 1; ch <= channels; ++ch)
         {
             uint8_t xf = sharedProDJLink->getChannelXfAssign(ch);
             if (xf == targetSide && sharedProDJLink->isPlayerOnAir(ch))
@@ -3527,7 +3532,7 @@ private:
         }
 
         // No on-air player -- keep current if still on right side (just faded out)
-        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= 4)
+        if (resolvedXfPlayer >= 1 && resolvedXfPlayer <= channels)
         {
             uint8_t xf = sharedProDJLink->getChannelXfAssign(resolvedXfPlayer);
             if (xf == targetSide)
@@ -3535,7 +3540,7 @@ private:
         }
 
         // Find any player on this side (not on-air but assigned)
-        for (int ch = 1; ch <= 4; ++ch)
+        for (int ch = 1; ch <= channels; ++ch)
         {
             uint8_t xf = sharedProDJLink->getChannelXfAssign(ch);
             if (xf == targetSide)
