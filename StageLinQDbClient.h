@@ -317,12 +317,25 @@ public:
     // for one (StageLinQ::kConnectionStopMs counts on that).
     //  - While a session is wanted, another device's offer is ignored: one
     //    database, the first device's (AUDIT SLQ-3).  The same device on
-    //    the same port (a reconnection) keeps what is loaded.
-    //  - The same device on another port has restarted its services (the
-    //    PRIME 4+ had a new port in each #23 capture): the session ends and
-    //    the database is fetched again (AUDIT SLQ-9).
-    //  - After a session failed (no sources, download or open failed), the
-    //    next device to offer FileTransfer starts a new one.
+    //    the same port (a reconnection) keeps what is loaded.  A device is
+    //    its IP: a unit that restarts on another address (DHCP) counts as
+    //    another device, and the database it had before stays in use for
+    //    as long as that session is wanted -- a rebooted peer does not end
+    //    it.
+    //  - The same device on another port has restarted its services: the
+    //    session ends and the database is fetched again (AUDIT SLQ-9).  The
+    //    two #23 captures saw the PRIME 4+ on different ports (and
+    //    addresses); within the second one port served two of STC's
+    //    connections, so a reconnection on the same port is not taken for
+    //    a restart.
+    //  - After a session failed (no sources, download or open failed, the
+    //    device gone), the last offer ignored while a session was wanted --
+    //    another device's, or the same device's again -- starts a new one,
+    //    also when it was ignored before the session's own device restarted
+    //    (the bullet above); without one, the next device to offer
+    //    FileTransfer does.  Before, an offer made during a session that
+    //    then failed was lost for good: a second unit was not fetched until
+    //    it reconnected (AUDIT SLQ-9).
     // start() and stop() are serialised.  MainComponent calls stop() only
     // after StageLinQInput::stop() has joined the connection threads, so a
     // start() does not wait on a stop() there.
@@ -335,10 +348,23 @@ public:
             std::lock_guard<std::mutex> lock(targetMutex);
             if (isRunningFlag.load())
             {
-                if (ip != targetIp || fileTransferPort == targetPort) return true;
+                if (ip != targetIp || fileTransferPort == targetPort)
+                {
+                    // Ignored while this session is wanted; kept in case it
+                    // fails (run).  The latest one replaces an earlier one.
+                    deferredIp = ip;
+                    deferredPort = fileTransferPort;
+                    std::memcpy(deferredToken, tkn, StageLinQ::kTokenLen);
+                    haveDeferred = true;
+                    return true;
+                }
                 DBG("StageLinQ DB: " + ip + " is back on FileTransfer port "
                     + juce::String(fileTransferPort) + " -- fetching its database again");
             }
+            // The offer served now supersedes an earlier one of its own
+            // device; another device's is kept, in case this session fails.
+            if (haveDeferred && deferredIp == ip)
+                haveDeferred = false;
             targetIp = ip;
             targetPort = fileTransferPort;
             std::memcpy(targetToken, tkn, StageLinQ::kTokenLen);
@@ -362,6 +388,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(targetMutex);
             isRunningFlag.store(false);
+            haveDeferred = false;
         }
         if (!isThreadRunning()) return;
         signalThreadShouldExit();
@@ -494,7 +521,21 @@ private:
 
             std::lock_guard<std::mutex> lock(targetMutex);
             if (targetSerial.load() == servedSerial)
-                isRunningFlag.store(false); // it failed (or stop()): the next start() begins anew
+            {
+                // It failed (or stop()).  An offer that start() ignored while
+                // it ran is served now; otherwise the next start() begins
+                // anew.  stop() clears both the flag and the offer.
+                if (haveDeferred && isRunningFlag.load() && !threadShouldExit())
+                {
+                    targetIp = deferredIp;
+                    targetPort = deferredPort;
+                    std::memcpy(targetToken, deferredToken, StageLinQ::kTokenLen);
+                    targetSerial.store(targetSerial.load() + 1);
+                    haveDeferred = false;
+                }
+                else
+                    isRunningFlag.store(false);
+            }
         }
     }
 
@@ -1688,6 +1729,12 @@ private:
     uint16_t targetPort = 0;
     uint8_t targetToken[StageLinQ::kTokenLen] = {};
     std::atomic<uint32_t> targetSerial { 0 };
+    // The last offer start() ignored while a session was wanted (also under
+    // targetMutex): served if that session fails (run).
+    juce::String deferredIp;
+    uint16_t deferredPort = 0;
+    uint8_t deferredToken[StageLinQ::kTokenLen] = {};
+    bool haveDeferred = false;
 
     std::mutex lifecycleMutex;           // serialises start() and stop()
 
