@@ -3163,19 +3163,19 @@ private:
                 }
 
                 // Disk cache check (instant, ~1ms) -- load beats/cues/phrases/detail
-                // from previous session BEFORE re-enqueueing phase 2.
+                // (.anlz) and, for an entry with none, the colour preview
+                // (.wfc) from previous session BEFORE re-enqueueing phase 2.
                 //
                 // The disk key is artist|title|duration (TrackMapEntry::makeKey),
                 // so two versions of a track that share all three share one
-                // file, and once the file holds all four kinds of data and the
-                // entry has its colour preview, phase 2 never runs NFS for the
-                // track: a later rekordbox edit of its grid or cues is not
-                // picked up (AUDIT META-9; when to refresh is not decided
-                // yet).  The file holds no preview, so a player whose preview
-                // only NFS gives (any but a CDJ-3000) has NFS run once per
-                // entry anyway (AUDIT META-15).  Nothing stable identifies the
-                // audio file here -- track IDs are per export -- so the key
-                // stays.
+                // file, and once the files hold all four kinds of data and the
+                // preview, phase 2 never runs NFS for the track: a later
+                // rekordbox edit of its grid or cues is not picked up (AUDIT
+                // META-9; when to refresh is not decided yet).  The .wfc is
+                // what spares a player whose preview only NFS gives (any but a
+                // CDJ-3000) an NFS download per track in every session (AUDIT
+                // META-15).  Nothing stable identifies the audio file here --
+                // track IDs are per export -- so the key stays.
                 std::string diskKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3197,6 +3197,29 @@ private:
                             applyCachedAnlz(it->second, cached);
                             ++it->second.cacheVersion;
                             DBG("DbServerClient: phase 1 loaded ANLZ from disk cache");
+                        }
+                    }
+                }
+                bool wantPreview = false;
+                if (!diskKey.empty())
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    auto it = metadataCache.find(cacheKey);
+                    wantPreview = it != metadataCache.end() && !it->second.hasWaveform();
+                }
+                if (wantPreview && WaveformCache::exists(diskKey))
+                {
+                    auto cached = WaveformCache::load(diskKey);
+                    if (cached.valid)
+                    {
+                        const juce::SpinLock::ScopedLockType lock(cacheLock);
+                        auto it = metadataCache.find(cacheKey);
+                        if (it != metadataCache.end() && !it->second.hasWaveform())
+                        {
+                            it->second.waveformData          = std::move(cached.data);
+                            it->second.waveformEntryCount    = cached.entryCount;
+                            it->second.waveformBytesPerEntry = cached.bytesPerEntry;
+                            ++it->second.cacheVersion;
                         }
                     }
                 }
@@ -3350,9 +3373,9 @@ private:
 
             // --- NFS ANLZ Fallback ---
             // If dbserver queries AND disk cache both failed to provide beat grid,
-            // cues, song structure, detail or the colour preview (which the disk
-            // cache does not hold; AUDIT META-15), download via NFS from CDJ
-            // USB/SD (once per entry: nfsAttempted).
+            // cues, song structure, detail or the colour preview (whose disk
+            // cache is the .wfc phase 1 loads; AUDIT META-15), download via NFS
+            // from CDJ USB/SD (once per entry: nfsAttempted).
             {
                 bool needsNfs = false;
                 uint32_t trackIdForNfs = 0;
@@ -3600,6 +3623,7 @@ private:
             {
                 bool applied = false;
                 std::string diskKey;
+                TrackMetadata preview;   // the colour preview this download brought, if any
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
@@ -3609,8 +3633,16 @@ private:
                         && slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot) == mediaGeneration)
                     {
                         applied = true;
+                        const bool hadPreview = it->second.hasWaveform();
                         // NFS data is authoritative (from USB) -- always overwrite
                         applyNfsAnlzResult(it->second, anlz, true);
+                        if (!hadPreview && it->second.hasWaveform())
+                        {
+                            preview.waveformData          = it->second.waveformData;
+                            preview.waveformEntryCount    = it->second.waveformEntryCount;
+                            preview.waveformBytesPerEntry = it->second.waveformBytesPerEntry;
+                            preview.durationSeconds       = it->second.durationSeconds;
+                        }
                         ++it->second.cacheVersion;
                         DBG("DbServerClient: NFS ANLZ applied -- beats="
                             + juce::String((int)it->second.beatGrid.size())
@@ -3625,9 +3657,19 @@ private:
                     }
                 }
 
-                // Persist to disk cache for next session
+                // Persist to disk cache for next session: the analysis
+                // (.anlz), and the colour preview (.wfc) when this download
+                // brought it and no session saved one -- phase 1 loads it
+                // from there next time, so NFS does not run again just for
+                // the preview (AUDIT META-15).
                 if (applied && !diskKey.empty())
+                {
                     saveAnlzToDisk(cacheKey, diskKey);
+                    if (preview.hasWaveform() && !WaveformCache::exists(diskKey))
+                        WaveformCache::save(diskKey, preview.waveformData,
+                                            preview.waveformEntryCount, preview.waveformBytesPerEntry,
+                                            preview.durationSeconds > 0 ? (uint32_t) preview.durationSeconds * 1000 : 0);
+                }
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
         });
