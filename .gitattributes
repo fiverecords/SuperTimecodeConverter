@@ -2,3 +2,4 @@ sqlite3.c linguist-vendored
 sqlite3.h linguist-vendored
 BTT.h linguist-vendored
 btt_amalgamation.c linguist-vendored
+btt_amalgamation.inc linguist-vendored
