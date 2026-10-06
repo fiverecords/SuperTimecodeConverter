@@ -2274,8 +2274,10 @@ MainComponent::~MainComponent()
     // 2. Detach LookAndFeel before destroying any child components
     setLookAndFeel(nullptr);
 
-    // 3. Save settings while engines are still alive
-    flushSettings();
+    // 3. Settings are saved once, at the end of step 6, with every floating
+    //    window's bounds and the main window's (stored by MainWindow before
+    //    it quit); the engines are still alive there.  The exit used to save
+    //    three times (AUDIT UI-12).
 
     // 4. UpdateChecker thread stops in its own destructor (10s timeout)
 
@@ -2337,7 +2339,9 @@ MainComponent::~MainComponent()
         stageLinQViewWindow.reset();
     }
 
-    settings.save();
+    // The one save at exit: flushSettings copies the engines' state into the
+    // settings and writes them (nothing, after a restore: AUDIT SET-5).
+    flushSettings();
 
     // 7. Stop ProDJLink receiver FIRST. This joins its thread, so no more
     //    gcPlayers() calls can fire onPlayerLost after this returns.
@@ -2358,19 +2362,20 @@ MainComponent::~MainComponent()
     // 10. Now stop StageLinQ database client
     sharedStageLinQDb.stop();
 
-    // 10. Explicitly shut down each engine (timers, threads, sockets)
+    // 11. Explicitly shut down each engine (timers, threads, sockets)
     //    BEFORE engines.clear() destroys the objects, so all HighResolutionTimer
     //    threads are stopped while the message manager is still alive.
     //    Also disconnect shared pointers (TrackMap, MixerMap, ProDJLink, DbServer)
     //    so no stale references survive into AppSettings destruction.
     //
-    // Order is important: the Generator audio player owns a JUCE audio device
-    // and a loader thread that read atomics from this engine; closing the
-    // device explicitly here lets removeAudioCallback wait for the in-flight
-    // callback to return BEFORE engines.clear() races the destructor.  The
-    // same applies to AudioBpm and TriggerOutput.  Without these explicit
-    // stops a closing app could trip an std::atomic load on a member whose
-    // owning engine had already started destruction.
+    // Order is important: the generator audio player and Audio BPM are
+    // clients of a shared device (AudioDeviceHub, DESIGN D23) whose callback
+    // reads atomics from this engine; releasing them here waits for an
+    // in-flight callback to return BEFORE engines.clear() races the
+    // destructor.  TriggerOutput's MIDI and OSC are closed for the same
+    // reason.  Without these explicit stops a closing app could trip an
+    // std::atomic load on a member whose owning engine had already started
+    // destruction.
     for (auto& eng : engines)
     {
         eng->setMidiClockEnabled(false);
@@ -2380,8 +2385,8 @@ MainComponent::~MainComponent()
         eng->setSharedProDJLinkInput(nullptr);
         eng->setSharedStageLinQInput(nullptr);
         eng->setDbServerClient(nullptr);
-        eng->stopGeneratorAudio();      // closes JUCE audio device + stops loader thread
-        eng->stopAudioBpm();            // closes BPM input device + analyser thread
+        eng->stopGeneratorAudio();      // releases its hub device client + stops the read-ahead thread
+        eng->stopAudioBpm();            // releases its hub device client + frees the BTT analyser
         eng->getTriggerOutput().stopMidi();
         eng->getTriggerOutput().disconnectOsc();
         eng->stopMtcOutput();
@@ -2395,10 +2400,10 @@ MainComponent::~MainComponent()
         eng->stopLtcInput();
     }
 
-    // 10. Now safe to destroy engine objects
+    // 12. Now safe to destroy engine objects
     engines.clear();
 
-    // 11. Every audio client has released its device; close the shared
+    // 13. Every audio client has released its device; close the shared
     // devices and drop their managers while JUCE is still alive, so the
     // hub's static instance destroys nothing at process exit.
     AudioDeviceHub::shutdown();

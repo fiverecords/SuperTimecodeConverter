@@ -61,7 +61,9 @@ public:
             setContentOwned(mc, true);
 
             setResizable(true, true);
-            setResizeLimits(800, 550, 2560, 1440);
+            // No maximum size (JUCE's own default maximum): a 2560x1440 cap
+            // kept the window from filling a 4K display (AUDIT UI-12).
+            setResizeLimits(800, 550, 0x3fffffff, 0x3fffffff);
             centreWithSize(getWidth(), getHeight());
 
             // Restore saved window position/size
@@ -75,9 +77,24 @@ public:
                                                    parts[2].getIntValue(), parts[3].getIntValue());
                     if (b.getWidth() >= 800 && b.getHeight() >= 550)
                     {
-                        auto c = b.getCentre();
+                        // Restored only where its title bar -- what the window
+                        // is dragged by -- lies in a display's user area (off
+                        // the taskbar and menu bar) for its full height and
+                        // at least 100 px of its width.  The old test, the
+                        // window's centre on some display, let a window saved
+                        // on a monitor since removed or rearranged come back
+                        // with its title bar out of reach (AUDIT UI-12).
+                        // Otherwise it stays centred as above.
+                        const auto titleBar = b.withHeight(getTitleBarHeight());
                         for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                            if (d.logicalBounds.contains(c.toFloat())) { setBounds(b); break; }
+                        {
+                            const auto onDisplay = titleBar.getIntersection(d.userBounds.toNearestInt());
+                            if (onDisplay.getHeight() == titleBar.getHeight() && onDisplay.getWidth() >= 100)
+                            {
+                                setBounds(b);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -89,9 +106,14 @@ public:
         {
             auto* mc = dynamic_cast<MainComponent*>(getContentComponent());
 
-            // If Show Lock is active, confirm before quitting
+            // If Show Lock is active, confirm before quitting.  One
+            // confirmation at a time: a second close or Cmd+Q while it is up
+            // does nothing, where it used to stack another (AUDIT UI-12).
             if (mc != nullptr && mc->isShowModeLocked())
             {
+                if (quitConfirmShowing)
+                    return;
+                quitConfirmShowing = true;
                 auto options = juce::MessageBoxOptions()
                     .withIconType(juce::MessageBoxIconType::WarningIcon)
                     .withTitle("Show Lock Active")
@@ -104,6 +126,7 @@ public:
                 juce::AlertWindow::showAsync(options, [safeThis](int result)
                 {
                     if (safeThis == nullptr) return;
+                    safeThis->quitConfirmShowing = false;
                     if (result == 1)
                     {
                         auto* mc2 = dynamic_cast<MainComponent*>(safeThis->getContentComponent());
@@ -117,13 +140,17 @@ public:
         }
 
     private:
+        bool quitConfirmShowing = false;   // the Show Lock quit confirmation is up
+
         void saveWindowBoundsAndQuit(MainComponent* mc)
         {
-            // Save window bounds before quitting
+            // Hand the window bounds to the settings before quitting; the
+            // MainComponent destructor, which quit() reaches through
+            // shutdown(), writes them with everything else in one save.
             if (mc != nullptr)
             {
                 auto b = getBounds();
-                mc->saveMainWindowBounds(
+                mc->setMainWindowBounds(
                     juce::String(b.getX()) + " " + juce::String(b.getY()) + " "
                     + juce::String(b.getWidth()) + " " + juce::String(b.getHeight()));
             }

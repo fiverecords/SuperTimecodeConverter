@@ -153,14 +153,12 @@ public:
     void onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
                              const juce::Array<AudioDeviceEntry>& outputs);
 
-    /// Main window bounds persistence (called by MainWindow in Main.cpp)
+    /// Main window bounds persistence (called by MainWindow in Main.cpp).
+    /// setMainWindowBounds only stores them: the destructor's flushSettings
+    /// writes them, in the one save at exit (AUDIT UI-12).
     juce::String getSavedMainWindowBounds() const { return settings.mainWindowBounds; }
     bool isShowModeLocked() const { return settings.showModeLocked; }
-    void saveMainWindowBounds(const juce::String& bounds)
-    {
-        settings.mainWindowBounds = bounds;
-        settings.save();
-    }
+    void setMainWindowBounds(const juce::String& bounds) { settings.mainWindowBounds = bounds; }
 
 private:
     //==============================================================================
