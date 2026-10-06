@@ -103,8 +103,8 @@ struct SafeJsonFile
     /// replaceWithText writes the JSON writer's CR LF line ends unchanged,
     /// so a file STC wrote compares equal to the text it was written from; a
     /// file that differs in any way is rotated and written as before.
-    /// Called directly only by a restore, which must write while saves are
-    /// suspended.
+    /// Called directly only by a restore, which must also write when an
+    /// earlier restore in this session has suspended saves.
     static bool writeRotating(const juce::File& file, const juce::String& text)
     {
         if (file.existsAsFile())
