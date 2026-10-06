@@ -779,12 +779,15 @@ public:
                             if (!deckBounds[pn - 1].isEmpty())
                                 repaint(deckBounds[pn - 1]);
 
-                            // Save waveform + artwork to disk cache for future sessions
+                            // Save waveform + artwork to disk cache for future sessions.
+                            // The preview is written when no valid .wfc is there:
+                            // one an older version left truncated does not load,
+                            // and is replaced (AUDIT META-15, META-10).
                             if (meta.title.isNotEmpty())
                             {
                                 auto diskKey = TrackMapEntry::makeKey(
                                     meta.artist, meta.title, meta.durationSeconds);
-                                if (!WaveformCache::exists(diskKey))
+                                if (!WaveformCache::load(diskKey).valid)
                                 {
                                     uint32_t durMs = (meta.durationSeconds > 0)
                                         ? (uint32_t)meta.durationSeconds * 1000 : 0;

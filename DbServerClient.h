@@ -3369,11 +3369,16 @@ private:
 
             // Save to disk cache ALWAYS (not gated by hasNewerRequests).
             // Even if dbserver queries were skipped, save whatever we have
-            // now (disk cache + dbserver).  The NFS thread saves its own
+            // now (disk cache + dbserver): the analysis to the .anlz, and the
+            // colour preview to the .wfc when no valid one is there
+            // (savePreviewIfMissing) -- also the preview an NFS download
+            // brought while the entry had no title, which the NFS thread
+            // could not save (AUDIT META-15).  The NFS thread saves its own
             // results when it finishes.
             {
                 std::string saveDiskKey;
                 bool hasNewData = false;
+                bool hasPreview = false;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
@@ -3381,13 +3386,16 @@ private:
                     {
                         hasNewData = (it->second.hasBeatGrid() || it->second.hasCueList()
                                       || it->second.hasSongStructure() || it->second.hasDetailWaveform());
-                        if (hasNewData && it->second.title.isNotEmpty())
+                        hasPreview = it->second.hasWaveform();
+                        if ((hasNewData || hasPreview) && it->second.title.isNotEmpty())
                             saveDiskKey = TrackMapEntry::makeKey(
                                 it->second.artist, it->second.title, it->second.durationSeconds);
                     }
                 }
                 if (!saveDiskKey.empty() && hasNewData)
                     saveAnlzToDisk(cacheKey, saveDiskKey);
+                if (!saveDiskKey.empty() && hasPreview)
+                    savePreviewIfMissing(cacheKey, saveDiskKey);
             }
 
             // --- NFS ANLZ Fallback ---
@@ -3642,7 +3650,6 @@ private:
             {
                 bool applied = false;
                 std::string diskKey;
-                TrackMetadata preview;   // the colour preview this download brought, if any
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
@@ -3652,16 +3659,8 @@ private:
                         && slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot) == mediaGeneration)
                     {
                         applied = true;
-                        const bool hadPreview = it->second.hasWaveform();
                         // NFS data is authoritative (from USB) -- always overwrite
                         applyNfsAnlzResult(it->second, anlz, true);
-                        if (!hadPreview && it->second.hasWaveform())
-                        {
-                            preview.waveformData          = it->second.waveformData;
-                            preview.waveformEntryCount    = it->second.waveformEntryCount;
-                            preview.waveformBytesPerEntry = it->second.waveformBytesPerEntry;
-                            preview.durationSeconds       = it->second.durationSeconds;
-                        }
                         ++it->second.cacheVersion;
                         DBG("DbServerClient: NFS ANLZ applied -- beats="
                             + juce::String((int)it->second.beatGrid.size())
@@ -3677,17 +3676,14 @@ private:
                 }
 
                 // Persist to disk cache for next session: the analysis
-                // (.anlz), and the colour preview (.wfc) when this download
-                // brought it and no session saved one -- phase 1 loads it
-                // from there next time, so NFS does not run again just for
-                // the preview (AUDIT META-15).
+                // (.anlz), and the entry's colour preview (.wfc) when no
+                // valid one is on disk -- phase 1 loads it from there next
+                // time, so NFS does not run again just for the preview
+                // (AUDIT META-15; savePreviewIfMissing).
                 if (applied && !diskKey.empty())
                 {
                     saveAnlzToDisk(cacheKey, diskKey);
-                    if (preview.hasWaveform() && !WaveformCache::exists(diskKey))
-                        WaveformCache::save(diskKey, preview.waveformData,
-                                            preview.waveformEntryCount, preview.waveformBytesPerEntry,
-                                            preview.durationSeconds > 0 ? (uint32_t) preview.durationSeconds * 1000 : 0);
+                    savePreviewIfMissing(cacheKey, diskKey);
                 }
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
@@ -3718,6 +3714,33 @@ private:
         if (nfsThread.joinable())
             nfsThread.join();
         return true;
+    }
+
+    /// Worker or NFS thread.  Write the entry's colour preview to the .wfc
+    /// under diskKey when no valid one is there: none, or one that does not
+    /// load (an older version left it truncated, AUDIT META-10).  Phase 1
+    /// loads the preview only from a valid .wfc, so a missing or truncated
+    /// one sent a player whose preview only NFS gives (any but a CDJ-3000)
+    /// to NFS for the track in every session (AUDIT META-15).  A valid
+    /// .wfc is kept as it is.
+    void savePreviewIfMissing(const CacheKey& cacheKey, const std::string& diskKey)
+    {
+        if (diskKey.empty() || WaveformCache::load(diskKey).valid)
+            return;
+        TrackMetadata preview;
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            auto it = metadataCache.find(cacheKey);
+            if (it == metadataCache.end() || !it->second.hasWaveform())
+                return;
+            preview.waveformData          = it->second.waveformData;
+            preview.waveformEntryCount    = it->second.waveformEntryCount;
+            preview.waveformBytesPerEntry = it->second.waveformBytesPerEntry;
+            preview.durationSeconds       = it->second.durationSeconds;
+        }
+        WaveformCache::save(diskKey, preview.waveformData,
+                            preview.waveformEntryCount, preview.waveformBytesPerEntry,
+                            preview.durationSeconds > 0 ? (uint32_t) preview.durationSeconds * 1000 : 0);
     }
 
     /// Build a CachedAnlz from in-memory TrackMetadata and save to disk.
