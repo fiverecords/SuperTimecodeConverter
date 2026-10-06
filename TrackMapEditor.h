@@ -1207,7 +1207,7 @@ private:
             uint32_t tid = proDJLinkInput->getTrackID(player);
             if (tid != 0)
             {
-                auto meta = dbClient->getCachedMetadataByTrackId(tid);
+                auto meta = getLearnPlayerMetadata(player, tid);
                 if (meta.isValid() && meta.hasCueList()
                     && meta.artist.equalsIgnoreCase(entry.artist.trim())
                     && meta.title.equalsIgnoreCase(entry.title.trim()))
@@ -1259,6 +1259,24 @@ private:
     //--------------------------------------------------------------------------
     // Button actions
     //--------------------------------------------------------------------------
+
+    /// The dbserver metadata of the track on Learn player `player`, looked
+    /// up by the player whose media holds it, its slot and the ID, as the
+    /// PDL View does: the same ID on another USB, or in the other slot, can
+    /// be another track (AUDIT META-5).  Empty when that player is not on
+    /// the network or nothing is cached for the track there.
+    TrackMetadata getLearnPlayerMetadata(int player, uint32_t trackId) const
+    {
+        if (dbClient == nullptr || proDJLinkInput == nullptr || trackId == 0)
+            return {};
+        uint8_t src = proDJLinkInput->getLoadedPlayer(player);
+        if (src == 0) src = (uint8_t) player;
+        const juce::String ip = proDJLinkInput->getPlayerIP((int) src);
+        if (ip.isEmpty())
+            return {};
+        return dbClient->getCachedMetadata(ip, proDJLinkInput->getLoadedSlot(player), trackId);
+    }
+
     void onLearn()
     {
         if (learnRetryInProgress) return;  // retry already scheduled
@@ -1289,23 +1307,16 @@ private:
             learnTitle  = tinfo.title;
 
             // Enrich with dbClient cache if available
-            if (dbClient != nullptr)
+            const auto meta = getLearnPlayerMetadata(player, cdjId);
+            if (meta.isValid())
             {
-                auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
-                if (meta.isValid())
-                {
-                    if (meta.artist.isNotEmpty()) learnArtist = meta.artist;
-                    if (meta.title.isNotEmpty())  learnTitle  = meta.title;
-                }
+                if (meta.artist.isNotEmpty()) learnArtist = meta.artist;
+                if (meta.title.isNotEmpty())  learnTitle  = meta.title;
             }
 
             learnedDurationSec = (int)proDJLinkInput->getTrackLengthSec(player);
-            if (learnedDurationSec == 0 && dbClient != nullptr)
-            {
-                auto meta = dbClient->getCachedMetadataByTrackId(cdjId);
-                if (meta.isValid() && meta.durationSeconds > 0)
-                    learnedDurationSec = meta.durationSeconds;
-            }
+            if (learnedDurationSec == 0 && meta.isValid() && meta.durationSeconds > 0)
+                learnedDurationSec = meta.durationSeconds;
         }
         // Fallback: get track info from the active engine (StageLinQ,
         // Winamp, etc.)
@@ -1332,9 +1343,10 @@ private:
         // but its cue-point editor timeline has no scale, so the user
         // would see a blank waveform with no cursor.  Up to 2.5 s of
         // background retries usually catches the late-arriving duration.
-        // Only retry on the engine-callback path -- ProDJLink always
-        // returns a duration immediately (it comes from the CDJ status
-        // packet, not from local decoding).
+        // Only retry on the engine-callback path, which the retry polls.
+        // On the ProDJLink path the duration is the CDJ-3000's (0x0b
+        // packets) or, as an NXS2 sends none, the dbserver's once cached;
+        // with neither, the entry is learned without one.
         if (learnedDurationSec == 0 && !useProDJLinkPath && onLearnTrackInfo)
         {
             learnRetryInProgress = true;
