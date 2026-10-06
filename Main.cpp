@@ -4,6 +4,7 @@
 
 #include <JuceHeader.h>
 #include "MainComponent.h"
+#include <csignal>
 
 class SuperTimecodeConverterApplication : public juce::JUCEApplication
 {
@@ -16,6 +17,16 @@ public:
 
     void initialise(const juce::String&) override
     {
+       #if JUCE_LINUX || JUCE_MAC
+        // A write to a TCP peer that has reset the connection raises
+        // SIGPIPE, whose default action ends the process: JUCE 9.0.3's
+        // StreamingSocket::write is send() without MSG_NOSIGNAL.  A Denon
+        // unit closing its StageLinQ connection while STC still sends
+        // keepalives did exactly that (AUDIT SLQ-5).  Ignored, the write
+        // fails with EPIPE and the connection's own error handling runs.
+        // Set before any thread starts; it applies to the whole process.
+        std::signal(SIGPIPE, SIG_IGN);
+       #endif
         mainWindow.reset(new MainWindow(getApplicationName()));
     }
 
