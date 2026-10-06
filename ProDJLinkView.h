@@ -184,6 +184,7 @@ private:
         juce::String srcIP;                  // player whose media holds the track (empty: not on the network)
         uint8_t  srcSlot = 0;                // and its slot: with the ID, the dbserver cache key (AUDIT META-5)
         bool     metadataRequested = false;  // true once we've sent a dbserver request for this track
+        juce::String requestedSrcIP;         // the address that request went to
         int      metadataRequestTick = 0;   // tick counter for retry after ~3s
 
         // Cached deck image -- Windows only (GDI benefits from caching).
@@ -642,6 +643,14 @@ public:
             ds.srcIP   = srcIP;
             ds.srcSlot = srcSlot;
 
+            // A player that moved to another address keeps its track and
+            // its track version, but the cache is keyed by address, and what
+            // was held under the old one may have been dropped with it: ask
+            // again at the new address.  requestMetadata does nothing when
+            // the track is already fully cached there (AUDIT PDL-3).
+            if (ds.metadataRequested && srcIP != ds.requestedSrcIP)
+                ds.metadataRequested = false;
+
             if (ds.trackId != 0 && !ds.metadataRequested
                 && !srcIP.isEmpty() && dbClient.getIsRunning())
             {
@@ -668,6 +677,7 @@ public:
                     dbClient.requestMetadata(
                         srcIP, srcSlot, 1, ds.trackId, dbCtx, model);
                     ds.metadataRequested = true;
+                    ds.requestedSrcIP = srcIP;
                     ds.metadataRequestTick = 0;
                 }
             }
