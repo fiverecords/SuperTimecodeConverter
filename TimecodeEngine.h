@@ -5259,6 +5259,38 @@ private:
         framePhaseValid = true;
     }
 
+    /// FPS CONVERT (AUDIT ENG-5): the sources publish the phase on the INPUT
+    /// rate's grid -- time since the start of currentTimecode's frame at
+    /// currentFps -- while LtcOutput reads it as time since the start of
+    /// the frame it is given (`outTc`, the converted value) at the output
+    /// rate: modulo an output frame for the phase lock (DESIGN D24), whole
+    /// output frames carried into the value at a seed.  Taken as it was,
+    /// the encoder worked from a position up to a frame off and locked to
+    /// a boundary up to half a frame off.  Rewritten here as the source's
+    /// position (input frame start plus phase) less the start of `outTc`'s
+    /// frame: a converted value names the output frame holding the INPUT
+    /// frame's start, so this is under one input plus one output frame,
+    /// and the encoder ages the value by the whole frames in it.  The
+    /// epsilon is setFramePhaseFromPosition's, for the same reason: a
+    /// position on an output boundary must read as the next frame and 0,
+    /// not as this one and a whole frame.  False (nothing published this
+    /// tick) when the two sit on different sides of midnight.
+    bool phaseOnOutputGrid(const Timecode& outTc, FrameRate outRate)
+    {
+        const double f = frameRateToDouble(outRate);
+        if (f <= 0.0) return false;
+        const double frameMs = 1000.0 / f;
+        const double sinceStart = timecodeToMs(currentTimecode, currentFps) + framePhaseMs
+                                - timecodeToMs(outTc, outRate);
+        const double frames = sinceStart / frameMs;
+        if (frames < -1e-6 || frames > 4.0) return false;
+        const double idx = std::floor(juce::jmax(0.0, frames) + 1e-9);
+        double rem = (frames - idx) * frameMs;
+        if (rem < 0.0) rem = 0.0;
+        framePhaseMs = idx * frameMs + rem;
+        return true;
+    }
+
     /// Follow the frame rate a signal input detected (tick, message thread).
     /// Rates its wire cannot tell apart -- 24 for 23.976 always, 30 for
     /// 29.97 when `thirtyAmbiguous` -- leave a 23.976 or 29.97 the user chose
@@ -5290,18 +5322,23 @@ private:
         // the LTC input, system date).  No-op in MANUAL mode.
         refreshDynamicUserBits();
 
-        // Hand the encoder the sub-frame phase gathered this tick, so its
-        // frame boundary lands on the timecode frame boundary instead of
-        // wherever the audio device happened to start (issue #15).
-        if (framePhaseValid)
-            ltcOutput.setFramePhaseMs(framePhaseMs);
-        framePhaseValid = false;   // each tick must publish afresh
-
         FrameRate outRate = getEffectiveOutputFps();
         Timecode baseTc = fpsConvertEnabled
                         ? convertTimecodeRate(currentTimecode, currentFps, outRate)
                         : currentTimecode;
         outputTimecode = baseTc;
+
+        // Hand the encoder the sub-frame phase gathered this tick, so its
+        // frame boundary lands on the timecode frame boundary instead of
+        // wherever the audio device happened to start (issue #15).  The
+        // encoder reads it as time since the start of the frame it is given,
+        // at the output rate; with FPS CONVERT it is re-expressed on that
+        // grid first (AUDIT ENG-5).
+        if (framePhaseValid && fpsConvertEnabled && outRate != currentFps)
+            framePhaseValid = phaseOnOutputGrid(baseTc, outRate);
+        if (framePhaseValid)
+            ltcOutput.setFramePhaseMs(framePhaseMs);
+        framePhaseValid = false;   // each tick must publish afresh
 
         bool wasActive = outputsWereActive;
         outputsWereActive = sourceActive;
