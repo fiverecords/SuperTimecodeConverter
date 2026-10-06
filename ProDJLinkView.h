@@ -1065,6 +1065,7 @@ public:
                                 ds.detailCuesFed = true;
                                 if (ds.cueCount == 0)
                                     ds.cueCount = (int)meta.cueList.size();
+                                autoPopulateRekordboxCues(pn, ds, meta);
                             }
 
                             // Persist ANLZ to disk (detail waveform + whatever else arrived)
@@ -1122,68 +1123,7 @@ public:
                                 ds.invalidateDeckImg();
                             }
 
-                            // Auto-populate TrackMap cue points from rekordbox
-                            // hot cues, but only if the entry exists and has NO
-                            // manually-configured cue points.
-                            // Blocked during Show Lock -- TrackMap is configuration.
-                            if (ds.title.isNotEmpty()
-                                && (!isShowLockedFn || !isShowLockedFn()))
-                            {
-                                int dur = (int)ds.trackLenSec;
-                                auto* mutableEntry = trackMap.find(ds.artist, ds.title, dur);
-                                if (!mutableEntry && dur > 0)
-                                    mutableEntry = trackMap.find(ds.artist, ds.title, 0);
-                                if (!mutableEntry)
-                                    mutableEntry = trackMap.findIgnoringDuration(ds.artist, ds.title);
-                                if (mutableEntry != nullptr && mutableEntry->cuePoints.empty())
-                                {
-                                    for (auto& rc : meta.cueList)
-                                    {
-                                        if (rc.positionMs == 0) continue;  // skip track start
-                                        CuePoint cp;
-                                        cp.positionMs = rc.positionMs;
-                                        auto letter = rc.hotCueLetter();
-                                        if (letter.isNotEmpty())
-                                            cp.name = letter;
-                                        if (rc.comment.isNotEmpty())
-                                            cp.name += cp.name.isNotEmpty()
-                                                ? " " + rc.comment : rc.comment;
-                                        if (cp.name.isEmpty())
-                                        {
-                                            if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint)
-                                                cp.name = "MEM";
-                                            else if (rc.type == TrackMetadata::RekordboxCue::Loop)
-                                                cp.name = "LOOP";
-                                        }
-                                        mutableEntry->cuePoints.push_back(std::move(cp));
-                                    }
-                                    mutableEntry->sortCuePoints();
-
-                                    // Persist the populated cues (in the
-                                    // background: this is the 60 Hz timer), and
-                                    // have the engines following this deck load
-                                    // them.  Without this they reached the file
-                                    // only with the next save made for another
-                                    // reason (at the latest on quit), and the
-                                    // engines' armed cue list stayed empty
-                                    // until their next track change or Track
-                                    // Map refresh.  A refresh keeps the cues
-                                    // behind where the deck's cues were checked
-                                    // up to as passed, so none fires at once or
-                                    // twice (DESIGN D36; AUDIT ENG-18).
-                                    // Message thread.
-                                    if (!mutableEntry->cuePoints.empty())
-                                    {
-                                        trackMap.saveAsync();
-                                        for (auto& eng : engines)
-                                        {
-                                            if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
-                                                && eng->getEffectivePlayer() == pn)
-                                                eng->refreshTrackMapLookup();
-                                        }
-                                    }
-                                }
-                            }
+                            autoPopulateRekordboxCues(pn, ds, meta);
                         }
                         else if (!ds.detailCuesFed)
                         {
@@ -2653,6 +2593,74 @@ private:
             case FrameRate::FPS_2997: return "29.97";
             case FrameRate::FPS_30:   return "30";
             default:                  return "?";
+        }
+    }
+
+    //==========================================================================
+    // Fill deck pn's Track Map entry with the rekordbox cues of meta when it
+    // has none.  Called when the deck's cues are first fed to the detail
+    // view: with the detail waveform's first fetch when they came in it (the
+    // disk cache, an NFS download), or later when they arrive on their own.
+    // It ran only in the second case, so an entry stayed empty whenever the
+    // cues came with the detail (AUDIT ENG-18).  Message thread.
+    //==========================================================================
+    void autoPopulateRekordboxCues(int pn, DeckState& ds, const TrackMetadata& meta)
+    {
+        // Auto-populate TrackMap cue points from rekordbox hot cues, but only
+        // if the entry exists and has NO manually-configured cue points.
+        // Blocked during Show Lock -- TrackMap is configuration.
+        if (ds.title.isNotEmpty()
+            && (!isShowLockedFn || !isShowLockedFn()))
+        {
+            int dur = (int)ds.trackLenSec;
+            auto* mutableEntry = trackMap.find(ds.artist, ds.title, dur);
+            if (!mutableEntry && dur > 0)
+                mutableEntry = trackMap.find(ds.artist, ds.title, 0);
+            if (!mutableEntry)
+                mutableEntry = trackMap.findIgnoringDuration(ds.artist, ds.title);
+            if (mutableEntry != nullptr && mutableEntry->cuePoints.empty())
+            {
+                for (auto& rc : meta.cueList)
+                {
+                    if (rc.positionMs == 0) continue;  // skip track start
+                    CuePoint cp;
+                    cp.positionMs = rc.positionMs;
+                    auto letter = rc.hotCueLetter();
+                    if (letter.isNotEmpty())
+                        cp.name = letter;
+                    if (rc.comment.isNotEmpty())
+                        cp.name += cp.name.isNotEmpty()
+                            ? " " + rc.comment : rc.comment;
+                    if (cp.name.isEmpty())
+                    {
+                        if (rc.type == TrackMetadata::RekordboxCue::MemoryPoint)
+                            cp.name = "MEM";
+                        else if (rc.type == TrackMetadata::RekordboxCue::Loop)
+                            cp.name = "LOOP";
+                    }
+                    mutableEntry->cuePoints.push_back(std::move(cp));
+                }
+                mutableEntry->sortCuePoints();
+
+                // Persist the populated cues (in the background: this is the
+                // 60 Hz timer), and have the engines following this deck load
+                // them.  Without this they reached the file only with the next
+                // save made for another reason (at the latest on quit), and the
+                // engines' armed cue list stayed empty until their next track
+                // change or Track Map refresh.  A refresh keeps the cues behind
+                // where the deck's cues were checked up to as passed, so none
+                // fires at once or twice (DESIGN D36; AUDIT ENG-18).
+                if (!mutableEntry->cuePoints.empty())
+                {
+                    trackMap.saveAsync();
+                    for (auto& eng : engines)
+                    {
+                        if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
+                            && eng->getEffectivePlayer() == pn)
+                            eng->refreshTrackMapLookup();
+                    }
+                }
+            }
         }
     }
 
