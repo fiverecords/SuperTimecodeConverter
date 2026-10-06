@@ -9305,9 +9305,15 @@ void MainComponent::timerCallback()
                             if (!wfCues.empty())
                                 waveformDisplay.setRekordboxCues(wfCues);
 
-                            // Auto-populate TrackMap cue points (same as ProDJLink path)
+                            // Auto-populate TrackMap cue points when the entry
+                            // has none (same as the Pro DJ Link path, the PDL
+                            // View's autoPopulateRekordboxCues).  Blocked
+                            // during Show Lock -- TrackMap is configuration.
+                            // The setting is read, not isShowLocked(): the
+                            // operator did nothing, so the lock button does
+                            // not flash.
                             auto cueTrackInfo = eng.getActiveTrackInfo();
-                            if (cueTrackInfo.title.isNotEmpty())
+                            if (cueTrackInfo.title.isNotEmpty() && !settings.showModeLocked)
                             {
                                 int dur = (int)sharedStageLinQInput.getTrackLengthSec(slqDeck);
                                 auto* tmEntry = settings.trackMap.find(cueTrackInfo.artist, cueTrackInfo.title, dur);
@@ -9337,8 +9343,10 @@ void MainComponent::timerCallback()
                                         tmEntry->cuePoints.push_back(std::move(cp));
                                     }
                                     tmEntry->sortCuePoints();
-                                    // Persist the populated cues (they were
-                                    // gone at the next start), let every
+                                    // Persist the populated cues now (before,
+                                    // they reached the file only with the
+                                    // next settings save, at the latest on
+                                    // quit, and a crash lost them), let every
                                     // engine's armed list pick them up, and
                                     // show them in the TrackMap editor if it
                                     // is open, as saveBpmMultToTrackMap does
