@@ -3525,6 +3525,14 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
     cuePointEditedArtist  = entry->artist;
     cuePointEditedTitle   = entry->title;
 
+    // The waveform cache (.wfc) has no source tag.  A Pioneer preview goes
+    // under the Track Map key, which DbServerClient and the PDL View load
+    // for a Pro DJ Link deck; a StageLinQ deck's Engine DJ overview goes
+    // under a key of its own, so it is never taken for a Pioneer deck's
+    // preview (AUDIT META-15).  A .wfc that does not load (none, or one an
+    // older version left truncated) is written again (AUDIT META-10).
+    const std::string slqWaveformKey = entry->key() + "|slq";
+
     // Try to find artwork, waveform, and duration for this track
     bool foundMeta = false;
     bool foundWaveform = false;
@@ -3565,7 +3573,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
                     foundWaveform = true;
 
                     // Cache waveform to disk for offline use
-                    if (!WaveformCache::exists(entry->key()))
+                    if (!WaveformCache::load(entry->key()).valid)
                     {
                         uint32_t durMs = (meta.durationSeconds > 0)
                             ? (uint32_t)meta.durationSeconds * 1000
@@ -3601,11 +3609,11 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
                         cuePointWindow->setWaveformData(wf.data, wf.entryCount, 3);
                         foundWaveform = true;
 
-                        if (!WaveformCache::exists(entry->key()))
+                        if (!WaveformCache::load(slqWaveformKey).valid)
                         {
                             uint32_t durMs = (info.durationSec > 0)
                                 ? (uint32_t)info.durationSec * 1000 : 0;
-                            WaveformCache::save(entry->key(), wf.data,
+                            WaveformCache::save(slqWaveformKey, wf.data,
                                 wf.entryCount, 3, durMs);
                         }
                     }
@@ -3663,7 +3671,7 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
                 cuePointWindow->setWaveformData(meta.waveformData,
                     meta.waveformEntryCount, meta.waveformBytesPerEntry);
                 foundWaveform = true;
-                if (!WaveformCache::exists(entry->key()))
+                if (!WaveformCache::load(entry->key()).valid)
                 {
                     uint32_t durMs = (meta.durationSeconds > 0)
                         ? (uint32_t)meta.durationSeconds * 1000 : 0;
@@ -3680,10 +3688,13 @@ void MainComponent::openCuePointEditor(TrackMapEntry* entry)
         }
     }
 
-    // If no live waveform was found, try loading from cache
+    // If no live waveform was found, try loading from cache: the Pioneer
+    // preview, else the Engine DJ overview
     if (!foundWaveform)
     {
         auto cached = WaveformCache::load(entry->key());
+        if (!cached.valid)
+            cached = WaveformCache::load(slqWaveformKey);
         if (cached.valid)
         {
             cuePointWindow->setWaveformData(cached.data,
