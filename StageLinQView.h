@@ -957,12 +957,24 @@ public:
                                            parts[2].getIntValue(), parts[3].getIntValue());
             if (b.getWidth() >= 200 && b.getHeight() >= 150)
             {
-                auto centre = b.getCentre();
-                bool onScreen = false;
+                // Restored only where its title bar -- what the window is
+                // dragged by -- lies in a display's user area for its full
+                // height and at least 100 px of its width, as the main
+                // window and the PDL View are (AUDIT UI-12).  The old test,
+                // the window's centre on some display, let a window saved on
+                // a monitor since removed or rearranged come back with its
+                // title bar out of reach.  Otherwise it stays where the
+                // constructor put it.  Message thread.
+                const auto titleBar = b.withHeight(getTitleBarHeight());
                 for (auto& disp : juce::Desktop::getInstance().getDisplays().displays)
-                    if (disp.logicalBounds.contains(centre.toFloat())) { onScreen = true; break; }
-                if (onScreen)
-                    setBounds(b);
+                {
+                    const auto onDisplay = titleBar.getIntersection(disp.userBounds.toNearestInt());
+                    if (onDisplay.getHeight() == titleBar.getHeight() && onDisplay.getWidth() >= 100)
+                    {
+                        setBounds(b);
+                        break;
+                    }
+                }
             }
         }
     }
