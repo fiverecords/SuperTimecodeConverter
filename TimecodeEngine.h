@@ -1923,6 +1923,23 @@ public:
                                 (uint32_t)pdlSnapMs, getEffectiveOutputFps());
                             tcSourceMs = (double)(uint32_t)pdlSnapMs;
                         }
+                        else
+                        {
+                            // Same grid position with the deck stopped at the
+                            // last packet (NXS2 beat fallback): move the anchor
+                            // to this packet and to the position shown while
+                            // stopped, the beat start, so that the first advance
+                            // after play starts from there.  Left at the last
+                            // packet before the stop, the second status after
+                            // play advanced it by the whole pause at the new
+                            // speed: the timecode leapt ahead by the pause
+                            // length, the cues in between fired at once, and
+                            // the next beat snapped it back (AUDIT ENG-2).
+                            // Where in the beat the deck stopped is not known
+                            // here; the position catches up at the next beat.
+                            pdlSnapMs = (double)rawPlayheadMs;
+                            pdlSnapTime = now;
+                        }
                         // Always refresh speed -- the DJ may have moved the
                         // pitch fader between beats, and the interpolation
                         // should use the latest velocity immediately.
