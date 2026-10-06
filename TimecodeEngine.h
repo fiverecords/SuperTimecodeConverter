@@ -61,7 +61,7 @@ public:
         std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1); lastMixerPktCount = 0;
 
         // Named in "IN USE BY <name>" when another engine's MTC is refused on
-        // the port this engine streams on (D32).
+        // the port this engine streams on (DESIGN D32).
         mtcOutput.setOwnerName(engineName);
 
         // Only the primary engine (index 0) gets AudioThru
@@ -318,7 +318,7 @@ public:
             appendLtcGapLogLine(line);
         }
 
-        // Value corrections and re-seeds (D30), same file, so a capture of a
+        // Value corrections and re-seeds (DESIGN D30), same file, so a capture of a
         // skipped or repeated frame can be lined up with STC's own view.
         const int events = ltcOutput.getTrackEventCount();
         if (events != lastLoggedTrackCount)
@@ -607,8 +607,6 @@ public:
         ltcOutput.setUserBits(ltcUserBitsReversed ? reverseNibbles(v) : v);
     }
 
-    /// User-bits source mode.  Switching back to MANUAL immediately restores
-    /// the operator's stored value so the field and the wire agree again.
     /// Four-character label used by the NAME user-bits mode.  Blank falls
     /// back to STC<engine number>.
     void setLtcUserBitsName(const juce::String& n)
@@ -622,6 +620,8 @@ public:
     /// ms.  Derived from the audio device, not a user setting.
     double getLtcLatencyCompMs() const { return ltcOutput.getLatencyCompensationMs(); }
 
+    /// User-bits source mode.  Switching back to MANUAL immediately restores
+    /// the operator's stored value so the field and the wire agree again.
     void setLtcUserBitsMode(int mode)
     {
         ltcUserBitsMode = juce::jlimit(kUserBitsManual, kUserBitsDebugBuffers, mode);
@@ -748,18 +748,16 @@ public:
         return juce::String::toHexString((juce::int64) v).toUpperCase();
     }
 
-    /// Human-readable rendering of a user-bits word for the UI.
-    /// Always shows the raw 8 hex digits.  User bits are conventionally
-    /// filled with BCD, i.e. one decimal digit per 4-bit group, so when
-    /// every group holds 0-9 the hex string IS the decimal reading -- and
-    /// if it also parses as a plausible YYYYMMDD it is shown as a date.
-    /// (Converting the 32-bit word to a binary decimal integer instead
-    /// would render 0x20260724 as 539300644, which is meaningless for the
-    /// date/reel conventions these bits actually carry.)
-    /// Human reading of a user-bits word.  With the binary group flags from
-    /// the decoder it can say what the sender declared: ST 309 date and zone
-    /// (BGF2 = 1, BGF0 = 0), or four eight-bit characters (BGF0 = 1).  With
-    /// no flags it falls back to the BCD heuristics.
+    /// Human reading of a user-bits word for the UI, always with the raw 8
+    /// hex digits.  With the binary group flags from the decoder it can say
+    /// what the sender declared: ST 309 date and zone (BGF2 = 1, BGF0 = 0),
+    /// or four eight-bit characters (BGF0 = 1).  With no flags it falls back
+    /// to the BCD heuristics: user bits are conventionally BCD, one decimal
+    /// digit per 4-bit group, so when every group holds 0-9 the hex string
+    /// IS the decimal reading, shown as a date when it parses as a plausible
+    /// YYYYMMDD.  (A binary decimal integer would render 0x20260724 as
+    /// 539300644, meaningless for the date/reel conventions these bits
+    /// carry.)
     static juce::String describeUserBits(uint32_t v, uint8_t bgf = 0)
     {
         juce::String hex = juce::String::toHexString((juce::int64) v)
@@ -843,7 +841,7 @@ public:
     bool isOnAirGateEnabled() const     { return onAirGateEnabled; }
     void setOnAirGateEnabled(bool e)    { onAirGateEnabled = e; }
 
-    // ON AIR on StageLinQ, OFF AIR AT (D34): the level at or below which a
+    // ON AIR on StageLinQ, OFF AIR AT (DESIGN D34): the level at or below which a
     // deck counts as quiet -- 0 SILENCE (default), 1 -80 dB, 2 -60 dB,
     // 3 -40 dB (StageLinQ::onAirQuietLevel).  Pro DJ Link has no level:
     // the DJM decides on-air there.
@@ -1059,9 +1057,6 @@ public:
         // Previously this was "currentFps = outputFps" which would overwrite
         // a user-selected 25fps with outputFps=30 (the default) when loading
         // settings, because startProDJLinkInput runs after the initial load.
-
-        // LTC direct mode is now toggled dynamically per tick
-        // (direct in transient, auto-increment in stable)
 
         proDJLinkPlayer = juce::jlimit(1, kPlayerOnAir, player);
         resolvedXfPlayer = 0;  // force resolve on first tick
@@ -1478,7 +1473,7 @@ public:
             mtcOutStatusText = "TX: " + mtcOutput.getCurrentDeviceName();
             return true;
         }
-        // One MTC stream per MIDI port (D32): a port already carrying another
+        // One MTC stream per MIDI port (DESIGN D32): a port already carrying another
         // engine's MTC refuses this one and names it.
         mtcOutStatusText = (deviceIndex < 0) ? "NO MIDI DEVICE"
                          : mtcOutput.getBlockedBy().isNotEmpty() ? "IN USE BY " + mtcOutput.getBlockedBy()
@@ -1655,7 +1650,7 @@ public:
                 if (mtcInput.getIsRunning())
                 {
                     // Value and phase from one clock reading and one sync
-                    // point (D29): two separate getters took two clock
+                    // point (DESIGN D29): two separate getters took two clock
                     // readings against a sync instant that is dated a
                     // quarter frame ahead, and disagreed by a frame for the
                     // first 10 ms after every sequence.
@@ -1874,7 +1869,7 @@ public:
                     currentTimecode = ProDJLink::playheadToTimecode(rawPlayheadMs, getEffectiveOutputFps());
                     // The millisecond position currentTimecode was derived from,
                     // kept alongside it so the sub-frame phase published to the
-                    // LTC encoder (D5) is that of the value actually on the wire.
+                    // LTC encoder (DESIGN D5) is that of the value actually on the wire.
                     // Truncated exactly like playheadToTimecode's argument, so the
                     // two cannot disagree at a frame boundary.
                     double tcSourceMs = (double)rawPlayheadMs;
@@ -1985,8 +1980,12 @@ public:
                     // timecode stream runs faster/slower matching the CDJ.
                     // MTC and ArtNet don't need pitch scaling -- they send at
                     // nominal rate and the timecode values advance naturally.
-                    // When timecode is frozen (end-of-track), zero the pitch so
-                    // the LTC encoder stops generating audio.
+                    // When timecode is frozen (end-of-track) the pitch reads 0;
+                    // the encoder takes any pitch <= 0 as nominal (the output
+                    // is paused then, and HOLD ON PAUSE keeps the held value
+                    // at the normal bit rate).  PlayheadPLL's pitch also
+                    // reads 0 on its initialising tick and while the deck is
+                    // stopped.
                     ltcOutput.setPitchMultiplier(pdlTcFrozen ? 0.0 : pll.pitch);
 
                     // Always auto-increment: encoder goes N->N+1->N+2 at actualSpeed.
@@ -2127,7 +2126,7 @@ public:
                                                    currentFps);
                     }
 
-                    // Publish the sub-frame phase of the value on the wire (D5).
+                    // Publish the sub-frame phase of the value on the wire (DESIGN D5).
                     // Not while frozen at end-of-track: the value is a snapshot
                     // and the encoder is paused anyway.
                     if (!pdlTcFrozen)
@@ -2304,7 +2303,7 @@ public:
             case InputSource::StageLinQ:
                 if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
                 {
-                    // XF-A/XF-B auto-follow (same logic as ProDJLink), ON AIR (D34)
+                    // XF-A/XF-B auto-follow (same logic as ProDJLink), ON AIR (DESIGN D34)
                     if (isXfMode())
                         resolveXfPlayerStageLinQ();
                     else if (isOnAirMode())
@@ -2474,7 +2473,7 @@ public:
                                                    currentFps);
                     }
 
-                    // Publish the sub-frame phase of the value on the wire (D5).
+                    // Publish the sub-frame phase of the value on the wire (DESIGN D5).
                     setFramePhaseFromPosition(tcSourceMs, currentFps);
 
                     // --- Fire cue point triggers ---
@@ -2755,7 +2754,8 @@ public:
 
         // --- Audio BPM forwarding (non-DJ sources only) ---
         // ProDJLink and StageLinQ have their own precise BPM from the CDJs/Denon;
-        // audio detection is only useful for MTC, LTC, ArtNet, and SystemTime.
+        // audio detection serves every other source (generator, MTC, LTC,
+        // Art-Net, LA-Net, HippoNet, Winamp).
         if (audioBpmEnabled && audioBpmInput.getIsRunning()
             && activeInput != InputSource::ProDJLink
             && activeInput != InputSource::StageLinQ)
@@ -2800,10 +2800,6 @@ public:
     juce::String getInputStatusText() const { return inputStatusText; }
     juce::String getMtcOutStatusText() const { return mtcOutStatusText; }
     juce::String getArtnetOutStatusText() const { return artnetOutStatusText; }
-    /// LTC output status line.  When the audio device reports an output
-    /// latency, the compensation being applied to the frame phase is shown
-    /// alongside it -- visible for anyone measuring the signal, without
-    /// being a control the operator has to understand or set.
     /// "48k/512": the sample rate and buffer size the driver actually
     /// settled on, which is what the operator needs to see when a driver
     /// ignores the requested values (ASIO interfaces set theirs in their own
@@ -2816,6 +2812,10 @@ public:
         return bufferSize > 0 ? sr + "/" + juce::String(bufferSize) : sr;
     }
 
+    /// LTC output status line.  When the audio device reports an output
+    /// latency, the compensation being applied to the frame phase is shown
+    /// alongside it -- visible for anyone measuring the signal, without
+    /// being a control the operator has to understand or set.
     juce::String getLtcOutStatusText() const
     {
         if (ltcOutStatusText.isEmpty()) return ltcOutStatusText;
@@ -2923,8 +2923,7 @@ public:
         generatorAudioPlayer.stopAndReset();
     }
 
-    /// Set start timecode in ms from midnight.
-    /// Freewheel (D10): how long the signal inputs (MTC, LTC, Art-Net,
+    /// Freewheel (AUDIT D10): how long the signal inputs (MTC, LTC, Art-Net,
     /// LA-Net, HippoNet) keep counting as present after the last frame or
     /// packet.  Operator's choice per engine; the senders count on their own
     /// through it, so a dropout shorter than this never reaches the wire.
@@ -2945,6 +2944,7 @@ public:
     void setGeneratorPresetName(const juce::String& name) { genPresetName = name.trim(); }
     juce::String getGeneratorPresetName() const           { return genPresetName; }
 
+    /// Set start timecode in ms from midnight.
     void setGeneratorStartMs(double ms)
     {
         genStartMs = juce::jmax(0.0, ms);
@@ -3354,22 +3354,21 @@ private:
     double genStartMs   = 0.0;     // start TC in ms from midnight
     double genStopMs    = 0.0;     // stop TC in ms (0 = freerun)
     double genCurrentMs = 0.0;     // current position in ms
-    int inputFreewheelMs = (int) kSourceTimeoutMs;   // D10
+    int inputFreewheelMs = (int) kSourceTimeoutMs;   // AUDIT D10
     juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
     bool   cueCursorInclusive = false;  // next crossing check includes a cue exactly at lastCueCheckMs
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
-    int    lastLoggedTrackCount = 0;    // LTC value corrections already written there (D30)
-    WallClockFollower clockFollower;    // clock mode: time of day, followed rather than jumped to (D31)
+    int    lastLoggedTrackCount = 0;    // LTC value corrections already written there (DESIGN D30)
+    WallClockFollower clockFollower;    // clock mode: time of day, followed rather than jumped to (DESIGN D31)
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
 
     // A/B loop: when genLoopEnabled and genLoopOutMs > genLoopInMs, the tick
     // wraps genCurrentMs from loopOutMs to loopInMs.  Pressing Play with loop
     // enabled snaps position to loopInMs first (standard DAW / CDJ loop).
-    // Set / cleared from the message thread; the tick reads on its own
-    // thread but the writes are simple word stores, so no lock is needed --
-    // worst case the tick observes the previous values for one cycle.
+    // Set and cleared on the message thread, which also runs the tick, so
+    // no lock is needed.
     // Cleared automatically in setGeneratorAudioFile / clearGeneratorAudioFile
     // when a different file is loaded, so the loop is effectively
     // per-track within the engine: switching pistas wipes In/Out/Enabled
@@ -3409,7 +3408,7 @@ private:
     // mixer's own gating logic (fader + cross-fader + EQ + mute), so no
     // threshold or channel selection is needed.
     bool onAirGateEnabled = false;
-    int  onAirQuietStep = 0;      // OFF AIR AT, StageLinQ ON AIR (D34): 0 = SILENCE
+    int  onAirQuietStep = 0;      // OFF AIR AT, StageLinQ ON AIR (DESIGN D34): 0 = SILENCE
 
     int mtcOutputOffset    = 0;
     int artnetOutputOffset = 0;
@@ -3491,7 +3490,7 @@ private:
     static constexpr int kPlayerXfA    = 7;        // auto-follow crossfader side A
     static constexpr int kPlayerXfB    = 8;        // auto-follow crossfader side B
     static constexpr int kPlayerMaster = 9;        // auto-follow whichever player has DJM master
-    static constexpr int kPlayerOnAir  = 10;       // auto-follow the deck on air (D34, Pro DJ Link and StageLinQ)
+    static constexpr int kPlayerOnAir  = 10;       // auto-follow the deck on air (DESIGN D34, Pro DJ Link and StageLinQ)
     int  resolvedXfPlayer = 0;                  // physical player currently followed in XF / MASTER / ON AIR mode
 
     bool isXfMode() const     { return proDJLinkPlayer == kPlayerXfA || proDJLinkPlayer == kPlayerXfB; }
@@ -3688,7 +3687,7 @@ private:
         }
     }
 
-    /// Resolve which deck to follow in ON AIR mode (D34), for Pro DJ Link
+    /// Resolve which deck to follow in ON AIR mode (DESIGN D34), for Pro DJ Link
     /// (players 1-6, on air from the DJM, loudest by channel fader) and for
     /// StageLinQ (decks 1-4, on air above the OFF AIR AT level and loudest
     /// by ExternalMixerVolume).  The
@@ -3760,7 +3759,7 @@ private:
     //     speed TCNet carries (getSourceSpeedRatio);
     //   - `actualSpeed` / `smoothVelocity`: the source-active test;
     //   - `seekDetected` (an error over 500 ms): cue dispatch's seek rule
-    //     (DESIGN D17, D36) and the outputs' resync.
+    //     (DESIGN D17 and D36) and the outputs' resync.
     // The timecode does NOT come from it: tick() interpolates the deck's own
     // position (pdlSnapMs/pdlSnapTime/pdlSnapSpeed), and `positionMs` serves
     // only the 500 ms seek test.
@@ -3999,7 +3998,7 @@ private:
     LinkBridge   linkBridge;
     std::unique_ptr<AudioThru> audioThru;  // Only for primary engine
 
-    // Audio BPM detection (for non-DJ sources: MTC, LTC, ArtNet, SystemTime)
+    // Audio BPM detection (every source but Pro DJ Link and StageLinQ)
     AudioBpmInput audioBpmInput;
     bool audioBpmEnabled = false;
 
@@ -4095,7 +4094,7 @@ private:
     static constexpr float kOscBpmThreshold = 0.05f;   // 0.05 BPM
 
     // Mixer fader dedup (last sent values, -1 = never sent)
-    // MixerMap-driven dedup: one slot per MixerMap entry (max 64)
+    // MixerMap-driven dedup: one slot per MixerMap entry (at most kMaxMixerEntries)
     static constexpr int kMaxMixerEntries = 128;  // 6ch x 13 params + ~45 globals
     int lastSentMixer[kMaxMixerEntries];  // initialised to -1 in constructor/reset
     uint32_t lastMixerPktCount = 0;      // for dirty-flag skip in forwardMixerParams
@@ -4800,7 +4799,7 @@ private:
         // that far apart (@mungewell: every 46 minutes).  The follower pulls
         // towards the wall clock continuously instead, and only jumps for a
         // disagreement of more than a second: the clock being set, a resume,
-        // midnight (D31).
+        // midnight (DESIGN D31).
         if (genClockMode)
         {
             auto now = juce::Time::getCurrentTime();
@@ -5027,14 +5026,11 @@ private:
     // Forward StageLinQ mixer data (faders + crossfader) via OSC/MIDI/ArtNet.
     //
     // StageLinQ provides channel faders (0.0-1.0) and crossfader (0.0-1.0)
-    // directly from StateMap. No MixerMap needed -- we use built-in addresses.
-    //
-    // OSC:    /mixer/ch1/fader .. /mixer/ch4/fader, /mixer/crossfader  (0.0-1.0)
-    // MIDI:   CC 1-4 = faders, CC 5 = crossfader  (0-127)
-    // ArtNet: DMX ch 1-4 = faders, ch 5 = crossfader  (0-255)
-    //
-    // When more mixer paths are discovered from hardware (EQ, effects, etc.),
-    // they can be added here without requiring a MixerMap editor.
+    // directly from StateMap.  Where each goes (OSC address, MIDI CC/note,
+    // DMX channel) and whether it is sent come from the Denon MixerMap
+    // (slqMixerMapPtr, MixerMap::buildDenonDefaults), five entries in this
+    // order: CH1-CH4 fader, crossfader (readSlqMixerValue).  Values go out
+    // as 0.0-1.0 on OSC, 0-127 on MIDI and 0-255 on DMX.
     //==========================================================================
     void forwardStageLinQMixer()
     {
@@ -5111,6 +5107,9 @@ private:
     ///                 comp,eq_lo_mid,send,cue_b
     ///   [13-25] CH2, [26-38] CH3, [39-51] CH4, [52-64] CH5, [65-77] CH6
     ///   [78+]   globals (crossfader, master, monitor, fx, sends, isolator, etc.)
+    /// MixerMap::buildDefaults() ends with a jassert on this layout (6 x 13
+    /// channel entries, then 45 globals from the crossfader to Multi I/O
+    /// Level, AUDIT DEBT-9): the two change together.
     int readMixerValue(int entryIndex) const
     {
         if (!sharedProDJLink) return -1;
@@ -5426,7 +5425,10 @@ private:
                     laNetTCOutput.setTimecode(offsetTimecode(baseTc, laNetTCOutputOffset, outRate));
                     laNetTCOutput.forceResync();
                 }
-                // LTC: set final timecode so encoder finishes current frame cleanly
+                // LTC: the stop value.  With HOLD ON PAUSE the encoder carries
+                // it from the next frame boundary (the frame in progress
+                // finishes); without it the output goes silent at once,
+                // mid-codeword.
                 if (outputLtcEnabled && ltcOutput.getIsRunning())
                     ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
                 if (outputHippoEnabled && hippotizerOutput.getIsRunning())
