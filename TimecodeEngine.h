@@ -920,11 +920,16 @@ public:
     //==========================================================================
     // Start / Stop input protocols
     //==========================================================================
+    /// MTC input on device `deviceIndex` of the MIDI input list as it is
+    /// now.  A negative index -- the operator's device is not listed, or
+    /// none was picked -- opens nothing: STC never opens a MIDI port the
+    /// operator did not pick.  It used to open the first device, and the
+    /// next save then named that one in the settings (AUDIT UI-6).
+    /// Message thread.
     bool startMtcInput(int deviceIndex)
     {
         stopMtcInput();
         mtcInput.refreshDeviceList();
-        if (deviceIndex < 0 && mtcInput.getDeviceCount() > 0) deviceIndex = 0;
         if (deviceIndex >= 0 && mtcInput.start(deviceIndex))
         {
             inputStatusText = "RX: " + mtcInput.getCurrentDeviceName();
@@ -1473,11 +1478,13 @@ public:
     //==========================================================================
     // Start / Stop output protocols
     //==========================================================================
+    /// MTC output on device `deviceIndex` of the MIDI output list as it is
+    /// now; a negative index opens nothing, as for startMtcInput (AUDIT
+    /// UI-6).  Message thread.
     bool startMtcOutput(int deviceIndex)
     {
         stopMtcOutput();
         mtcOutput.refreshDeviceList();
-        if (deviceIndex < 0 && mtcOutput.getDeviceCount() > 0) deviceIndex = 0;
         if (deviceIndex >= 0 && mtcOutput.start(deviceIndex))
         {
             mtcOutput.setFrameRate(getEffectiveOutputFps());

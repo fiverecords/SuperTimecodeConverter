@@ -75,6 +75,46 @@ static int findInterfaceLabel(const juce::StringArray& labels, const juce::Strin
 }
 
 //==============================================================================
+// The position, in the MIDI device list as it is now, of the device a MIDI
+// selector shows -- or, with nothing selected, of `savedName`, the engine's
+// configured device -- found by name.  The selector's items are the list
+// from when it was filled, and the MTC input or output enumerates the
+// devices again when it starts, so a device plugged in or out since then
+// moved the positions.  The shown position is kept while it still holds
+// that name (two ports can share one).  The shown and the saved name are
+// stripComboMarker's, which also strips a device's own trailing " [...]"
+// or space when no marker follows it, so a device matches by its name or
+// by its name stripped the same way: the exact name at the shown position,
+// then anywhere, then the stripped name at the shown position, then
+// anywhere -- a "Port" still listed wins over a "Port [2]" now at the
+// shown position.  -1 when the device is not listed, or there is no name:
+// the engine opens nothing then, so STC never opens a MIDI port the
+// operator did not pick (AUDIT UI-6).  Message thread.
+//==============================================================================
+static int midiDeviceToStart(const juce::ComboBox& cmb, const juce::String& savedName, bool isInput)
+{
+    const int selectedId = cmb.getSelectedId();
+    const juce::String name = stripComboMarker(selectedId > 0 ? cmb.getText() : savedName);
+    if (name.isEmpty())
+        return -1;
+    const auto devices = isInput ? juce::MidiInput::getAvailableDevices()
+                                 : juce::MidiOutput::getAvailableDevices();
+    for (const bool exact : { true, false })
+    {
+        auto isNamed = [&name, exact](const juce::String& device)
+        {
+            return exact ? device == name : stripComboMarker(device) == name;
+        };
+        if (selectedId > 0 && selectedId <= devices.size() && isNamed(devices[selectedId - 1].name))
+            return selectedId - 1;
+        for (int i = 0; i < devices.size(); ++i)
+            if (isNamed(devices[i].name))
+                return i;
+    }
+    return -1;
+}
+
+//==============================================================================
 // BPM x 100 for a TCNet layer, as the casts it replaces computed it
 // (truncated), and 0 for a tempo that is unknown, not finite, negative or
 // beyond 1000 BPM: a double -> uint32_t cast of a value out of range is
@@ -564,9 +604,9 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        int sel = cmbMidiInputDevice.getSelectedId() - 1;
-        if (sel >= 0 && currentEngine().getActiveInput() == SrcType::MTC)
+        if (cmbMidiInputDevice.getSelectedId() > 0 && currentEngine().getActiveInput() == SrcType::MTC)
         {
+            const int sel = midiDeviceToStart(cmbMidiInputDevice, {}, true);   // as listed now (AUDIT UI-6)
             currentEngine().stopMtcInput();
             currentEngine().getMtcInput().refreshDeviceList();
             currentEngine().startMtcInput(sel);
@@ -1785,10 +1825,11 @@ MainComponent::MainComponent()
     {
         if (syncing) return;
         if (isShowLockedRevert()) return;
-        int sel = cmbMidiOutputDevice.getSelectedId() - 1;
         auto& eng = currentEngine();
-        if (sel >= 0 && eng.isOutputMtcEnabled())
+        if (cmbMidiOutputDevice.getSelectedId() > 0 && eng.isOutputMtcEnabled())
         {
+            const int sel = midiDeviceToStart(cmbMidiOutputDevice, {}, false);   // as listed now (AUDIT UI-6)
+
             // Clear sharing before stopping old MTC device
             eng.getTriggerOutput().setSharedMidiOutput(nullptr);
             eng.stopMtcOutput();
@@ -1796,7 +1837,7 @@ MainComponent::MainComponent()
             // Release trigger's own handle if it matches the new device
             eng.getMtcOutput().refreshDeviceList();
             auto mtcNames = eng.getMtcOutput().getDeviceNames();
-            if (sel < mtcNames.size()
+            if (sel >= 0 && sel < mtcNames.size()
                 && eng.getTriggerOutput().hasOwnMidiOpen()
                 && eng.getTriggerOutput().getCurrentMidiDeviceName() == mtcNames[sel])
             {
@@ -3024,8 +3065,11 @@ void MainComponent::syncUIFromEngine()
 void MainComponent::startCurrentMtcInput()
 {
     auto& eng = currentEngine();
-    int sel = cmbMidiInputDevice.getSelectedId() - 1;
-    eng.startMtcInput(sel);
+    // The device shown, or with an empty selector the configured one if it
+    // is listed now; otherwise nothing is opened (AUDIT UI-6).
+    const juce::String saved = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size()
+                             ? settings.engines[(size_t) selectedEngine].midiInputDevice : juce::String();
+    eng.startMtcInput(midiDeviceToStart(cmbMidiInputDevice, saved, true));
 }
 
 void MainComponent::startCurrentArtnetInput()
@@ -4051,7 +4095,11 @@ void MainComponent::startCurrentMtcOutput()
 {
     auto& eng = currentEngine();
     auto& trig = eng.getTriggerOutput();
-    int sel = cmbMidiOutputDevice.getSelectedId() - 1;
+    // The device shown, or with an empty selector the configured one if it
+    // is listed now; otherwise nothing is opened (AUDIT UI-6).
+    const juce::String saved = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size()
+                             ? settings.engines[(size_t) selectedEngine].midiOutputDevice : juce::String();
+    const int sel = midiDeviceToStart(cmbMidiOutputDevice, saved, false);
 
     // If TriggerOutput has its OWN port open on the same device, release it
     // before MtcOutput opens.  Historical: the two were separate JUCE handles
@@ -5896,9 +5944,17 @@ int MainComponent::findDeviceByName(const juce::ComboBox& cmb, const juce::Strin
     {
         auto text = cmb.getItemText(i);
         // Exact match, or match ignoring the " [ENGINE N]" or " *" marker suffix
-        if (text == cleanName || text.startsWith(cleanName + " [") || text == cleanName + dotSuffix)
+        if (text == name || text == cleanName || text.startsWith(cleanName + " [") || text == cleanName + dotSuffix)
             return i;
     }
+    // Then the item's text stripped as the name is.  A device whose own
+    // name ends in a space (Windows' MIDI API cuts names at 31 characters)
+    // is saved without it -- flushSettings saves stripComboMarker's text --
+    // and matched none of the above: it was not selected, and since AUDIT
+    // UI-6 the restore opened nothing for it.
+    for (int i = 0; i < cmb.getNumItems(); i++)
+        if (stripComboMarker(cmb.getItemText(i)) == cleanName)
+            return i;
     return -1;
 }
 
