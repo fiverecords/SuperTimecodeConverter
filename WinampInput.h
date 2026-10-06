@@ -128,7 +128,8 @@ public:
 
     // True if Winamp answered an IPC call within kStaleTimeoutMs.  A window
     // that is found but does not answer (a hung or long-busy player) is
-    // connected and not receiving, and getPositionMs() holds its position.
+    // connected and not receiving, and getPositionMs() holds its position
+    // (kStaleTimeoutMs past its last position answer).
     // TimecodeEngine does not call it: it gates the Winamp source on
     // isConnected() and the play state.
     bool isReceiving() const
@@ -170,12 +171,24 @@ public:
     // by up to half a buffer even though the audio plays smoothly).
     //
     // While paused or stopped we return the anchor verbatim so timecode
-    // freezes correctly, mirroring what the player itself does.
+    // freezes correctly, mirroring what the player itself does.  A stop
+    // re-anchors at 0 (see run()).
     //
     // A player that stops answering stays "Playing" (an IPC failure is not
     // taken as a stop -- see run()), so the extrapolation runs at most
-    // kStaleTimeoutMs past Winamp's last answer, i.e. until isReceiving()
-    // turns false, and then holds (AUDIT UI-13).  It ran on without limit.
+    // kStaleTimeoutMs past the anchor -- the last position answer -- and
+    // then holds (AUDIT UI-13).  It ran on without limit.  The bound is the
+    // anchor's own age, not the time since Winamp's last answer: when the
+    // answers resume, the first (IPC_ISPLAYING) comes before the position,
+    // and between the two a bound on the answer clock let the stale anchor
+    // run on for the whole silence (+3 s after a 3 s freeze, for a few ms).
+    //
+    // Trade-off: a stall longer than about 1.5 s while the audio keeps
+    // playing (the player's UI thread busy) holds the position about 1 s
+    // past the last answer; when the answers resume the anchor snaps
+    // forward to the audio's position, a step of more than 500 ms that
+    // TimecodeEngine takes as a seek (Track Map cues in the step are passed
+    // without firing).
     //
     // The SpinLock guarantees the (pos, time) pair is read atomically as
     // a unit -- without it, the engine could read a freshly-updated
@@ -196,10 +209,8 @@ public:
         if (s != State::Playing || anchorT <= 0.0)
             return (int32_t)anchorP;
 
-        double now   = juce::Time::getMillisecondCounterHiRes();
-        double until = juce::jmin(now, lastAnswerTime.load(std::memory_order_relaxed)
-                                           + kStaleTimeoutMs);
-        double dt    = until - anchorT;
+        double now = juce::Time::getMillisecondCounterHiRes();
+        double dt  = juce::jmin(now - anchorT, kStaleTimeoutMs);
         if (dt < 0.0) dt = 0.0;          // monotonic clock guard
         return (int32_t)(anchorP + dt);
     }
@@ -253,7 +264,10 @@ private:
     // selectors in well under 1 ms.
     //
     // An answer -- any value, -1 included -- is timed in lastAnswerTime, the
-    // clock isReceiving() and getPositionMs() read.
+    // clock isReceiving() reads.  run() checks threadShouldExit() after each
+    // call, so a stop() waits for one call (200 ms) at most, inside
+    // stopThread(500)'s grace: four calls in a row against a busy player
+    // (~850 ms) made JUCE kill the thread by force (AUDIT UI-13).
     LRESULT ipcSend(HWND hwnd, WPARAM wparam, LPARAM lparam)
     {
         DWORD_PTR result = 0;
@@ -308,13 +322,30 @@ private:
             //
             // On IPC failure (-1) we leave `state` at the last known good
             // value; the next successful poll updates it.
+            //
+            // A stop (Playing or Paused -> Stopped) re-anchors at 0 with no
+            // lock (anchor time 0): Winamp rewinds to the start of the track
+            // on stop, and IPC_GETOUTPUTTIME returns -1 while it is stopped
+            // (Winamp SDK), so nothing would move the anchor until play.
+            // Held instead, the position stayed at the last playing one while
+            // Winamp showed 0 -- since the " [Stopped]" title suffix is no
+            // longer a track change (AUDIT UI-13).  With no lock the
+            // first position answer after play snaps, and getPositionMs()
+            // returns 0 until then.
             LRESULT ps = ipcSend(hwnd, 0, IPC_ISPLAYING);
+            if (threadShouldExit()) return;
             if (ps >= 0)
             {
                 State st = (ps == 1) ? State::Playing
                          : (ps == 3) ? State::Paused
                                      : State::Stopped;
-                state.store(st, std::memory_order_relaxed);
+                const State before = state.exchange(st, std::memory_order_relaxed);
+                if (st == State::Stopped && before != State::Stopped)
+                {
+                    const juce::SpinLock::ScopedLockType lock(anchorLock);
+                    positionAnchorMs   = 0.0;
+                    positionAnchorTime = 0.0;
+                }
             }
 
             // -- Position in ms (wparam=0 returns ms, -1 if not playing) -----
@@ -353,6 +384,7 @@ private:
             // realistic quantisation or clock-drift can produce on a single
             // poll, so the threshold never trips during steady playback.
             LRESULT pos = ipcSend(hwnd, 0, IPC_GETOUTPUTTIME);
+            if (threadShouldExit()) return;
             if (pos >= 0)
             {
                 double now         = juce::Time::getMillisecondCounterHiRes();
@@ -397,6 +429,7 @@ private:
 
             // -- Duration in seconds (wparam=1, -1 if not playing) -----------
             LRESULT len = ipcSend(hwnd, 1, IPC_GETOUTPUTTIME);
+            if (threadShouldExit()) return;
             if (len >= 0)
                 durationSec.store((int32_t)len, std::memory_order_relaxed);
 
@@ -406,6 +439,7 @@ private:
             //    IPC failure (-1) leaves the previously reported index in
             //    place instead of pretending we're back at position -1.
             LRESULT idx = ipcSend(hwnd, 0, IPC_GETLISTPOS);
+            if (threadShouldExit()) return;
             if (idx >= 0)
                 playlistIndex.store((int)idx, std::memory_order_relaxed);
 
