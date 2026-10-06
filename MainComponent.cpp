@@ -77,30 +77,34 @@ static int findInterfaceLabel(const juce::StringArray& labels, const juce::Strin
 //==============================================================================
 // The position, in the MIDI device list as it is now, of the device a MIDI
 // selector shows -- or, with nothing selected, of `savedName`, the engine's
-// configured device -- found by name.  The selector's items are the list
-// from when it was filled, and the MTC input or output enumerates the
-// devices again when it starts, so a device plugged in or out since then
-// moved the positions.  The shown position is kept while it still holds
-// that name (two ports can share one).  The shown and the saved name are
-// stripComboMarker's, which also strips a device's own trailing " [...]"
-// or space when no marker follows it, so a device matches by its name or
-// by its name stripped the same way: the exact name at the shown position,
-// then anywhere, then the stripped name at the shown position, then
-// anywhere -- a "Port" still listed wins over a "Port [2]" now at the
-// shown position.  -1 when the device is not listed, or there is no name:
-// the engine opens nothing then, so STC never opens a MIDI port the
-// operator did not pick (AUDIT UI-6).  Message thread.
+// configured device.  The selector's items are the list from when it was
+// filled, and the MTC input or output enumerates the devices again when it
+// starts, so a device plugged in or out since then moved the positions.
+// The shown device is the name the selector was filled with for that item
+// (`filledNames`, by item ID - 1), not the item's text: the text carries
+// the in-use marker, and stripping it cannot tell a device named
+// "Port [2]" from a "Port" in use by another engine.  That exact name is
+// looked for at the shown position (two ports can share one), then
+// anywhere.  The saved name is stripComboMarker's text, as flushSettings
+// saves it, which also strips a device's own trailing " [...]" or space:
+// it matches a device by its name, then by its name stripped the same way.
+// -1 when the device is not listed, or there is no name: the engine opens
+// nothing then, so STC never opens a MIDI port the operator did not pick
+// (AUDIT UI-6).  Message thread.
 //==============================================================================
-static int midiDeviceToStart(const juce::ComboBox& cmb, const juce::String& savedName, bool isInput)
+static int midiDeviceToStart(const juce::ComboBox& cmb, const juce::StringArray& filledNames,
+                             const juce::String& savedName, bool isInput)
 {
     const int selectedId = cmb.getSelectedId();
-    const juce::String name = stripComboMarker(selectedId > 0 ? cmb.getText() : savedName);
+    const juce::String name = selectedId > 0 ? filledNames[selectedId - 1] : stripComboMarker(savedName);
     if (name.isEmpty())
         return -1;
     const auto devices = isInput ? juce::MidiInput::getAvailableDevices()
                                  : juce::MidiOutput::getAvailableDevices();
     for (const bool exact : { true, false })
     {
+        if (! exact && selectedId > 0)
+            break;   // the shown device is known by its own name
         auto isNamed = [&name, exact](const juce::String& device)
         {
             return exact ? device == name : stripComboMarker(device) == name;
@@ -616,7 +620,7 @@ MainComponent::MainComponent()
         if (isShowLockedRevert()) return;
         if (cmbMidiInputDevice.getSelectedId() > 0 && currentEngine().getActiveInput() == SrcType::MTC)
         {
-            const int sel = midiDeviceToStart(cmbMidiInputDevice, {}, true);   // as listed now (AUDIT UI-6)
+            const int sel = midiDeviceToStart(cmbMidiInputDevice, midiInputNames, {}, true);   // as listed now (AUDIT UI-6)
             currentEngine().stopMtcInput();
             currentEngine().getMtcInput().refreshDeviceList();
             currentEngine().startMtcInput(sel);
@@ -1838,7 +1842,7 @@ MainComponent::MainComponent()
         auto& eng = currentEngine();
         if (cmbMidiOutputDevice.getSelectedId() > 0 && eng.isOutputMtcEnabled())
         {
-            const int sel = midiDeviceToStart(cmbMidiOutputDevice, {}, false);   // as listed now (AUDIT UI-6)
+            const int sel = midiDeviceToStart(cmbMidiOutputDevice, midiOutputNames, {}, false);   // as listed now (AUDIT UI-6)
 
             // Clear sharing before stopping old MTC device
             eng.getTriggerOutput().setSharedMidiOutput(nullptr);
@@ -3082,7 +3086,7 @@ void MainComponent::startCurrentMtcInput()
     // is listed now; otherwise nothing is opened (AUDIT UI-6).
     const juce::String saved = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size()
                              ? settings.engines[(size_t) selectedEngine].midiInputDevice : juce::String();
-    eng.startMtcInput(midiDeviceToStart(cmbMidiInputDevice, saved, true));
+    eng.startMtcInput(midiDeviceToStart(cmbMidiInputDevice, midiInputNames, saved, true));
 }
 
 void MainComponent::startCurrentArtnetInput()
@@ -4112,7 +4116,7 @@ void MainComponent::startCurrentMtcOutput()
     // is listed now; otherwise nothing is opened (AUDIT UI-6).
     const juce::String saved = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size()
                              ? settings.engines[(size_t) selectedEngine].midiOutputDevice : juce::String();
-    const int sel = midiDeviceToStart(cmbMidiOutputDevice, saved, false);
+    const int sel = midiDeviceToStart(cmbMidiOutputDevice, midiOutputNames, saved, false);
 
     // If TriggerOutput has its OWN port open on the same device, release it
     // before MtcOutput opens.  Historical: the two were separate JUCE handles
@@ -4731,19 +4735,23 @@ void MainComponent::populateMidiAndNetworkCombos()
     // MIDI Input
     auto midiIns = juce::MidiInput::getAvailableDevices();
     cmbMidiInputDevice.clear(juce::dontSendNotification);
+    midiInputNames.clear();
     for (int i = 0; i < midiIns.size(); i++)
     {
         auto marker = getDeviceInUseMarker(midiIns[i].name, "", true);
         cmbMidiInputDevice.addItem(midiIns[i].name + marker, i + 1);
+        midiInputNames.add(midiIns[i].name);
     }
 
     // MIDI Output
     auto midiOuts = juce::MidiOutput::getAvailableDevices();
     cmbMidiOutputDevice.clear(juce::dontSendNotification);
+    midiOutputNames.clear();
     for (int i = 0; i < midiOuts.size(); i++)
     {
         auto marker = getDeviceInUseMarker(midiOuts[i].name, "", false);
         cmbMidiOutputDevice.addItem(midiOuts[i].name + marker, i + 1);
+        midiOutputNames.add(midiOuts[i].name);
     }
 
     // Art-Net interfaces

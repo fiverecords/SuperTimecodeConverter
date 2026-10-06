@@ -655,6 +655,11 @@ private:
     void startAudioDeviceScan();
     bool stopAudioScanThread();   // false: the scan did not stop and was left behind
     void populateMidiAndNetworkCombos();
+    // The device names the MIDI selectors were filled with, by item ID - 1.
+    // An item's text is the name plus an in-use marker, which a device's own
+    // name can look like ("Port [2]"), so a start resolves the shown item
+    // through these (midiDeviceToStart, AUDIT UI-6).  Message thread.
+    juce::StringArray midiInputNames, midiOutputNames;
 
     // Network interfaces are persisted as positions in the list of the day
     // (AUDIT C13, deferred).  Within a session each interface setting
