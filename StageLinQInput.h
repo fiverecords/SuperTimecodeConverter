@@ -838,7 +838,7 @@ struct StageLinQDeckState
     // as it does in that capture's subscription dump.  Samples are
     // confirmed on that unit only (Engine OS 5.0.4); chrisle's
     // docs/protocol.md calls it a duration in seconds, and a unit that
-    // sent seconds would read as a length of 0 s here (BENCH).
+    // sent seconds would read as a length of 0 s here (BENCH B89).
     std::atomic<double>   trackLengthSamples { 0.0 }; // from Track/TrackLength (samples)
     std::atomic<bool>     songLoaded { false };     // from Track/SongLoaded
     std::atomic<bool>     songLoadedReceived { false };

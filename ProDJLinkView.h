@@ -1110,7 +1110,12 @@ public:
                             ds.detailWaveform.setBeatGrid(meta.beatGrid);
                             ds.detailBeatGridFed = true;
                             supplementaryFed = true;
-                            // Feed to engines for PLL micro-correction
+                            // Feed to the engines following this deck (they
+                            // also fetch it themselves; this gets it there
+                            // sooner): on an NXS2 the grid gives the beat
+                            // fallback's position, which is what they send
+                            // (AUDIT ENG-4); the PLL nudge it also drives
+                            // changes nothing sent (AUDIT ENG-15).
                             for (auto& eng : engines)
                             {
                                 if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink

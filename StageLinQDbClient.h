@@ -336,9 +336,14 @@ public:
     //    FileTransfer does.  An ignored offer of the session's own device
     //    (a reconnection on its port) does not replace another device's:
     //    when the session fails, the other device is tried, not the one
-    //    that just failed.  Before, an offer made during a session that
-    //    then failed was lost for good: a second unit was not fetched until
-    //    it reconnected (AUDIT SLQ-9).
+    //    that just failed.  Trade-off: when the session's device itself
+    //    recovers (the failure was transient) after re-offering on its
+    //    port, the other unit's deferred offer is still served, not the
+    //    session's device again, and that unit's database stays in use
+    //    while its session holds -- AUDIT SLQ-3's first-device rule gives
+    //    way.  Before, an offer made during a session that then failed was
+    //    lost for good: a second unit was not fetched until it reconnected
+    //    (AUDIT SLQ-9).
     // start() and stop() are serialised.  MainComponent calls stop() only
     // after StageLinQInput::stop() has joined the connection threads, so a
     // start() does not wait on a stop() there.
