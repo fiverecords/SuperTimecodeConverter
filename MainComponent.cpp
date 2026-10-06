@@ -4050,7 +4050,7 @@ void MainComponent::importConfig()
                     {
                         // From here to the restart nothing is saved: the
                         // running engines keep their configuration, and any
-                        // save -- the debounced one, the exit ones -- would
+                        // save -- the debounced one, the exit one -- would
                         // write it back over the restored files (AUDIT SET-5;
                         // why, at SafeJsonFile::writesSuspended).  The message
                         // below says so.
@@ -4312,8 +4312,9 @@ void MainComponent::updateCurrentOutputStates()
 //==============================================================================
 void MainComponent::startAudioDeviceScan()
 {
-    // A scan still running is asked to stop, and posts nothing (run()).  If
-    // it does not stop in time, no new scan starts this time.
+    // A scan still running is asked to stop; one that has not reached its
+    // last check posts nothing (run()).  If it does not stop in time, no new
+    // scan starts this time.
     if (!stopAudioScanThread())
     { DBG("WARNING: AudioScanThread did not stop within 2s timeout -- skipping new scan"); return; }
     scanThread = std::make_unique<AudioScanThread>(this);
@@ -6309,7 +6310,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     btnBpmD2.setVisible(showProDJLinkIn);
     btnBpmD4.setVisible(showProDJLinkIn);
 
-    // Audio BPM: available for non-DJ sources (MTC, LTC, ArtNet, SystemTime)
+    // Audio BPM: available for every source but Pro DJ Link and StageLinQ.
     // For SystemTime there is no collapse button, so show unconditionally.
     bool isNonDjSource = (input != SrcType::ProDJLink && input != SrcType::StageLinQ);
     bool showAudioBpmToggle = isNonDjSource
@@ -9113,7 +9114,11 @@ void MainComponent::timerCallback()
                     waveformDisplay.setRekordboxCues(meta.cueList);
                 if (meta.hasBeatGrid())
                     waveformDisplay.setBeatGrid(meta.beatGrid);
-                // Feed beat grid to engine for PLL micro-correction
+                // Hand the beat grid to the engine (which also fetches its
+                // own, AUDIT ENG-4).  On an NXS2 without absolute position
+                // the grid gives the beat-fallback position, the one sent;
+                // the PLL nudge it also feeds changes nothing sent (AUDIT
+                // ENG-15).
                 if (meta.hasBeatGrid())
                     eng.setBeatGrid(meta.beatGrid, wfTrackId);
             }

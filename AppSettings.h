@@ -96,13 +96,14 @@ struct SafeJsonFile
     /// file already holds exactly `text`, do neither: the write would change
     /// nothing, and the rotation would replace the previous version in .bak
     /// with a second copy of the current one.  Saves of an unchanged state
-    /// come in runs (the exit path alone saves three times), so without this
-    /// a file written wrongly once -- an empty map, defaults after a
-    /// quarantine -- reached .bak on the next save and the last good version
-    /// was gone (AUDIT SET-1).  The comparison reads the file back as text:
-    /// replaceWithText writes the JSON writer's CR LF line ends unchanged,
-    /// so a file STC wrote compares equal to the text it was written from; a
-    /// file that differs in any way is rotated and written as before.
+    /// come in runs (every settings save writes the Track Map and preset
+    /// files too, changed or not), so without this a file written wrongly
+    /// once -- an empty map, defaults after a quarantine -- reached .bak on
+    /// the next save and the last good version was gone (AUDIT SET-1).  The
+    /// comparison reads the file back as text: replaceWithText writes the
+    /// JSON writer's CR LF line ends unchanged, so a file STC wrote compares
+    /// equal to the text it was written from; a file that differs in any way
+    /// is rotated and written as before.
     /// Called directly only by a restore, which must also write when an
     /// earlier restore in this session has suspended saves.
     static bool writeRotating(const juce::File& file, const juce::String& text)
@@ -147,14 +148,14 @@ struct SafeJsonFile
     ///    but the running engines keep their configuration (inputs,
     ///    outputs, generator, their Track Map override sets) until the
     ///    restart, and every flushSettings -- the debounced save, the exit
-    ///    saves -- copies it back into the engine blocks before
+    ///    save -- copies it back into the engine blocks before
     ///    AppSettings::save, undoing the restore.
     ///  - the other files: MainComponent reloads the Track Map, the presets
     ///    and the mixer maps too, so a later save of those writes the
-    ///    restored content plus the edit -- except from an editor left open
-    ///    across the restore, whose rows and references were taken from
-    ///    the maps before the reload.  (A background Track Map snapshot
-    ///    still on its way is dropped by the write order, AUDIT SET-7.)
+    ///    restored content plus the edit: MainComponent closes the editors
+    ///    that hold references into the maps before the reload.  (A
+    ///    background Track Map snapshot still on its way is dropped by the
+    ///    write order, AUDIT SET-7.)
     /// The cost: an edit made between the restore and the restart is not
     /// saved either, so the UI must say so when the restore completes.
     /// Atomic: read on the message thread and on the Track Map's

@@ -144,9 +144,9 @@ inline Timecode incrementFrame(const Timecode& tc, FrameRate fps)
 // the source is considered paused.  MTC at 24fps sends QF every ~10ms,
 // Art-Net at 30fps sends a packet every ~33ms, LTC frames arrive every
 // ~33-42ms.  150ms covers several missed frames with margin.  This is the
-// default freewheel (AUDIT D10); the operator can set 50-5000 ms per
-// engine, and LTC IN adds its device period and input latency on top
-// (LtcInput::isReceivingAt).
+// default freewheel (AUDIT D10); the operator picks 150 ms to 2 s per
+// engine (the setting is clamped to 50-5000 ms), and LTC IN adds its
+// device period and input latency on top (LtcInput::isReceivingAt).
 //==============================================================================
 inline constexpr double kSourceTimeoutMs = 150.0;
 

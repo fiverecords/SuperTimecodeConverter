@@ -380,7 +380,7 @@ private:
     // selection is.  SAVE updates this preset.  The selected row is only
     // an index into `rows`, which an Import rebuilds without touching the
     // selection or the form, so the highlighted row could name another
-    // preset (AUDIT Part 7, the class of AUDIT SET-3).  Message thread.
+    // preset (AUDIT SET-2; the same class as AUDIT SET-3).  Message thread.
     juce::String editingName;
 
     // Buttons
