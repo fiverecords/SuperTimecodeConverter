@@ -340,10 +340,18 @@ inline bool bindInputSocket(juce::DatagramSocket& socket, int port, const Networ
 /// INTERFACES, Localhost, a fallback) it is that call.  Otherwise it reads
 /// with recvmsg to get the destination address, the one thing
 /// DatagramSocket::read cannot give.  Receive thread, after waitUntilReady.
+/// That read uses the raw descriptor without the lock DatagramSocket's
+/// read() and shutdown() share (it is private), so with the filter active
+/// the owner's stop() must end the receive thread before it shuts the
+/// socket down (ArtnetInput::stop): otherwise a stop() between this taking
+/// the descriptor and reading it closes it under the read, and its number
+/// can meanwhile belong to another socket.
 inline int readInputDatagram(juce::DatagramSocket& socket, void* buffer, int size,
                              const SubnetFilter& filter)
 {
-   #ifndef _WIN32
+   #ifdef _WIN32
+    juce::ignoreUnused(filter);   // never active on Windows (bindInputSocket)
+   #else
     if (filter.isActive())
     {
         const int fd = socket.getRawSocketHandle();

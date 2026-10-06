@@ -95,6 +95,24 @@ public:
         isRunningFlag.store(false, std::memory_order_relaxed);
         bindFellBack.store(false, std::memory_order_relaxed);
 
+        // With the interface filter in use, the receive thread reads the
+        // socket's descriptor itself (readInputDatagram), outside the lock
+        // JUCE's own read() and shutdown() share.  So the thread is ended
+        // first, and the descriptor closed after: it never reads one that
+        // shutdown() has closed, or whose number has been given to another
+        // socket meanwhile.  ::shutdown() without the close wakes its wait
+        // at once on Linux (on macOS it sees the flag within its 100 ms
+        // wait, as before).  Message thread; sourceFilter is only read
+        // here, as by the thread.
+        if (sourceFilter.isActive() && isThreadRunning())
+        {
+           #ifndef _WIN32
+            if (socket != nullptr && socket->getRawSocketHandle() >= 0)
+                ::shutdown(socket->getRawSocketHandle(), SHUT_RDWR);
+           #endif
+            stopThread(1000);
+        }
+
         if (socket != nullptr)
             socket->shutdown();
 
