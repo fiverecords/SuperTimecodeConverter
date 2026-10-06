@@ -3007,10 +3007,13 @@ public:
         generatorAudioPlayer.stopAndReset();
     }
 
-    /// Freewheel (AUDIT D10): how long the signal inputs (MTC, LTC, Art-Net,
+    /// Freewheel (AUDIT D10): how long the signal inputs (LTC, Art-Net,
     /// LA-Net, HippoNet) keep counting as present after the last frame or
-    /// packet.  Operator's choice per engine; the senders count on their own
-    /// through it, so a dropout shorter than this never reaches the wire.
+    /// packet.  MTC stays present this long after the last quarter frame; a
+    /// Full Frame does not refresh it and keeps the source present for two
+    /// frames at most (MtcInput::setTimeoutMs, AUDIT LTC-13).  Operator's
+    /// choice per engine; the senders count on their own through it, so a
+    /// dropout shorter than this never reaches the wire.
     void setInputFreewheelMs(int ms)
     {
         inputFreewheelMs = juce::jlimit(50, 5000, ms);
