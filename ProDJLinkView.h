@@ -172,6 +172,7 @@ private:
         bool detailCuesFed = false, detailBeatGridFed = false, detailSongStructFed = false;
         uint32_t lastMetaVersion = 0;  // tracks DbServerClient cache version to skip redundant copies
         uint32_t lastDetailVersion = 0;  // separate version tracker for detail waveform section
+        uint32_t dbTrackLenSec = 0;      // this track's length from the dbserver (0: not known)
         juce::Rectangle<int> tcLocalBounds;  // timecode row relative to deck (set during paintDeckStatic)
         juce::Rectangle<int> mapLocalBounds; // offset timecode row relative to deck
         juce::Rectangle<int> timeLocalBounds; // track time row relative to deck (for click-to-toggle)
@@ -539,9 +540,16 @@ public:
             ds.beatInBar     = proDJLink.getBeatInBar(pn);
             ds.xfAssign      = proDJLink.hasMixerFaderData() ? proDJLink.getChannelXfAssign(pn) : 0;
             ds.playheadMs    = proDJLink.getPlayheadMs(pn);
-            ds.trackLenSec   = proDJLink.getTrackLengthSec(pn);
             ds.trackId       = proDJLink.getTrackID(pn);
             ds.posSource     = proDJLink.getPositionSourceString(pn);
+
+            // Track length: the dbserver's once it is known for this track
+            // (TimecodeEngine keys the Track Map with it too), else the
+            // protocol's -- a CDJ-3000's 0x0b; an NXS2 reports none, and its
+            // 0 replaced the dbserver's length every tick, hiding the track
+            // time and giving Track Map entries a duration of 0 (AUDIT UI-14).
+            const uint32_t protoLenSec = proDJLink.getTrackLengthSec(pn);
+            ds.trackLenSec   = ds.dbTrackLenSec > 0 ? ds.dbTrackLenSec : protoLenSec;
 
             // Timecode from playhead
             FrameRate fps = proDJLink.getDetectedFrameRate(pn);
@@ -613,6 +621,8 @@ public:
                 ds.detailSongStructFed = false;
                 ds.lastMetaVersion = 0;
                 ds.lastDetailVersion = 0;
+                ds.dbTrackLenSec = 0;
+                ds.trackLenSec = protoLenSec;
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
@@ -710,13 +720,14 @@ public:
                         ds.artworkId = meta.artworkId;
                         ds.cueCount  = (int)meta.cueList.size();
 
-                        // Update trackLenSec from dbserver metadata.
-                        // CDJ-3000: already set from abspos packets (redundant but harmless).
-                        // NXS2: no abspos → trackLenSec starts at 0. Without this,
+                        // Track length from dbserver metadata, kept for the
+                        // track (see the top of the loop).
+                        // CDJ-3000: also sent in 0x0b.
+                        // NXS2: no 0x0b length, the protocol's is 0. Without this,
                         // artwork disk cache is saved under a key without duration,
                         // mismatching the TrackMap entry key and CuePointEditor lookup.
                         if (meta.durationSeconds > 0)
-                            ds.trackLenSec = (uint32_t)meta.durationSeconds;
+                            ds.trackLenSec = ds.dbTrackLenSec = (uint32_t)meta.durationSeconds;
 
                         if (meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                         {
@@ -895,6 +906,7 @@ public:
                 ds.detailSongStructFed = false;
                 ds.lastMetaVersion = 0;
                 ds.lastDetailVersion = 0;
+                ds.dbTrackLenSec = 0;
                 ds.displayedArtworkId = 0;
                 ds.cachedArtworkImg = {};
                 ds.artist.clear();
