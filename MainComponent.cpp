@@ -6868,17 +6868,22 @@ void MainComponent::setupOscInputServer()
         cmbOscInputInterface.addItem(names[i], i + 1);
     cmbOscInputInterface.setSelectedId(settings.oscInputInterface + 1, juce::dontSendNotification);
 
-    oscInputServer.onMessage = [this](const OscInputServer::Message& msg)
+    // The component may be gone by the time a posted message runs (a packet
+    // arriving during shutdown), so it is reached through a SafePointer.
+    // That SafePointer is made here, once, on the message thread: making one
+    // creates the component's shared weak-reference pointer on first use
+    // (WeakReference::Master::getSharedPointer), which is not thread-safe,
+    // and the listener thread used to make one per packet (AUDIT C11,
+    // UI-11).  The listener thread only copies it, which counts a reference
+    // atomically.
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+    oscInputServer.onMessage = [safeThis](const OscInputServer::Message& msg)
     {
-        // Dispatch on message thread (callback runs on listener thread).
-        // The component may be gone by the time the message runs (a packet
-        // arriving during shutdown), so it is reached through a SafePointer.
-        juce::Component::SafePointer<MainComponent> safeThis(this);
+        // Listener thread: dispatch on the message thread.
         juce::MessageManager::callAsync([safeThis, msg]()
         {
-            if (safeThis == nullptr) return;
-            auto* self = safeThis.getComponent();
-            self->handleOscMessage(msg);
+            if (auto* self = safeThis.getComponent())
+                self->handleOscMessage(msg);
         });
     };
 }
