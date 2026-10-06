@@ -198,22 +198,27 @@ public:
         float tcWidth = fontSize * displayChars * charWidthRatio;
         float startX = centerX - tcWidth / 2.0f;
 
+        // Character layout: HH:MM:SS.FF (11 chars), plus /FF (14) when converting.
+        // Character i spans [i, i+1) character widths from startX, so a pair
+        // at chars i and i+1 is centred at i + 1.0.  Each label is centred on
+        // its pair in a 30 px box: the pairs were taken as centred at i + 0.5
+        // here (half a character left) and at quarters of the width with a
+        // 60 px box (up to two characters right) below (AUDIT UI-16).
+        float charW = tcWidth / displayChars;
+
         if (fpsConvertActive)
         {
-            // Character layout: HH:MM:SS.FF/FF = 14 chars
-            // Positions:         01 2 34 5 67 8 9A B CD
             // Centre of each group:
-            //   HRS = chars 0-1  -> centre at char 1.0
-            //   MIN = chars 3-4  -> centre at char 3.5
-            //   SEC = chars 6-7  -> centre at char 6.5
-            //   FRM = chars 9-10 -> centre at char 9.5
-            //   OUT = chars 12-13-> centre at char 12.5
-            float charW = tcWidth / displayChars;
+            //   HRS = chars 0-1   -> centre at char 1.0
+            //   MIN = chars 3-4   -> centre at char 4.0
+            //   SEC = chars 6-7   -> centre at char 7.0
+            //   FRM = chars 9-10  -> centre at char 10.0
+            //   OUT = chars 12-13 -> centre at char 13.0
             float posHrs = startX + 1.0f  * charW;
-            float posMn  = startX + 3.5f  * charW;
-            float posSec = startX + 6.5f  * charW;
-            float posFrm = startX + 9.5f  * charW;
-            float posOut = startX + 12.5f * charW;
+            float posMn  = startX + 4.0f  * charW;
+            float posSec = startX + 7.0f  * charW;
+            float posFrm = startX + 10.0f * charW;
+            float posOut = startX + 13.0f * charW;
 
             g.setColour(juce::Colour(0xFF546E7A));
             g.drawText("HRS", juce::Rectangle<float>(posHrs - 15.0f, labelY, 30.0f, 14.0f), juce::Justification::centred);
@@ -227,16 +232,16 @@ public:
         }
         else
         {
-            float segW = tcWidth / 4.0f;
-            float positions[] = { startX + segW * 0.5f, startX + segW * 1.5f,
-                                  startX + segW * 2.5f, startX + segW * 3.5f };
+            // HRS, MIN, SEC, FRM: chars 0-1, 3-4, 6-7, 9-10 -> centres 1, 4, 7, 10
+            float positions[] = { startX + 1.0f * charW, startX + 4.0f * charW,
+                                  startX + 7.0f * charW, startX + 10.0f * charW };
             const char* labels[] = { "HRS", "MIN", "SEC", "FRM" };
 
             g.setColour(juce::Colour(0xFF546E7A));
             for (int i = 0; i < 4; i++)
             {
                 g.drawText(labels[i],
-                           juce::Rectangle<float>(positions[i] - 15.0f, labelY, 60.0f, 14.0f),
+                           juce::Rectangle<float>(positions[i] - 15.0f, labelY, 30.0f, 14.0f),
                            juce::Justification::centred);
             }
         }

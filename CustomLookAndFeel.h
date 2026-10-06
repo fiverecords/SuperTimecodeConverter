@@ -260,6 +260,20 @@ public:
         (void)box;
     }
 
+    // JUCE draws the "nothing selected" text into the label's bounds, which
+    // positionComboBoxText collapses, so setTextWhenNothingSelected showed
+    // nothing (AUDIT UI-16).  Draw it where drawComboBox draws the item
+    // text, dimmed as LookAndFeel_V2 does.
+    void drawComboBoxTextWhenNothingSelected(juce::Graphics& g, juce::ComboBox& box,
+                                             juce::Label&) override
+    {
+        g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain)));
+        g.setColour(box.findColour(juce::ComboBox::textColourId).withMultipliedAlpha(0.5f));
+        g.drawText(box.getTextWhenNothingSelected(),
+                   juce::Rectangle<int>(6, 0, box.getWidth() - 28, box.getHeight()),
+                   juce::Justification::centredLeft, true);
+    }
+
     //==============================================================================
     // POPUP MENU
     //==============================================================================
