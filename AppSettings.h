@@ -881,7 +881,11 @@ public:
     /// An entry saved without duration wins; among entries saved with one,
     /// the shortest duration (then the smallest key) -- the same entry
     /// every time, for every caller.  The first match in hash order, as
-    /// before, could change when the map rehashed (AUDIT SET-9).
+    /// before, could change when the map rehashed (AUDIT SET-9).  An entry
+    /// saved with a duration has the key "artist|title|<digits>" and a
+    /// duration above 0 (makeKey appends it only then); both are checked,
+    /// so another title that only begins with this one and a '|' ("Song|Edit"
+    /// for "Song", saved with or without a duration) is not taken for it.
     const TrackMapEntry* findIgnoringDuration(const juce::String& artist,
                                               const juce::String& title) const
     {
@@ -894,7 +898,9 @@ public:
         const TrackMapEntry* best = nullptr;
         const std::string* bestKey = nullptr;
         for (auto& [k, v] : entries)
-            if (k.size() > prefix.size() && k.compare(0, prefix.size(), prefix) == 0
+            if (v.durationSec > 0
+                && k.size() > prefix.size() && k.compare(0, prefix.size(), prefix) == 0
+                && k.find_first_not_of("0123456789", prefix.size()) == std::string::npos
                 && (best == nullptr || v.durationSec < best->durationSec
                     || (v.durationSec == best->durationSec && k < *bestKey)))
             {
