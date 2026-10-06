@@ -746,6 +746,7 @@ public:
                     auto meta = dbClient.getCachedMetadata(srcIP, srcSlot, ds.trackId);
                     if (meta.isValid())
                     {
+                        const bool firstApply = !ds.metaApplied;
                         ds.lastMetaVersion = meta.cacheVersion;
                         ds.metaApplied = true;
                         if (meta.artist.isNotEmpty()) ds.artist = meta.artist;
@@ -762,6 +763,17 @@ public:
                         // mismatching the TrackMap entry key and CuePointEditor lookup.
                         if (meta.durationSeconds > 0)
                             ds.trackLenSec = ds.dbTrackLenSec = (uint32_t)meta.durationSeconds;
+
+                        // The title arrives after the rekordbox cues reached
+                        // the detail waveform (an entry whose NFS analysis
+                        // came first, AUDIT META-7): the auto-populate ran
+                        // then under the placeholder "Track #N", found no
+                        // Track Map entry, and does not run again for this
+                        // load (detailCuesFed).  Run it now, with the title
+                        // and the dbserver length; it still declines under
+                        // Show Lock (AUDIT ENG-18).
+                        if (firstApply && ds.detailCuesFed && meta.hasCueList())
+                            autoPopulateRekordboxCues(pn, ds, meta);
 
                         if (meta.hasWaveform() && ds.displayedWaveformTrackId != ds.trackId)
                         {
