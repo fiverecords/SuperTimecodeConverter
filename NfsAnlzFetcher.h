@@ -148,12 +148,15 @@ public:
         {
             // A handle went stale during the download: the slot's filesystem
             // changed (new media), so the cached index the path came from is
-            // gone (forgetSlot).  Look the track up in the new export.pdb.
+            // gone (forgetSlot).  Look the track up in the new export.pdb and
+            // download both files again, even under the same path: the .DAT
+            // may have come from the old media before the .EXT went stale,
+            // and the same path on another export is not the same analysis
+            // (AUDIT META-4).
             const juce::String freshPath = findAnlzPathFromPdb(playerIP, mountPath, trackId);
             if (freshPath.isEmpty())
                 return {};
-            if (freshPath != anlzPath)
-                result = fetchAnalysisFiles(playerIP, mountPath, freshPath, nullptr);
+            result = fetchAnalysisFiles(playerIP, mountPath, freshPath, nullptr);
         }
         return result;
     }
@@ -247,7 +250,9 @@ public:
     // export.pdb index of track ID -> ANLZ path).  rekordbox IDs are per
     // export, so a cached index is only right for the media it came from.
     // All three may be called from any thread while a fetch runs; a fetch
-    // that started before the call does not store what it learnt.
+    // running at the time does not store what it learnt about the player or
+    // slot the call forgets, and still stores what it learnt about others
+    // (AUDIT META-4).
     //==========================================================================
 
     /// Forget everything learnt from one player: its RPC ports, its mount
@@ -260,7 +265,7 @@ public:
         portCache.erase(playerIP);
         for (auto it = pdbAnlzCache.begin(); it != pdbAnlzCache.end();)
             it = (it->first.first == playerIP) ? pdbAnlzCache.erase(it) : std::next(it);
-        ++cacheEpoch;
+        ++playerEpoch[playerIP];
     }
 
     /// Forget the export.pdb index and the mount handle of one slot of one
@@ -268,12 +273,13 @@ public:
     void clearPdbCache(const juce::String& playerIP, uint8_t slot)
     {
         const juce::String mountPath = slotToMountPath(slot);
+        if (mountPath.isEmpty()) return;
         const std::lock_guard<std::mutex> lock(cacheMutex);
         auto m = mountCache.find(playerIP);
         if (m != mountCache.end())
             m->second.erase(mountPath);
         pdbAnlzCache.erase(SlotKey { playerIP, mountPath });
-        ++cacheEpoch;
+        ++slotEpoch[SlotKey { playerIP, mountPath }];
     }
 
     /// Forget every export.pdb index and mount handle, for all players.
@@ -282,7 +288,7 @@ public:
         const std::lock_guard<std::mutex> lock(cacheMutex);
         pdbAnlzCache.clear();
         mountCache.clear();
-        ++cacheEpoch;
+        ++allSlotsEpoch;
     }
 
 private:
@@ -525,11 +531,11 @@ private:
     struct PlayerPorts { int mountPort = 0; int nfsPort = 0; };
 
     //==========================================================================
-    // Caches (see removePlayer).  cacheMutex guards the three maps and
-    // cacheEpoch; nothing is sent or received while it is held.
+    // Caches (see removePlayer).  cacheMutex guards the three maps and the
+    // invalidation counters below; nothing is sent or received while it is
+    // held.
     //==========================================================================
     std::mutex cacheMutex;
-    uint32_t cacheEpoch = 0;   // bumped by removePlayer / clearPdbCache
     /// playerIP -> {mountPort, nfsPort}
     std::map<juce::String, PlayerPorts> portCache;
     struct FHandle { uint8_t data[kFHandleSize] = {}; };
@@ -539,8 +545,36 @@ private:
     using SlotKey = std::pair<juce::String, juce::String>;
     std::map<SlotKey, std::map<uint32_t, juce::String>> pdbAnlzCache;
 
+    // Invalidation counters, only ever increased.  A fetch notes the ones
+    // covering what it is about to learn and stores it only if none moved
+    // meanwhile.  One counter for everything made a removePlayer() of one
+    // player throw away another player's freshly downloaded export.pdb
+    // index, ports and mount handle (AUDIT META-4).
+    uint32_t allSlotsEpoch = 0;                         // clearPdbCache()
+    std::map<juce::String, uint32_t> playerEpoch;       // removePlayer(ip)
+    std::map<SlotKey, uint32_t> slotEpoch;              // clearPdbCache(ip, slot)
+
+    /// Caller holds cacheMutex.  What a port lookup on playerIP notes: only
+    /// removePlayer forgets ports.
+    uint64_t portEpochLocked(const juce::String& playerIP) const
+    {
+        auto p = playerEpoch.find(playerIP);
+        return p != playerEpoch.end() ? p->second : 0u;
+    }
+
+    /// Caller holds cacheMutex.  What a mount or export.pdb lookup on one
+    /// slot notes: removePlayer(ip), clearPdbCache(ip, slot) and
+    /// clearPdbCache() all forget a slot.  The counters only increase, so
+    /// their sum moves whenever one of them does.
+    uint64_t slotEpochLocked(const juce::String& playerIP, const juce::String& mountPath) const
+    {
+        auto s = slotEpoch.find(SlotKey { playerIP, mountPath });
+        return (uint64_t) allSlotsEpoch + portEpochLocked(playerIP)
+             + (s != slotEpoch.end() ? s->second : 0u);
+    }
+
     /// After NFSERR_STALE (on the NFS thread): drop the slot's mount handle
-    /// and export.pdb index.  Not an invalidation in the cacheEpoch sense --
+    /// and export.pdb index.  Not an invalidation in the counters' sense --
     /// the fetch that saw it learns the new state itself.
     void forgetSlot(const juce::String& playerIP, const juce::String& mountPath)
     {
@@ -574,13 +608,13 @@ private:
     /// Get (or discover) the mount and NFS ports for a player.
     PlayerPorts getPlayerPorts(const juce::String& playerIP)
     {
-        uint32_t epoch = 0;
+        uint64_t epoch = 0;
         {
             const std::lock_guard<std::mutex> lock(cacheMutex);
             auto it = portCache.find(playerIP);
             if (it != portCache.end() && it->second.mountPort > 0 && it->second.nfsPort > 0)
                 return it->second;
-            epoch = cacheEpoch;
+            epoch = portEpochLocked(playerIP);
         }
 
         PlayerPorts ports;
@@ -593,7 +627,7 @@ private:
                 + " -- mount=" + juce::String(ports.mountPort)
                 + " nfs=" + juce::String(ports.nfsPort));
             const std::lock_guard<std::mutex> lock(cacheMutex);
-            if (cacheEpoch == epoch)
+            if (portEpochLocked(playerIP) == epoch)
                 portCache[playerIP] = ports;
         }
         else
@@ -674,7 +708,7 @@ private:
     bool nfsMount(const juce::String& playerIP, const juce::String& mountPath, FHandle& outHandle)
     {
         // Check cache first
-        uint32_t epoch = 0;
+        uint64_t epoch = 0;
         {
             const std::lock_guard<std::mutex> lock(cacheMutex);
             auto pm = mountCache.find(playerIP);
@@ -687,7 +721,7 @@ private:
                     return true;
                 }
             }
-            epoch = cacheEpoch;
+            epoch = slotEpochLocked(playerIP, mountPath);
         }
 
         // Build MOUNTPROC_MNT args: DirPath (variable-length opaque, UTF-16LE)
@@ -728,7 +762,7 @@ private:
         std::memcpy(outHandle.data, r + 4, kFHandleSize);
         {
             const std::lock_guard<std::mutex> lock(cacheMutex);
-            if (cacheEpoch == epoch)
+            if (slotEpochLocked(playerIP, mountPath) == epoch)
                 mountCache[playerIP][mountPath] = outHandle;
         }
         DBG("NfsAnlzFetcher: mounted " + mountPath + " on " + playerIP);
@@ -990,7 +1024,7 @@ private:
     {
         // Check this slot's index first
         const SlotKey key { playerIP, mountPath };
-        uint32_t epoch = 0;
+        uint64_t epoch = 0;
         {
             const std::lock_guard<std::mutex> lock(cacheMutex);
             auto idx = pdbAnlzCache.find(key);
@@ -1000,7 +1034,7 @@ private:
                 if (t != idx->second.end())
                     return t->second;
             }
-            epoch = cacheEpoch;
+            epoch = slotEpochLocked(playerIP, mountPath);
         }
 
         // Not there (or no index yet): download export.pdb
@@ -1021,7 +1055,7 @@ private:
             path = t->second;
         {
             const std::lock_guard<std::mutex> lock(cacheMutex);
-            if (cacheEpoch == epoch)
+            if (slotEpochLocked(playerIP, mountPath) == epoch)
                 pdbAnlzCache[key] = std::move(index);
         }
 
