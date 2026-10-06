@@ -9231,9 +9231,12 @@ void MainComponent::timerCallback()
                         else
                             artworkDisplay.clearImage();
 
+                        // The Engine DJ overview, drawn as 1.9.14-beta2 drew
+                        // it -- not with rekordbox's PWV6 weighting, which
+                        // was never checked on a PRIME (AUDIT META-12).
                         auto wf = sharedStageLinQDb.getWaveformForTrack(netPath);
                         if (wf.valid && wf.entryCount > 0)
-                            waveformDisplay.setColorWaveformData(wf.data, wf.entryCount, 3);
+                            waveformDisplay.setEngineOverviewData(wf.data, wf.entryCount);
                         else
                             waveformDisplay.clearWaveform();
 
