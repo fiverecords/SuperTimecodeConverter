@@ -149,6 +149,10 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
         // point-to-point link (a VPN's utun or tun, ppp) the same field
         // holds the peer's address -- ifa_broadaddr and ifa_dstaddr share
         // storage -- and it was offered as the "broadcast" (AUDIT NET-16).
+        // Every user of the field now sends to 255.255.255.255 on such a
+        // link instead of to the peer: the Art-Net, LA-Net, TCNet and
+        // HippoNet outputs, and ProDJLinkInput's keepalives, StageLinQInput's
+        // discovery and HippotizerInput's announce.
         char broadcastStr[INET_ADDRSTRLEN] = "255.255.255.255";
         if ((ifa->ifa_flags & IFF_BROADCAST) != 0 && ifa->ifa_broadaddr != nullptr
             && ifa->ifa_broadaddr->sa_family == AF_INET)
@@ -213,6 +217,16 @@ inline juce::Array<NetworkInterface> getNetworkInterfaces(bool includeLoopback =
 //    that sets it too, and then the kernel hands each unicast to one of the
 //    sockets, so the other program could take STC's (ProDJLinkInput keeps
 //    it off its status socket for that reason).
+//  - One input on an interface and another engine's on ALL INTERFACES,
+//    same protocol and port: before, one held <interface>:port and the
+//    other 0.0.0.0:port, and both received.  Now both want 0.0.0.0:port.
+//    Linux: a unicast to the interface goes to whichever bound last
+//    (nic_all_sim: the interface input lost every one when the ALL input
+//    started after it).  macOS: the ALL input started second has no
+//    fallback and fails to bind.
+//  - A sender on another subnet of the same network that broadcasts to
+//    255.255.255.255 is dropped by the filter on macOS and Linux (its
+//    address is not on the interface's subnet); Windows receives it.
 //  - The input now also hears STC's own broadcasts on that interface and
 //    port -- Art-Net or LA-Net out of another engine, or of the same engine
 //    -- as it already did on Windows and with ALL INTERFACES.  It cannot
