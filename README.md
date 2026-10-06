@@ -41,7 +41,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
-- **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net, HippoNet), how long the source still counts as present after the last frame or packet: 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
+- **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net, HippoNet), how long the source still counts as present after the last frame or packet (for MTC, after the last quarter frame; a Full Frame on its own keeps the source present for two frames at most): 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
 - **Generator** — internal timecode generator with two modes: **Clock** (follows the system wall clock continuously, for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. Supports an **A/B loop**: set the loop in and out points at the current position and arm the LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
 - **LA-Net (LaserAnimation Net-Timecode)** — receive Net-Timecode over the network from LaserAnimation systems (configurable interface)
 - **Winamp / WACUP** *(Windows only)* — follow playback position from a running Winamp or WACUP instance. The input attaches automatically as soon as a Winamp window appears, so it can be selected before the player is launched. On macOS and Linux this source falls back to the Generator.
@@ -179,6 +179,7 @@ Per-track timed triggers that fire at specific playhead positions during playbac
 - **Manual entry:** add cue points by typing the position (MM:SS.mmm) directly.
 - **Same trigger types as track change:** MIDI Note, MIDI CC, OSC, Art-Net DMX -- any combination per cue point.
 - **Seek-aware:** seeking backward resets cues so they fire again. Seeking forward skips already-passed cues.
+- **Only cues the playhead crosses fire:** when an engine moves to another deck (XF-A / XF-B, MASTER, ON AIR), when a track is loaded at a memory cue, when a paused deck is moved and then played, or when the generator's cues are re-armed, the cues behind the playhead at that moment are passed, not fired. A paused deck moved back and then played fires the cues ahead of it again when it crosses them.
 - **Playback-only firing:** cue points only fire during actual playback. Scrub, jog, and cue preview do not trigger cues -- DJs can preview tracks freely without causing spurious output.
 - **Live editing:** cue points added or modified while a track is playing take effect immediately without reloading the track.
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
@@ -397,7 +398,7 @@ The sections below are for developers who want to build STC from source.
 
 ### Prerequisites
 
-- **JUCE Framework 8.x** — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
+- **JUCE Framework 9** (the releases are built with 9.0.2) — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
 
 #### Windows
 
@@ -428,13 +429,13 @@ The sections below are for developers who want to build STC from source.
 
 2. **Clone JUCE** (if you don't have it already):
    ```bash
-   git clone --depth 1 --branch 8.0.6 https://github.com/juce-framework/JUCE.git ../JUCE
+   git clone --depth 1 --branch 9.0.2 https://github.com/juce-framework/JUCE.git ../JUCE
    ```
 
 3. **Create a `CMakeLists.txt`** in the project root:
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.9)
+   project(SuperTimecodeConverter VERSION 1.9.14)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -444,11 +445,14 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.9"
+       VERSION "1.9.14"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
        MICROPHONE_PERMISSION_TEXT "STC needs access to your audio interface for LTC input"
+       LOCAL_NETWORK_PERMISSION_ENABLED TRUE
+       LOCAL_NETWORK_PERMISSION_TEXT "STC needs the local network for Pro DJ Link, StageLinQ, Art-Net, TCNet, OSC and HippoNet"
+       PLIST_TO_MERGE "<plist><dict><key>NSAppSleepDisabled</key><true/></dict></plist>"
    )
 
    juce_generate_juce_header(SuperTimecodeConverter)
@@ -456,6 +460,7 @@ The sections below are for developers who want to build STC from source.
    target_sources(SuperTimecodeConverter PRIVATE
        Main.cpp
        MainComponent.cpp
+       btt_build.cpp
        sqlite3.c
    )
 
@@ -563,8 +568,8 @@ The **Backup** and **Restore** buttons in the title bar let you export and impor
 All settings are automatically saved per engine to:
 
 - **Windows:** `%APPDATA%\SuperTimecodeConverter\settings.json`
-- **macOS:** `~/Library/Application Support/SuperTimecodeConverter/settings.json`
-- **Linux:** `~/.local/share/SuperTimecodeConverter/settings.json`
+- **macOS:** `~/Library/SuperTimecodeConverter/settings.json`
+- **Linux:** `~/.config/SuperTimecodeConverter/settings.json` (or `$XDG_CONFIG_HOME/SuperTimecodeConverter/` when that is set)
 
 ---
 
@@ -671,7 +676,7 @@ The application is built around a modular, header-only architecture:
 | `TimecodeEngine.h` | Per-engine state container: input/output routing, PLL, TrackMap/MixerMap forwarding |
 | `ProDJLinkInput.h` | Native Pro DJ Link protocol: player discovery, status, absolute position, DJM mixer/VU data |
 | `DbServerClient.h` | Background TCP client for CDJ metadata queries (title, artist, artwork, waveform, beat grid, cue list, song structure, detail waveform). Two-phase request pipeline with disk cache (ANLZ) |
-| `NfsAnlzFetcher.h` | NFS download of rekordbox ANLZ files (.DAT/.EXT) directly from CDJ USB/SD. Fallback when dbserver tag queries fail on CDJ-3000 |
+| `NfsAnlzFetcher.h` | NFS download of the rekordbox export.pdb index and ANLZ files (.DAT/.EXT) directly from the player's USB/SD: the analysis route for players STC does not query over dbserver, and the fallback when dbserver fails |
 | `MtcInput.h` | MIDI Time Code receiver (Quarter Frame + Full Frame) with interpolation |
 | `MtcOutput.h` | MIDI Time Code transmitter (high-resolution timer with fractional accumulator) |
 | `ArtnetInput.h` | Art-Net timecode receiver (UDP) with bind fallback |
@@ -680,11 +685,15 @@ The application is built around a modular, header-only architecture:
 | `LANetTimecodeOutput.h` | LaserAnimation Net-Timecode broadcaster (UDP) with drift-free timing |
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
 | `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
+| `HippotizerOutput.h` | HippoNet timecode sender (behind a hidden flag; unconfirmed on hardware) |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC), including user bits |
 | `LtcOutput.h` | LTC audio encoder with auto-increment, user bits, and SMPTE 12M binary group flags |
 | `WinampInput.h` | Winamp / WACUP playback position reader (Windows; stub on other platforms) |
 | `AudioThru.h` | Audio passthrough with independent device routing (Engine 1 only) |
+| `AudioDeviceHub.h` | One shared `AudioDeviceManager` per physical audio interface: LTC in/out, Audio Thru, Audio BPM and the generator player attach to it and are fanned out from one callback |
+| `MidiOutputHub.h` | One MIDI output per physical port: every send serialised under the port's lock, one MTC stream per port |
+| `OnAirFollow.h` | The ON AIR rule shared by Pro DJ Link and StageLinQ: keep the deck on air until it goes quiet, then the loudest deck on air |
 | `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
 | `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
 | `MixerMap.h` | DJM parameter mapping with three-tier model support (900NXS2 / A9 / V10) and ParamType-aware value mapping (Continuous / Toggle / Discrete) |
@@ -692,10 +701,10 @@ The application is built around a modular, header-only architecture:
 | `OscInputServer.h` | OSC 1.0 UDP listener with message parsing and dispatch for generator remote control |
 | `TriggerOutput.h` | MIDI and OSC dispatch for track change triggers + continuous mixer forwarding |
 | `LinkBridge.h` | Ableton Link tempo sync (compile-time optional, no-op stub when disabled) |
-| `AudioBpmInput.h` | Real-time audio BPM detection: independent AudioDeviceManager, BTT integration, EMA smoothing, atomic BPM/beat/confidence output |
+| `AudioBpmInput.h` | Real-time audio BPM detection: a client of the shared `AudioDeviceHub`, BTT integration, EMA smoothing, atomic BPM/beat/confidence output |
 | `BTT.h` | Standalone public API header for the Beat-and-Tempo-Tracking library |
 | `btt_build.cpp` | C++ build wrapper for BTT amalgamation (MSVC compatibility, macro isolation) |
-| `btt_amalgamation.inc` | Single-file BTT library amalgamation (not added to Projucer, included by btt_build.cpp) |
+| `btt_amalgamation.inc` | Single-file BTT library amalgamation (not compiled on its own: included by btt_build.cpp) |
 | `StageLinQInput.h` | Native StageLinQ protocol: device discovery, StateMap, BeatInfo, mixer state |
 | `StageLinQDbClient.h` | Engine Library database access via FileTransfer + SQLite for waveform preview and artwork |
 | `StageLinQView.h` | External window: Denon deck display with track info, deck state, mixer data |
@@ -706,6 +715,8 @@ The application is built around a modular, header-only architecture:
 | `TrackMapEditor.h` | Table editor for artist+title -> timecode offset + trigger mapping |
 | `CuePointEditor.h` | Table editor for per-track cue points with waveform strip, click + drag cursor, Capture from live playhead |
 | `GeneratorPresetEditor.h` | Table editor for generator presets (Name, Start TC, Stop TC) |
+| `GeneratorAudioPlayer.h` | Generator audio file playback on the shared audio device; the generator's timecode follows its audio clock while a file plays |
+| `GeneratorWaveformView.h` / `GeneratorWaveformWindow.h` | Generator waveform strip and its external window |
 | `GeneratorCuePointEditor.h` | Per-preset cue point editor with mirror waveform strip, click + drag cursor, and live playback cursor |
 | `MixerMapEditor.h` | Table editor for DJM parameter -> protocol output mapping |
 | `TimecodeDisplay.h` | Real-time timecode display widget |
@@ -719,7 +730,7 @@ The application is built around a modular, header-only architecture:
 - **Multi-engine architecture:** each engine encapsulates its own input/output state, enabling up to 8 independent timecode pipelines
 - **Lock-free audio:** LTC decode and audio passthrough use lock-free ring buffers (SPSC) for real-time safety
 - **Thread safety:** atomics with explicit memory ordering for cross-thread data, SpinLocks for composite structures, SPSC queues for producer-consumer patterns
-- **Independent audio devices:** LTC Input, LTC Output, Audio Thru, and Audio BPM each manage their own `AudioDeviceManager`, allowing independent device selection
+- **One audio device per interface:** LTC Input, LTC Output, Audio Thru, Audio BPM and the generator player each choose their device independently; clients that pick the same physical interface share one `AudioDeviceManager` (`AudioDeviceHub`), instead of each opening the driver on its own
 - **BTT amalgamation:** the Beat-and-Tempo-Tracking library is bundled as a single-file amalgamation (same pattern as sqlite3) with `extern "C"` linkage and MSVC macro isolation (`#undef real/imag` against JUCE PCH contamination)
 - **Fractional accumulators:** MTC and Art-Net outputs use fractional timing accumulators to eliminate drift from integer-ms timer resolution
 - **Native rendering:** OpenGL context intentionally disabled to prevent GL-thread data races on juce::String refcounts (paint() vs timerCallback()). Windows DWM already hardware-accelerates the native GDI composite path, and the waveform/deck image caches minimize per-frame paint work
