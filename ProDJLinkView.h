@@ -1143,10 +1143,12 @@ public:
             }
 
 
-            // Detail waveform: update playhead and active loop every frame
+            // Detail waveform: update playhead and active loop every frame.
+            // With the direction: in reverse play a smaller position is the
+            // deck playing, not a seek to snap to (AUDIT UI-15).
             if (ds.detailWaveform.hasDetailData())
             {
-                ds.detailWaveform.setPlayheadMs(ds.playheadMs, ds.isPlaying, ds.faderPitch);
+                ds.detailWaveform.setPlayheadMs(ds.playheadMs, ds.isPlaying, ds.faderPitch, ds.isReverse);
                 ds.detailWaveform.setActiveLoop(
                     proDJLink.getLoopStartMs(pn),
                     proDJLink.getLoopEndMs(pn));
