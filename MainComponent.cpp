@@ -224,6 +224,14 @@ MainComponent::MainComponent()
     {
         sharedDbClient.invalidatePlayer(playerIP);
     };
+    sharedProDJLinkInput.onPlayerMoved = [this](const juce::String& oldIp, const juce::String& newIp)
+    {
+        sharedDbClient.movePlayer(oldIp, newIp);
+    };
+    sharedProDJLinkInput.onMediaChanged = [this](const juce::String& playerIP, uint8_t slot)
+    {
+        sharedDbClient.mediaChanged(playerIP, slot);
+    };
     engines[0]->setDbServerClient(&sharedDbClient);
     engines[0]->setTrackMap(&settings.trackMap);
     engines[0]->setMixerMap(&sharedMixerMap);
@@ -2390,15 +2398,18 @@ MainComponent::~MainComponent()
     // settings and writes them (nothing, after a restore: AUDIT SET-5).
     flushSettings();
 
-    // 7. Stop ProDJLink receiver FIRST. This joins its thread, so no more
-    //    gcPlayers() calls can fire onPlayerLost after this returns.
+    // 7. Stop ProDJLink receiver FIRST. This joins its thread, so nothing
+    //    can fire onPlayerLost, onPlayerMoved or onMediaChanged after this
+    //    returns.
     sharedProDJLinkInput.stop();
 
-    // 8. Now it's safe to disconnect the callback and stop DbClient.
+    // 8. Now it's safe to disconnect the callbacks and stop DbClient.
     //    Reassigning std::function from another thread while the ProDJLink
     //    thread might be invoking it would be a race (std::function is not
     //    atomic). Doing it after stop() ensures the callback isn't running.
     sharedProDJLinkInput.onPlayerLost = nullptr;
+    sharedProDJLinkInput.onPlayerMoved = nullptr;
+    sharedProDJLinkInput.onMediaChanged = nullptr;
     sharedDbClient.stop();
 
     // 9. Stop StageLinQ receiver first to join its thread, so the callbacks
