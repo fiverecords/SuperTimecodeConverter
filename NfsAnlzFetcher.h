@@ -9,8 +9,8 @@
 // queries did not deliver (DbServerClient::launchNfsAsync).  Two entries:
 // fetchByTrackId looks the track up in the slot's export.pdb, as Crate Digger
 // does, and is the one DbServerClient uses; fetchAndParse takes an ANLZ path
-// from its caller and has none since AUDIT META-1 (the dbserver item once
-// read as that path, 0x000E, is the record label).  Either way the
+// from its caller, and has no caller since AUDIT META-1 (the dbserver item
+// once read as that path, 0x000E, is the record label).  Either way the
 // track's .DAT and .EXT are downloaded, parsed and merged (mergeDatExt).  The
 // .2EX (CDJ-3000 3-band waveforms, PWV6/PWV7) is not downloaded.
 //
