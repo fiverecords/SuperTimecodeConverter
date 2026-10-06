@@ -8,7 +8,9 @@
 // DbServerClient runs it on its NFS thread for the analysis data its dbserver
 // queries did not deliver (DbServerClient::launchNfsAsync).  Two entries:
 // fetchByTrackId looks the track up in the slot's export.pdb, as Crate Digger
-// does; fetchAndParse takes the ANLZ path dbserver gave.  Either way the
+// does, and is the one DbServerClient uses; fetchAndParse takes an ANLZ path
+// from its caller and has none since AUDIT META-1 (the dbserver item once
+// read as that path, 0x000E, is the record label).  Either way the
 // track's .DAT and .EXT are downloaded, parsed and merged (mergeDatExt).  The
 // .2EX (CDJ-3000 3-band waveforms, PWV6/PWV7) is not downloaded.
 //
@@ -162,15 +164,17 @@ public:
     }
 
     //==========================================================================
-    // High-level API: fetch ANLZ by the path dbserver gave
+    // High-level API: fetch ANLZ by a path the caller gives
     //==========================================================================
 
     /// Fetch the ANLZ .DAT and .EXT files of a track and merge them, as
     /// fetchByTrackId does once it has the path.
     /// @param playerIP   IP address of the CDJ
     /// @param slot        Media slot (2=SD, 3=USB)
-    /// @param anlzPath   Path from dbserver metadata, e.g. "PIONEER/USBANLZ/P053/0000/ANLZ0006.DAT"
-    ///                   (.DAT, .EXT or .2EX; the other extension is derived).
+    /// @param anlzPath   An ANLZ path as export.pdb stores it, e.g.
+    ///                   "PIONEER/USBANLZ/P053/0000/ANLZ0006.DAT" (.DAT, .EXT or
+    ///                   .2EX; the other extension is derived).  dbserver gives
+    ///                   no such path (AUDIT META-1); no caller in the app.
     /// @return Parsed ANLZ data, or result with ok=false on failure.
     AnlzResult fetchAndParse(const juce::String& playerIP, uint8_t slot,
                              const juce::String& anlzPath)

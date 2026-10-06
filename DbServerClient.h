@@ -695,7 +695,7 @@ private:
     static constexpr int kMaxConnections    = 6;
     static constexpr int kReconnectCooldownMs = 5000;   // per player IP, after a failed attempt or fresh session (AUDIT META-8)
     static constexpr int kCooldownRetries     = 3;      // asks again after the cooldown, per request (AUDIT META-8)
-    static constexpr int kMaxCooldownRetryRequests = 16;
+    static constexpr int kMaxCooldownRetryRequests = 16;  // remembered requests at most; the oldest is dropped
     // Idle connection lifetime.  Set to 30 s to mirror the way Beat Link's
     // ConnectionManager keeps a Client open between successive queries to the
     // same player (see ConnectionManager.invokeWithClientSession in the
@@ -1567,10 +1567,12 @@ private:
     /// Worker thread.  req found no dbserver session.  If that is because
     /// its player is in the reconnect cooldown and the entry still has no
     /// title, remember req: requeueCooldownRetries() asks again once the
-    /// cooldown has passed.  Nothing else would -- TimecodeEngine asks once
-    /// per track change -- so without this a title (and the Track Map offset
-    /// that depends on it) missed during a cooldown stayed missing
-    /// (AUDIT META-8).  A request already remembered keeps its count.
+    /// cooldown has passed.  Nothing else would while the PDL View is
+    /// closed -- TimecodeEngine asks once per track change; the PDL View,
+    /// while open, asks again about every 3 s while a deck still lacks its
+    /// metadata -- so without this a title (and the Track Map offset that
+    /// depends on it) missed during a cooldown stayed missing (AUDIT
+    /// META-8).  A request already remembered keeps its count.
     void retryAfterCooldown(const MetadataRequest& req, const CacheKey& cacheKey)
     {
         if (!inFailureCooldown(req.playerIP, juce::Time::getMillisecondCounterHiRes()))
