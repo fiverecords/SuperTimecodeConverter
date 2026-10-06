@@ -8891,7 +8891,11 @@ void MainComponent::timerCallback()
         // When CDJ 2 loads a track from CDJ 1's USB via Link export, CDJ 2's
         // own address finds nothing; and rekordbox IDs are per export, so the
         // same ID from another medium is another track (AUDIT META-5).  A
-        // change of medium therefore shows as a new track here.
+        // change of medium therefore shows as a new track here, and so does
+        // the panel coming from the StageLinQ branch below, which shares the
+        // two displays and leaves displayedPdlMedia empty: both displays are
+        // cleared, so a track without artwork or waveform does not keep the
+        // previous one's.
         const auto media = getPdlMediaSource(pdlPlayer);
         {
             const juce::String mediaKey = media.ip + "/" + juce::String((int) media.slot);
@@ -8900,9 +8904,10 @@ void MainComponent::timerCallback()
                 displayedPdlMedia = mediaKey;
                 displayedArtworkId = 0;
                 displayedWaveformTrackId = 0;
+                artworkDisplay.clearImage();
+                waveformDisplay.clearWaveform();
             }
         }
-        // The StageLinQ branch below shares the two displays.
         displayedSlqTrackVersion = 0;
         slqPanelClearedFor = 0;
 
@@ -9054,10 +9059,18 @@ void MainComponent::timerCallback()
             // Artwork + waveform from StageLinQ database.  The panel's
             // StageLinQ state is a track version, kept apart from the Pro DJ
             // Link branch's rekordbox IDs, which the two used to share
-            // (AUDIT SLQ-12); each branch resets the other's.
+            // (AUDIT SLQ-12); each branch resets the other's.  Coming from
+            // the Pro DJ Link branch (displayedPdlMedia set), the displays
+            // are cleared first: a StageLinQ deck with no track would
+            // otherwise keep that branch's artwork and waveform.
+            if (displayedPdlMedia.isNotEmpty())
+            {
+                artworkDisplay.clearImage();
+                waveformDisplay.clearWaveform();
+                displayedPdlMedia.clear();
+            }
             displayedWaveformTrackId = 0;
             displayedArtworkId = 0;
-            displayedPdlMedia.clear();
             {
                 auto netPath = sharedStageLinQInput.getTrackNetworkPath(slqDeck);
                 uint32_t slqTrackVer = sharedStageLinQInput.getTrackVersion(slqDeck);
