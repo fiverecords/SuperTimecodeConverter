@@ -171,8 +171,8 @@ public:
     // by up to half a buffer even though the audio plays smoothly).
     //
     // While paused or stopped we return the anchor verbatim so timecode
-    // freezes correctly, mirroring what the player itself does.  A stop
-    // re-anchors at 0 (see run()).
+    // freezes correctly, mirroring what the player itself does.  A stop,
+    // and the Winamp window going away, re-anchor at 0 (see run()).
     //
     // A player that stops answering stays "Playing" (an IPC failure is not
     // taken as a stop -- see run()), so the extrapolation runs at most
@@ -188,7 +188,16 @@ public:
     // past the last answer; when the answers resume the anchor snaps
     // forward to the audio's position, a step of more than 500 ms that
     // TimecodeEngine takes as a seek (Track Map cues in the step are passed
-    // without firing).
+    // without firing).  A player that keeps answering IPC_ISPLAYING
+    // (playing) but answers -1 to IPC_GETOUTPUTTIME for more than 1 s while
+    // it plays is held the same way: the position holds 1 s past the last
+    // one answered, then steps to the player's.  Past about 1.5 s the step
+    // is over 500 ms and TimecodeEngine takes it as a seek (Track Map cues
+    // in it are passed); a shorter step is played through, so the cues in
+    // it fire late, at the step.  Winamp, WACUP and AIMP answer -1 only for
+    // the first tick or so after a track change (see run()); with the bound
+    // on the answer clock, the IPC_ISPLAYING answers kept such a stretch
+    // running on.
     //
     // The SpinLock guarantees the (pos, time) pair is read atomically as
     // a unit -- without it, the engine could read a freshly-updated
@@ -293,8 +302,20 @@ private:
 
             if (hwnd == nullptr)
             {
+                // No Winamp window: stopped, and re-anchored at 0 with no
+                // lock (anchor time 0) when it was not, as an IPC_ISPLAYING
+                // stop is (below).
+                // Held instead, a Winamp closed while playing and reopened
+                // stopped on the same title kept the last playing position
+                // until play: the reopened player's first answer is a stop
+                // from Stopped, which does not re-anchor (AUDIT UI-13).
                 winampConnected.store(false, std::memory_order_relaxed);
-                state.store(State::Stopped, std::memory_order_relaxed);
+                if (state.exchange(State::Stopped, std::memory_order_relaxed) != State::Stopped)
+                {
+                    const juce::SpinLock::ScopedLockType lock(anchorLock);
+                    positionAnchorMs   = 0.0;
+                    positionAnchorTime = 0.0;
+                }
                 juce::Thread::sleep(kPollIntervalMs);
                 continue;
             }
