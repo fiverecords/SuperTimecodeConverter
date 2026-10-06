@@ -568,8 +568,13 @@ public:
     // it -- metadata and artwork, keyed by the address of the player holding
     // the media -- is kept and re-keyed to newIp, where the callers look from
     // now on (getPlayerIP gives newIp).  An entry newIp already has with a
-    // title is kept over the moved one.  The connections to oldIp are closed
-    // and its dbserver port and NFS state forgotten, as for a lost player.
+    // title is kept over the moved one.  A moved entry that still lacks the
+    // beat grid, cues, phrases, detail or preview is marked not yet asked
+    // for (waveformQueried) and not yet tried over NFS (nfsAttempted), so
+    // the next request for it at newIp runs both phases there.  The
+    // connections to oldIp are closed and its dbserver port and NFS state
+    // (the fetcher's ports, mount handles and export.pdb index for that
+    // address) forgotten, as for a lost player (forgetAddress).
     // invalidatePlayer() here erased the current track's metadata, and
     // nothing asked for it again.  Any thread (the Pro DJ Link network
     // thread).
@@ -596,6 +601,19 @@ public:
             {
                 CacheKey newKey = key;
                 newKey.ip = to;
+                // An entry still missing what the NFS route brings is asked
+                // for again at the new address: an NFS download launched to
+                // the old one before the move (detected only after its 5 s
+                // of silence) fails, or its result finds no entry under the
+                // old key.  The next request (the engine and the PDL View
+                // ask once when the address changes) runs phase 1, and phase
+                // 2 runs NFS there (AUDIT PDL-3).
+                if (!meta.hasBeatGrid() || !meta.hasCueList() || !meta.hasSongStructure()
+                    || !meta.hasDetailWaveform() || !meta.hasWaveform())
+                {
+                    meta.nfsAttempted = false;
+                    meta.waveformQueried = false;   // so requestMetadata does not take it as complete
+                }
                 auto it = metadataCache.find(newKey);
                 if (it == metadataCache.end() || !it->second.isValid())
                     metadataCache[newKey] = std::move(meta);

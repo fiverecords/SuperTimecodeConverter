@@ -736,11 +736,19 @@ public:
     /// Called when a player moves to a new address (readdressPlayer, AUDIT
     /// PDL-3): the same unit, so its media and the metadata cached for it are
     /// still right.  Wire this to DbServerClient::movePlayer(), which keeps
-    /// that metadata under the new address and closes the connections to the
-    /// old one.  Unwired, nothing is told: the metadata stays under the old
-    /// address, where a lookup by track ID alone still finds it and one
-    /// under the new address does not, and the idle dbserver connection to
-    /// the old address is closed after its idle timeout.  Network thread.
+    /// that metadata under the new address (an entry still missing analysis
+    /// is asked for again there), closes the connections to the old one and
+    /// forgets what belongs to the old address: its dbserver port, cooldown
+    /// and retries, and the NFS fetcher's ports, mount handles and
+    /// export.pdb index for it.  Unwired, nothing is told: the metadata
+    /// stays under the old address, where a lookup by track ID alone still
+    /// finds it and one under the new address does not; the idle dbserver
+    /// connection to the old address is closed after its idle timeout; and
+    /// nothing of the old address is forgotten -- which onPlayerLost's
+    /// invalidatePlayer did before AUDIT PDL-3 -- so a device that takes
+    /// that address later in the session gets the moved unit's NFS ports,
+    /// mount handles and export.pdb index, and its track IDs resolve to the
+    /// moved unit's ANLZ paths.  Network thread.
     std::function<void(const juce::String& oldIp, const juce::String& newIp)> onPlayerMoved;
 
     /// Called when a player's own SD (slot 2) or USB (slot 3) slot reports
