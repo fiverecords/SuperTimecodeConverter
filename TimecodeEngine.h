@@ -217,6 +217,7 @@ public:
         trackMapped = false;
         cachedTrackId = 0;
         cachedLoadedPlayer = cachedLoadedSlot = 0;
+        cachedMediaChanges = 0;
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
         cachedBpmMultiplier = 0;
         bpmPlayerOverride = kBpmNoOverride;
@@ -1028,6 +1029,7 @@ public:
         trackMapped = false;
         cachedTrackId = 0;
         cachedLoadedPlayer = cachedLoadedSlot = 0;
+        cachedMediaChanges = 0;
         dbRequestIp.clear();
         lastSeenTrackVersion = 0;
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
@@ -1232,6 +1234,7 @@ public:
                 {
                     cachedLoadedPlayer = sharedProDJLink->getLoadedPlayer(getEffectivePlayer());
                     cachedLoadedSlot   = sharedProDJLink->getLoadedSlot(getEffectivePlayer());
+                    cachedMediaChanges = sharedProDJLink->getMediaChangeCount(cachedLoadedPlayer, cachedLoadedSlot);
                 }
                 cachedTrackId = id;
                 auto tinfo = sharedProDJLink->getTrackInfo(getEffectivePlayer());
@@ -2029,7 +2032,21 @@ public:
                     // next status bumps it again for the same track and
                     // source.  The version is read first (acquire): the ID,
                     // player and slot read after it are that change's or
-                    // newer.  (Tr, the track type, is not exposed.)
+                    // newer.  (Tr, the track type, is not exposed.)  A
+                    // rekordbox ID is unique only within one medium, so the
+                    // count of media changes in that player's slot is part
+                    // of the identity too: the same ID from the same player
+                    // and slot after a USB or SD swap is another track
+                    // (AUDIT META-4).  It is read only here, on a new
+                    // version: between the unmount and the next load the
+                    // deck may still play the old track (emergency loop),
+                    // and asking then would fetch the new medium's track
+                    // with that ID.  A deck that loads the same ID from the
+                    // new medium straight from that emergency loop, with no
+                    // unload in between, bumps no version (ProDJLinkInput
+                    // bumps it for a new ID, player, slot or type only), so
+                    // that load is not seen; a stopped deck unloads at the
+                    // swap (ID 0), and its next load is.
                     uint32_t pdlTrackVer = sharedProDJLink->getTrackVersion(ep);
                     if (pdlTrackVer != lastSeenTrackVersion)
                     {
@@ -2037,12 +2054,15 @@ public:
                         uint32_t newId = sharedProDJLink->getTrackID(ep);
                         const uint8_t newDr = sharedProDJLink->getLoadedPlayer(ep);
                         const uint8_t newSr = sharedProDJLink->getLoadedSlot(ep);
+                        const uint32_t newMc = sharedProDJLink->getMediaChangeCount(newDr, newSr);
                         if (newId != 0 && (newId != cachedTrackId
-                                           || newDr != cachedLoadedPlayer || newSr != cachedLoadedSlot))
+                                           || newDr != cachedLoadedPlayer || newSr != cachedLoadedSlot
+                                           || newMc != cachedMediaChanges))
                         {
                             cachedTrackId = newId;
                             cachedLoadedPlayer = newDr;
                             cachedLoadedSlot = newSr;
+                            cachedMediaChanges = newMc;
                             auto tinfo = sharedProDJLink->getTrackInfo(ep);
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
@@ -3788,6 +3808,7 @@ private:
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         cachedTrackId = 0;
         cachedLoadedPlayer = cachedLoadedSlot = 0;
+        cachedMediaChanges = 0;
         dbRequestIp.clear();
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
@@ -4078,6 +4099,7 @@ private:
     uint32_t  cachedTrackId     = 0;        // currently tracked Track ID: rekordbox ID (Pro DJ Link), deck load counter (StageLinQ), 0 (Winamp)
     uint8_t   cachedLoadedPlayer = 0;       // Pro DJ Link: player (Dr) and slot (Sr) the track was
     uint8_t   cachedLoadedSlot   = 0;       //   loaded from -- part of its identity (AUDIT PDL-7)
+    uint32_t  cachedMediaChanges = 0;       //   ... and that slot's media change count (AUDIT META-4)
     juce::String dbRequestIp;               // Pro DJ Link: address last asked for its metadata (AUDIT PDL-3)
     uint32_t  lastSeenTrackVersion = 0;     // per-engine version counter for track change detection
     int       cachedOffH = 0, cachedOffM = 0, cachedOffS = 0, cachedOffF = 0;
