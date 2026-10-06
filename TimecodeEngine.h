@@ -37,8 +37,14 @@
 // AudioThru is only available on the primary engine (index 0).
 //==============================================================================
 // All public methods of TimecodeEngine are designed to be called exclusively
-// from the JUCE message thread.  Protocol handler callbacks (MTC/ArtNet/LTC)
-// communicate back via atomics only.  No additional synchronisation is needed.
+// from the JUCE message thread, which also runs tick(); the engine's own
+// state needs no lock.  The protocol handlers run on their own threads
+// (MIDI, network, audio) and publish what the engine reads through atomics,
+// sequence locks (LTC, Art-Net and LA-Net in, the Pro DJ Link position) or
+// short locks of their own, taken by the getters the engine calls (e.g.
+// MtcInput's spin lock, WinampInput's position anchor, HippotizerInput's
+// channel lock, a Pro DJ Link player's identity, DbServerClient's cache,
+// StageLinQ's strings under a mutex).
 inline constexpr int kPrimaryEngineIndex = 0;
 inline constexpr int kMaxEngines = 8;
 
@@ -146,11 +152,9 @@ public:
     //==========================================================================
     InputSource getActiveInput() const { return activeInput; }
     FrameRate getCurrentFps() const { return currentFps; }
-    Timecode getCurrentTimecode() const
-    {
-        const juce::SpinLock::ScopedLockType sl(timecodeLock);
-        return currentTimecode;
-    }
+    /// Message thread, like the tick() that writes it.  (A spin lock taken
+    /// here and nowhere else guarded nothing and is gone, AUDIT ENG-16.)
+    Timecode getCurrentTimecode() const { return currentTimecode; }
     bool isSourceActive() const { return sourceActive; }
     bool getUserOverrodeLtcFps() const { return userOverrodeLtcFps; }
 
@@ -1147,12 +1151,6 @@ public:
     void setTrackMap(TrackMap* map)
     {
         trackMapPtr = map;
-        if (map == nullptr)
-        {
-            // Clear pending flags to avoid stale operations on a null pointer
-            trackMapDirty = false;
-            trackMapAutoFilled = false;
-        }
     }
 
     /// The per-engine override layer (see TrackMapOverrides).  Owned here so
@@ -1412,13 +1410,15 @@ public:
             requestDbMetadata(cachedTrackId);
     }
 
-    /// Returns true (once) if auto-fill modified the TrackMap and it was saved.
-    /// Used by MainComponent to refresh the TrackMapEditor window if open.
-    bool consumeTrackMapAutoFilled()
-    {
-        if (trackMapAutoFilled) { trackMapAutoFilled = false; return true; }
-        return false;
-    }
+    /// Always false: the engine does not fill the TrackMap in.  An auto-fill
+    /// in tick() once marked the map dirty, saved it (AUDIT C8) and set the
+    /// flag this returned, so MainComponent refreshed the TrackMap editor;
+    /// the auto-fill is gone (nothing sets the flags anywhere in this
+    /// repository's history, back to 1.9.12-dev), and the save and the flag
+    /// went with it (AUDIT ENG-18).  The cue auto-populate that fills
+    /// entries today is in ProDJLinkView and MainComponent.  Kept so
+    /// MainComponent's call still compiles.  Message thread.
+    bool consumeTrackMapAutoFilled() { return false; }
 
     //==========================================================================
     // Track change triggers (MIDI / OSC)
@@ -2050,17 +2050,6 @@ public:
                         }
                     }
 
-                    // --- Persist auto-filled metadata ---
-                    // tick() runs on the message thread (timerCallback), so we can
-                    // call save() directly.  The previous callAsync captured a raw
-                    // pointer that could dangle if the app closed between post and
-                    // execution.
-                    if (trackMapDirty && trackMapPtr != nullptr)
-                    {
-                        trackMapDirty = false;
-                        trackMapPtr->saveAsync();   // C8: serialised and written off the tick
-                    }
-
                     // Deferred duration pickup: NXS2 doesn't report duration in
                     // protocol packets.  If we missed it at track-change time,
                     // check ProDJLinkInput (CDJ-3000 abspos) or dbClient cache.
@@ -2416,13 +2405,6 @@ public:
                             fireTrackTrigger(entry);
                             loadCuePointsForTrack(entry);
                         }
-                    }
-
-                    // Persist auto-filled metadata
-                    if (trackMapDirty && trackMapPtr != nullptr)
-                    {
-                        trackMapDirty = false;
-                        trackMapPtr->saveAsync();   // C8: serialised and written off the tick
                     }
 
                     // Deferred duration pickup: TrackLength may arrive after
@@ -3313,7 +3295,6 @@ private:
     // Input state
     InputSource activeInput = InputSource::SystemTime;
     FrameRate currentFps = FrameRate::FPS_30;
-    mutable juce::SpinLock timecodeLock;  // protects currentTimecode for getCurrentTimecode() thread safety
     Timecode currentTimecode;
     bool sourceActive = true;
     bool outputsWereActive = false;  // previous sourceActive state for transition detection
@@ -3995,8 +3976,6 @@ private:
     MixerMap* slqMixerMapPtr    = nullptr;  // Denon StageLinQ mixer map
     bool      trackMapEnabled   = false;
     bool      trackMapped       = false;    // current track has a mapping
-    bool      trackMapDirty     = false;    // auto-fill modified map, needs save
-    bool      trackMapAutoFilled = false;   // UI-consumable: editor needs refresh
     uint32_t  cachedTrackId     = 0;        // currently tracked Track ID: rekordbox ID (Pro DJ Link), deck load counter (StageLinQ), 0 (Winamp)
     uint8_t   cachedLoadedPlayer = 0;       // Pro DJ Link: player (Dr) and slot (Sr) the track was
     uint8_t   cachedLoadedSlot   = 0;       //   loaded from -- part of its identity (AUDIT PDL-7)
