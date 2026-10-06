@@ -112,8 +112,17 @@ public:
     AnlzResult fetchByTrackId(const juce::String& playerIP, uint8_t slot,
                               uint32_t trackId)
     {
+        return fetchByTrackId(playerIP, slot, trackId, cancelToken());
+    }
+
+    /// As above, for a fetch decided when @p token was taken (cancelToken()):
+    /// a cancel() after that moment ends it, even one that lands before the
+    /// thread running the fetch has begun (AUDIT WIRE-6).
+    AnlzResult fetchByTrackId(const juce::String& playerIP, uint8_t slot,
+                              uint32_t trackId, uint32_t token)
+    {
         AnlzResult result;
-        fetchGeneration = cancelGeneration.load(std::memory_order_relaxed);
+        fetchGeneration = token;
         if (playerIP.isEmpty() || trackId == 0) return result;
 
         juce::String mountPath = slotToMountPath(slot);
@@ -220,11 +229,17 @@ public:
         return m;
     }
 
-    /// Abandon the fetch in progress, if any: it returns within ~50 ms with
-    /// what it has (ok=false when a file is missing).  Any thread; a fetch that
-    /// starts after the call is not affected.  For DbServerClient::stop(),
-    /// before it joins the NFS thread.
+    /// Abandon the fetch in progress, if any, and a fetch whose token was taken
+    /// before the call but which has not begun yet: it returns within ~50 ms
+    /// with what it has (ok=false when a file is missing).  Any thread; a
+    /// fetch whose token is taken after the call is not affected.  For
+    /// DbServerClient::stop(), before it joins the NFS thread.
     void cancel() noexcept { cancelGeneration.fetch_add(1, std::memory_order_relaxed); }
+
+    /// The token for a fetch decided now (any thread): DbServerClient takes it
+    /// on its worker before it starts the NFS thread, and passes it to
+    /// fetchByTrackId.
+    uint32_t cancelToken() const noexcept { return cancelGeneration.load(std::memory_order_relaxed); }
 
     //==========================================================================
     // Cache invalidation.  What the fetcher learns is cached per player IP
@@ -1583,10 +1598,11 @@ private:
     uint32_t nextXid = 1;  // RPC transaction ID counter
 
     // Cancellation (cancel()).  A fetch runs on DbServerClient's NFS thread,
-    // one at a time; it notes cancelGeneration when it begins and stops when
-    // the value moves.
+    // one at a time; it begins from the value of cancelGeneration its token
+    // holds (taken at launch, or when it begins) and stops when the value
+    // moves.
     std::atomic<uint32_t> cancelGeneration { 0 };
-    uint32_t fetchGeneration = 0;   // NFS thread only
+    uint32_t fetchGeneration = 0;   // the running fetch's token; NFS thread only
     bool isCancelled() const noexcept
     {
         return cancelGeneration.load(std::memory_order_relaxed) != fetchGeneration;

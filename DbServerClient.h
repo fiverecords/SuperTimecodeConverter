@@ -247,9 +247,11 @@ public:
         if (isThreadRunning())
             stopThread(kStopTimeoutMs);
 
-        // Wait for any in-flight NFS download to finish.  It is not
-        // cancelled: a long export.pdb download keeps stop() waiting until
-        // it ends (stopping it is the NFS side's, AUDIT WIRE-6).
+        // End any in-flight NFS download (NfsAnlzFetcher::cancel, AUDIT
+        // WIRE-6) and wait for its thread.  The worker took the download's
+        // cancel token before it started the thread, so a download whose
+        // thread has not begun yet ends too.
+        nfsAnlzFetcher.cancel();
         if (nfsThread.joinable())
             nfsThread.join();
 
@@ -3452,12 +3454,15 @@ private:
         if (threadShouldExit()) return;
         forgetLostPlayersInNfs();   // before a download could use their stale handles
 
+        // Taken here, before the thread exists: stop()'s cancel() ends this
+        // download even if it lands before the thread begins (AUDIT WIRE-6).
+        const uint32_t cancelToken = nfsAnlzFetcher.cancelToken();
         nfsBusy.store(true, std::memory_order_release);
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey, cancelToken]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
             DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
-            NfsAnlzFetcher::AnlzResult anlz = nfsAnlzFetcher.fetchByTrackId(playerIP, slot, trackId);
+            NfsAnlzFetcher::AnlzResult anlz = nfsAnlzFetcher.fetchByTrackId(playerIP, slot, trackId, cancelToken);
 
             if (anlz.ok && isRunningFlag.load(std::memory_order_relaxed))
             {
