@@ -22,10 +22,12 @@
 // to a temporary file of its own in the same directory and moved over the
 // target in one step, one move at a time (AUDIT META-10): a reader sees the
 // old file or the new one, never half of one.  Of two saves of one key, the
-// one moved last wins.  Loads read the whole file and reject one that
-// is shorter than its header says, so a truncated file (an older version
-// interrupted mid-write) is ignored instead of loading as zeros.  The cache
-// has no size bound and no expiry.
+// one moved last wins.  Loads read the whole file and reject a truncated one
+// (an older version interrupted mid-write): a .wfc or .anlz shorter than its
+// header says, which used to load as zeros, and a .art.png without the IEND
+// chunk at its end, which crashed JUCE's PNG reader.  The cache has no size
+// bound and no expiry, and a temporary file left by a crash between a write
+// and its move stays in the directory (hidden, named after the target).
 
 #pragma once
 #include <JuceHeader.h>
@@ -119,17 +121,28 @@ public:
         return writeAtomically(getArtworkFile(trackKey), fos);
     }
 
-    /// Load cached artwork for a track key.
+    /// Load cached artwork for a track key.  The whole file is read, and one
+    /// that does not start with the PNG signature and end with the IEND
+    /// chunk saveArtwork's PNG writer puts last (a write an older version
+    /// left cut short) is rejected before it reaches the decoder: JUCE's PNG
+    /// reader crashed on such a file (AUDIT META-10).
     static juce::Image loadArtwork(const std::string& trackKey)
     {
-        auto file = getArtworkFile(trackKey);
-        if (!file.existsAsFile()) return {};
+        juce::MemoryBlock file;
+        if (!readWholeFile(getArtworkFile(trackKey), file)) return {};
 
-        juce::FileInputStream fis(file);
-        if (fis.failedToOpen()) return {};
+        static const uint8_t signature[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+        static const uint8_t iend[12] = { 0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
+        const auto* d = static_cast<const uint8_t*>(file.getData());
+        const size_t n = file.getSize();
+        if (n < sizeof(signature) + sizeof(iend)
+            || std::memcmp(d, signature, sizeof(signature)) != 0
+            || std::memcmp(d + n - sizeof(iend), iend, sizeof(iend)) != 0)
+            return {};
 
+        juce::MemoryInputStream in(file, false);
         juce::PNGImageFormat png;
-        return png.decodeImage(fis);
+        return png.decodeImage(in);
     }
 
     /// Check if cached artwork exists for a track key.
@@ -373,7 +386,8 @@ private:
     }
 
     /// Largest cache file a load will read (the largest .anlz saveAnlz can
-    /// write within loadAnlz's limits is about 7.7 MB).
+    /// write within loadAnlz's limits is about 7.7 MB; an artwork PNG larger
+    /// than this is not loaded).
     static constexpr juce::int64 kMaxFileBytes = 16 * 1024 * 1024;
 
     /// Serialises the creation of the cache directory and the moves of
