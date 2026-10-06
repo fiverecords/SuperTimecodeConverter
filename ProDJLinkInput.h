@@ -717,9 +717,19 @@ public:
     int  getVCDJPlayerNumber() const    { return vCDJPlayerNumber; }
 
     /// Called when a player disappears from the network (10s keepalive timeout),
-    /// and with its old address when a player moves to a new one (AUDIT PDL-3).
+    /// or when another device takes its number at a new address (AUDIT PDL-3).
     /// Wire this to DbServerClient::invalidatePlayer() to close stale connections.
+    /// Network thread.
     std::function<void(const juce::String& playerIP)> onPlayerLost;
+
+    /// Called when a player moves to a new address (readdressPlayer, AUDIT
+    /// PDL-3): the same unit, so its media and the metadata cached for it are
+    /// still right.  Wire this to DbServerClient::movePlayer(), which keeps
+    /// that metadata under the new address and closes the connections to the
+    /// old one.  Unwired, nothing is told: the metadata stays under the old
+    /// address (lookups by track ID alone still find it) and its idle
+    /// dbserver connection is closed after its idle timeout.  Network thread.
+    std::function<void(const juce::String& oldIp, const juce::String& newIp)> onPlayerMoved;
     void setVCDJPlayerNumber(int n)     { vCDJPlayerNumber = juce::jlimit(1, 127, n); }
 
     /// Bridge identity profile for the 54B keepalive (see constants above).
@@ -2551,9 +2561,11 @@ private:
         // Kept, the slot stayed alive on these keepalives while every 0x0b
         // was dropped by the address checks, and the 95 B, 0x55 and
         // dbserver kept going to the old address (AUDIT PDL-3).  The same
-        // model is taken as the same player and moved in place
-        // (readdressPlayer); another model is another player, and its slot
-        // starts again from this keepalive, as after the 10 s timeout.
+        // model with the same MAC (bytes 38-43 of the keepalive) is taken as
+        // the same player and moved in place (readdressPlayer); another model,
+        // or another unit of the same model (a spare swapped in for a failed
+        // one), is another player, and its slot starts again from this
+        // keepalive, as after the 10 s timeout.
         // While the old address is still heard, two live devices use this
         // number (dysentery startup.adoc: a device on an XDJ-XZ's laptop
         // port may be let use 1 or 2), and the slot stays where it is, as
@@ -2563,8 +2575,9 @@ private:
             && heardNow - p.addrHeardMs > ProDJLink::kReaddressQuietMs)
         {
             DBG("ProDJLink: Player " << (int)pn << " moved from " << p.ipStr << " to " << sender);
-            if (hasSameModel(p, data, len, 12))
-                readdressPlayer(idx, sender, len >= 44 ? data + 38 : nullptr);
+            const uint8_t* mac = len >= 44 ? data + 38 : nullptr;
+            if (hasSameModel(p, data, len, 12) && hasSameMac(p, mac))
+                readdressPlayer(idx, sender, mac);
             else
                 losePlayer(idx);
         }
@@ -3252,7 +3265,8 @@ private:
     /// Forget player slot i (0-based) and tell onPlayerLost its old address,
     /// so DbServerClient closes stale TCP connections and clears cached
     /// metadata for it.  Network thread: the 10 s timeout (gcPlayers), and
-    /// another model on a known number at a new address (AUDIT PDL-3).
+    /// another model, or from a keepalive another MAC, on a known number at
+    /// a new address (AUDIT PDL-3).
     void losePlayer(int i)
     {
         const juce::String lostIp(players[(size_t) i].ipStr);
@@ -3275,10 +3289,23 @@ private:
         return std::strncmp(name, p.model, sizeof(name)) == 0;
     }
 
+    /// Network thread: whether the MAC of a keepalive (6 bytes at mac) is the
+    /// one slot p has.  Unknown on either side -- no MAC given, or all zeros,
+    /// as for a slot found from status packets, which carry none -- counts as
+    /// the same, so the model decides alone.
+    static bool hasSameMac(const ProDJLinkPlayerState& p, const uint8_t* mac)
+    {
+        static const uint8_t none[6] = {};
+        if (mac == nullptr || std::memcmp(mac, none, 6) == 0 || std::memcmp(p.macAddr, none, 6) == 0)
+            return true;
+        return std::memcmp(p.macAddr, mac, 6) == 0;
+    }
+
     /// Network thread: player slot i (0-based), silent at its address for
-    /// kReaddressQuietMs, is heard with the same model at newIp: the same
-    /// player has moved (AUDIT PDL-3).  Only the address changes, and the
-    /// MAC when a keepalive gives one.  Its play state, on-air, master and
+    /// kReaddressQuietMs, is heard with the same model (and, from a
+    /// keepalive, the same MAC) at newIp: the same player has moved (AUDIT
+    /// PDL-3).  Only the address changes, and the MAC when a keepalive gives
+    /// one.  Its play state, on-air, master and
     /// track fields stay: the status handler does not check the address of
     /// a keepalive-discovered player, so the new address's status has kept
     /// them current, and clearing them (reset()) showed the deck stopped
@@ -3287,8 +3314,12 @@ private:
     /// 0x0b format and the BPM stay too; the 0x0b from the new address,
     /// accepted from now on, refreshes them.  Only the reverse-play
     /// reference is dropped, so the jump across the silence does not read
-    /// as reverse.  onPlayerLost gets the old address, so DbServerClient
-    /// closes its connections there.
+    /// as reverse.  onPlayerMoved gets the old and the new address: the
+    /// unit and its media are the same, so DbServerClient keeps what it
+    /// cached for them under the new address.  The move used to report the
+    /// old address to onPlayerLost, which erased the current track's
+    /// metadata, and nothing asked for it again: the track ID and version
+    /// do not change in a move.
     void readdressPlayer(int i, const juce::String& newIp, const uint8_t* mac)
     {
         auto& p = players[(size_t) i];
@@ -3302,8 +3333,8 @@ private:
                 std::memcpy(p.macAddr, mac, 6);
         }
         p.prevAbsPosMs = 0;
-        if (onPlayerLost && oldIp.isNotEmpty())
-            onPlayerLost(oldIp);
+        if (onPlayerMoved && oldIp.isNotEmpty())
+            onPlayerMoved(oldIp, newIp);
     }
 
     //==========================================================================

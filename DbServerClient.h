@@ -519,18 +519,70 @@ public:
                     ++it;
             }
         }
-        // Queue this player for connection close by the worker thread.
-        // Closing the socket directly from here would race against the worker
-        // which may be in the middle of a TCP query using that socket.
+        forgetAddress(playerIP);
+    }
+
+    //==========================================================================
+    // A player moved to a new address (ProDJLinkInput::onPlayerMoved, AUDIT
+    // PDL-3).  It is the same unit with the same media, so what is cached for
+    // it -- metadata and artwork, keyed by the address of the player holding
+    // the media -- is kept and re-keyed to newIp, where the callers look from
+    // now on (getPlayerIP gives newIp).  An entry newIp already has with a
+    // title is kept over the moved one.  The connections to oldIp are closed
+    // and its dbserver port and NFS state forgotten, as for a lost player.
+    // invalidatePlayer() here erased the current track's metadata, and
+    // nothing asked for it again.  Any thread (the Pro DJ Link network
+    // thread).
+    //==========================================================================
+    void movePlayer(const juce::String& oldIp, const juce::String& newIp)
+    {
+        const uint32_t from = ipToUint32(oldIp), to = ipToUint32(newIp);
+        if (from == to)
+            return;
         {
-            const juce::ScopedLock sl(pendingInvalidateLock);
-            pendingInvalidateIPs.addIfNotAlreadyThere(playerIP);
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            std::vector<std::pair<CacheKey, TrackMetadata>> moved;
+            for (auto it = metadataCache.begin(); it != metadataCache.end(); )
+            {
+                if (it->first.ip == from)
+                {
+                    moved.emplace_back(it->first, std::move(it->second));
+                    it = metadataCache.erase(it);
+                }
+                else
+                    ++it;
+            }
+            for (auto& [key, meta] : moved)
+            {
+                CacheKey newKey = key;
+                newKey.ip = to;
+                auto it = metadataCache.find(newKey);
+                if (it == metadataCache.end() || !it->second.isValid())
+                    metadataCache[newKey] = std::move(meta);
+            }
         }
-        // Drop cached db port — if the player reappears it may have changed.
         {
-            const juce::ScopedLock sl(knownDbPortsLock);
-            knownDbPorts.erase(playerIP.toStdString());
+            const juce::SpinLock::ScopedLockType lock(artCacheLock);
+            std::vector<std::pair<CacheKey, juce::Image>> moved;
+            for (auto it = artworkCache.begin(); it != artworkCache.end(); )
+            {
+                if (it->first.ip == from)
+                {
+                    moved.emplace_back(it->first, it->second);
+                    it = artworkCache.erase(it);
+                }
+                else
+                    ++it;
+            }
+            for (auto& [key, img] : moved)
+            {
+                CacheKey newKey = key;
+                newKey.ip = to;
+                if (artworkCache.find(newKey) == artworkCache.end())
+                    artworkCache[newKey] = img;
+            }
         }
+        forgetAddress(oldIp);
     }
 
     /// Stats for UI/debugging
@@ -548,6 +600,24 @@ public:
     uint32_t getDbPortInboundCount() const { return dbPortInboundCount.load(std::memory_order_relaxed); }
 
 private:
+    /// An address no player uses any more (lost, or moved away): queue it
+    /// for the worker, which closes its connections and drops its cooldown,
+    /// retries and NFS state; and drop its dbserver port -- if a player
+    /// appears there again, the port may have changed.  Any thread.
+    void forgetAddress(const juce::String& playerIP)
+    {
+        // Closing the socket directly from here would race against the worker
+        // which may be in the middle of a TCP query using that socket.
+        {
+            const juce::ScopedLock sl(pendingInvalidateLock);
+            pendingInvalidateIPs.addIfNotAlreadyThere(playerIP);
+        }
+        {
+            const juce::ScopedLock sl(knownDbPortsLock);
+            knownDbPorts.erase(playerIP.toStdString());
+        }
+    }
+
     /// Internal enqueue (called from background thread for phase 2 re-enqueue).
     void enqueueInternal(const juce::String& playerIP, const juce::String& playerModel,
                          uint8_t slot, uint8_t trackType, uint32_t trackId,
@@ -2810,9 +2880,9 @@ private:
 
             if (threadShouldExit()) break;
 
-            // Process pending invalidations — close connections for players
-            // that were reported lost by ProDJLink. Safe to do here because
-            // we're between TCP queries on this thread.
+            // Process pending invalidations — close connections to addresses
+            // ProDJLink reported lost or moved away from (forgetAddress). Safe
+            // to do here because we're between TCP queries on this thread.
             {
                 juce::StringArray ips;
                 {
@@ -2825,7 +2895,7 @@ private:
                     {
                         if (conn.playerIP == ip)
                         {
-                            DBG("DbServerClient: closing connection to lost player " + ip);
+                            DBG("DbServerClient: closing connection to " + ip + " (player lost or moved)");
                             // Player is off the network -- teardown has nowhere
                             // to go and waitUntilReady would block for 200ms
                             // waiting for a close signal that will never arrive.
@@ -3308,8 +3378,9 @@ private:
     std::unordered_map<std::string, int> knownDbPorts;
     juce::CriticalSection knownDbPortsLock;
 
-    // Deferred invalidation: external threads (e.g. ProDJLink onPlayerLost)
-    // queue IPs here; the worker thread closes the matching connections
+    // Deferred invalidation: external threads (ProDJLink onPlayerLost and
+    // onPlayerMoved, through forgetAddress) queue IPs here; the worker
+    // thread closes the matching connections
     // between TCP queries. Avoids closing sockets while they are in use.
     juce::StringArray pendingInvalidateIPs;
     juce::CriticalSection pendingInvalidateLock;
