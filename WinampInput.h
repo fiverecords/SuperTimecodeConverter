@@ -106,10 +106,10 @@ public:
         state.store(State::Stopped,     std::memory_order_relaxed);
         durationSec.store(0,            std::memory_order_relaxed);
         playlistIndex.store(-1,         std::memory_order_relaxed);
-        lastPollTime.store(0.0,         std::memory_order_relaxed);
+        lastAnswerTime.store(0.0,       std::memory_order_relaxed);
         {
             const juce::SpinLock::ScopedLockType lock(anchorLock);
-            positionAnchorMs   = 0;
+            positionAnchorMs   = 0.0;
             positionAnchorTime = 0.0;
         }
 
@@ -126,19 +126,20 @@ public:
     // of playback state -- Winamp can be connected and stopped at the same time.
     bool isConnected() const { return winampConnected.load(std::memory_order_relaxed); }
 
-    // True if the input loop polled Winamp within kStaleTimeoutMs ago.
-    // The engine uses this the same way it uses isReceiving() on the
-    // MTC / ArtNet / LTC inputs: as the gate that promotes the source
-    // to "active" and lets its data drive the output.
+    // True if Winamp answered an IPC call within kStaleTimeoutMs.  A window
+    // that is found but does not answer (a hung or long-busy player) is
+    // connected and not receiving, and getPositionMs() holds its position.
+    // TimecodeEngine does not call it: it gates the Winamp source on
+    // isConnected() and the play state.
     bool isReceiving() const
     {
         if (!winampConnected.load(std::memory_order_relaxed))
             return false;
-        double lpt = lastPollTime.load(std::memory_order_relaxed);
-        if (lpt == 0.0)
+        double lat = lastAnswerTime.load(std::memory_order_relaxed);
+        if (lat == 0.0)
             return false;
         double now = juce::Time::getMillisecondCounterHiRes();
-        return (now - lpt) < kStaleTimeoutMs;
+        return (now - lat) < kStaleTimeoutMs;
     }
 
     State    getState()         const { return state.load(std::memory_order_relaxed); }
@@ -171,6 +172,11 @@ public:
     // While paused or stopped we return the anchor verbatim so timecode
     // freezes correctly, mirroring what the player itself does.
     //
+    // A player that stops answering stays "Playing" (an IPC failure is not
+    // taken as a stop -- see run()), so the extrapolation runs at most
+    // kStaleTimeoutMs past Winamp's last answer, i.e. until isReceiving()
+    // turns false, and then holds (AUDIT UI-13).  It ran on without limit.
+    //
     // The SpinLock guarantees the (pos, time) pair is read atomically as
     // a unit -- without it, the engine could read a freshly-updated
     // anchorPos paired with a stale anchorTime (or vice versa) in the
@@ -178,8 +184,8 @@ public:
     // interpolated value that's off by tens of ms for one tick.
     int32_t getPositionMs() const
     {
-        int32_t anchorP;
-        double  anchorT;
+        double anchorP;
+        double anchorT;
         {
             const juce::SpinLock::ScopedLockType lock(anchorLock);
             anchorP = positionAnchorMs;
@@ -188,12 +194,14 @@ public:
 
         State s = state.load(std::memory_order_relaxed);
         if (s != State::Playing || anchorT <= 0.0)
-            return anchorP;
+            return (int32_t)anchorP;
 
-        double now = juce::Time::getMillisecondCounterHiRes();
-        double dt  = now - anchorT;
+        double now   = juce::Time::getMillisecondCounterHiRes();
+        double until = juce::jmin(now, lastAnswerTime.load(std::memory_order_relaxed)
+                                           + kStaleTimeoutMs);
+        double dt    = until - anchorT;
         if (dt < 0.0) dt = 0.0;          // monotonic clock guard
-        return anchorP + (int32_t)dt;
+        return (int32_t)(anchorP + dt);
     }
 
     juce::String getArtist() const
@@ -219,7 +227,10 @@ private:
     static constexpr int IPC_GETLISTPOS    = 125;  // 0-based playlist index of current track
 
     static constexpr int kPollIntervalMs   = 50;     // 20 Hz
-    static constexpr double kStaleTimeoutMs = 500.0;  // 10 missed polls -> "not receiving"
+    // No IPC answer for this long -> "not receiving".  A busy player's
+    // stalls (the VBR scan after a load) last hundreds of ms and are
+    // bridged by the extrapolation; a longer silence is not.
+    static constexpr double kStaleTimeoutMs = 1000.0;
 
     //--------------------------------------------------------------------------
     // Cross-process IPC send with a hung-process timeout.
@@ -240,12 +251,19 @@ private:
     //
     // The 200 ms timeout is generous -- responsive Winamp / WACUP serves these
     // selectors in well under 1 ms.
-    LRESULT ipcSend(HWND hwnd, WPARAM wparam, LPARAM lparam) const
+    //
+    // An answer -- any value, -1 included -- is timed in lastAnswerTime, the
+    // clock isReceiving() and getPositionMs() read.
+    LRESULT ipcSend(HWND hwnd, WPARAM wparam, LPARAM lparam)
     {
         DWORD_PTR result = 0;
         LRESULT ok = ::SendMessageTimeoutA(hwnd, WM_WA_IPC, wparam, lparam,
                                             SMTO_ABORTIFHUNG, 200, &result);
-        return ok != 0 ? (LRESULT)result : (LRESULT)-1;
+        if (ok == 0)
+            return (LRESULT)-1;
+        lastAnswerTime.store(juce::Time::getMillisecondCounterHiRes(),
+                             std::memory_order_relaxed);
+        return (LRESULT)result;
     }
 
     //--------------------------------------------------------------------------
@@ -304,8 +322,14 @@ private:
             // The anchor is filtered through a single-pole IIR low-pass with
             // alpha = 1/20 (one part in twenty of the difference applied per
             // poll), plus a hard-snap escape hatch for genuine transport
-            // events.  Why a continuous filter instead of a tiered slew /
-            // dead-zone scheme:
+            // events.  The anchor and the arithmetic are in double: in
+            // int32_t, drift / 20 left any drift under 20 ms uncorrected (a
+            // +/-19 ms dead zone) and the truncated time since the anchor
+            // lost ~0.5 ms a poll, so the output ran ~10 ms behind
+            // (AUDIT UI-13).
+            //
+            // Why a continuous filter instead of a tiered slew / dead-zone
+            // scheme:
             //
             // Winamp / WACUP / AIMP all round their reported position to an
             // audio-buffer boundary (1024 samples = ~23 ms at 44.1 kHz,
@@ -331,11 +355,11 @@ private:
             LRESULT pos = ipcSend(hwnd, 0, IPC_GETOUTPUTTIME);
             if (pos >= 0)
             {
-                double  now         = juce::Time::getMillisecondCounterHiRes();
-                int32_t reportedPos = (int32_t)pos;
+                double now         = juce::Time::getMillisecondCounterHiRes();
+                double reportedPos = (double)pos;
 
-                int32_t oldAnchorP;
-                double  oldAnchorT;
+                double oldAnchorP;
+                double oldAnchorT;
                 {
                     const juce::SpinLock::ScopedLockType lock(anchorLock);
                     oldAnchorP = positionAnchorMs;
@@ -343,26 +367,26 @@ private:
                 }
 
                 // What the local interpolation thinks the position is at
-                // "now" (this is what the engine would read from
-                // getPositionMs() right now if it were called) -- the IIR
+                // "now" (what getPositionMs() returns now, before its stale
+                // limit: after a silence longer than kStaleTimeoutMs this
+                // is where a player that kept playing has got to) -- the IIR
                 // operates on the difference between that and the report,
                 // not between the raw anchor and the report, otherwise the
                 // time-since-anchor delay would look like extra drift.
-                State   s = state.load(std::memory_order_relaxed);
-                int32_t curInterpolated;
+                State  s = state.load(std::memory_order_relaxed);
+                double curInterpolated;
                 if (s == State::Playing && oldAnchorT > 0.0)
-                    curInterpolated = oldAnchorP + (int32_t)(now - oldAnchorT);
+                    curInterpolated = oldAnchorP + (now - oldAnchorT);
                 else
                     curInterpolated = oldAnchorP;
 
-                int32_t drift    = reportedPos - curInterpolated;
-                int32_t absDrift = drift < 0 ? -drift : drift;
+                double drift = reportedPos - curInterpolated;
 
-                int32_t newAnchorP;
-                if (oldAnchorT <= 0.0 || absDrift >= 500)
-                    newAnchorP = reportedPos;                    // snap (first lock / seek)
+                double newAnchorP;
+                if (oldAnchorT <= 0.0 || std::abs(drift) >= 500.0)
+                    newAnchorP = reportedPos;                     // snap (first lock / seek)
                 else
-                    newAnchorP = curInterpolated + drift / 20;   // IIR, tau = 1 s
+                    newAnchorP = curInterpolated + drift / 20.0;  // IIR, tau = 1 s
 
                 {
                     const juce::SpinLock::ScopedLockType lock(anchorLock);
@@ -395,7 +419,7 @@ private:
             // catches every visible change because the title is the same
             // surface the user sees in the player window.  One Win32 call
             // per poll, no allocation in the common "no change" path.
-            juce::String currentTitleBar = fetchTitleBar(hwnd);
+            juce::String currentTitleBar = stripPlaybackStateSuffix(fetchTitleBar(hwnd));
             if (currentTitleBar.isNotEmpty() && currentTitleBar != lastSeenTitleBar)
             {
                 lastSeenTitleBar = currentTitleBar;
@@ -424,14 +448,11 @@ private:
                 // previous track's anchor forward.
                 {
                     const juce::SpinLock::ScopedLockType lock(anchorLock);
-                    positionAnchorMs   = 0;
+                    positionAnchorMs   = 0.0;
                     positionAnchorTime = juce::Time::getMillisecondCounterHiRes();
                 }
                 durationSec.store(0, std::memory_order_relaxed);
             }
-
-            lastPollTime.store(juce::Time::getMillisecondCounterHiRes(),
-                               std::memory_order_relaxed);
 
             juce::Thread::sleep(kPollIntervalMs);
         }
@@ -525,6 +546,24 @@ private:
         title  = newTitle;
     }
 
+    /// Winamp appends " [Paused]" or " [Stopped]" to its window title while
+    /// paused or stopped.  That is not part of the track, so it is removed
+    /// before the title is compared or parsed: kept, every pause and resume
+    /// read as a track change (triggers fired, cues re-armed, position
+    /// re-anchored at 0) and the title parsed as "Winamp [Paused]", with
+    /// "Artist - Title" as the artist (AUDIT UI-13).
+    static juce::String stripPlaybackStateSuffix(const juce::String& titleBar)
+    {
+        static const char* const kStateSuffixes[] = { "[Paused]", "[Stopped]" };
+        for (auto* suffix : kStateSuffixes)
+        {
+            if (titleBar.endsWithIgnoreCase(suffix))
+                return titleBar.dropLastCharacters((int)juce::String(suffix).length())
+                               .trimEnd();
+        }
+        return titleBar;
+    }
+
     /// Read the current title bar text into a juce::String.
     ///
     /// Cheap Win32 call; safe to do on every poll cycle.  Empty result on
@@ -545,7 +584,7 @@ private:
     std::atomic<State>   state            { State::Stopped };
     std::atomic<int32_t> durationSec      { 0 };
     std::atomic<int>     playlistIndex    { -1 };
-    std::atomic<double>  lastPollTime     { 0.0 };
+    std::atomic<double>  lastAnswerTime   { 0.0 };   // last IPC answer (ipcSend)
 
     // Position anchor: a (position, wall-clock-time) pair updated by the
     // poll thread with PLL-style filtering and read by the engine via
@@ -555,7 +594,7 @@ private:
     // correct -- see getPositionMs).  Mutable so the const getter can
     // take the lock.
     mutable juce::SpinLock anchorLock;
-    int32_t                positionAnchorMs   { 0 };
+    double                 positionAnchorMs   { 0.0 };
     double                 positionAnchorTime { 0.0 };
 
     juce::SpinLock metadataLock;
