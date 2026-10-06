@@ -1243,8 +1243,12 @@ public:
         }
 
         // Two levels of dirty:
-        // - staticDirty: anything except timecode.frames changed -> invalidate cached deck image
-        // - frameDirty:  only timecode.frames changed -> repaint (timecode + waveform cursor overlay)
+        // - staticDirty: anything except the frames changed -> invalidate cached deck image
+        // - frameDirty:  only the frames changed -> repaint the live strips (timecode,
+        //   waveform cursor, offset timecode).  The offset timecode is drawn live, so
+        //   it is frame-dirty: as static it rebuilt the Windows deck image every frame
+        //   for a mapped track, and an edited offset that kept the frames was not
+        //   repainted at all (AUDIT UI-10).
         for (int deck = 0; deck < 4; ++deck)
         {
             auto& ds = deckState[deck];
@@ -1271,10 +1275,13 @@ public:
                              || ds.timecode.hours     != snap.timecode.hours
                              || ds.timecode.minutes   != snap.timecode.minutes
                              || ds.timecode.seconds   != snap.timecode.seconds
-                             || ds.offsetTimecode.frames != snap.offsetTimecode.frames
                              || ds.engineNames        != snap.engineNames);
 
-            bool frameDirty = (ds.timecode.frames != snap.timecode.frames);
+            bool frameDirty = (ds.timecode.frames        != snap.timecode.frames
+                            || ds.offsetTimecode.hours   != snap.offsetTimecode.hours
+                            || ds.offsetTimecode.minutes != snap.offsetTimecode.minutes
+                            || ds.offsetTimecode.seconds != snap.offsetTimecode.seconds
+                            || ds.offsetTimecode.frames  != snap.offsetTimecode.frames);
 
             if (staticDirty || frameDirty)
             {
@@ -1309,7 +1316,7 @@ public:
                 }
                 else if (frameDirty && !deckBounds[deck].isEmpty())
                 {
-                    // Only timecode frame changed -- repaint just the live overlay
+                    // Only the frames changed -- repaint just the live overlay
                     // strips (TC digits + waveform cursor + detail waveform + offset TC).
                     // This avoids compositing the full HiDPI deck image (~3MB on
                     // Retina) when only a few rows of pixels actually changed.
@@ -1390,16 +1397,19 @@ public:
     //==========================================================================
     void paintOverChildren(juce::Graphics& g) override
     {
-        // Paint each deck (skip if bounds are too small)
+        // Paint each deck the repaint reaches (skip if bounds are too small).
+        // The timer's per-frame repaint of one deck's live strips otherwise
+        // laid out and painted all four decks (AUDIT UI-10).
         for (int deck = 0; deck < 4; ++deck)
-            if (!deckBounds[deck].isEmpty())
+            if (!deckBounds[deck].isEmpty() && g.clipRegionIntersects(deckBounds[deck]))
                 paintDeck(g, deckBounds[deck], deck);
 
-        // Paint mixer (only if visible)
-        if (showMixer && !mixerBounds.isEmpty())
+        // Paint mixer (only if visible and reached)
+        if (showMixer && !mixerBounds.isEmpty() && g.clipRegionIntersects(mixerBounds))
             paintMixer(g, mixerBounds);
 
-        paintPdlDiagnostics(g);
+        if (g.clipRegionIntersects(diagBounds))
+            paintPdlDiagnostics(g);
     }
 
     //==========================================================================
