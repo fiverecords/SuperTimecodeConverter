@@ -1754,6 +1754,9 @@ public:
                     pll.tick(pdlPos.playheadMs, pdlPos.packetTs, cdjSpeed,
                              sharedProDJLink->isPositionMoving(ep));
 
+                    // This engine's own beat grid for its player (AUDIT ENG-4).
+                    refreshBeatGridFromDb();
+
                     // Beat grid micro-correction: nudge PLL toward nearest beat
                     if (!pdlBeatGrid.empty())
                         pll.beatGridCorrect(pdlBeatGrid);
@@ -1768,6 +1771,10 @@ public:
                     // beat grid.  This handles variable-BPM tracks and non-zero
                     // first-beat offsets that the simple formula misses.
                     // CDJ-3000 already provides precise ms via abspos packets.
+                    // What goes on the wire therefore depends on this grid,
+                    // which is why every engine fetches its own (it used to
+                    // be pushed only to the engine shown on screen, so two
+                    // engines on one NXS2 could send different positions).
                     if (!hasAbs && !pdlBeatGrid.empty())
                     {
                         uint32_t bc = sharedProDJLink->getBeatCount(ep);
@@ -3910,6 +3917,7 @@ private:
     // applies a gentle nudge toward the nearest beat position, reducing drift.
     std::vector<TrackMetadata::BeatEntry> pdlBeatGrid;
     uint32_t pdlBeatGridTrackId = 0;  // track ID for which beat grid is loaded
+    uint32_t beatGridCheckedVersion = 0;  // dbserver cache version last looked at (refreshBeatGridFromDb)
 
     LinkBridge   linkBridge;
     std::unique_ptr<AudioThru> audioThru;  // Only for primary engine
@@ -4087,11 +4095,17 @@ public:
         lastSentOscBpm   = -1.0f;
     }
 
-    /// Set the beat grid for PLL micro-correction.  Called when rekordbox
-    /// beat grid data is downloaded from the CDJ.  The grid is cleared
-    /// automatically on track change.
+    /// Hand the engine the rekordbox beat grid of `trackId`.  The engine
+    /// fetches its own player's grid from the dbserver cache since AUDIT
+    /// ENG-4 (refreshBeatGridFromDb), so this only gets it there sooner when
+    /// the UI already has it; a grid for another track than the one the
+    /// engine follows, or for an engine not on Pro DJ Link (whose track id
+    /// is not a rekordbox ID), is ignored.  The grid gives the NXS2's
+    /// position (see tick) and nudges the PLL.  Cleared on track change.
+    /// Message thread.
     void setBeatGrid(const std::vector<TrackMetadata::BeatEntry>& grid, uint32_t trackId)
     {
+        if (activeInput != InputSource::ProDJLink || trackId == 0 || trackId != cachedTrackId) return;
         if (trackId == pdlBeatGridTrackId && !pdlBeatGrid.empty()) return;
         pdlBeatGrid = grid;
         pdlBeatGridTrackId = trackId;
@@ -4101,6 +4115,7 @@ public:
     {
         pdlBeatGrid.clear();
         pdlBeatGridTrackId = 0;
+        beatGridCheckedVersion = 0;
     }
 
     // Returns the effective multiplier: session override if set, else TrackMap value.
@@ -4228,6 +4243,31 @@ private:
         uint8_t slot = 0;
         if (dbClient == nullptr || cachedTrackId == 0 || !getDbSource(ip, slot)) return {};
         return dbClient->getCachedMetadataLight(ip, slot, cachedTrackId);
+    }
+
+    /// This engine's beat grid (AUDIT ENG-4): the grid of the track its own
+    /// player has loaded, from the dbserver cache, taken when that track's
+    /// cache entry changes (a version number, so the full entry is copied
+    /// only then).  The grid used to arrive only through setBeatGrid() from
+    /// the engine on screen and the PDL View, so on an NXS2, where the grid
+    /// gives the position (tick()), what an engine sent depended on which
+    /// tab was open.  Message thread.
+    void refreshBeatGridFromDb()
+    {
+        if (dbClient == nullptr || cachedTrackId == 0) return;
+        if (!pdlBeatGrid.empty() && pdlBeatGridTrackId == cachedTrackId) return;
+        juce::String ip;
+        uint8_t slot = 0;
+        if (!getDbSource(ip, slot)) return;
+        const uint32_t version = dbClient->getMetadataVersion(ip, slot, cachedTrackId);
+        if (version == 0 || version == beatGridCheckedVersion) return;
+        beatGridCheckedVersion = version;
+        auto meta = dbClient->getCachedMetadata(ip, slot, cachedTrackId);
+        if (meta.hasBeatGrid())
+        {
+            pdlBeatGrid = std::move(meta.beatGrid);
+            pdlBeatGridTrackId = cachedTrackId;
+        }
     }
 
     /// Request metadata from dbserver for a track on the current ProDJLink player.
