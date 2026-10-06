@@ -27,6 +27,54 @@ static juce::String stripComboMarker(const juce::String& text)
 }
 
 //==============================================================================
+// Select the item of `cmb` that shows `label` (markers stripped), preferring
+// `preferredId` while its item still shows it -- two MIDI ports can share a
+// name.  With no such item nothing is selected.  Returns whether one was.
+//==============================================================================
+static bool selectComboItemByLabel(juce::ComboBox& cmb, const juce::String& label, int preferredId)
+{
+    const int preferredIndex = cmb.indexOfItemId(preferredId);
+    if (preferredIndex >= 0 && stripComboMarker(cmb.getItemText(preferredIndex)) == label)
+    {
+        cmb.setSelectedId(preferredId, juce::dontSendNotification);
+        return true;
+    }
+    for (int i = 0; i < cmb.getNumItems(); ++i)
+        if (stripComboMarker(cmb.getItemText(i)) == label)
+        {
+            cmb.setSelectedItemIndex(i, juce::dontSendNotification);
+            return true;
+        }
+    cmb.setSelectedId(0, juce::dontSendNotification);
+    return false;
+}
+
+//==============================================================================
+// Where the interface labelled `label` ("name (ip)") is in `labels`: the
+// same label, or else the only label with the same interface name -- the
+// interface with a new address, such as a link-local one replaced by a
+// DHCP lease.  -1 when there is neither, or when the name is listed with
+// more than one address and none is the old one.
+//==============================================================================
+static int findInterfaceLabel(const juce::StringArray& labels, const juce::String& label)
+{
+    if (const int same = labels.indexOf(label); same >= 0)
+        return same;
+    auto nameOf = [](const juce::String& l) { return l.upToLastOccurrenceOf(" (", false, false); };
+    const auto name = nameOf(label);
+    int found = -1;
+    for (int i = 0; i < labels.size(); ++i)
+    {
+        if (nameOf(labels[i]) != name)
+            continue;
+        if (found >= 0)
+            return -1;
+        found = i;
+    }
+    return found;
+}
+
+//==============================================================================
 // BPM x 100 for a TCNet layer, as the casts it replaces computed it
 // (truncated), and 0 for a tempo that is unknown, not finite, negative or
 // beyond 1000 BPM: a double -> uint32_t cast of a value out of range is
@@ -322,7 +370,7 @@ MainComponent::MainComponent()
         if (anyTcnet && !sharedTcnetOutput.getIsRunning())
         {
             sharedTcnetOutput.refreshNetworkInterfaces();
-            sharedTcnetOutput.start(settings.tcnetInterface);
+            sharedTcnetOutput.start(nicSettingNow(nullptr, kNicTcnet, settings.tcnetInterface));   // in-session position (AUDIT UI-6)
         }
         else if (!anyTcnet && sharedTcnetOutput.getIsRunning())
         {
@@ -1338,7 +1386,7 @@ MainComponent::MainComponent()
         // If ArtNet timecode out is already running, this is a no-op.
         if (btnArtnetMixerFwd.getToggleState() && !currentEngine().getArtnetOutput().getIsRunning())
         {
-            int iface = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
+            int iface = nicIdToStart(cmbArtnetDmxInterface, kNicArtnetDmx) - 2;  // -1=All, 0+=NIC
             currentEngine().startArtnetOutput(iface);
         }
         propagateGlobalSettings();
@@ -1620,7 +1668,7 @@ MainComponent::MainComponent()
         // Ensure ArtNet output is running if enabled
         if (btnArtnetTrigger.getToggleState() && !currentEngine().getArtnetOutput().getIsRunning())
         {
-            int iface = cmbArtnetDmxInterface.getSelectedId() - 2;  // -1=All, 0+=NIC
+            int iface = nicIdToStart(cmbArtnetDmxInterface, kNicArtnetDmx) - 2;  // -1=All, 0+=NIC
             currentEngine().startArtnetOutput(iface);
         }
         updateDeviceSelectorVisibility();
@@ -1831,6 +1879,7 @@ MainComponent::MainComponent()
         if (syncing) return;
         if (isShowLockedRevert()) return;
         settings.tcnetInterface = cmbTcnetInterface.getSelectedId() - 2;  // 1=All(-1), 2+=NIC index
+        forgetNicMove(nullptr, kNicTcnet);   // the operator's choice (AUDIT UI-6)
         if (sharedTcnetOutput.getIsRunning())
         {
             sharedTcnetOutput.stop();
@@ -2445,6 +2494,7 @@ void MainComponent::removeEngine(int index)
         }
     }
 
+    forgetNicMoves(engines[(size_t)index].get());   // keyed by the engine about to go
     engines.erase(engines.begin() + index);
 
     // Re-index remaining engines so isPrimary() and getIndex() stay correct.
@@ -2738,42 +2788,18 @@ void MainComponent::syncUIFromEngine()
         cmbMidiOutputDevice.setSelectedId(idx >= 0 ? idx + 1 : 0, juce::dontSendNotification);
     }
 
-    // ArtNet interface selections -- restore from saved settings
     if (selectedEngine < (int)settings.engines.size())
     {
         auto& es = settings.engines[(size_t)selectedEngine];
-        int artInId = es.artnetInputInterface + 1;   // combo id is 1-based (1 = All Interfaces)
-        if (artInId < 1) artInId = 1;                // handle legacy -1 default
-        if (artInId <= cmbArtnetInputInterface.getNumItems())
-            cmbArtnetInputInterface.setSelectedId(artInId, juce::dontSendNotification);
 
-        int laNetTCInId = es.laNetTCInputInterface + 1;   // combo id is 1-based (1 = All Interfaces)
-        if (laNetTCInId < 1) laNetTCInId = 1;                // handle legacy -1 default
-        if (laNetTCInId <= cmbLANetTCInputInterface.getNumItems())
-            cmbLANetTCInputInterface.setSelectedId(laNetTCInId, juce::dontSendNotification);
-
-        int hippoInId = es.hippotizerInputInterface + 1;
-        if (hippoInId < 1) hippoInId = 1;
-        if (hippoInId <= cmbHippoInputInterface.getNumItems())
-            cmbHippoInputInterface.setSelectedId(hippoInId, juce::dontSendNotification);
+        // Interface selections (Art-Net, LA-Net, HippoNet, DMX, and the
+        // global TCNet, Pro DJ Link and StageLinQ) -- restore from the
+        // settings, at their in-session positions.  A setting whose
+        // interface is no longer listed selects nothing rather than
+        // whatever now sits at its position (AUDIT UI-6).
+        selectNicsFromSettings(false);
         cmbHippoTcChannel.setSelectedId(es.hippotizerTcChannel + 1, juce::dontSendNotification);
         eng.getHippotizerInput().setSelectedTcIndex(es.hippotizerTcChannel);
-
-        int artOutId = es.artnetOutputInterface + 1;
-        if (artOutId < 1) artOutId = 1;              // handle legacy -1 default
-        if (artOutId <= cmbArtnetOutputInterface.getNumItems())
-            cmbArtnetOutputInterface.setSelectedId(artOutId, juce::dontSendNotification);
-
-        int laNetTCOutId = es.laNetTCOutputInterface + 1;
-        if (laNetTCOutId < 1) laNetTCOutId = 1;
-        if (laNetTCOutId <= cmbLANetTCOutputInterface.getNumItems())
-            cmbLANetTCOutputInterface.setSelectedId(laNetTCOutId, juce::dontSendNotification);
-
-        // TCNet interface combo (global setting, not per-engine)
-        int tcnetIfId = settings.tcnetInterface + 2;  // -1->1(All), 0->2, 1->3...
-        if (tcnetIfId < 1) tcnetIfId = 1;
-        if (tcnetIfId <= cmbTcnetInterface.getNumItems())
-            cmbTcnetInterface.setSelectedId(tcnetIfId, juce::dontSendNotification);
 
         // TrackMap toggle
         btnTrackMap.setToggleState(eng.isTrackMapEnabled(), juce::dontSendNotification);
@@ -2792,14 +2818,6 @@ void MainComponent::syncUIFromEngine()
         setArtNetCombosFromAddress(cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni, eng.getArtnetTriggerUniverse());
         edOscFwdBpmAddr.setText(eng.getOscFwdBpmAddr(), false);
         edOscFwdBpmCmd.setText(eng.getOscFwdBpmCmd(), false);
-
-        // Art-Net DMX interface (for trigger + mixer forward)
-        {
-            int artDmxId = es.artnetDmxInterface + 2;  // -1->1 (All), 0->2, 1->3...
-            if (artDmxId < 1) artDmxId = 1;
-            if (artDmxId <= cmbArtnetDmxInterface.getNumItems())
-                cmbArtnetDmxInterface.setSelectedId(artDmxId, juce::dontSendNotification);
-        }
 
         // Ableton Link toggle
         btnLink.setToggleState(eng.getLinkBridge().isEnabled(), juce::dontSendNotification);
@@ -2832,10 +2850,6 @@ void MainComponent::syncUIFromEngine()
 
         // Pro DJ Link (per-engine player) -- ids 1-6 = players, 7=XF-A, 8=XF-B, 9=MASTER, 10=ON AIR
         cmbProDJLinkPlayer.setSelectedId(juce::jlimit(1, 10, es.proDJLinkPlayer), juce::dontSendNotification);
-        // ProDJLink interface (global)
-        int pdlIfId = settings.proDJLinkInterface + 1;
-        if (pdlIfId >= 1 && pdlIfId <= cmbProDJLinkInterface.getNumItems())
-            cmbProDJLinkInterface.setSelectedId(pdlIfId, juce::dontSendNotification);
 
         // ProDJLink bridge identity + 95B keepalive scope (global)
         cmbPdlBridgeIdentity.setSelectedId(
@@ -2844,11 +2858,6 @@ void MainComponent::syncUIFromEngine()
         cmbPdl95bMode.setSelectedId(
             juce::jlimit(0, 2, settings.prodjlink95bMode) + 1,
             juce::dontSendNotification);
-
-        // StageLinQ interface (global, independent from ProDJLink)
-        int slqIfId = settings.stageLinQInterface + 1;
-        if (slqIfId >= 1 && slqIfId <= cmbStageLinQInterface.getNumItems())
-            cmbStageLinQInterface.setSelectedId(slqIfId, juce::dontSendNotification);
 
         // Trigger toggles + destination
         auto& trig = eng.getTriggerOutput();
@@ -3011,14 +3020,14 @@ void MainComponent::startCurrentMtcInput()
 void MainComponent::startCurrentArtnetInput()
 {
     auto& eng = currentEngine();
-    int sel = cmbArtnetInputInterface.getSelectedId() - 1;
+    int sel = nicIdToStart(cmbArtnetInputInterface, kNicArtnetIn) - 1;
     eng.startArtnetInput(sel);
 }
 
 void MainComponent::startCurrentLANetTCInput()
 {
     auto& eng = currentEngine();
-    int sel = cmbLANetTCInputInterface.getSelectedId() - 1;
+    int sel = nicIdToStart(cmbLANetTCInputInterface, kNicLANetIn) - 1;
     eng.startLANetTCInput(sel);
 }
 
@@ -3052,7 +3061,7 @@ void MainComponent::startCurrentLtcInput()
 void MainComponent::startCurrentProDJLinkInput()
 {
     auto& eng = currentEngine();
-    int iface = cmbProDJLinkInterface.getSelectedId() - 1;
+    int iface = nicIdToStart(cmbProDJLinkInterface, kNicProDJLink) - 1;
     int player = cmbProDJLinkPlayer.getSelectedId();
     if (player < 1) player = 1;
     if (iface < 0) iface = 0;
@@ -3107,7 +3116,7 @@ void MainComponent::startCurrentProDJLinkInput()
 void MainComponent::startCurrentStageLinQInput()
 {
     auto& eng = currentEngine();
-    int iface = cmbStageLinQInterface.getSelectedId() - 1;
+    int iface = nicIdToStart(cmbStageLinQInterface, kNicStageLinQ) - 1;
     int player = cmbProDJLinkPlayer.getSelectedId();
     if (player < 1) player = 1;
     if (iface < 0) iface = 0;
@@ -3137,7 +3146,7 @@ void MainComponent::startCurrentStageLinQInput()
 void MainComponent::startCurrentHippotizerInput()
 {
     auto& eng = currentEngine();
-    int sel = cmbHippoInputInterface.getSelectedId() - 1;
+    int sel = nicIdToStart(cmbHippoInputInterface, kNicHippoIn) - 1;
     eng.startHippotizerInput(sel);
 }
 
@@ -3956,6 +3965,7 @@ void MainComponent::importConfig()
                         const bool locked = settings.showModeLocked;
                         settings.load();
                         settings.showModeLocked = locked;
+                        forgetNicMoves(nullptr);   // the restored interface settings replace them (AUDIT UI-6)
                         sharedMixerMap.resetToDefaults();
                         sharedMixerMap.load();
                         sharedSlqMixerMap.resetToDefaults();
@@ -4055,14 +4065,14 @@ void MainComponent::startCurrentArtnetOutput()
     auto& eng = currentEngine();
     // ArtnetOutput convention: -1 = All Interfaces, 0 = first NIC
     // Combo IDs: 1 = All, 2 = first NIC -> subtract 2
-    int sel = cmbArtnetOutputInterface.getSelectedId() - 2;
+    int sel = nicIdToStart(cmbArtnetOutputInterface, kNicArtnetOut) - 2;
     eng.startArtnetOutput(sel);
 }
 
 void MainComponent::startCurrentLANetTCOutput()
 {
     auto& eng = currentEngine();
-    int sel = cmbLANetTCOutputInterface.getSelectedId() - 3;
+    int sel = nicIdToStart(cmbLANetTCOutputInterface, kNicLANetOut) - 3;
     eng.startLANetTCOutput(sel);
 }
 
@@ -4610,16 +4620,25 @@ void MainComponent::restartAllAudioDevices()
 
 void MainComponent::populateMidiAndNetworkCombos()
 {
-    // Save current selections before clearing
-    int savedMidiIn   = cmbMidiInputDevice.getSelectedId();
-    int savedMidiOut  = cmbMidiOutputDevice.getSelectedId();
-    int savedArtIn    = cmbArtnetInputInterface.getSelectedId();
-    int savedHippoIn  = cmbHippoInputInterface.getSelectedId();
-    int savedLAIn     = cmbLANetTCInputInterface.getSelectedId();
-    int savedArtOut   = cmbArtnetOutputInterface.getSelectedId();
-    int savedLAOut    = cmbLANetTCOutputInterface.getSelectedId();
-    int savedArtDmx   = cmbArtnetDmxInterface.getSelectedId();
-    int savedTcnetIf  = cmbTcnetInterface.getSelectedId();
+    // Save current selections before clearing: the ID and what the item
+    // shows, markers stripped -- the device, or "name (ip)".
+    struct Saved { int id; juce::String label; };
+    auto save = [](const juce::ComboBox& cmb) -> Saved
+    {
+        const int id = cmb.getSelectedId();
+        return { id, id > 0 ? stripComboMarker(cmb.getText()) : juce::String() };
+    };
+    const Saved savedMidiIn   = save(cmbMidiInputDevice);
+    const Saved savedMidiOut  = save(cmbMidiOutputDevice);
+    const Saved savedArtIn    = save(cmbArtnetInputInterface);
+    const Saved savedHippoIn  = save(cmbHippoInputInterface);
+    const Saved savedLAIn     = save(cmbLANetTCInputInterface);
+    const Saved savedArtOut   = save(cmbArtnetOutputInterface);
+    const Saved savedLAOut    = save(cmbLANetTCOutputInterface);
+    const Saved savedArtDmx   = save(cmbArtnetDmxInterface);
+    const Saved savedTcnetIf  = save(cmbTcnetInterface);
+    const Saved savedProDJLinkIf = save(cmbProDJLinkInterface);
+    const Saved savedStageLinQIf = save(cmbStageLinQInterface);
 
     // MIDI Input
     auto midiIns = juce::MidiInput::getAvailableDevices();
@@ -4641,6 +4660,13 @@ void MainComponent::populateMidiAndNetworkCombos()
 
     // Art-Net interfaces
     auto nets = getNetworkInterfaces(true);   // same list the Art-Net / LA-Net components use, localhost last
+    const juce::StringArray previousNicLabels = nicLabels;
+    {
+        juce::StringArray labels;
+        for (auto& ni : nets)
+            labels.add(ni.name + " (" + ni.ip + ")");
+        remapNicSettings(labels);
+    }
     cmbArtnetInputInterface.clear(juce::dontSendNotification);
     cmbArtnetOutputInterface.clear(juce::dontSendNotification);
     cmbArtnetDmxInterface.clear(juce::dontSendNotification);
@@ -4734,7 +4760,6 @@ void MainComponent::populateMidiAndNetworkCombos()
     }
 
     // Pro DJ Link interfaces
-    int savedProDJLinkIf = cmbProDJLinkInterface.getSelectedId();
     cmbProDJLinkInterface.clear(juce::dontSendNotification);
     {
         // Determine which IP is currently active for ProDJLink
@@ -4751,13 +4776,8 @@ void MainComponent::populateMidiAndNetworkCombos()
             cmbProDJLinkInterface.addItem(label, i + 1);
         }
     }
-    if (savedProDJLinkIf > 0 && savedProDJLinkIf <= cmbProDJLinkInterface.getNumItems())
-        cmbProDJLinkInterface.setSelectedId(savedProDJLinkIf, juce::dontSendNotification);
-    else if (cmbProDJLinkInterface.getNumItems() > 0)
-        cmbProDJLinkInterface.setSelectedId(1, juce::dontSendNotification);
 
     // StageLinQ interfaces (independent combo)
-    int savedStageLinQIf = cmbStageLinQInterface.getSelectedId();
     cmbStageLinQInterface.clear(juce::dontSendNotification);
     {
         juce::String slqActiveIp;
@@ -4773,10 +4793,6 @@ void MainComponent::populateMidiAndNetworkCombos()
             cmbStageLinQInterface.addItem(label, i + 1);
         }
     }
-    if (savedStageLinQIf > 0 && savedStageLinQIf <= cmbStageLinQInterface.getNumItems())
-        cmbStageLinQInterface.setSelectedId(savedStageLinQIf, juce::dontSendNotification);
-    else if (cmbStageLinQInterface.getNumItems() > 0)
-        cmbStageLinQInterface.setSelectedId(1, juce::dontSendNotification);
 
     // Hippotizer interfaces (same NIC list as Art-Net, with All Interfaces)
     cmbHippoInputInterface.clear(juce::dontSendNotification);
@@ -4784,32 +4800,233 @@ void MainComponent::populateMidiAndNetworkCombos()
     for (int i = 0; i < nets.size(); i++)
         cmbHippoInputInterface.addItem(nets[i].name + " (" + nets[i].ip + ")", i + 2);
 
-    // Restore all selections (IDs are stable across repopulate)
-    if (savedMidiIn > 0 && savedMidiIn <= cmbMidiInputDevice.getNumItems())
-        cmbMidiInputDevice.setSelectedId(savedMidiIn, juce::dontSendNotification);
-    if (savedMidiOut > 0 && savedMidiOut <= cmbMidiOutputDevice.getNumItems())
-        cmbMidiOutputDevice.setSelectedId(savedMidiOut, juce::dontSendNotification);
-    if (savedArtIn > 0 && savedArtIn <= cmbArtnetInputInterface.getNumItems())
-        cmbArtnetInputInterface.setSelectedId(savedArtIn, juce::dontSendNotification);
-    if (savedHippoIn > 0 && savedHippoIn <= cmbHippoInputInterface.getNumItems())
-        cmbHippoInputInterface.setSelectedId(savedHippoIn, juce::dontSendNotification);
-    else if (cmbHippoInputInterface.getNumItems() > 0)
-        cmbHippoInputInterface.setSelectedId(1, juce::dontSendNotification);
-    if (savedArtOut > 0 && savedArtOut <= cmbArtnetOutputInterface.getNumItems())
-        cmbArtnetOutputInterface.setSelectedId(savedArtOut, juce::dontSendNotification);
-    if (savedArtDmx > 0 && savedArtDmx <= cmbArtnetDmxInterface.getNumItems())
-        cmbArtnetDmxInterface.setSelectedId(savedArtDmx, juce::dontSendNotification);
-    else if (cmbArtnetDmxInterface.getNumItems() > 0)
-        cmbArtnetDmxInterface.setSelectedId(1, juce::dontSendNotification);
-    if (savedTcnetIf > 0 && savedTcnetIf <= cmbTcnetInterface.getNumItems())
-        cmbTcnetInterface.setSelectedId(savedTcnetIf, juce::dontSendNotification);
-    else if (cmbTcnetInterface.getNumItems() > 0)
-        cmbTcnetInterface.setSelectedId(1, juce::dontSendNotification);  // default: All Interfaces
+    // Restore every selection by what it shows, not by its ID.  IDs are
+    // list positions: a device or interface plugged in or out moves them,
+    // and an ID kept across the repopulate selected another device, which
+    // the next flushSettings then saved (AUDIT UI-6).  An interface is
+    // found as remapNicSettings finds its setting, so one at a new address
+    // stays selected.  One no longer listed leaves its selector empty.
+    auto restore = [&](juce::ComboBox& cmb, const Saved& saved, bool isNic)
+    {
+        if (saved.id <= 0)
+            return;
+        juce::String label = saved.label;
+        if (isNic && previousNicLabels.contains(label))   // not All Interfaces or Localhost
+        {
+            const int now = findInterfaceLabel(nicLabels, label);
+            if (now < 0)
+                return;                                    // gone: left empty
+            label = nicLabels[now];
+        }
+        selectComboItemByLabel(cmb, label, saved.id);
+    };
+    restore(cmbMidiInputDevice,        savedMidiIn,      false);
+    restore(cmbMidiOutputDevice,       savedMidiOut,     false);
+    restore(cmbArtnetInputInterface,   savedArtIn,       true);
+    restore(cmbHippoInputInterface,    savedHippoIn,     true);
+    restore(cmbArtnetOutputInterface,  savedArtOut,      true);
+    restore(cmbArtnetDmxInterface,     savedArtDmx,      true);
+    restore(cmbTcnetInterface,         savedTcnetIf,     true);
+    restore(cmbLANetTCInputInterface,  savedLAIn,        true);
+    restore(cmbLANetTCOutputInterface, savedLAOut,       true);
+    restore(cmbProDJLinkInterface,     savedProDJLinkIf, true);
+    restore(cmbStageLinQInterface,     savedStageLinQIf, true);
 
-    if (savedLAIn > 0 && savedLAIn <= cmbLANetTCInputInterface.getNumItems())
-        cmbLANetTCInputInterface.setSelectedId(savedLAIn, juce::dontSendNotification);
-    if (savedLAOut > 0 && savedLAOut <= cmbLANetTCOutputInterface.getNumItems())
-        cmbLANetTCOutputInterface.setSelectedId(savedLAOut, juce::dontSendNotification);
+    // A selector left with no selection shows its setting where it can,
+    // so an interface or MIDI device listed again reappears.  One whose
+    // interface is still gone stays empty: the fixed default it got here
+    // before -- the first interface or All Interfaces -- was then saved
+    // over the setting by the next flushSettings (selectNicsFromSettings).
+    selectNicsFromSettings(true);
+    if (selectedEngine < (int)settings.engines.size())
+    {
+        const auto& es = settings.engines[(size_t)selectedEngine];
+        auto showSaved = [this](juce::ComboBox& cmb, const juce::String& name)
+        {
+            if (cmb.getSelectedId() > 0)
+                return;
+            const int idx = findDeviceByName(cmb, name);   // as syncUIFromEngine selects it
+            if (idx >= 0)
+                cmb.setSelectedId(idx + 1, juce::dontSendNotification);
+        };
+        showSaved(cmbMidiInputDevice,  es.midiInputDevice);
+        showSaved(cmbMidiOutputDevice, es.midiOutputDevice);
+    }
+}
+
+//==============================================================================
+// The selector item ID an interface setting stands for in this session (its
+// position followed across list changes, nicSettingNow), as flushSettings
+// maps the IDs to the settings: the selected engine's setting, or the
+// global one for TCNet, Pro DJ Link and StageLinQ.  A legacy value below
+// the first item gives All Interfaces, as syncUIFromEngine always read it;
+// 0 when there is no setting to show.  Message thread.
+//==============================================================================
+int MainComponent::nicSettingComboId(NicField field) const
+{
+    if (field == kNicTcnet)     return juce::jmax(1, nicSettingNow(nullptr, field, settings.tcnetInterface) + 2);   // -1 -> 1 (All), 0 -> 2...
+    if (field == kNicProDJLink) return juce::jmax(0, nicSettingNow(nullptr, field, settings.proDJLinkInterface) + 1);
+    if (field == kNicStageLinQ) return juce::jmax(0, nicSettingNow(nullptr, field, settings.stageLinQInterface) + 1);
+    if (selectedEngine < 0 || selectedEngine >= (int)settings.engines.size() || selectedEngine >= (int)engines.size())
+        return 0;
+    const auto& es = settings.engines[(size_t)selectedEngine];
+    const void* owner = engines[(size_t)selectedEngine].get();
+    switch (field)
+    {
+        case kNicArtnetIn:  return juce::jmax(1, nicSettingNow(owner, field, es.artnetInputInterface) + 1);      // 1 = All Interfaces
+        case kNicLANetIn:   return juce::jmax(1, nicSettingNow(owner, field, es.laNetTCInputInterface) + 1);
+        case kNicHippoIn:   return juce::jmax(1, nicSettingNow(owner, field, es.hippotizerInputInterface) + 1);
+        case kNicArtnetOut: return juce::jmax(1, nicSettingNow(owner, field, es.artnetOutputInterface) + 1);
+        case kNicLANetOut:  return juce::jmax(1, nicSettingNow(owner, field, es.laNetTCOutputInterface) + 1);
+        case kNicArtnetDmx: return juce::jmax(1, nicSettingNow(owner, field, es.artnetDmxInterface) + 2);        // -1 -> 1 (All), 0 -> 2...
+        case kNicTcnet: case kNicProDJLink: case kNicStageLinQ: break;
+    }
+    return 0;
+}
+
+//==============================================================================
+// Select in each interface selector the item its setting stands for
+// (nicSettingComboId), and nothing while the setting's interface is gone
+// (AUDIT UI-6).  A setting out of the list's range leaves the selector as
+// it is.  onlyEmpty (after a repopulate): only the selectors with no
+// selection, and one with no setting to show then gets its fixed default;
+// the others keep what populateMidiAndNetworkCombos restored, which may be
+// the operator's choice not yet flushed to the settings.  Message thread.
+//==============================================================================
+void MainComponent::selectNicsFromSettings(bool onlyEmpty)
+{
+    const void* engKey = selectedEngine >= 0 && selectedEngine < (int)engines.size()
+                       ? engines[(size_t)selectedEngine].get() : nullptr;
+    auto select = [&](juce::ComboBox& cmb, NicField field, const void* owner, int defaultId)
+    {
+        if (onlyEmpty && cmb.getSelectedId() > 0)
+            return;
+        const int id = nicSettingComboId(field);
+        if (isNicGone(owner, field))
+            cmb.setSelectedId(0, juce::dontSendNotification);
+        else if (id >= 1 && id <= cmb.getNumItems())
+            cmb.setSelectedId(id, juce::dontSendNotification);
+        else if (onlyEmpty && defaultId > 0 && cmb.getNumItems() > 0)
+            cmb.setSelectedId(defaultId, juce::dontSendNotification);
+    };
+    select(cmbArtnetInputInterface,   kNicArtnetIn,  engKey,  0);
+    select(cmbLANetTCInputInterface,  kNicLANetIn,   engKey,  0);
+    select(cmbHippoInputInterface,    kNicHippoIn,   engKey,  1);
+    select(cmbArtnetOutputInterface,  kNicArtnetOut, engKey,  0);
+    select(cmbLANetTCOutputInterface, kNicLANetOut,  engKey,  0);
+    select(cmbArtnetDmxInterface,     kNicArtnetDmx, engKey,  1);
+    select(cmbTcnetInterface,         kNicTcnet,     nullptr, 1);   // default: All Interfaces
+    select(cmbProDJLinkInterface,     kNicProDJLink, nullptr, 1);
+    select(cmbStageLinQInterface,     kNicStageLinQ, nullptr, 1);
+}
+
+//==============================================================================
+// The selector item ID a component is started from: the selected item, or,
+// with none -- its interface is gone (AUDIT UI-6) -- the item its setting
+// stands for in this session (nicSettingComboId), as startup starts it from
+// the setting (loadAndApplyNonAudioSettings).  That is the position the
+// interface last had, where another interface may now be listed (AUDIT
+// C13); before, an empty selector started on All Interfaces or the first
+// interface.  Message thread.
+//==============================================================================
+int MainComponent::nicIdToStart(const juce::ComboBox& cmb, NicField field) const
+{
+    const int id = cmb.getSelectedId();
+    return id > 0 ? id : nicSettingComboId(field);
+}
+
+void MainComponent::remapNicSettings(const juce::StringArray& newLabels)
+{
+    // Message thread.  Called with the interface list each time the
+    // selectors are filled; on the first call there is nothing to move.
+    // Only the in-session positions move (nicFollow); `settings` keeps the
+    // loaded ones (MainComponent.h).
+    if (nicLabels.isEmpty() || newLabels == nicLabels)
+    {
+        nicLabels = newLabels;
+        return;
+    }
+
+    // `value - offset` is a position in nicLabels; values below `offset`
+    // are All Interfaces or Localhost and stay.
+    auto remap = [&](int saved, int offset, const void* owner, NicField field)
+    {
+        const auto key = std::make_pair(owner, (int) field);
+        const int value = nicSettingNow(owner, field, saved);
+        juce::String label;
+        if (auto it = goneNics.find(key); it != goneNics.end())
+            label = it->second;                       // gone earlier: still its old position
+        else if (value - offset >= 0 && value - offset < nicLabels.size())
+            label = nicLabels[value - offset];
+        else
+            return;
+        const int index = findInterfaceLabel(newLabels, label);   // also at a new address
+        if (index >= 0)
+        {
+            goneNics.erase(key);
+            if (index + offset == saved)
+                nicFollow.erase(key);
+            else
+                nicFollow[key] = index + offset;
+        }
+        else
+        {
+            goneNics[key] = label;                    // keeps its position (AUDIT C13)
+        }
+    };
+
+    // Offsets as the selectors' IDs map to the settings (flushSettings).
+    for (size_t i = 0; i < settings.engines.size() && i < engines.size(); ++i)
+    {
+        auto& es = settings.engines[i];
+        const void* owner = engines[i].get();
+        remap(es.artnetInputInterface,     1, owner, kNicArtnetIn);
+        remap(es.laNetTCInputInterface,    1, owner, kNicLANetIn);
+        remap(es.hippotizerInputInterface, 1, owner, kNicHippoIn);
+        remap(es.artnetOutputInterface,    1, owner, kNicArtnetOut);
+        remap(es.laNetTCOutputInterface,   2, owner, kNicLANetOut);
+        remap(es.artnetDmxInterface,       0, owner, kNicArtnetDmx);
+    }
+    remap(settings.tcnetInterface,     0, nullptr, kNicTcnet);
+    remap(settings.proDJLinkInterface, 0, nullptr, kNicProDJLink);
+    remap(settings.stageLinQInterface, 0, nullptr, kNicStageLinQ);
+    nicLabels = newLabels;
+}
+
+//==============================================================================
+// Forget the moved and gone marks of one engine (owner), or of every
+// setting (nullptr), when its settings are removed or reloaded.  Message
+// thread.
+//==============================================================================
+void MainComponent::forgetNicMoves(const void* owner)
+{
+    for (auto it = nicFollow.begin(); it != nicFollow.end(); )
+        it = (owner == nullptr || it->first.first == owner) ? nicFollow.erase(it) : std::next(it);
+    for (auto it = goneNics.begin(); it != goneNics.end(); )
+        it = (owner == nullptr || it->first.first == owner) ? goneNics.erase(it) : std::next(it);
+}
+
+//==============================================================================
+// flushSettings' rule for one interface setting (saved: the setting in
+// `settings`, offset: selector ID - setting).  A selector with no selection
+// -- its interface is gone -- leaves the saved position as it is.  So does
+// one that shows what its setting stands for in this session: if the
+// interface has moved in the list, the saved position stays as loaded --
+// what a selector that kept its ID across the move saved before -- and the
+// next start resolves it again (AUDIT C13).  Anything else shown is the
+// operator's choice, or the interface a start fell back to, and is saved,
+// as before; the setting is then neither moved nor gone.  Message thread.
+//==============================================================================
+void MainComponent::saveNicSetting(int& saved, const juce::ComboBox& cmb, int offset,
+                                   const void* owner, NicField field)
+{
+    const int id = cmb.getSelectedId();
+    if (id <= 0)
+        return;
+    if (!isNicGone(owner, field) && id - offset == nicSettingNow(owner, field, saved))
+        return;
+    saved = id - offset;
+    forgetNicMove(owner, field);
 }
 
 void MainComponent::populateAudioCombos()
@@ -5343,11 +5560,16 @@ void MainComponent::flushSettings()
         // For the selected engine, read from combos (may have been changed)
         if (i == selectedEngine)
         {
-            es.midiInputDevice = stripComboMarker(cmbMidiInputDevice.getText());
-            es.midiOutputDevice = stripComboMarker(cmbMidiOutputDevice.getText());
-            es.artnetInputInterface = cmbArtnetInputInterface.getSelectedId() - 1;
-            es.laNetTCInputInterface = cmbLANetTCInputInterface.getSelectedId() - 1;
-            es.hippotizerInputInterface = cmbHippoInputInterface.getSelectedId() - 1;
+            // A selector with no selection -- its device or interface is no
+            // longer listed (populateMidiAndNetworkCombos) -- leaves the
+            // saved one as it is.  The interfaces' rule is saveNicSetting's
+            // (AUDIT UI-6).
+            auto selected = [](const juce::ComboBox& cmb) { return cmb.getSelectedId() > 0; };
+            if (selected(cmbMidiInputDevice))       es.midiInputDevice = stripComboMarker(cmbMidiInputDevice.getText());
+            if (selected(cmbMidiOutputDevice))      es.midiOutputDevice = stripComboMarker(cmbMidiOutputDevice.getText());
+            saveNicSetting(es.artnetInputInterface,     cmbArtnetInputInterface,  1, &eng, kNicArtnetIn);
+            saveNicSetting(es.laNetTCInputInterface,    cmbLANetTCInputInterface, 1, &eng, kNicLANetIn);
+            saveNicSetting(es.hippotizerInputInterface, cmbHippoInputInterface,   1, &eng, kNicHippoIn);
             es.hippotizerTcChannel = cmbHippoTcChannel.getSelectedId() - 1;
             // The destination fields are saved from their text, and they can
             // be typed into while Show Lock is on: the edit is reverted only
@@ -5367,8 +5589,8 @@ void MainComponent::flushSettings()
             es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
             es.generatorLoopOutMs   = eng.getGeneratorLoopOutMs();
             es.generatorLoopEnabled = eng.getGeneratorLoopEnabled();
-            es.artnetOutputInterface = cmbArtnetOutputInterface.getSelectedId() - 1;
-            es.laNetTCOutputInterface = cmbLANetTCOutputInterface.getSelectedId() - 1;
+            saveNicSetting(es.artnetOutputInterface,  cmbArtnetOutputInterface,  1, &eng, kNicArtnetOut);
+            saveNicSetting(es.laNetTCOutputInterface, cmbLANetTCOutputInterface, 1, &eng, kNicLANetOut);
             es.trackMapEnabled = eng.isTrackMapEnabled();
             es.trackMapOverrides = eng.getTrackMapOverrides();
             es.midiClockEnabled = eng.isMidiClockEnabled();
@@ -5382,7 +5604,7 @@ void MainComponent::flushSettings()
             es.artnetMixerForward  = eng.isArtnetMixerForwardEnabled();
             es.artnetMixerUniverse = eng.getArtnetMixerUniverse();
             es.artnetTriggerUniverse = eng.getArtnetTriggerUniverse();
-            es.artnetDmxInterface = cmbArtnetDmxInterface.getSelectedId() - 2;  // combo 1->-1(All), 2->0, 3->1...
+            saveNicSetting(es.artnetDmxInterface, cmbArtnetDmxInterface, 2, &eng, kNicArtnetDmx);  // combo 1->-1(All), 2->0, 3->1...
             es.linkEnabled = eng.getLinkBridge().isEnabled();
 
             // Pro DJ Link
@@ -5555,15 +5777,14 @@ void MainComponent::flushSettings()
         }
     }
 
-    // Pro DJ Link global settings
-    settings.proDJLinkInterface = cmbProDJLinkInterface.getSelectedId() - 1;
-    if (settings.proDJLinkInterface < 0) settings.proDJLinkInterface = 0;
+    // Pro DJ Link global settings (the interface by saveNicSetting's rule,
+    // as above)
+    saveNicSetting(settings.proDJLinkInterface, cmbProDJLinkInterface, 1, nullptr, kNicProDJLink);
     settings.prodjlinkBridgeIdentity = juce::jlimit(0, 3, cmbPdlBridgeIdentity.getSelectedId() - 1);
     settings.prodjlink95bMode        = juce::jlimit(0, 2, cmbPdl95bMode.getSelectedId() - 1);
 
     // StageLinQ global settings
-    settings.stageLinQInterface = cmbStageLinQInterface.getSelectedId() - 1;
-    if (settings.stageLinQInterface < 0) settings.stageLinQInterface = 0;
+    saveNicSetting(settings.stageLinQInterface, cmbStageLinQInterface, 1, nullptr, kNicStageLinQ);
 
     // Capture window bounds (if windows are open and visible)
     if (proDJLinkViewWindow != nullptr && proDJLinkViewWindow->isVisible())

@@ -25,6 +25,7 @@
 #include "TCNetOutput.h"
 #include <vector>
 #include <memory>
+#include <map>
 
 //==============================================================================
 class GainSlider : public juce::Slider
@@ -657,6 +658,50 @@ private:
     void startAudioDeviceScan();
     bool stopAudioScanThread();   // false: the scan did not stop and was left behind
     void populateMidiAndNetworkCombos();
+
+    // Network interfaces are persisted as positions in the list of the day
+    // (AUDIT C13, deferred).  Within a session each interface setting
+    // follows its interface when the list changes (AUDIT UI-6), also to a
+    // new address of the same interface name: nicLabels is the list, as
+    // "name (ip)", that the settings currently refer to; nicFollow holds
+    // the in-session position of each setting whose interface has moved
+    // since the settings were loaded, and goneNics names the interface of
+    // each setting whose interface is no longer listed -- such a setting
+    // keeps its position, and its selector shows nothing across
+    // repopulates (selectNicsFromSettings), until the interface is listed
+    // again, when it is selected again, or the operator picks another.
+    // The saved position (`settings`) is not moved: positions loaded at
+    // startup may already name another interface than the one configured
+    // -- the show NIC not up yet -- and following that one would save it
+    // (AUDIT C13).  It changes only when a selector shows something other
+    // than its setting (saveNicSetting), as before.  A component started
+    // from an empty selector starts from the setting's in-session position
+    // (nicIdToStart).  Keyed by the engine (nullptr: the global settings)
+    // and a NicField.  The running components are not touched: each
+    // resolved its interface when it started.  Message thread.
+    enum NicField : uint8_t { kNicArtnetIn, kNicLANetIn, kNicHippoIn, kNicArtnetOut, kNicLANetOut,
+                    kNicArtnetDmx, kNicTcnet, kNicProDJLink, kNicStageLinQ };
+    juce::StringArray nicLabels;
+    std::map<std::pair<const void*, int>, int> nicFollow;
+    std::map<std::pair<const void*, int>, juce::String> goneNics;
+    void remapNicSettings(const juce::StringArray& newLabels);
+    bool isNicGone(const void* owner, NicField field) const { return goneNics.count({ owner, (int) field }) > 0; }
+    int nicSettingNow(const void* owner, NicField field, int saved) const
+    {
+        const auto it = nicFollow.find({ owner, (int) field });
+        return it != nicFollow.end() ? it->second : saved;
+    }
+    // The setting now names what the operator chose: neither moved nor gone.
+    void forgetNicMove(const void* owner, NicField field)
+    {
+        goneNics.erase({ owner, (int) field });
+        nicFollow.erase({ owner, (int) field });
+    }
+    void forgetNicMoves(const void* owner);
+    void saveNicSetting(int& saved, const juce::ComboBox& cmb, int offset, const void* owner, NicField field);
+    int nicSettingComboId(NicField field) const;
+    void selectNicsFromSettings(bool onlyEmpty);
+    int nicIdToStart(const juce::ComboBox& cmb, NicField field) const;
     void populateAudioCombos();
     void repopulateTcnetLayerCombo();
     void populateTypeFilterCombos();
