@@ -847,7 +847,7 @@ struct StageLinQDeckState
     std::atomic<double>   cuePosition { 0.0 };     // from Track/CuePosition (samples: 11659.7 in the #23 capture, 0.26 s)
     std::atomic<int>      currentKeyIndex { -1 };  // from Track/CurrentKeyIndex (live, changes with key shift)
     std::atomic<bool>     keyLock { false };        // from Track/KeyLock
-    std::atomic<double>   sampleRate { 44100.0 };  // from Track/SampleRate (44100 in the #23 captures)
+    std::atomic<double>   sampleRate { 44100.0 };  // from Track/SampleRate (44100 in the second #23 capture; the first has none)
     std::atomic<int>      trackBytes { 0 };        // from Track/TrackBytes (file size)
     std::atomic<bool>     trackWasPlayed { false }; // from Track/TrackWasPlayed
     std::atomic<int>      playPauseLEDState { 0 }; // from Track/PlayPauseLEDState
@@ -1605,7 +1605,8 @@ public:
 
 private:
     /// Track/SampleRate, or 44100 when the device has not sent a usable one
-    /// (DESIGN D35 assumed 44100; the #23 captures confirm it).
+    /// (STC's default all along; the first #23 capture has no SampleRate,
+    /// so DESIGN D35's speeds rest on it; the second capture sends 44100).
     double effectiveSampleRate(int idx) const
     {
         const double sr = decks[(size_t)idx].sampleRate.load(std::memory_order_relaxed);
@@ -2355,7 +2356,9 @@ private:
         {
             // /Mixer/ChannelAssignment1 -> channel 1's crossfader side, as
             // getChannelAssignment() reads it (assumed 0=THRU, 1=A, 2=B;
-            // a PRIME 4+ never sends it, DESIGN D35)
+            // a PRIME 4+ never sends it: the second #23 capture has it
+            // neither at subscription nor at any of six assignment
+            // switches; DESIGN D35, after the first, had left it open)
             int ch = path[24] - '0';
             if (ch >= 1 && ch <= StageLinQ::kMaxMixerChannels)
             {
