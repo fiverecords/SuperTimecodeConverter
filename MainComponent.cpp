@@ -161,9 +161,11 @@ void MainComponent::AudioScanThread::run()
             outputs.add({ typeName, name, AudioDeviceEntry::makeDisplayName(typeName, name) });
     }
 
-    // A scan asked to stop -- by the destructor, or by a newer scan that
-    // replaces it -- posts nothing: its lists would arrive after, or on top
-    // of, the newer state (AUDIT UI-1).
+    // A scan that sees the stop request -- from the destructor, or from a
+    // newer scan that replaces it -- before posting posts nothing: its lists
+    // would arrive after, or on top of, the newer state (AUDIT UI-1).  A
+    // stop requested after this check still posts; those lists then apply
+    // before the newer scan's.
     if (threadShouldExit()) return;
 
     juce::MessageManager::callAsync([owner = safeOwner, inputs, outputs]()
@@ -5443,7 +5445,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
         //     eng.startHippotizerOutput(es.hippotizerDestIp);
 
         if (es.laNetTCOutEnabled)
-            eng.startLANetTCOutput(es.laNetTCOutputInterface - 2);  // saved as combo-2; LANetTCOutput needs -2=All, -1=Localost, 0=firstNIC
+            eng.startLANetTCOutput(es.laNetTCOutputInterface - 2);  // saved as combo-1; LANetTCOutput needs -2=All, -1=Localhost, 0=firstNIC (combo ID - 3)
     }
 
     // Start TCNet output if any engine has it enabled
@@ -9111,10 +9113,8 @@ void MainComponent::timerCallback()
             displayedWaveformTrackId = 0;
         }
 
-        // Update waveform cursor position from PLL-smoothed playhead.
-        // Using the engine's PLL output instead of raw CDJ packets avoids
-        // visible cursor jitter, especially on macOS where timer scheduling
-        // has more variance than Windows.
+        // Waveform cursor: the input's latest position ratio
+        // (getSmoothedPlayPositionRatio; not interpolated, AUDIT ENG-14).
         if (waveformDisplay.hasWaveformData())
         {
             float posRatio = eng.getSmoothedPlayPositionRatio();
