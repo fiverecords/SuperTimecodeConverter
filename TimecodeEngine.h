@@ -205,23 +205,34 @@ public:
             setOutputFrameRate(outputFps);
         }
 
-        // Reset TrackMap cache when leaving ProDJLink / StageLinQ / Winamp
+        // Reset the TrackMap cache on every source change: the track, its
+        // offset and its BPM multiplier belong to the source that found
+        // them.  It used to survive a switch to another DJ source or to
+        // Winamp, so Winamp without a title went on applying the previous
+        // DJ track's offset (AUDIT ENG-13).
+        trackMapped = false;
+        cachedTrackId = 0;
+        cachedLoadedPlayer = cachedLoadedSlot = 0;
+        cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+        cachedBpmMultiplier = 0;
+        bpmPlayerOverride = kBpmNoOverride;
+        cachedTrackArtist.clear();
+        cachedTrackTitle.clear();
+        cachedTrackDurationSec = 0;
+        dbRequestIp.clear();
+        // Disable Link to avoid publishing stale tempo on the network
+        // (unless audio BPM is active -- it will keep feeding Link); the DJ
+        // sources and Winamp keep it.
         if (source != InputSource::ProDJLink && source != InputSource::StageLinQ
-            && source != InputSource::Winamp)
-        {
-            trackMapped = false;
-            cachedTrackId = 0;
-            cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
-            cachedBpmMultiplier = 0;
-            bpmPlayerOverride = kBpmNoOverride;
-            cachedTrackArtist.clear();
-            cachedTrackTitle.clear();
-            cachedTrackDurationSec = 0;
-            // Disable Link to avoid publishing stale tempo on the network
-            // (unless audio BPM is active -- it will keep feeding Link)
-            if (!audioBpmEnabled)
-                linkBridge.setEnabled(false);
-        }
+            && source != InputSource::Winamp && !audioBpmEnabled)
+            linkBridge.setEnabled(false);
+
+        // The mixer forward's DMX frame and its send-once memory belong to
+        // the source that filled them (AUDIT ENG-10): after StageLinQ, Pro DJ
+        // Link went on sending the Denon faders every 100 ms in the channels
+        // it did not write.  The next source starts from an empty frame and
+        // sends every value again.
+        resetMixerForward();
 
         // Clear armed cues whenever the input source changes.  The list
         // was populated by either a TrackMap entry (ProDJLink / StageLinQ)
@@ -4006,8 +4017,8 @@ private:
     int  midiMixerCCChannel      = 1;   // 1-16 (for CC messages)
     int  midiMixerNoteChannel    = 1;   // 1-16 (for Note messages)
     int  artnetMixerUniverse     = 0;   // 0-32767
-    uint8_t dmxBuffer[512] {};          // persistent DMX frame for Art-Net mixer forward
-    int  dmxHighWaterMark = 0;          // highest DMX channel ever written (persistent)
+    uint8_t dmxBuffer[512] {};          // DMX frame of the Art-Net mixer forward (Pro DJ Link or StageLinQ; emptied on a source change)
+    int  dmxHighWaterMark = 0;          // highest DMX channel written since then
     double lastDmxSendTime = 0.0;       // for periodic re-send (DMX timeout compliance)
 
     // Track trigger Art-Net DMX (one-shot on track change, separate from mixer forward)
@@ -4880,6 +4891,18 @@ private:
     // changed values via OSC and/or MIDI CC using the addresses and CC numbers
     // configured in the MixerMap.
     //==========================================================================
+    /// Empty the mixer forward's DMX frame and forget what was sent, so the
+    /// next source's values all go out afresh (setInputSource, AUDIT ENG-10).
+    void resetMixerForward()
+    {
+        std::memset(dmxBuffer, 0, sizeof(dmxBuffer));
+        dmxHighWaterMark = 0;
+        lastDmxSendTime = 0.0;
+        std::fill(std::begin(lastSentMixer), std::end(lastSentMixer), -1);
+        lastMixerPktCount = 0;
+        std::fill(std::begin(lastSentSlqMixer), std::end(lastSentSlqMixer), -1);
+    }
+
     void forwardMixerParams()
     {
         if (!sharedProDJLink || !mixerMapPtr) return;
