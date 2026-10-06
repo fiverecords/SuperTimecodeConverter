@@ -9121,8 +9121,10 @@ void MainComponent::timerCallback()
             displayedWaveformTrackId = 0;
         }
 
-        // Waveform cursor: the input's latest position ratio
-        // (getSmoothedPlayPositionRatio; not interpolated, AUDIT ENG-14).
+        // Waveform cursor: the input's own position ratio, not the engine's
+        // interpolated playhead (getSmoothedPlayPositionRatio: Pro DJ Link
+        // and StageLinQ the last packet, Winamp extrapolated from its last
+        // poll; AUDIT ENG-14).
         if (waveformDisplay.hasWaveformData())
         {
             float posRatio = eng.getSmoothedPlayPositionRatio();

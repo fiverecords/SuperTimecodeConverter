@@ -2212,10 +2212,14 @@ public:
                     // forward relocation that moves the beat count by
                     // exactly one is the same step -- a beat jump of one
                     // beat, or a hot cue, memory cue or needle search into
-                    // the next beat, up to almost two beats ahead: the cues
-                    // jumped over fire at the jump, as they always did at
-                    // 120 BPM and above, where such a step stays within
-                    // the 500 ms seek test.  A step back in the beat
+                    // the next beat, up to almost two beats ahead: while
+                    // the deck plays, the cues jumped over fire at the
+                    // jump, as they always did at 120 BPM and above, where
+                    // such a step stays within the 500 ms seek test.  While
+                    // it is paused nothing fires and the step raises no
+                    // seek verdict, so the cues it passed are passed at
+                    // play (DESIGN D36) and a paused hot cue of one beat
+                    // count forward does not re-arm.  A step back in the beat
                     // count is still a seek; but on this fallback
                     // ProDJLinkInput takes a status beat count below its own
                     // only when it is more than 4 beats behind, and counts
@@ -4724,7 +4728,9 @@ private:
     /// to 4 beats (ProDJLinkInput takes a status beat count below its own
     /// only when it is more than 4 beats behind): a jog back inside the
     /// beat, or by 4 beats or less, keeps the flags.  On any source a step
-    /// back of kCueMovedBackMs or less keeps them.
+    /// back of kCueMovedBackMs or less while the deck does not play keeps
+    /// them (Winamp's position runs on up to one poll past a pause); while
+    /// it plays, any step back is a seek (tickCuePoints).
     /// Before, the paused position was only followed: a relocation forward
     /// then play fired every cue in between at once, and one backward left
     /// the cues ahead marked fired (AUDIT ENG-2).
