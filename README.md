@@ -58,7 +58,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 
 ### Pro DJ Link Integration
 
-STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtual CDJ, converting the DJ's playhead position into frame-accurate SMPTE timecode in real time.
+STC connects directly to Pioneer CDJ and DJM hardware on the network, announcing itself as a PRO DJ LINK Bridge (see **Network identity** below), and converts the DJ's playhead position into frame-accurate SMPTE timecode in real time.
 
 **Tested hardware:** CDJ-3000, CDJ-3000X, CDJ-2000NXS2, DJM-900NXS2, DJM-V10, DJM-A9. Other Pro DJ Link compatible hardware (XDJ series, older CDJ models) should work but has not been verified yet -- please report any issues on GitHub.
 
@@ -76,7 +76,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network as a Virtua
 **Smooth timecode generation:**
 - Direct CDJ playhead display with linear interpolation between packets (60Hz smooth output from 30Hz CDJ data)
 - PLL-driven pitch calculation for LTC bit-rate scaling
-- Beat grid micro-correction: when a rekordbox beat grid is available, the PLL gently nudges toward the nearest beat position between CDJ packets, reducing interpolation drift
+- Beat grid position: on a player that sends no absolute position (an NXS2 that does not stream its own position packets, older models), the rekordbox beat grid gives the time of the current beat in place of beat count × 60000/BPM, so variable-BPM tracks and a first beat that is not at zero come out right
 - Instant resync on seek, hot cue, or track load
 - Clean pause/stop handling: outputs decelerate naturally following the CDJ motor ramp
 - Multi-deck all-in-one units (XDJ-XZ) are detected from their status stream, so both decks appear even though the unit announces a single network identity
@@ -162,7 +162,7 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 - **Enter/Return to save:** press Enter in any form field to save the entry directly, without clicking the Save button
 
 **Per-track triggers (any combination, fired simultaneously on track change):**
-- MIDI Note On (+ immediate Note Off)
+- MIDI Note On (+ Note Off 100 ms later)
 - MIDI CC (controller + value)
 - OSC (address + typed arguments with variable expansion)
 - Art-Net DMX (channel + value, configurable universe)
@@ -262,7 +262,7 @@ Link is **exclusive per engine** — only one engine can have Link active at a t
 
 ### Audio BPM Detection
 
-Real-time beat tracking from a live audio input, enabling BPM output for non-DJ input sources. When the engine input is MTC, LTC, Art-Net, or Generator, an independent audio device can be configured for BPM analysis. The detected tempo feeds MIDI Clock, OSC BPM forward, and Ableton Link -- the same outputs that Pro DJ Link and StageLinQ use.
+Real-time beat tracking from a live audio input, enabling BPM output for non-DJ input sources. For every engine input except Pro DJ Link and StageLinQ, an audio input can be chosen for BPM analysis; like every audio client, it shares the interface with the other clients of the same physical device (`AudioDeviceHub`). The detected tempo feeds MIDI Clock, OSC BPM forward, and Ableton Link -- the same outputs that Pro DJ Link and StageLinQ use.
 
 - **BPM display** with colour-coded confidence: green (locked), orange (tracking), dim orange (uncertain), grey (no signal)
 - **Beat LED** flashes at the detected BPM rate
@@ -278,11 +278,11 @@ Useful for vinyl DJs, MIDI controller DJs, live bands, or any scenario where aud
 Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites, madMapper, and other TCNet-compatible lighting and video systems. No intermediate hardware or bridge software required -- STC replaces the PRO DJ LINK Bridge entirely.
 
 **Why TCNet instead of LTC/MTC for video?**
-- **60Hz position updates** vs 24-30Hz with LTC/MTC -- Resolume interpolates between samples, enabling smooth 60fps video playback even from a 24fps timecode source. This breaks the traditional 30fps ceiling that LTC imposed on Resolume clips.
+- **60Hz Time packets** vs 24-30Hz with LTC/MTC -- each carries the layer's latest position (its playback speed goes in the Metrics packets, 30 Hz, to each registered receiver), and Resolume interpolates between them, enabling smooth 60fps video playback even from a 24fps timecode source. This breaks the traditional 30fps ceiling that LTC imposed on Resolume clips. The position itself changes as often as the source reports one: about 30 times a second from a CDJ-3000, once a beat from an NXS2 without absolute position, once a frame from a timecode input or the generator.
 - **Automatic clip triggering** -- Resolume assigns clips by track name. When a CDJ loads a track, Resolume can automatically trigger the matching clip. For non-DJ sources, the engine name becomes the track title, allowing pre-mapped clip assignments per engine.
 - **Track metadata** -- artist, title, and album artwork appear in Resolume's deck display. CDJ/Denon tracks show real metadata; non-DJ sources show the input type and engine name.
 - **Play/pause sync** -- Resolume follows the CDJ's transport state in real time. Pause on the CDJ pauses the clip in Resolume.
-- **Millisecond position** -- TCNet carries playhead position in milliseconds, not frame-quantized SMPTE. Resolume receives sub-frame precision for smoother scrubbing and seeking.
+- **Millisecond position** -- TCNet carries playhead position in milliseconds. From a DJ deck it is the deck's own position as last reported, not quantized to frames (millisecond precision from a CDJ-3000); from a timecode input or the generator it is the timecode in milliseconds, so it moves in whole frames.
 - **Fader-controlled opacity** -- when a DJM or Denon mixer is connected, the channel fader position drives clip opacity in Resolume. Pull down the fader, the video fades out. No mixer = always fully visible.
 
 **Architecture:**
@@ -316,7 +316,7 @@ A visual companion to the Generator audio playback: a waveform view of the loade
 - **DAW-style stereo rendering** — left channel above the centreline, right channel below (Ableton / Logic / Reaper convention).
 - **Click-to-seek and drag-to-scrub** — clicking the waveform seeks both the audio and the generated timecode to that position. Dragging continuously seeks (scrubbing). A semi-transparent hover line previews where a click would land, with a tooltip showing the file time and absolute TC at the cursor.
 - **State-aware seek** — Playing keeps playing from the new position; Paused stays paused at the new position; Stopped transitions to Paused (preserves the seek so the next Play resumes from there instead of resetting to Start TC).
-- **Show Lock** — seek and the EDIT button are blocked under Show Lock; transport, navigation and volume remain operational.
+- **Show Lock** — seek, the loop In / Out points and the EDIT button are blocked under Show Lock; transport, navigation, LOOP on/off and volume remain operational.
 
 ### Shared MIDI Output
 
@@ -366,9 +366,22 @@ User bits are specific to LTC. The Art-Net and TCNet timecode packets have no eq
 
 ### Show Lock
 
-Prevents accidental changes during live shows. A single click on the **SHOW LOCK** button in the tab bar locks all configuration: input sources, frame rates, device assignments, engine add/remove, TrackMap editor, output frame offsets, integration toggles (OSC, MIDI clock, MIDI/ArtNet mixer forward, Ableton Link, triggers), and backup/restore. Attempting a blocked action flashes the lock button as visual feedback; ComboBox and slider selections revert automatically.
+Prevents accidental changes during live shows. A single click on the **SHOW LOCK** button in the tab bar locks all configuration:
 
-Operational controls remain active while locked: output enable/disable (for emergency silencing), gain sliders, BPM multiplier, freewheel controls, and view windows. Unlock requires a confirmation dialog to prevent accidental unlock. Lock state persists across restarts.
+- input sources, frame rates and FPS conversion, and the freewheel time
+- device and network interface selectors, sample rate and buffer size, and Refresh Devices
+- engine add, remove and rename
+- output enable/disable -- to switch an output on or off during a show, unlock first
+- gain sliders: LTC in and out, Audio Thru in and out, Audio BPM gain and smoothing
+- output frame offsets, the TCNet offsets and layer, LTC user bits and HOLD ON PAUSE
+- the generator's Start / Stop TC fields, its CLOCK toggle, audio output with its device, channel and file channels, its loop In / Out points, and click-to-seek in its waveform window
+- integration settings: OSC input, OSC BPM forward, MIDI clock, OSC / MIDI / Art-Net mixer forward, Ableton Link, Audio BPM, triggers and their destinations, the deck selection (Pro DJ Link and StageLinQ), the Pro DJ Link bridge identity, CDJ 95 B keepalive and ON-AIR ONLY, and StageLinQ's OFF AIR AT
+- the Track Map: its on/off toggle, saving a BPM multiplier to it (double click), and filling an empty entry's cue points from the deck's rekordbox or Engine DJ cues
+- backup and restore, from the buttons and the keyboard shortcuts
+
+Engaging the lock closes the Track Map, Mixer Map, generator preset and cue point editors, and they cannot be opened while it is on. Attempting a blocked action in the main window flashes the lock button as visual feedback; toggles, selectors, sliders and text fields go back to their value.
+
+Operational controls remain active while locked: the generator transport (PLAY / PAUSE / STOP, preset selection, PREV / NEXT / GO), its audio volume and LOOP on/off, the OSC IN commands that drive the generator (`/stc/N/gen/clock`, `start`, `stoptime` and `preset` included, so a show controller can still change its clock mode and Start / Stop TC), the BPM multiplier as a session override (single click), switching the engine on screen, collapsing panels, and the view windows (Pro DJ Link View, StageLinQ View, generator waveform). Unlock requires a confirmation dialog to prevent accidental unlock, and quitting while locked asks for confirmation. Lock state persists across restarts.
 
 ### Additional Capabilities
 
@@ -466,6 +479,7 @@ The sections below are for developers who want to build STC from source.
 
    target_compile_definitions(SuperTimecodeConverter PRIVATE
        JUCE_WEB_BROWSER=0
+       JUCE_USE_MP3AUDIOFORMAT=1
        JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_PRODUCT_NAME>"
        JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
        SQLITE_THREADSAFE=1
@@ -685,7 +699,7 @@ The application is built around a modular, header-only architecture:
 | `LANetTimecodeOutput.h` | LaserAnimation Net-Timecode broadcaster (UDP) with drift-free timing |
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
 | `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
-| `HippotizerOutput.h` | HippoNet timecode sender (behind a hidden flag; unconfirmed on hardware) |
+| `HippotizerOutput.h` | HippoNet timecode sender (disabled in this version: controls hidden, pending hardware validation) |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC), including user bits |
 | `LtcOutput.h` | LTC audio encoder with auto-increment, user bits, and SMPTE 12M binary group flags |
