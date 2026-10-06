@@ -3043,11 +3043,15 @@ private:
                 //
                 // The disk key is artist|title|duration (TrackMapEntry::makeKey),
                 // so two versions of a track that share all three share one
-                // file, and once the file holds all four kinds of data phase 2
-                // never runs NFS for the track: a later rekordbox edit of its
-                // grid or cues is not picked up (AUDIT META-9; when to refresh
-                // is not decided yet).  Nothing stable identifies the audio
-                // file here -- track IDs are per export -- so the key stays.
+                // file, and once the file holds all four kinds of data and the
+                // entry has its colour preview, phase 2 never runs NFS for the
+                // track: a later rekordbox edit of its grid or cues is not
+                // picked up (AUDIT META-9; when to refresh is not decided
+                // yet).  The file holds no preview, so a player whose preview
+                // only NFS gives (any but a CDJ-3000) has NFS run once per
+                // entry anyway (AUDIT META-15).  Nothing stable identifies the
+                // audio file here -- track IDs are per export -- so the key
+                // stays.
                 std::string diskKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3222,8 +3226,9 @@ private:
 
             // --- NFS ANLZ Fallback ---
             // If dbserver queries AND disk cache both failed to provide beat grid,
-            // cues, song structure or detail, download via NFS from CDJ USB/SD
-            // (once per entry: nfsAttempted).
+            // cues, song structure, detail or the colour preview (which the disk
+            // cache does not hold; AUDIT META-15), download via NFS from CDJ
+            // USB/SD (once per entry: nfsAttempted).
             {
                 bool needsNfs = false;
                 uint32_t trackIdForNfs = 0;
@@ -3235,7 +3240,8 @@ private:
                         && !it->second.nfsAttempted
                         && (!it->second.hasBeatGrid() || !it->second.hasCueList()
                             || !it->second.hasSongStructure()
-                            || !it->second.hasDetailWaveform()))
+                            || !it->second.hasDetailWaveform()
+                            || !it->second.hasWaveform()))
                     {
                         needsNfs = true;
                         trackIdForNfs = req.trackId;
@@ -3323,8 +3329,9 @@ private:
     // NFS ANLZ fetcher -- reads the media's export.pdb for the track's ANLZ
     // path, then downloads and parses its analysis files straight from the
     // player's USB/SD.  Runs, once per entry (nfsAttempted), whenever an
-    // entry still lacks beat grid, cues, phrases or detail: in phase 2, or
-    // at once when there is no dbserver session (AUDIT META-7).  The only
+    // entry still lacks beat grid, cues, phrases, detail or colour preview
+    // (AUDIT META-15): in phase 2, or at once when there is no dbserver
+    // session (AUDIT META-7).  The only
     // route for non-3000 players (their dbserver analysis queries are
     // skipped), a fallback for CDJ-3000s.  Runs on its own thread
     // (nfsThread), one download at a time: before launching the next, the
@@ -3417,7 +3424,8 @@ private:
                 && !it->second.nfsAttempted
                 && (!it->second.hasBeatGrid() || !it->second.hasCueList()
                     || !it->second.hasSongStructure()
-                    || !it->second.hasDetailWaveform()))
+                    || !it->second.hasDetailWaveform()
+                    || !it->second.hasWaveform()))
             {
                 needsNfs = true;
                 it->second.nfsAttempted = true;
@@ -3683,6 +3691,18 @@ private:
                 meta.detailEntryCount   = anlz.detailEntryCount;
                 meta.detailBytesPerEntry = anlz.detailBytesPerEntry;
             }
+        }
+
+        // Colour preview (PWV4, 6 bytes per column, from the .EXT), only when
+        // the entry has none: the only preview a player other than the
+        // CDJ-3000 gets, since its dbserver preview query is skipped; a
+        // CDJ-3000's dbserver preview (PWV6, 3-band) is kept (AUDIT META-15).
+        if (anlz.previewEntryCount > 0 && !anlz.previewData.empty() && !meta.hasWaveform())
+        {
+            meta.waveformData          = anlz.previewData;
+            meta.waveformEntryCount    = anlz.previewEntryCount;
+            meta.waveformBytesPerEntry = anlz.previewBytesPerEntry;
+            meta.waveformQueried       = true;
         }
     }
 
