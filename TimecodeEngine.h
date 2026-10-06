@@ -2131,7 +2131,11 @@ public:
                                 if (pdlModel.isNotEmpty())
                                     inputStatusText += " " + pdlModel;
 
-                                if (!sharedProDJLink->isPositionMoving(ep))
+                                // The play state while the deck is not moving,
+                                // and EMERGENCY always: an emergency loop counts
+                                // as moving since AUDIT PDL-10, and the media
+                                // pulled from the followed deck must still show.
+                                if (!sharedProDJLink->isPositionMoving(ep) || sharedProDJLink->isEmergencyLoop(ep))
                                     inputStatusText += " " + sharedProDJLink->getPlayStateString(ep);
 
                                 double pdlBpm = sharedProDJLink->getBPM(ep);
