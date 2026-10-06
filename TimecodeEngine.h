@@ -2220,15 +2220,30 @@ public:
                     // seek verdict, so the cues it passed are passed at
                     // play (DESIGN D36) and a paused hot cue of one beat
                     // count forward does not re-arm.  A step back in the beat
-                    // count is still a seek; but on this fallback
-                    // ProDJLinkInput takes a status beat count below its own
-                    // only when it is more than 4 beats behind, and counts
-                    // its own up at every beat packet, so a jump back, a
-                    // loop or a paused jog of 4 beats or less does not reach
-                    // here as a step back: the beat-derived position then
-                    // stays up to 4 beats ahead of the deck, and the cues
-                    // fire early, twice or not at all.  The outputs' resync
-                    // keeps PlayheadPLL's verdict.
+                    // count is still a seek.  ProDJLinkInput counts its own
+                    // up at every beat packet and takes the player's status
+                    // count, forward or back, except a count 1-4 beats lower
+                    // that may predate the latest beat packet (handled within
+                    // ProDJLink::kStatusAfterBeatMs, 50 ms, of it and not
+                    // below the count before it; AUDIT ENG-2).  So a jump
+                    // back, a loop or a paused jog reaches here as a step
+                    // back at the player's first status after it: when the
+                    // player sends a beat packet at the landing, likely
+                    // within about 70 ms (on the CDJ-2000nexus captures its
+                    // first status after a beat packet came 0-70 ms after it,
+                    // also after a hot-cue landing); otherwise at its next
+                    // regular status, up to about 200 ms.  Until then the
+                    // beat-derived position runs on past the point the deck
+                    // left (a loop's out point), from one beat on after a
+                    // landing beat packet, and a cue in that stretch fires
+                    // early, at every loop pass, and again when the deck
+                    // reaches it.  It lasts until the first status 50 ms or
+                    // more after the packet (up to about 0.25 s on those
+                    // captures) when the landing is in the beat
+                    // ProDJLinkInput held (a one-beat loop) or the deck
+                    // crosses a beat before the player's first status after
+                    // the step: that status is refused as possibly stale.
+                    // The outputs' resync keeps PlayheadPLL's verdict.
                     const bool cueSeek = pll.seekDetected
                         && ! (! hasAbs && pdlBeatCount == pdlPrevBeatCount + 1);
                     pdlPrevBeatCount = pdlBeatCount;
@@ -4724,13 +4739,14 @@ private:
     /// stops, with the grid up to a whole beat behind cues already fired,
     /// and taken for a move back that made them fire twice after a plain
     /// pause and play below 120 BPM.  On that fallback what the deck does
-    /// within one beat while stopped is not seen, nor is a step back of up
-    /// to 4 beats (ProDJLinkInput takes a status beat count below its own
-    /// only when it is more than 4 beats behind): a jog back inside the
-    /// beat, or by 4 beats or less, keeps the flags.  On any source a step
-    /// back of kCueMovedBackMs or less while the deck does not play keeps
-    /// them (Winamp's position runs on up to one poll past a pause); while
-    /// it plays, any step back is a seek (tickCuePoints).
+    /// within one beat while stopped is not seen: a jog back inside the
+    /// beat keeps the flags.  A jog back into an earlier beat is seen from
+    /// the player's next status on (no beat packet comes while the deck is
+    /// stopped, and ProDJLinkInput refuses a lower status beat count only
+    /// within 50 ms of one, AUDIT ENG-2).  On any
+    /// source a step back of kCueMovedBackMs or less while the deck does not
+    /// play keeps them (Winamp's position runs on up to one poll past a
+    /// pause); while it plays, any step back is a seek (tickCuePoints).
     /// Before, the paused position was only followed: a relocation forward
     /// then play fired every cue in between at once, and one backward left
     /// the cues ahead marked fired (AUDIT ENG-2).
