@@ -737,8 +737,9 @@ public:
     /// still right.  Wire this to DbServerClient::movePlayer(), which keeps
     /// that metadata under the new address and closes the connections to the
     /// old one.  Unwired, nothing is told: the metadata stays under the old
-    /// address (lookups by track ID alone still find it) and its idle
-    /// dbserver connection is closed after its idle timeout.  Network thread.
+    /// address, where a lookup by track ID alone still finds it and one
+    /// under the new address does not, and the idle dbserver connection to
+    /// the old address is closed after its idle timeout.  Network thread.
     std::function<void(const juce::String& oldIp, const juce::String& newIp)> onPlayerMoved;
 
     /// Called when the media in a player's own SD (slot 2) or USB (slot 3)
