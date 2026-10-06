@@ -1219,6 +1219,21 @@ public:
                 lookupTrackInMap();
             }
         }
+        else if (trackMapPtr && activeInput == InputSource::StageLinQ && cachedTrackId != 0)
+        {
+            // StageLinQ parallel of the ProDJLink branch above (AUDIT ENG-6):
+            // without it, TRACK MAP off and on with a track loaded read
+            // NO MAP until the next track.  The map is looked up for the
+            // identity the tick already holds: the tick takes each load the
+            // deck publishes whether TRACK MAP is on or off, and keeps the
+            // identity, its version and its length.  None of them is read
+            // from the deck here: artist and title change at once on a load
+            // but the version goes up only when they have settled
+            // (StageLinQInput::publishSettledTracks, up to 1 s later), so a
+            // live read here would hold the new track under the old version
+            // and its publication would then look like the same track.
+            lookupTrackInMap();
+        }
         else if (trackMapPtr && activeInput == InputSource::Winamp
                  && winampInput.getIsRunning() && winampInput.isConnected())
         {
@@ -2343,17 +2358,35 @@ public:
                     ltcOutput.setPitchMultiplier(pll.pitch);
 
                     // --- Track change detection ---
+                    // StageLinQInput raises the version once per load, when the
+                    // identity has settled, and not for the track it last
+                    // published (AUDIT ENG-7, stage A).  The identity is read
+                    // live here, so a track loaded between one publication and
+                    // the tick that sees it is taken under that version; its
+                    // own publication then finds the identity this engine
+                    // already holds (artist, title, and the length when both
+                    // are known), and, as Pro DJ Link's branch does for its
+                    // ID, only takes the new version: the trigger does not
+                    // fire again and the cues are not reloaded.
                     uint32_t slqTrackVer = sharedStageLinQ->getTrackVersion(ep);
                     if (slqTrackVer != lastSeenTrackVersion)
                     {
                         lastSeenTrackVersion = slqTrackVer;
                         auto tinfo = sharedStageLinQ->getTrackInfo(ep);
-                        if (tinfo.artist.isNotEmpty() || tinfo.title.isNotEmpty())
+                        const int newLenSec = (int) sharedStageLinQ->getTrackLengthSec(ep);
+                        const bool sameTrack = cachedTrackId != 0
+                            && tinfo.artist == cachedTrackArtist && tinfo.title == cachedTrackTitle
+                            && (newLenSec == cachedTrackDurationSec || newLenSec == 0 || cachedTrackDurationSec == 0);
+                        if (sameTrack)
+                        {
+                            cachedTrackId = slqTrackVer;
+                        }
+                        else if (tinfo.artist.isNotEmpty() || tinfo.title.isNotEmpty())
                         {
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
                             cachedTrackId = slqTrackVer;  // StageLinQ has no numeric ID; use version
-                            cachedTrackDurationSec = (int)sharedStageLinQ->getTrackLengthSec(ep);
+                            cachedTrackDurationSec = newLenSec;
 
                             DBG("TimecodeEngine: StageLinQ track changed -- "
                                 + cachedTrackArtist + " - " + cachedTrackTitle
