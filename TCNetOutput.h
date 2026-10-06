@@ -434,7 +434,7 @@ public:
     ///   3 = three band heights per entry, each masked to 5 bits: the
     ///       CDJ-3000's PWV6 preview (mid, high, low) or PWV7 detail, and
     ///       StageLinQ's overview (reordered to mid, high, low)
-    ///   6 = the NXS2's PWV4 colour preview, d0..d5 (see case 6)
+    ///   6 = a colour preview in the PWV4 layout, d0..d5 (see case 6)
     ///   2 = the NXS2's PWV5 detail (see case 2)
     ///
     /// The output is always 2400 bytes, 1200 entries of (height, colour):
@@ -496,11 +496,14 @@ public:
                     color = (uint8_t)(((hi >> 1) << 4) | (mid >> 1));
                     break;
                 }
-                case 6:  // NXS2 PWV4 colour preview, d0..d5
+                case 6:  // Colour preview in the PWV4 layout, d0..d5
                 {
-                    // Since AUDIT META-15 an NXS2 deck has this preview and
-                    // comes here; before, it went through the detail
-                    // fallback (case 2).  Read as: the height from the
+                    // What a CDJ-3000-class player's dbserver gives as its
+                    // colour preview.  An NXS2's PWV4, which the NFS route
+                    // gives it since AUDIT META-15, does not come here: the
+                    // MainComponent feed keeps such a deck on the detail
+                    // fallback (case 2), as 1.9.14-beta2 did.  Read as: the
+                    // height from the
                     // largest of d0..d2 (5 bits each), the colour as
                     // (d4 & 0x0F) << 4 | (d3 & 0x0F).  The references read
                     // these bytes otherwise: dysentery (track_metadata,

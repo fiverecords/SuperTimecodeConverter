@@ -8722,7 +8722,19 @@ void MainComponent::timerCallback()
                     auto md = sharedDbClient.getCachedMetadata(media.ip, media.slot, info.trackId);
 
                     // Waveform: prefer preview (hasWaveform).  Fallback to detail.
-                    if (md.hasWaveform())
+                    // The preview goes out only for a track on a CDJ-3000-class
+                    // player, as in 1.9.14-beta2, when only that player's
+                    // dbserver gave one.  Any other player's preview comes from
+                    // the NFS route since this round (AUDIT META-15), and what
+                    // TCNetOutput makes of a PWV4 preview has not been checked
+                    // against a TCNet receiver (AUDIT META-11): those decks keep
+                    // sending the detail waveform, so what TCNet receives does
+                    // not change (DESIGN D2).
+                    uint8_t mediaPlayer = sharedProDJLinkInput.getLoadedPlayer(ep);
+                    if (mediaPlayer == 0) mediaPlayer = (uint8_t) ep;
+                    const bool previewAsBefore =
+                        sharedProDJLinkInput.getPlayerModel((int) mediaPlayer).containsIgnoreCase("3000");
+                    if (md.hasWaveform() && previewAsBefore)
                     {
                         sharedTcnetOutput.setLayerSmallWaveform(
                             layer, md.waveformData.data(),
