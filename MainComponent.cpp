@@ -5190,6 +5190,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         }
         else if (src == SrcType::Winamp)
         {
+            // Not merged with the Hippotizer branch above: the two are the
+            // same only off Windows, and for different reasons.
            #if JUCE_WINDOWS
             // Windows: try to attach to a running Winamp / WACUP instance.
             // If no Winamp window is found right now the thread will keep
@@ -5318,10 +5320,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
         }
         if (es.artnetOutEnabled)
             eng.startArtnetOutput(es.artnetOutputInterface - 1);  // saved as combo-1; ArtnetOutput needs -1=All, 0=firstNIC
-        else if (es.artnetMixerForward && !eng.getArtnetOutput().getIsRunning())
-            eng.startArtnetOutput(es.artnetDmxInterface);  // DMX mixer needs the socket even without timecode output
-        else if (es.artnetTriggerEnabled && !eng.getArtnetOutput().getIsRunning())
-            eng.startArtnetOutput(es.artnetDmxInterface);  // DMX triggers need the socket even without timecode output
+        else if ((es.artnetMixerForward || es.artnetTriggerEnabled) && !eng.getArtnetOutput().getIsRunning())
+            eng.startArtnetOutput(es.artnetDmxInterface);  // DMX mixer forwarding and triggers need the socket even without timecode output
         // HippoNet output disabled in this version (pending hardware validation)
         // if (es.hippoOutEnabled)
         //     eng.startHippotizerOutput(es.hippotizerDestIp);
@@ -6635,7 +6635,7 @@ void MainComponent::updateStatusLabels()
             {
                 case WinampInput::State::Playing: statePrefix = "PLAYING"; break;
                 case WinampInput::State::Paused:  statePrefix = "PAUSED";  break;
-                case WinampInput::State::Stopped: statePrefix = "STOPPED"; break;
+                case WinampInput::State::Stopped: break;   // the initial value
             }
 
             // Track display
@@ -9519,7 +9519,10 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
         const int code = key.getKeyCode();
         auto& eng = currentEngine();
 
-        if (code == '[' || code == juce::KeyPress::numberPad0 + 0xDB)
+        // JUCE reports these keys with key code '[' / ']' where the
+        // keyboard layout types them without a modifier (on Windows the
+        // key code is the key's unmodified character).
+        if (code == '[')
         {
             // Loop In is a config-style timestamp-setting gesture; gated
             // by Show Lock for symmetry with Stop TC editing and the
@@ -9534,7 +9537,7 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
             saveSettings();
             return true;
         }
-        if (code == ']' || code == juce::KeyPress::numberPad0 + 0xDD)
+        if (code == ']')
         {
             // Symmetric with '[' -- Show Lock gates the Out timestamp too.
             if (isShowLocked()) return true;

@@ -276,7 +276,6 @@ private:
     bool syncing = false;
 
     void syncUIFromEngine();      // Load engine state into UI controls
-    void syncEngineFromUI();      // Save UI state into engine settings
 
     //==============================================================================
     // UI COMPONENTS (single set, bound to selected engine)
@@ -809,8 +808,6 @@ private:
     void startOscInput();
     void stopOscInput();
 
-    void layoutLeftPanel();
-    void layoutRightPanel();
     void saveSettings();
     void flushSettings();
     int findDeviceByName(const juce::ComboBox& cmb, const juce::String& name);
