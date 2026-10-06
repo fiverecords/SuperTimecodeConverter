@@ -973,6 +973,8 @@ public:
     {
         trackMapped = false;
         cachedTrackId = 0;
+        cachedLoadedPlayer = cachedLoadedSlot = 0;
+        dbRequestIp.clear();
         lastSeenTrackVersion = 0;
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
         cachedTrackArtist.clear();
@@ -1181,6 +1183,11 @@ public:
             uint32_t id = (cachedTrackId != 0) ? cachedTrackId : sharedProDJLink->getTrackID(getEffectivePlayer());
             if (id != 0)
             {
+                if (cachedTrackId == 0)
+                {
+                    cachedLoadedPlayer = sharedProDJLink->getLoadedPlayer(getEffectivePlayer());
+                    cachedLoadedSlot   = sharedProDJLink->getLoadedSlot(getEffectivePlayer());
+                }
                 cachedTrackId = id;
                 auto tinfo = sharedProDJLink->getTrackInfo(getEffectivePlayer());
                 cachedTrackArtist = tinfo.artist;
@@ -1190,7 +1197,7 @@ public:
                 // Phase 2: check dbClient cache or request if missing
                 if (dbClient != nullptr && dbClient->getIsRunning())
                 {
-                    auto meta = dbClient->getCachedMetadataLightById(id);
+                    auto meta = getTrackDbMetadata();
                     if (meta.isValid())
                     {
                         if (meta.artist.isNotEmpty()) cachedTrackArtist = meta.artist;
@@ -1299,12 +1306,13 @@ public:
             info.offset = TrackMapEntry::formatTimecodeString(
                               cachedOffH, cachedOffM, cachedOffS, cachedOffF);
 
-        // Phase 2: enrich with dbClient cache if available.
+        // Phase 2: enrich with dbClient cache if available -- Pro DJ Link
+        // only, by the exact (player, slot, ID) key (getTrackDbMetadata).
         // Uses the lightweight lookup to avoid copying waveform data (~3600B)
         // every frame at 60Hz.
         if (dbClient != nullptr && cachedTrackId != 0)
         {
-            auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
+            auto meta = getTrackDbMetadata();
             if (meta.isValid())
             {
                 info.album      = meta.album;
@@ -1909,14 +1917,28 @@ public:
                     // Resync only on seek (handled by packFrame's >1 frame check).
 
                     // --- Track change detection ---
+                    // A track is its rekordbox ID AND where it was loaded
+                    // from: the same ID from another player or slot is
+                    // another track (ProDJLinkInput bumps the version for it,
+                    // AUDIT PDL-7).  A new version alone is not a change:
+                    // reset() zeroes the version on the 10 s timeout and the
+                    // next status bumps it again for the same track and
+                    // source.  The version is read first (acquire): the ID,
+                    // player and slot read after it are that change's or
+                    // newer.  (Tr, the track type, is not exposed.)
                     uint32_t pdlTrackVer = sharedProDJLink->getTrackVersion(ep);
                     if (pdlTrackVer != lastSeenTrackVersion)
                     {
                         lastSeenTrackVersion = pdlTrackVer;
                         uint32_t newId = sharedProDJLink->getTrackID(ep);
-                        if (newId != 0 && newId != cachedTrackId)
+                        const uint8_t newDr = sharedProDJLink->getLoadedPlayer(ep);
+                        const uint8_t newSr = sharedProDJLink->getLoadedSlot(ep);
+                        if (newId != 0 && (newId != cachedTrackId
+                                           || newDr != cachedLoadedPlayer || newSr != cachedLoadedSlot))
                         {
                             cachedTrackId = newId;
+                            cachedLoadedPlayer = newDr;
+                            cachedLoadedSlot = newSr;
                             auto tinfo = sharedProDJLink->getTrackInfo(ep);
                             cachedTrackArtist = tinfo.artist;
                             cachedTrackTitle  = tinfo.title;
@@ -1945,6 +1967,22 @@ public:
                         }
                     }
 
+                    // The player holding the track's media moved to another
+                    // address, or was lost and came back: DbServerClient
+                    // dropped what it had cached under the old one
+                    // (onPlayerLost), and nothing else asks again for a track
+                    // that did not change (AUDIT PDL-3).  Asked once per
+                    // address.
+                    if (cachedTrackId != 0)
+                    {
+                        juce::String srcIp;
+                        uint8_t srcSlot = 0;
+                        if (!getDbSource(srcIp, srcSlot))
+                            dbRequestIp.clear();
+                        else if (srcIp != dbRequestIp)
+                            requestDbMetadata(cachedTrackId);
+                    }
+
                     // Phase 2: poll dbClient cache for async metadata results.
                     // When "Track #12345" resolves to real artist/title, update cache
                     // and re-run TrackMap lookup (the first attempt on track change would
@@ -1952,7 +1990,7 @@ public:
                     if (dbClient != nullptr && cachedTrackId != 0
                         && cachedTrackTitle.startsWith("Track #"))
                     {
-                        auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
+                        auto meta = getTrackDbMetadata();
                         if (meta.isValid() && meta.title.isNotEmpty())
                         {
                             if (meta.artist.isNotEmpty()) cachedTrackArtist = meta.artist;
@@ -1991,7 +2029,7 @@ public:
                         int nowDur = (int)sharedProDJLink->getTrackLengthSec(ep);
                         if (nowDur == 0 && dbClient != nullptr && cachedTrackId != 0)
                         {
-                            auto meta = dbClient->getCachedMetadataLightById(cachedTrackId);
+                            auto meta = getTrackDbMetadata();
                             if (meta.isValid() && meta.durationSeconds > 0)
                                 nowDur = meta.durationSeconds;
                         }
@@ -3588,6 +3626,8 @@ private:
         pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
         cachedTrackId = 0;
+        cachedLoadedPlayer = cachedLoadedSlot = 0;
+        dbRequestIp.clear();
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
         cachedTrackDurationSec = 0;
@@ -3865,7 +3905,10 @@ private:
     bool      trackMapped       = false;    // current track has a mapping
     bool      trackMapDirty     = false;    // auto-fill modified map, needs save
     bool      trackMapAutoFilled = false;   // UI-consumable: editor needs refresh
-    uint32_t  cachedTrackId     = 0;        // currently tracked Track ID
+    uint32_t  cachedTrackId     = 0;        // currently tracked Track ID: rekordbox ID (Pro DJ Link), deck load counter (StageLinQ), 0 (Winamp)
+    uint8_t   cachedLoadedPlayer = 0;       // Pro DJ Link: player (Dr) and slot (Sr) the track was
+    uint8_t   cachedLoadedSlot   = 0;       //   loaded from -- part of its identity (AUDIT PDL-7)
+    juce::String dbRequestIp;               // Pro DJ Link: address last asked for its metadata (AUDIT PDL-3)
     uint32_t  lastSeenTrackVersion = 0;     // per-engine version counter for track change detection
     int       cachedOffH = 0, cachedOffM = 0, cachedOffS = 0, cachedOffF = 0;
     juce::String cachedTrackArtist, cachedTrackTitle;
@@ -4123,6 +4166,39 @@ public:
     const LinkBridge& getLinkBridge() const { return linkBridge; }
 private:
 
+    /// Where the followed player's track lives for dbserver: the address of
+    /// the player holding the media (Dr; the player itself when 0) and the
+    /// slot (Sr) -- the key the metadata cache is filed under
+    /// (DbServerClient, AUDIT META-5).  Pro DJ Link only: a rekordbox ID
+    /// means nothing on another input, where the engine's track id is a
+    /// StageLinQ version or 0 (AUDIT ENG-8).  False when there is no such
+    /// source.  Message thread.
+    bool getDbSource(juce::String& ip, uint8_t& slot) const
+    {
+        if (activeInput != InputSource::ProDJLink || sharedProDJLink == nullptr) return false;
+        const int effP = getEffectivePlayer();
+        if (effP < 1) return false;
+        uint8_t src = sharedProDJLink->getLoadedPlayer(effP);
+        if (src == 0) src = (uint8_t) effP;
+        ip = sharedProDJLink->getPlayerIP((int) src);
+        slot = sharedProDJLink->getLoadedSlot(effP);
+        return ip.isNotEmpty() && slot != 0;
+    }
+
+    /// The cached dbserver metadata of the track this engine follows, by the
+    /// exact key (getDbSource).  The lookup by ID alone could answer with
+    /// another medium's track that shares the ID (AUDIT META-5), or, on
+    /// StageLinQ, with whatever rekordbox track has the number of the deck's
+    /// load counter (AUDIT ENG-8).  Invalid when there is no Pro DJ Link
+    /// source or nothing is cached.  Message thread.
+    DbServerClient::MetadataLight getTrackDbMetadata() const
+    {
+        juce::String ip;
+        uint8_t slot = 0;
+        if (dbClient == nullptr || cachedTrackId == 0 || !getDbSource(ip, slot)) return {};
+        return dbClient->getCachedMetadataLight(ip, slot, cachedTrackId);
+    }
+
     /// Request metadata from dbserver for a track on the current ProDJLink player.
     /// Encapsulates source-player discovery, dbCtx collision avoidance, and model propagation.
     void requestDbMetadata(uint32_t trackId)
@@ -4137,6 +4213,7 @@ private:
         if (srcPlayer == 0) srcPlayer = (uint8_t)effP;
         juce::String srcIP = sharedProDJLink->getPlayerIP((int)srcPlayer);
         uint8_t slot = sharedProDJLink->getLoadedSlot(effP);
+        dbRequestIp = srcIP;   // asked of this address (see the re-request in tick)
 
         if (srcIP.isEmpty() || slot == 0)
         {
