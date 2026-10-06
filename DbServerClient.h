@@ -47,6 +47,7 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
 #else
+    #include <netinet/in.h>
     #include <netinet/tcp.h>
 #endif
 #include "NfsAnlzFetcher.h"
