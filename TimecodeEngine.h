@@ -5483,15 +5483,6 @@ private:
 
         if (sourceActive)
         {
-            // Inactive -> active for ANY source: the LTC encoder was paused
-            // mid-frame with stale bits and its phase alignment is gone, so
-            // it seeds afresh at the published phase.  (Pro DJ Link and
-            // StageLinQ used to do this in their own branches; MTC, LTC,
-            // Art-Net, LA-Net, Hippotizer, Winamp and the generator resumed
-            // unaligned.)
-            if (!wasActive && outputLtcEnabled && ltcOutput.getIsRunning())
-                ltcOutput.reseed();
-
             if (outputMtcEnabled && mtcOutput.getIsRunning())
             {
                 mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));
@@ -5510,6 +5501,19 @@ private:
             if (outputLtcEnabled && ltcOutput.getIsRunning())
             {
                 ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
+                // Inactive -> active for ANY source: the LTC encoder was
+                // paused mid-frame with stale bits and its phase alignment
+                // is gone, so it seeds afresh at the published phase.  (Pro
+                // DJ Link and StageLinQ used to do this in their own
+                // branches; MTC, LTC, Art-Net, LA-Net, Hippotizer, Winamp
+                // and the generator resumed unaligned.)  Asked for after the
+                // new value is published: with HOLD ON PAUSE the encoder
+                // runs while paused, and a callback between the two used to
+                // seed from the stop value -- after a move made while
+                // stopped, the old position went out until the tracking
+                // snapped.
+                if (!wasActive)
+                    ltcOutput.reseed();
                 ltcOutput.setPaused(false);
             }
             if (outputHippoEnabled && hippotizerOutput.getIsRunning())
