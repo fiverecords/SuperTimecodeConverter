@@ -403,7 +403,7 @@ private:
     juce::ComboBox cmbSampleRate;            juce::Label lblSampleRate;
     juce::ComboBox cmbBufferSize;            juce::Label lblBufferSize;
     juce::ComboBox cmbMidiInputDevice;       juce::Label lblMidiInputDevice;
-    juce::ComboBox cmbInputFreewheel;        juce::Label lblInputFreewheel;   // D10, signal inputs
+    juce::ComboBox cmbInputFreewheel;        juce::Label lblInputFreewheel;   // AUDIT D10, signal inputs
     juce::ComboBox cmbArtnetInputInterface;  juce::Label lblArtnetInputInterface;
     juce::ComboBox cmbHippoInputInterface;  juce::Label lblHippoInputInterface;
     juce::ComboBox cmbHippoTcChannel;      juce::Label lblHippoTcChannel;
@@ -411,7 +411,7 @@ private:
     // Pro DJ Link controls
     juce::ComboBox cmbProDJLinkInterface;    juce::Label lblProDJLinkInterface;
     juce::ComboBox cmbProDJLinkPlayer;       juce::Label lblProDJLinkPlayer;
-    juce::ComboBox cmbOnAirQuiet;            juce::Label lblOnAirQuiet;       // D34, StageLinQ ON AIR
+    juce::ComboBox cmbOnAirQuiet;            juce::Label lblOnAirQuiet;       // DESIGN D34, StageLinQ ON AIR
     juce::ComboBox cmbPdlBridgeIdentity;     juce::Label lblPdlBridgeIdentity;
     juce::ComboBox cmbPdl95bMode;            juce::Label lblPdl95bMode;
     juce::ComboBox cmbStageLinQInterface;    juce::Label lblStageLinQInterface;
@@ -719,8 +719,8 @@ private:
     void populateOutputAudioCombos();
     double getPreferredSampleRate() const;
     int    getPreferredBufferSize() const;
-    /// Effective SR/Buffer for the Generator's audio playback device.
-    /// Returns the per-engine override if set, otherwise the global preferred.
+    /// Applies the global SAMPLE RATE / BUFFER SIZE to every open shared
+    /// device (AudioDeviceHub::reconfigureAll).  Message thread.
     void   restartAllAudioDevices();
 
     int findFilteredIndex(const juce::Array<int>& filteredIndices,
@@ -787,7 +787,7 @@ private:
     void updateFpsButtonStates();
     void updateOutputFpsButtonStates();
     void updateDeviceSelectorVisibility();
-    void updateOnAirQuietVisibility();   // OFF AIR AT: StageLinQ with ON AIR selected (D34)
+    void updateOnAirQuietVisibility();   // OFF AIR AT: StageLinQ with ON AIR selected (DESIGN D34)
     void updateStatusLabels();
     void updateNextCueLabel(TimecodeEngine& eng);
     static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);

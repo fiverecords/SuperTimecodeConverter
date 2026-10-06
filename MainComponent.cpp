@@ -190,7 +190,7 @@ MainComponent::MainComponent()
     engines[0]->setSlqMixerMap(&sharedSlqMixerMap);
 
     setSize(900, 700);
-    setWantsKeyboardFocus(true);  // enable Ctrl+D diagnostic shortcut
+    setWantsKeyboardFocus(true);  // for the keyboard shortcuts in keyPressed
 
     // --- Tab bar ---
     addAndMakeVisible(btnAddEngine);
@@ -542,7 +542,7 @@ MainComponent::MainComponent()
 
     addLabelAndCombo(lblMidiInputDevice, cmbMidiInputDevice, "MIDI INPUT DEVICE:");
 
-    // D10: how long the signal inputs keep counting as present after the
+    // AUDIT D10: how long the signal inputs keep counting as present after the
     // last frame or packet.  The operator's trade-off: a longer window
     // rides through USB stalls and display wakes without the outputs
     // noticing; a real stop reaches them that much later.
@@ -839,13 +839,11 @@ MainComponent::MainComponent()
             saveSettings();
         };
 
-        // Per-engine sample rate / buffer for the audio playback device.
-        // Default ("Default") = use the global preferred SR/Buffer; an explicit
-        // value overrides only this device.
-        // The generator's audio follows the global SAMPLE RATE / BUFFER SIZE
-        // like every other audio component (D7, D23): the interface is one
-        // shared device with one format, and a per-engine format here could
-        // only disagree with what was actually running.
+        // No sample rate / buffer of its own: the generator's audio follows
+        // the global SAMPLE RATE / BUFFER SIZE like every other audio
+        // component (DESIGN D7, DESIGN D23).  The interface is one shared
+        // device with one format, and a per-engine format here could only
+        // disagree with what was actually running.
 
         // Volume slider: 0..1.5 linear (1=unity, 1.5=+3.5 dB headroom).
         leftContent.addAndMakeVisible(lblGenAudioVolume);
@@ -1037,7 +1035,7 @@ MainComponent::MainComponent()
     cmbProDJLinkPlayer.addItem("XF-A", 7);
     cmbProDJLinkPlayer.addItem("XF-B", 8);
     cmbProDJLinkPlayer.addItem("MASTER", 9);
-    cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
+    cmbProDJLinkPlayer.addItem("ON AIR", 10);   // DESIGN D34
     cmbProDJLinkPlayer.setSelectedId(1, juce::dontSendNotification);
     cmbProDJLinkPlayer.onChange = [this]
     {
@@ -1068,7 +1066,7 @@ MainComponent::MainComponent()
         }
     };
 
-    // OFF AIR AT: when a deck counts as quiet for ON AIR on StageLinQ (D34).
+    // OFF AIR AT: when a deck counts as quiet for ON AIR on StageLinQ (DESIGN D34).
     // Pro DJ Link has no level to compare -- the DJM decides on-air -- so it
     // only shows with StageLinQ and ON AIR selected.
     addLabelAndCombo(lblOnAirQuiet, cmbOnAirQuiet, "OFF AIR AT:");
@@ -1812,7 +1810,7 @@ MainComponent::MainComponent()
             }
             else
             {
-                // Refused -- another engine streams MTC on that port (D32) --
+                // Refused -- another engine streams MTC on that port (DESIGN D32) --
                 // or failed to open.  The trigger output may have given up its
                 // own port above: let it take it back.
                 applyTriggerSettings();
@@ -4033,7 +4031,7 @@ void MainComponent::startCurrentMtcOutput()
 
     // If TriggerOutput has its OWN port open on the same device, release it
     // before MtcOutput opens.  Historical: the two were separate JUCE handles
-    // until D32; MidiOutputHub now gives both the same port.
+    // until DESIGN D32; MidiOutputHub now gives both the same port.
     if (trig.hasOwnMidiOpen() && sel >= 0)
     {
         eng.getMtcOutput().refreshDeviceList();
@@ -4058,7 +4056,7 @@ void MainComponent::startCurrentMtcOutput()
     }
     else
     {
-        // Refused -- another engine streams MTC on that port (D32) -- or
+        // Refused -- another engine streams MTC on that port (DESIGN D32) -- or
         // failed to open: the trigger output takes back the port it may have
         // released above.
         applyTriggerSettings();
@@ -4236,7 +4234,7 @@ void MainComponent::startAudioDeviceScan()
     // COM device enumerator, which needs a thread that has called
     // CoInitialize -- the scan thread has not.  The thread then scans every
     // type once more and posts the names.  A scan therefore holds the
-    // message thread, and with it every engine's tick (DESIGN D8), for as
+    // message thread, and with it every engine's tick (AUDIT D8), for as
     // long as the drivers take to enumerate (AUDIT UI-8).
     scanThread->tempManager->initialise(0, 0, nullptr, false);
     scanThread->startThread();
@@ -5292,7 +5290,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
             int idx = findDeviceByName(cmbMidiOutputDevice, es.midiOutputDevice);
 
             // Release TriggerOutput's own port if it matches the MTC device.
-            // Historical: separate JUCE handles until D32; the hub now shares one port.
+            // Historical: separate JUCE handles until DESIGN D32; the hub now shares one port.
             bool releasedTriggerPort = false;
             if (eng.getTriggerOutput().hasOwnMidiOpen()
                 && es.triggerMidiDevice == es.midiOutputDevice)
@@ -5313,7 +5311,7 @@ void MainComponent::loadAndApplyNonAudioSettings()
             else if (releasedTriggerPort && !eng.getMtcOutput().getIsRunning())
             {
                 // Refused -- an engine restored earlier already streams MTC on
-                // that port (D32) -- or failed to open: give the trigger output
+                // that port (DESIGN D32) -- or failed to open: give the trigger output
                 // back the port opened for it above.
                 eng.getTriggerOutput().startMidiByName(es.triggerMidiDevice);
             }
@@ -5462,7 +5460,7 @@ void MainComponent::applyAudioSettings()
         if (es.generatorAudioEnabled)
         {
             int ch = es.generatorAudioStereo ? -1 : es.generatorAudioChannel;
-            // Global format, like every other audio component (D7, D23).
+            // Global format, like every other audio component (DESIGN D7, DESIGN D23).
             const double sr = getPreferredSampleRate();
             const int    bs = getPreferredBufferSize();
             if (i == selectedEngine)
@@ -6279,7 +6277,7 @@ void MainComponent::updateDeviceSelectorVisibility()
                 cmbProDJLinkPlayer.addItem("DECK " + juce::String(i), i);
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
-            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
+            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // DESIGN D34
             // MASTER is not offered for StageLinQ yet (would need parallel
             // resolveMasterPlayerStageLinQ -- the data is there, just not wired).
             // PLAYER 5-6 and MASTER have no StageLinQ item: back to DECK 1,
@@ -6295,7 +6293,7 @@ void MainComponent::updateDeviceSelectorVisibility()
             cmbProDJLinkPlayer.addItem("XF-A", 7);
             cmbProDJLinkPlayer.addItem("XF-B", 8);
             cmbProDJLinkPlayer.addItem("MASTER", 9);
-            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // D34
+            cmbProDJLinkPlayer.addItem("ON AIR", 10);   // DESIGN D34
             if (prevId < 1 || prevId > 10) prevId = 1;
         }
         cmbProDJLinkPlayer.setSelectedId(prevId, juce::dontSendNotification);
@@ -7666,7 +7664,7 @@ void MainComponent::resized()
     {
         layCombo(lblProDJLinkPlayer, cmbProDJLinkPlayer, leftPanel);
 
-        // OFF AIR AT (StageLinQ, ON AIR selected; D34)
+        // OFF AIR AT (StageLinQ, ON AIR selected; DESIGN D34)
         if (cmbOnAirQuiet.isVisible())
             layCombo(lblOnAirQuiet, cmbOnAirQuiet, leftPanel);
 
