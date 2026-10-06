@@ -479,8 +479,9 @@ private:
 
     /// Put the form fields (name, Start/Stop TC, audio file, loop) into
     /// `p` and return it; whatever the form does not show -- the cue
-    /// points -- is left as `p` has it.  ADD passes a blank preset, SAVE
-    /// the stored one (AUDIT SET-2).
+    /// points -- is left as `p` has it.  SAVE passes the stored preset
+    /// (AUDIT SET-2); ADD a blank one carrying only the Start/Stop TC of
+    /// the preset the form was loaded from, if any (addNewPreset).
     /// A Start/Stop TC field that still holds `p`'s text is kept as it is;
     /// any other is normalised (normalizeTC), and the values are written
     /// back to the editors so what the user sees matches what gets saved.
@@ -543,7 +544,19 @@ private:
         }
 
         auto uniqueName = makeUniqueName(name);
-        auto p = readFormToPreset(uniqueName);
+        // ADD with a preset selected is how a copy is made ("Name (2)").
+        // The Start/Stop TC it was loaded with go in as the stored text, so
+        // fields the user did not touch are kept as they are, as SAVE keeps
+        // them, instead of being re-clamped at this window's rate (a 30 fps
+        // preset's :29 became :24 in a 25 fps window).  The cue points are
+        // not copied: ADD creates a preset without cues, as before.
+        GeneratorPreset seed;
+        if (const auto* src = editingName.isNotEmpty() ? presetMap.find(editingName) : nullptr)
+        {
+            seed.startTC = src->startTC;
+            seed.stopTC  = src->stopTC;
+        }
+        auto p = readFormToPreset(uniqueName, std::move(seed));
         // Reflect the actual stored name in the field whenever it differs
         // from what was typed -- either because we auto-numbered to avoid
         // a collision, or because the input had surrounding whitespace
