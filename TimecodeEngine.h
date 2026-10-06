@@ -1741,23 +1741,25 @@ public:
                         break;
                     }
 
-                    // PLL runs only for pitch calculation (LTC bit-rate scaling).
-                    // It does NOT drive the displayed timecode -- that comes directly
-                    // from the CDJ's playhead, which is clean and monotonic (~30Hz).
+                    // The PLL gives the pitch (LTC bit rate), the speed the
+                    // source-active test reads, and the seek verdict
+                    // (PlayheadPLL).  It does NOT drive the timecode -- that
+                    // comes from the CDJ's playhead, interpolated below.
+                    // Position and packet time from the same packet (AUDIT
+                    // PDL-8): two getters could pair one packet's position
+                    // with the next one's time, which the PLL takes for "a
+                    // new packet at this position".
                     double cdjSpeed = sharedProDJLink->getActualSpeed(ep);
-                    pll.tick(
-                        sharedProDJLink->getPlayheadMs(ep),
-                        sharedProDJLink->getAbsPositionTs(ep),
-                        cdjSpeed,
-                        sharedProDJLink->isPositionMoving(ep)
-                    );
+                    const auto pdlPos = sharedProDJLink->getPositionSnapshot(ep);
+                    pll.tick(pdlPos.playheadMs, pdlPos.packetTs, cdjSpeed,
+                             sharedProDJLink->isPositionMoving(ep));
 
                     // Beat grid micro-correction: nudge PLL toward nearest beat
                     if (!pdlBeatGrid.empty())
                         pll.beatGridCorrect(pdlBeatGrid);
 
                     // Smooth timecode display using interpolation between CDJ packets.
-                    uint32_t rawPlayheadMs = sharedProDJLink->getPlayheadMs(ep);
+                    uint32_t rawPlayheadMs = pdlPos.playheadMs;
                     double now = juce::Time::getMillisecondCounterHiRes();
                     bool hasAbs = sharedProDJLink->playerHasAbsolutePosition(ep);
 
@@ -1780,7 +1782,7 @@ public:
                     //   (~2Hz at 120BPM), but status packets arrive at 5Hz.
                     //   Use absPositionTs to detect all packets so the snap point
                     //   refreshes at 5Hz (prevents interpolation freeze between beats).
-                    double latestTs = sharedProDJLink->getAbsPositionTs(ep);
+                    double latestTs = pdlPos.packetTs;
                     bool isNewPacket;
                     if (hasAbs)
                     {
@@ -1866,15 +1868,18 @@ public:
                         // actualSpeed > 0).  Without this, NXS2 timecode stutters
                         // at 5Hz during the 4-5 second pause deceleration because
                         // only isNewPacket refreshes the timecode.
-                        // CDJ-3000 (abspos ~30Hz): cap scales with speed -- limits how
-                        //   far the interpolated position advances between updates.
-                        // NXS2 (beat-derived ~5-7Hz): fixed 250ms real-time cap.
-                        //   Status packets arrive at 5Hz regardless of playback speed,
-                        //   so the gap is always ~200ms.  Speed-scaling would starve
-                        //   the interpolation at low speeds (e.g. 0.5x -> 125ms < 200ms gap).
+                        // The cap is wall time since the anchor, because the
+                        // packets come at a fixed rate whatever the speed:
+                        // CDJ-3000 abspos every 30 ms (kInterpolationCapMs
+                        // bridges one late or lost packet), NXS2 status at
+                        // 5 Hz, ~200 ms (kNxs2InterpolationCapMs).  The CDJ-3000
+                        // cap was 50 ms x speed -- wall time against a figure
+                        // that scales with speed -- so below about 0.66x the
+                        // interpolation stopped before the next packet and the
+                        // value fell back to it (AUDIT ENG-17).
                         double elapsed = now - pdlSnapTime;
                         double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
-                        double maxAdvance = hasAbs ? (50.0 * pdlSnapSpeed) : 250.0;
+                        double maxAdvance = hasAbs ? kInterpolationCapMs : kNxs2InterpolationCapMs;
                         if (elapsed <= maxAdvance)
                         {
                             currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
@@ -2257,17 +2262,28 @@ public:
                         break;
                     }
 
-                    // Drive PLL from StageLinQ deck data
+                    // The playhead and the time its BeatInfo message was read.
+                    // StageLinQInput stores the position, then the time
+                    // (release); reading the time, the position and the time
+                    // again pairs them unless this falls between the two
+                    // stores of one message -- a window of a few instructions
+                    // every ~35 ms, where the position is a message newer than
+                    // the time for one snap (it has no sequence lock).
                     double slqSpeed = sharedStageLinQ->getActualSpeed(ep);
-                    pll.tick(
-                        sharedStageLinQ->getPlayheadMs(ep),
-                        sharedStageLinQ->getAbsPositionTs(ep),
-                        slqSpeed,
-                        sharedStageLinQ->isPositionMoving(ep)
-                    );
-
-                    // Smooth timecode display using interpolation between StateMap/BeatInfo updates
+                    double rawTs = sharedStageLinQ->getAbsPositionTs(ep);
                     uint32_t rawPlayheadMs = sharedStageLinQ->getPlayheadMs(ep);
+                    for (int retry = 0; retry < 4; ++retry)
+                    {
+                        const double ts2 = sharedStageLinQ->getAbsPositionTs(ep);
+                        if (ts2 == rawTs) break;
+                        rawTs = ts2;
+                        rawPlayheadMs = sharedStageLinQ->getPlayheadMs(ep);
+                    }
+
+                    // Drive PLL from StageLinQ deck data
+                    pll.tick(rawPlayheadMs, rawTs, slqSpeed, sharedStageLinQ->isPositionMoving(ep));
+
+                    // Smooth timecode display using interpolation between BeatInfo messages
                     double now = juce::Time::getMillisecondCounterHiRes();
 
                     bool isNewPacket = (rawPlayheadMs != pdlLastPlayheadMs);
@@ -2278,20 +2294,29 @@ public:
                     // publication below (see the Pro DJ Link branch).
                     double tcSourceMs = (double)rawPlayheadMs;
 
+                    // The position is interpolated from the moment its message
+                    // was read, not from the tick that first saw it -- up to a
+                    // tick later, a lag that changed from message to message --
+                    // and for up to kInterpolationCapMs of wall time: BeatInfo
+                    // comes about every 35 ms whatever the deck's speed.  The cap
+                    // was 50 ms x speed, wall time against a number that scales
+                    // with speed: 40 ms at a deck synced to 0.8x, so on the #23
+                    // capture interpolation stopped before the next message and
+                    // the value fell back a frame now and then (AUDIT SLQ-4,
+                    // ENG-17).
                     if (isNewPacket)
                     {
                         pdlLastPlayheadMs = rawPlayheadMs;
                         pdlSnapMs = (double)rawPlayheadMs;
-                        pdlSnapTime = now;
+                        pdlSnapTime = (rawTs > 0.0) ? rawTs : now;
                         pdlSnapSpeed = slqSpeed;
                     }
-                    else if (pdlSnapSpeed > 0.01 && sharedStageLinQ->isPlayerPlaying(ep))
+                    if (pdlSnapSpeed > 0.01 && sharedStageLinQ->isPlayerPlaying(ep))
                     {
-                        double elapsed = now - pdlSnapTime;
-                        double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
-                        double maxAdvance = 50.0 * pdlSnapSpeed;
-                        if (elapsed <= maxAdvance)
+                        const double elapsed = now - pdlSnapTime;
+                        if (elapsed > 0.0 && elapsed <= kInterpolationCapMs)
                         {
+                            const double interpMs = pdlSnapMs + elapsed * pdlSnapSpeed;
                             currentTimecode = StageLinQ::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
                             tcSourceMs = (double)(uint32_t)interpMs;
                         }
@@ -3865,6 +3890,12 @@ private:
     };
 
     PlayheadPLL pll;
+    // How long past the last position the DJ branches interpolate, in wall
+    // time (tick): CDJ-3000 abspos (every 30 ms) and StageLinQ BeatInfo
+    // (about every 35 ms), one late or lost message bridged; NXS2 status
+    // packets, 5 Hz.
+    static constexpr double kInterpolationCapMs     = 60.0;
+    static constexpr double kNxs2InterpolationCapMs = 250.0;
     Timecode pdlFrozenTc {};          // frozen timecode on end-of-track (prevents flicker)
     bool pdlTcFrozen = false;         // true = outputting frozen timecode
     uint32_t pdlLastPlayheadMs = 0;   // last CDJ playhead for change detection
