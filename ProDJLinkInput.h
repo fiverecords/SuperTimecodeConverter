@@ -394,6 +394,10 @@ struct ProDJLinkPlayerState
     // the first (AUDIT META-4; see handleStatusPacket).  Network thread only.
     static constexpr uint8_t kMediaUnknown = 0xFF;
     uint8_t localMedia[2] = { kMediaUnknown, kMediaUnknown };   // [0] SD (slot 2), [1] USB (slot 3)
+    // How many times each of those changed (getMediaChangeCount).  Only ever
+    // increased: reset() leaves them.  Written on the network thread, read
+    // from any.
+    std::atomic<uint32_t> mediaChanges[2] { { 0 }, { 0 } };
     std::atomic<double>   absPositionTs  { 0.0 };  // timestamp of last abs position (for interpolation)
     // playheadMs and absPositionTs are written as a pair, under a sequence
     // count that is odd while the network thread writes them (a seqlock), so
@@ -1005,6 +1009,22 @@ public:
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return 0;
         return players[idx].trackVersion.load(std::memory_order_acquire);
+    }
+
+    /// Media changes seen so far in the own SD (slot 2) or USB (slot 3) slot
+    /// of player playerNum: the mounted / not mounted transitions of its
+    /// status that also call onMediaChanged (AUDIT META-4); 0 for any other
+    /// slot.  A rekordbox ID is only unique within one medium, so the same
+    /// ID loaded from the same player and slot after this count moved is
+    /// another track, which getTrackVersion alone does not tell.  Never
+    /// reset: a change while the player was lost (10 s timeout) is not
+    /// counted, since its first status after it is found again only notes
+    /// the state.  Any thread.
+    uint32_t getMediaChangeCount(int playerNum, uint8_t slot) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers || (slot != 2 && slot != 3)) return 0;
+        return players[idx].mediaChanges[slot - 2].load(std::memory_order_relaxed);
     }
 
     /// Track info -- Phase 1 only provides what we can extract from status packets.
@@ -3133,8 +3153,12 @@ private:
                 const uint8_t mounted = data[kStateAt[k]] == 0x00 ? 1 : 0;
                 const uint8_t before = p.localMedia[k];
                 p.localMedia[k] = mounted;
-                if (before != ProDJLinkPlayerState::kMediaUnknown && before != mounted && onMediaChanged)
-                    onMediaChanged(sender, uint8_t(k + 2));
+                if (before != ProDJLinkPlayerState::kMediaUnknown && before != mounted)
+                {
+                    p.mediaChanges[k].fetch_add(1, std::memory_order_relaxed);
+                    if (onMediaChanged)
+                        onMediaChanged(sender, uint8_t(k + 2));
+                }
             }
         }
 
