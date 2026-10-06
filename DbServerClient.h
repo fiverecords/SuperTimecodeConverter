@@ -3354,7 +3354,6 @@ private:
             {
                 bool needsNfs = false;
                 uint32_t trackIdForNfs = 0;
-                std::string diskCacheKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
@@ -3367,18 +3366,12 @@ private:
                     {
                         needsNfs = true;
                         trackIdForNfs = req.trackId;
-
-                        if (it->second.title.isNotEmpty())
-                            diskCacheKey = TrackMapEntry::makeKey(
-                                it->second.artist, it->second.title,
-                                it->second.durationSeconds);
                     }
                 }
 
                 if (needsNfs)
                 {
-                    DBG("DbServerClient: NFS LAUNCH trackId=" + juce::String(trackIdForNfs)
-                        + " diskKey=" + juce::String(diskCacheKey.substr(0, 40)));
+                    DBG("DbServerClient: NFS LAUNCH trackId=" + juce::String(trackIdForNfs));
                     {
                         const juce::SpinLock::ScopedLockType lock(cacheLock);
                         auto it = metadataCache.find(cacheKey);
@@ -3388,8 +3381,7 @@ private:
 
                     juce::String nfsPlayerIP = req.playerIP;
                     uint8_t nfsSlot = req.slot;
-                    launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot,
-                                   trackIdForNfs, diskCacheKey);
+                    launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot, trackIdForNfs);
                 }
             }
         }
@@ -3546,7 +3538,6 @@ private:
         ensureEntry(cacheKey);
 
         bool needsNfs = false;
-        std::string diskCacheKey;
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             auto it = metadataCache.find(cacheKey);
@@ -3559,27 +3550,23 @@ private:
             {
                 needsNfs = true;
                 it->second.nfsAttempted = true;
-
-                if (it->second.title.isNotEmpty())
-                    diskCacheKey = TrackMapEntry::makeKey(
-                        it->second.artist, it->second.title,
-                        it->second.durationSeconds);
             }
         }
 
         if (needsNfs)
         {
             DBG("DbServerClient: NFS LAUNCH (no conn) trackId=" + juce::String(req.trackId));
-            launchNfsAsync(cacheKey, req.playerIP, req.slot,
-                           req.trackId, diskCacheKey);
+            launchNfsAsync(cacheKey, req.playerIP, req.slot, req.trackId);
         }
     }
 
     /// Launch the NFS download on its own thread.  One download at a time:
-    /// waits for the previous one to finish first.
+    /// waits for the previous one to finish first.  The result is saved to
+    /// the disk cache under the title the entry has when the result lands:
+    /// one launched while the entry had no title (no dbserver session, AUDIT
+    /// META-7) is saved too if the title came during the download.
     void launchNfsAsync(const CacheKey& cacheKey, const juce::String& playerIP,
-                        uint8_t slot, uint32_t trackId,
-                        const std::string& diskCacheKey)
+                        uint8_t slot, uint32_t trackId)
     {
         // Wait for the previous download in short slices rather than in
         // join(), so that stop() never waits on this thread behind a long
@@ -3601,7 +3588,7 @@ private:
             mediaGeneration = slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot);
         }
         nfsBusy.store(true, std::memory_order_release);
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, diskCacheKey, cancelToken, mediaGeneration]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, cancelToken, mediaGeneration]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
             DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
@@ -3610,6 +3597,7 @@ private:
             if (anlz.ok && isRunningFlag.load(std::memory_order_relaxed))
             {
                 bool applied = false;
+                std::string diskKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
@@ -3629,12 +3617,15 @@ private:
                             + " detailEntries=" + juce::String(it->second.detailEntryCount)
                             + " detailBpe=" + juce::String(it->second.detailBytesPerEntry)
                             + " detailDataSz=" + juce::String((int)it->second.detailData.size()));
+                        if (it->second.title.isNotEmpty())
+                            diskKey = TrackMapEntry::makeKey(
+                                it->second.artist, it->second.title, it->second.durationSeconds);
                     }
                 }
 
                 // Persist to disk cache for next session
-                if (applied && !diskCacheKey.empty())
-                    saveAnlzToDisk(cacheKey, diskCacheKey);
+                if (applied && !diskKey.empty())
+                    saveAnlzToDisk(cacheKey, diskKey);
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
         });
