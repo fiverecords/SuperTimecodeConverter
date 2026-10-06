@@ -454,8 +454,17 @@ private:
     uint64_t shiftRegLow  = 0;
     uint16_t shiftRegHigh = 0;
     static constexpr uint16_t LTC_SYNC_WORD = 0xBFFC;
+    // The sync word's bits read in reverse order: a source playing backwards.
+    static constexpr uint16_t LTC_SYNC_WORD_REVERSED = 0x3FFD;
     static constexpr int LTC_FRAME_BITS = 80;
     int bitsSinceSync = 0;          // bits since the last sync word (or the reset); 81 = frame broken
+    int bitsWithoutSync = 0;        // bits and out-of-range edges since a sync word in either direction (onEdgeDetected)
+    // Bit-clock estimate a reset starts from: ~27 fps, the midpoint of 24-30
+    // (2160 transitions/s), from which every rate at 1x decodes.
+    static constexpr double kStartTransitionsPerSecond = 2160.0;
+    // Bits (and out-of-range edges) without a sync word after which the bit
+    // clock starts again from there: eight frames' worth (onEdgeDetected).
+    static constexpr int kRelockBits = 8 * LTC_FRAME_BITS;
     double samplesSinceLastSync = 0.0;
     int consecutiveGoodFrames = 0;
     FrameRate candidateFps = FrameRate::FPS_25;   // rate the consecutive count refers to
@@ -472,11 +481,12 @@ private:
         shiftRegLow = 0;
         shiftRegHigh = 0;
         bitsSinceSync = 0;
+        bitsWithoutSync = 0;
         samplesSinceLastSync = 0.0;
         consecutiveGoodFrames = 0;
         // Initial bit period estimate: use ~27fps midpoint (2160 transitions/sec)
         // to minimize convergence time across all frame rates (24-30fps)
-        bitPeriodEstimate = currentSampleRate / 2160.0;
+        bitPeriodEstimate = currentSampleRate / kStartTransitionsPerSecond;
         lastSyncClosedFrame = false;
         sourcePeriodMs = 0.0;
         valueRepeats = 0;
@@ -488,6 +498,7 @@ private:
         shiftRegHigh = static_cast<uint16_t>((shiftRegHigh >> 1) | ((bit & 1) << 15));
         if (bitsSinceSync <= LTC_FRAME_BITS)
             ++bitsSinceSync;   // saturates past 80: "not a whole frame"
+        ++bitsWithoutSync;
         if (shiftRegHigh == LTC_SYNC_WORD)
         {
             // A frame is exactly 80 bits, sync word included.  Anything else
@@ -503,6 +514,7 @@ private:
             // period to the next one still measures the rate.
             const bool whole = (bitsSinceSync == LTC_FRAME_BITS);
             bitsSinceSync = 0;
+            bitsWithoutSync = 0;
             if (whole)
                 onSyncWordDetected();
             else
@@ -511,6 +523,12 @@ private:
                 samplesSinceLastSync = 0.0;
                 lastSyncClosedFrame = false;
             }
+        }
+        else if (shiftRegHigh == LTC_SYNC_WORD_REVERSED)
+        {
+            // A source playing backwards: nothing is decoded, but its bit
+            // clock is right, and the relock (onEdgeDetected) leaves it.
+            bitsWithoutSync = 0;
         }
     }
 
@@ -669,13 +687,13 @@ private:
         {
             // No bit lasts this long or this short: the signal dropped out,
             // jumped or took a spike, and the frame in progress cannot come
-            // out whole however many bits follow (see pushBit).
+            // out whole however many bits follow (see pushBit).  The edge
+            // counts toward the relock below as a bit does.
             halfBitPending = false;
             bitsSinceSync = LTC_FRAME_BITS + 1;
-            return;
+            ++bitsWithoutSync;
         }
-
-        if (interval < threshold)
+        else if (interval < threshold)
         {
             if (halfBitPending)
             {
@@ -695,6 +713,38 @@ private:
                 halfBitPending = false;
             pushBit(0);
             bitPeriodEstimate = bitPeriodEstimate * 0.95 + interval * 0.05;
+        }
+
+        // The estimate follows the source as it slows or winds, and from
+        // there a source back at 1x cannot always pull it back.  After a
+        // brake below about 0.6x every interval at 1x is shorter than the
+        // threshold, all are read as half bits, and the estimate settles
+        // near twice the true period.  After a brake below about 0.2x or to
+        // a standstill, or a wind to 4x, every interval at 1x fails the
+        // range check above and pushes no bit at all.  Either way no frame
+        // was decoded again until the device restarted (AUDIT LTC-10,
+        // ltcin_relock_b5).  In such a state only ones, only zeros or no
+        // bits at all are pushed, so no sync word forms in either direction.
+        // After eight frames' worth of bits and out-of-range edges without
+        // one, the bit clock starts again from the reset value, from which
+        // every rate at 1x decodes: a source back at 1x decodes again within
+        // about 0.6 s.  The window is that long because a source that starts
+        // from a stop at an off-1x speed is read without a sync word too,
+        // until the estimate has converged on it.  With two frames' worth, a
+        // ramp to a held 0.4-0.6x or an abrupt 2-3x start at 24 or 25 fps
+        // was not decoded at all, and a slow motor start locked from about
+        // 0.6x instead of 0.2-0.35x.  A source that is being decoded, or
+        // that plays backwards at a steady speed, reads a sync word every 80
+        // bits and is never reset.  One that stops sends no edges (nothing
+        // crosses the hysteresis threshold) and keeps the estimate it slowed
+        // to until it plays again; hum or noise above the threshold while it
+        // is stopped resets it after 640 edges (6.4 s of 50 Hz hum) to the
+        // value a device start uses.
+        if (bitsWithoutSync >= kRelockBits)
+        {
+            bitPeriodEstimate = currentSampleRate / kStartTransitionsPerSecond;
+            halfBitPending = false;
+            bitsWithoutSync = 0;
         }
     }
 
