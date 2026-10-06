@@ -3141,6 +3141,51 @@ private:
         //   [160-163] beat_count (uint32be)
         //   [166]     beat (1-4)
 
+        // Media in the player's own slots: S_l (0x73) for SD and U_l (0x6f)
+        // for USB read 00 while media is mounted, 04 when the slot is empty
+        // and 02 or 03 while it is being unmounted (dysentery vcdj.adoc;
+        // beat-link CdjStatus.isLocalSdLoaded / isLocalSdEmpty and the USB
+        // pair).  As beat-link's MetadataFinder.handleUpdate does, the media
+        // is gone only when the slot reports empty (04): a slot that goes 02
+        // and back to 00 kept its media, and reports nothing (capture S15b:
+        // the SD slot read 00 02 00 02 03 04 as its card was ejected).  When
+        // a mounted slot reports 04, and when media is mounted (00) in a slot
+        // that reported 04, the media there changed: rekordbox IDs are per
+        // export, so what is cached for this player and slot no longer
+        // describes it, and onMediaChanged is told (AUDIT META-4).  The
+        // report at the mount drops what a request still running at the
+        // unmount stored for the old media.  The first status that tells
+        // only sets the state (02 or 03 tell that media is there).  Only
+        // status from the player's own address counts, so a second device on
+        // the same number cannot make the state flap.  Counted before the
+        // track version below is bumped, so the bump (release) publishes the
+        // count with the track: the engine reads the version (acquire) and
+        // then the count, and never gets a load with the count from before a
+        // slot change in the same packet (AUDIT META-4).  Parse side only:
+        // nothing is sent (DESIGN D33).
+        if (p.ipStr[0] != '\0' && sender == p.ipStr)
+        {
+            static constexpr int kStateAt[2] = { 0x73, 0x6f };   // [0] SD (slot 2), [1] USB (slot 3)
+            for (int k = 0; k < 2; ++k)
+            {
+                const uint8_t state = data[kStateAt[k]];
+                const uint8_t before = p.localMedia[k];
+                uint8_t mounted = before;
+                if (state == 0x04)
+                    mounted = 0;
+                else if (state == 0x00 || (before == ProDJLinkPlayerState::kMediaUnknown
+                                           && (state == 0x02 || state == 0x03)))
+                    mounted = 1;
+                p.localMedia[k] = mounted;
+                if (before != ProDJLinkPlayerState::kMediaUnknown && before != mounted)
+                {
+                    p.mediaChanges[k].fetch_add(1, std::memory_order_relaxed);
+                    if (onMediaChanged)
+                        onMediaChanged(sender, uint8_t(k + 2));
+                }
+            }
+        }
+
         // Track ID, and where the track was loaded from: Dr (player), Sr
         // (slot) and Tr (track type) at 0x28-0x2a (dysentery vcdj.adoc).  A
         // rekordbox ID is only unique within one medium, so the same ID
@@ -3169,47 +3214,6 @@ private:
             p.trackVersion.fetch_add(1, std::memory_order_release);
             // Reset beat-derived position since beatCount restarts on new track
             p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
-        }
-
-        // Media in the player's own slots: S_l (0x73) for SD and U_l (0x6f)
-        // for USB read 00 while media is mounted, 04 when the slot is empty
-        // and 02 or 03 while it is being unmounted (dysentery vcdj.adoc;
-        // beat-link CdjStatus.isLocalSdLoaded / isLocalSdEmpty and the USB
-        // pair).  As beat-link's MetadataFinder.handleUpdate does, the media
-        // is gone only when the slot reports empty (04): a slot that goes 02
-        // and back to 00 kept its media, and reports nothing (capture S15b:
-        // the SD slot read 00 02 00 02 03 04 as its card was ejected).  When
-        // a mounted slot reports 04, and when media is mounted (00) in a slot
-        // that reported 04, the media there changed: rekordbox IDs are per
-        // export, so what is cached for this player and slot no longer
-        // describes it, and onMediaChanged is told (AUDIT META-4).  The
-        // report at the mount drops what a request still running at the
-        // unmount stored for the old media.  The first status that tells
-        // only sets the state (02 or 03 tell that media is there).  Only
-        // status from the player's own address counts, so a second device on
-        // the same number cannot make the state flap.  Parse side only:
-        // nothing is sent (DESIGN D33).
-        if (p.ipStr[0] != '\0' && sender == p.ipStr)
-        {
-            static constexpr int kStateAt[2] = { 0x73, 0x6f };   // [0] SD (slot 2), [1] USB (slot 3)
-            for (int k = 0; k < 2; ++k)
-            {
-                const uint8_t state = data[kStateAt[k]];
-                const uint8_t before = p.localMedia[k];
-                uint8_t mounted = before;
-                if (state == 0x04)
-                    mounted = 0;
-                else if (state == 0x00 || (before == ProDJLinkPlayerState::kMediaUnknown
-                                           && (state == 0x02 || state == 0x03)))
-                    mounted = 1;
-                p.localMedia[k] = mounted;
-                if (before != ProDJLinkPlayerState::kMediaUnknown && before != mounted)
-                {
-                    p.mediaChanges[k].fetch_add(1, std::memory_order_relaxed);
-                    if (onMediaChanged)
-                        onMediaChanged(sender, uint8_t(k + 2));
-                }
-            }
         }
 
         // Play state
