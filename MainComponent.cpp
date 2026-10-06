@@ -9304,7 +9304,25 @@ void MainComponent::timerCallback()
                                         tmEntry->cuePoints.push_back(std::move(cp));
                                     }
                                     tmEntry->sortCuePoints();
-                                    eng.refreshTrackMapLookup();
+                                    // Persist the populated cues (they were
+                                    // gone at the next start), let every
+                                    // engine's armed list pick them up, and
+                                    // show them in the TrackMap editor if it
+                                    // is open, as saveBpmMultToTrackMap does
+                                    // for its rekordbox cues (AUDIT ENG-18).
+                                    // saveAsync: this runs in the 60 Hz
+                                    // timer (AUDIT C8).  Only when a cue was
+                                    // added: the quick cues list every slot,
+                                    // set or not.
+                                    if (! tmEntry->cuePoints.empty())
+                                    {
+                                        settings.trackMap.saveAsync();
+                                        for (auto& e : engines)
+                                            e->refreshTrackMapLookup();
+                                        if (trackMapWindow != nullptr)
+                                            if (auto* editor = dynamic_cast<TrackMapEditor*>(trackMapWindow->getContentComponent()))
+                                                editor->refresh();
+                                    }
                                 }
                             }
                         }
