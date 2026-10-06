@@ -3614,10 +3614,12 @@ void btt_tempo_tracking              (BTT* self)
   //and min_lag a lag (103 / 112 at 44.1 / 48 kHz with STC's 200 BPM ceiling),
   //so this never fires.  Comparing candidate_tempo_lags[index_of_max_score],
   //as the comment means, was measured on click tracks at 48 kHz (AUDIT DEP-2):
-  //same BPM and certainty for 70-199 BPM and under hiss, certainty 0.44 ->
-  //0.68 at 100 BPM, but a 200 BPM click (its lag is min_lag) goes from 200.89
-  //at 0.29 to 199.12 at 0.09, below AudioBpmInput's threshold.  No measured
-  //gain, one loss: left as upstream has it.
+  //the same BPM for the 70-199 BPM clicks and for a click with hiss 20 dB
+  //under it, and the same certainty except at 100 BPM (0.44 -> 0.68); on
+  //hiss alone (-40 dBFS) the noise's tempo reads more certain (0.32-0.42 ->
+  //0.35-0.48, its BPM moving by up to 1.1); and a 200 BPM click (its lag is
+  //min_lag) goes from 200.89 at 0.29 to 199.12 at 0.09, below
+  //AudioBpmInput's threshold.  Left as upstream has it.
   if(index_of_max_score == self->min_lag)
     return;
   

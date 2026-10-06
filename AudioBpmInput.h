@@ -25,9 +25,13 @@
 //  - audioDeviceAboutToStart runs when the hub registers us (on the message
 //    thread, inside acquire(), BEFORE it puts us on the fan-out) and whenever
 //    the device restarts (the hub's reconfigureAll on the message thread, or
-//    a restart the driver starts itself).  On a restart JUCE announces the
-//    device before the stream runs, under the AudioDeviceManager's callback
-//    lock and the hub's fan-out lock, which the audio callback takes as well.
+//    a restart the driver starts itself).  On the hub's own restart the
+//    fan-out is taken off the AudioDeviceManager's callback list, the
+//    device is reopened and already running, and the fan-out is announced
+//    (JUCE's addAudioCallback) before it is put back on the list, so no
+//    audio callback reaches it meanwhile.  On a restart the driver starts
+//    itself, JUCE announces the device under its callback lock, and the
+//    fan-out under its own lock; the audio callback takes both.
 //    Either way it never runs at the same time as our audio callback, so
 //    that is where BTT is built (and rebuilt for a new sample rate) and the
 //    buffers are sized: allocation is fine there, and the callback never
