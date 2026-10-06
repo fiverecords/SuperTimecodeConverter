@@ -276,7 +276,14 @@ private:
 
         FrameRate fps = currentFps.load(std::memory_order_relaxed);
 
-        // Convert timecode to ms since midnight
+        // Convert timecode to ms since midnight.  The upper clamp is a real
+        // day, 86 400 000 ms, but the 23.976 timecode day is longer (DESIGN
+        // D20: 24 frames per timecode second, 0.1 % slow): from 23:58:33:17
+        // (86 400 022 ms) to 23:59:59:23 (86 486 358 ms) every packet carries
+        // 86 400 000, so the last ~86 s of the day stand still on the wire.
+        // Left so (DESIGN D2): what a Hippotizer sends or accepts past
+        // 86 400 000 at 23.976 has not been captured, and HippotizerInput
+        // drops values above it (AUDIT ENG-12).
         double ms = timecodeToMs(tc, fps);
         if (ms < 0.0) ms = 0.0;
         if (ms > 86400000.0) ms = 86400000.0;
