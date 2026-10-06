@@ -40,8 +40,15 @@
 //    threads: AudioTransportSource::setSource is not re-entrant (two calls
 //    at once delete the same BufferingAudioSource), and setPosition and
 //    start read the chain pointers setSource replaces, without a lock.  It
-//    can be held for as long as setSource takes to prefill the read-ahead
-//    buffer from disk, and is never taken on the audio thread.
+//    is held for as long as a load's setSource takes: the old chain's
+//    read-ahead thread finishing the chunk it is reading, and the new one
+//    prefilling its buffer from disk -- about 10 ms for a WAV on a local
+//    disk, as long as the read takes on a slow or sleeping one.  It is
+//    never taken on the audio thread.  play(), seekSeconds() and
+//    stopAndReset() do not touch the transport while a load is pending
+//    (pendingLoad), so the message thread waits on a load only in
+//    openDevice() / closeDevice() and in a device restart
+//    (audioDeviceAboutToStart / audioDeviceStopped, run by the hub).
 //  - transportLock guards our own state (reader source, file, tags, length,
 //    load error) and is only ever held for a few assignments, so UI
 //    accessors never wait on a load.  Order: sourceLock, then transportLock.
@@ -344,15 +351,17 @@ public:
     //                  which a play() resumes.
     //   userPaused  -- temporary mute that the audio callback honours.
     //
-    // play() during a pending async load: shouldPlay is set; when the loader
-    // thread finishes attaching the new source, it consults shouldPlay and
-    // calls transport.start() if appropriate.  This avoids the race where
-    // transport.start() runs before any source exists.
+    // play() during a pending async load: shouldPlay is set and nothing
+    // else.  The start comes once the load is done, from the onLoadCompleted
+    // listener (TimecodeEngine's catch-up: seekSeconds at the engine's
+    // playhead), or, when no listener is wired, from attachReaderToTransport
+    // at position 0.  This avoids the race where transport.start() runs
+    // before any source exists, or on the file about to be replaced.
     void play()
     {
         shouldPlay.store(true,  std::memory_order_release);
         userPaused.store(false, std::memory_order_release);
-        if (! hasFileLoaded()) return;             // load still pending; loader will start
+        if (! hasFileLoaded()) return;             // nothing to start yet; the load's catch-up (or attach) will
         // If a load is in flight, defer transport.start() to the
         // onLoadCompleted callback so the audio is started AT the engine's
         // current playhead instead of from position 0.  Without this guard
@@ -360,7 +369,9 @@ public:
         // hot-swap would start the previously loaded file from 0, audible
         // for the load duration, and then the new file would also start
         // from 0 when attachReaderToTransport runs -- the persistent
-        // cursor/audio desync the operator reported.
+        // cursor/audio desync the operator reported.  (A transport still
+        // running from before the load is not stopped here: the audio
+        // callback plays silence while the load is pending.)
         if (pendingLoad.load(std::memory_order_acquire)) return;
         if (! deviceOpen.load(std::memory_order_relaxed)) return;
         const juce::ScopedLock sl(sourceLock);
@@ -380,11 +391,20 @@ public:
         userPaused.store(true, std::memory_order_release);
     }
 
-    /// Stops and rewinds to the start of the file.
+    /// Stops and rewinds to the start of the file.  While a load is pending
+    /// the rewind is skipped, so the message thread does not wait for the
+    /// load's source swap (sourceLock).  A newly loaded file is attached at
+    /// position 0 (attachReaderToTransport); a request for the file already
+    /// loaded, an unload, or a load with the device closed attaches nothing
+    /// and leaves the old position.  A start from Stopped does not use it:
+    /// it seeks first (TimecodeEngine's generatorPlay, and its
+    /// onLoadCompleted catch-up while Playing).  A start from Paused after
+    /// a click on the timeline whose seek was dropped does (seekSeconds).
     void stopAndReset()
     {
         shouldPlay.store(false, std::memory_order_release);
         userPaused.store(true,  std::memory_order_release);
+        if (pendingLoad.load(std::memory_order_acquire)) return;
         const juce::ScopedLock sl(sourceLock);
         transport.setPosition(0.0);
     }
@@ -396,11 +416,27 @@ public:
     /// before this seek), the transport is re-engaged so audio resumes from
     /// the new position.  start() is a no-op when the transport is already
     /// playing, so the in-flight seek-while-playing case is unaffected.
-    /// Message thread.  Waits for a load in progress on the LoaderThread to
-    /// finish swapping the transport's source (sourceLock).
+    /// Message thread.
+    ///
+    /// While a load is pending it does nothing (AUDIT LTC-4): the position
+    /// and the start would go to the file about to be replaced -- a stale
+    /// onLoadCompleted catch-up, posted by a load that settled before a
+    /// newer requestLoad, started that file until the swap -- and the
+    /// message thread would wait for the load's source swap (sourceLock).
+    /// The last load's onLoadCompleted catch-up seeks to the engine's
+    /// playhead when the generator is Playing, which also starts the
+    /// transport, and a start from Stopped seeks first (generatorPlay).
+    /// A seek dropped while the generator is Paused is not made up for: a
+    /// click on the timeline while a preset's file loads (the click turns
+    /// Stopped into Paused) leaves the transport where it is -- 0 in a
+    /// newly attached file, the old position otherwise -- and a play from
+    /// Paused does not seek, so the audio starts there while the timecode
+    /// runs from the click.  Made before the load's swap, the seek would
+    /// reach only the file being replaced, with the same result.
     void seekSeconds(double seconds)
     {
         if (! hasFileLoaded()) return;
+        if (pendingLoad.load(std::memory_order_acquire)) return;
 
         seconds = juce::jmax(0.0, seconds);
 
@@ -494,16 +530,17 @@ public:
         else
             thumbnail.setSource(new juce::FileInputSource(file));
 
-        // Mark the player as having a load in flight so subsequent play()
-        // calls (and attachReaderToTransport's auto-start logic) defer
-        // their transport.start() to the onLoadCompleted callback.  This
-        // is what keeps the audio in sync after a hot-swap: starting the
-        // transport eagerly (either via play() before the LoaderThread
-        // runs, or via attachReaderToTransport's auto-start when the load
-        // completes) would always start at position 0, producing the
-        // load-duration desync that pause+play used to fix.  Set by
-        // LoaderThread::request under its state lock, and cleared by the
-        // LoaderThread only when no further request is queued after the
+        // Mark the player as having a load in flight so that play(),
+        // seekSeconds() and stopAndReset() leave the transport alone until
+        // it is done, and the start comes from the onLoadCompleted callback
+        // at the engine's playhead.  This is what keeps the audio in sync
+        // after a hot-swap: starting the transport eagerly, from play()
+        // before the LoaderThread runs, started the old file and then the
+        // new one at position 0, the load-duration desync that pause+play
+        // used to fix.  (attachReaderToTransport's own auto-start is off
+        // whenever onLoadCompleted is wired; it does not read this flag.)
+        // Set by LoaderThread::request under its state lock, and cleared by
+        // the LoaderThread only when no further request is queued after the
         // load it just finished (AUDIT LTC-4), so it covers every load path
         // including the same-file early return inside loadFile().
         loaderThread.request(file, shouldLoop);
@@ -725,6 +762,13 @@ private:
         if (shuttingDown.load(std::memory_order_acquire)) return;
 
         if (userPaused.load(std::memory_order_acquire)) return;
+        // While a load is pending the transport still holds the file being
+        // replaced, and it may still be running: stopAndReset() only mutes
+        // it, and a preset change during playback (stop, load, play) unmutes
+        // it at once, so it played from its start until the LoaderThread's
+        // swap stopped it (AUDIT LTC-4).  Silence instead; the new file
+        // starts from the onLoadCompleted catch-up.
+        if (pendingLoad.load(std::memory_order_acquire)) return;
         if (! transport.isPlaying()) return;
         if (! fileLoadedAtomic.load(std::memory_order_acquire)) return;
 
@@ -889,11 +933,12 @@ private:
     std::atomic<double> fileLengthAtomic    { 0.0 };
 
     // Set by LoaderThread::request (requestLoad), cleared by the
-    // LoaderThread once the last queued request is done.  Read by play() to
-    // defer transport.start() while a load is in flight -- the
-    // onLoadCompleted callback handles the start with the engine's current
-    // playhead so the audio does not race ahead of the cursor during a
-    // hot-swap.
+    // LoaderThread once the last queued request is done.  Read by play(),
+    // seekSeconds() and stopAndReset(), which leave the transport alone
+    // while a load is in flight, and by the audio callback, which plays
+    // silence then -- the onLoadCompleted callback handles the start with
+    // the engine's current playhead so the audio does not race ahead of the
+    // cursor during a hot-swap.
     std::atomic<bool>   pendingLoad         { false };
 
     juce::String currentDeviceName, currentTypeName;
