@@ -333,7 +333,10 @@ public:
     //    another device's, or the same device's again -- starts a new one,
     //    also when it was ignored before the session's own device restarted
     //    (the bullet above); without one, the next device to offer
-    //    FileTransfer does.  Before, an offer made during a session that
+    //    FileTransfer does.  An ignored offer of the session's own device
+    //    (a reconnection on its port) does not replace another device's:
+    //    when the session fails, the other device is tried, not the one
+    //    that just failed.  Before, an offer made during a session that
     //    then failed was lost for good: a second unit was not fetched until
     //    it reconnected (AUDIT SLQ-9).
     // start() and stop() are serialised.  MainComponent calls stop() only
@@ -351,11 +354,16 @@ public:
                 if (ip != targetIp || fileTransferPort == targetPort)
                 {
                     // Ignored while this session is wanted; kept in case it
-                    // fails (run).  The latest one replaces an earlier one.
-                    deferredIp = ip;
-                    deferredPort = fileTransferPort;
-                    std::memcpy(deferredToken, tkn, StageLinQ::kTokenLen);
-                    haveDeferred = true;
+                    // fails (run).  The latest one replaces an earlier one,
+                    // except that the session's own device does not replace
+                    // another device's (AUDIT SLQ-9).
+                    if (ip != targetIp || !haveDeferred || deferredIp == ip)
+                    {
+                        deferredIp = ip;
+                        deferredPort = fileTransferPort;
+                        std::memcpy(deferredToken, tkn, StageLinQ::kTokenLen);
+                        haveDeferred = true;
+                    }
                     return true;
                 }
                 DBG("StageLinQ DB: " + ip + " is back on FileTransfer port "
@@ -1730,7 +1738,8 @@ private:
     uint8_t targetToken[StageLinQ::kTokenLen] = {};
     std::atomic<uint32_t> targetSerial { 0 };
     // The last offer start() ignored while a session was wanted (also under
-    // targetMutex): served if that session fails (run).
+    // targetMutex): served if that session fails (run).  One of the
+    // session's own device does not replace another device's (start()).
     juce::String deferredIp;
     uint16_t deferredPort = 0;
     uint8_t deferredToken[StageLinQ::kTokenLen] = {};
