@@ -657,6 +657,21 @@ public:
     /// see dbPortListenerLoop().  Displayed in the PDL View toolbar.
     uint32_t getDbPortInboundCount() const { return dbPortInboundCount.load(std::memory_order_relaxed); }
 
+    /// Whether phase 1 may take a valid .wfc of bytesPerEntry as the
+    /// preview of a track on this player: only what the player's own
+    /// sources give.  The .wfc carries no source, and the Track Map cue
+    /// editor writes a StageLinQ track's Engine DJ overview (3 bytes per
+    /// entry) under the same artist|title|duration key as a Pioneer preview.
+    /// A CDJ-3000-class player (cdj3000Class: the request's player model
+    /// contains "3000", the test of the dbserver preview query) gets 3
+    /// (PWV6) or 6 (PWV4) from the dbserver and 6 over NFS: any valid .wfc,
+    /// as before.  Any other player gets only NFS's PWV4: 6 (AUDIT META-15).
+    /// Any thread.
+    static bool wfcFitsPlayer(int bytesPerEntry, bool cdj3000Class)
+    {
+        return cdj3000Class || bytesPerEntry == 6;
+    }
+
 private:
     /// An address no player uses any more (lost, or moved away): queue it
     /// for the worker, which closes its connections and drops its cooldown,
@@ -3193,8 +3208,17 @@ private:
                 // META-9; when to refresh is not decided yet).  The .wfc is
                 // what spares a player whose preview only NFS gives (any but a
                 // CDJ-3000) an NFS download per track in every session (AUDIT
-                // META-15).  Nothing stable identifies the audio file here --
-                // track IDs are per export -- so the key stays.
+                // META-15).  Only a .wfc whose bytes per entry this player's
+                // sources give is taken (wfcFitsPlayer): the file has no
+                // source tag, and another source's overview may sit under the
+                // same key.  A CDJ-3000-class player still takes any valid
+                // one, so another source's 3-byte overview can still reach
+                // it.  For any other player a 3-byte .wfc counts as none:
+                // phase 2 downloads the analysis over NFS, once if that
+                // brings a PWV4 (saved over the file), in every session if
+                // it cannot.  Nothing stable identifies the audio file here
+                // -- track IDs are per export -- so the key stays.
+                const bool diskCdj3000Class = req.playerModel.containsIgnoreCase("3000");
                 std::string diskKey;
                 {
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
@@ -3229,7 +3253,7 @@ private:
                 if (wantPreview && WaveformCache::exists(diskKey))
                 {
                     auto cached = WaveformCache::load(diskKey);
-                    if (cached.valid)
+                    if (cached.valid && wfcFitsPlayer(cached.bytesPerEntry, diskCdj3000Class))
                     {
                         const juce::SpinLock::ScopedLockType lock(cacheLock);
                         auto it = metadataCache.find(cacheKey);
@@ -3370,11 +3394,12 @@ private:
             // Save to disk cache ALWAYS (not gated by hasNewerRequests).
             // Even if dbserver queries were skipped, save whatever we have
             // now (disk cache + dbserver): the analysis to the .anlz, and the
-            // colour preview to the .wfc when no valid one is there
-            // (savePreviewIfMissing) -- also the preview an NFS download
-            // brought while the entry had no title, which the NFS thread
-            // could not save (AUDIT META-15).  The NFS thread saves its own
-            // results when it finishes.
+            // colour preview to the .wfc when no valid one this player's
+            // sources could have written is there (savePreviewIfMissing) --
+            // also the preview an NFS download brought while the entry had
+            // no title, which the NFS thread could not save (AUDIT META-15).
+            // The NFS thread saves its own results when it finishes.
+            const bool saveCdj3000Class = req.playerModel.containsIgnoreCase("3000");
             {
                 std::string saveDiskKey;
                 bool hasNewData = false;
@@ -3395,7 +3420,7 @@ private:
                 if (!saveDiskKey.empty() && hasNewData)
                     saveAnlzToDisk(cacheKey, saveDiskKey);
                 if (!saveDiskKey.empty() && hasPreview)
-                    savePreviewIfMissing(cacheKey, saveDiskKey);
+                    savePreviewIfMissing(cacheKey, saveDiskKey, saveCdj3000Class);
             }
 
             // --- NFS ANLZ Fallback ---
@@ -3433,7 +3458,7 @@ private:
 
                     juce::String nfsPlayerIP = req.playerIP;
                     uint8_t nfsSlot = req.slot;
-                    launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot, trackIdForNfs);
+                    launchNfsAsync(cacheKey, nfsPlayerIP, nfsSlot, trackIdForNfs, saveCdj3000Class);
                 }
             }
         }
@@ -3608,7 +3633,8 @@ private:
         if (needsNfs)
         {
             DBG("DbServerClient: NFS LAUNCH (no conn) trackId=" + juce::String(req.trackId));
-            launchNfsAsync(cacheKey, req.playerIP, req.slot, req.trackId);
+            launchNfsAsync(cacheKey, req.playerIP, req.slot, req.trackId,
+                           req.playerModel.containsIgnoreCase("3000"));
         }
     }
 
@@ -3617,8 +3643,12 @@ private:
     /// the disk cache under the title the entry has when the result lands:
     /// one launched while the entry had no title (no dbserver session, AUDIT
     /// META-7) is saved too if the title came during the download.
+    /// cdj3000Class is the request's CDJ-3000 test (its player model
+    /// contains "3000"), for the .wfc rule of savePreviewIfMissing; both
+    /// callers pass it.  Left out it is true, the rule from before the fit
+    /// test: any valid .wfc is kept, never replaced.
     void launchNfsAsync(const CacheKey& cacheKey, const juce::String& playerIP,
-                        uint8_t slot, uint32_t trackId)
+                        uint8_t slot, uint32_t trackId, bool cdj3000Class = true)
     {
         // Wait for the previous download in short slices rather than in
         // join(), so that stop() never waits on this thread behind a long
@@ -3640,7 +3670,7 @@ private:
             mediaGeneration = slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot);
         }
         nfsBusy.store(true, std::memory_order_release);
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, cancelToken, mediaGeneration]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, cancelToken, mediaGeneration, cdj3000Class]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
             DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
@@ -3677,13 +3707,14 @@ private:
 
                 // Persist to disk cache for next session: the analysis
                 // (.anlz), and the entry's colour preview (.wfc) when no
-                // valid one is on disk -- phase 1 loads it from there next
-                // time, so NFS does not run again just for the preview
-                // (AUDIT META-15; savePreviewIfMissing).
+                // valid one this player's sources could have written is on
+                // disk -- phase 1 loads it from there next time, so NFS does
+                // not run again just for the preview (AUDIT META-15;
+                // savePreviewIfMissing).
                 if (applied && !diskKey.empty())
                 {
                     saveAnlzToDisk(cacheKey, diskKey);
-                    savePreviewIfMissing(cacheKey, diskKey);
+                    savePreviewIfMissing(cacheKey, diskKey, cdj3000Class);
                 }
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher
@@ -3717,15 +3748,22 @@ private:
     }
 
     /// Worker or NFS thread.  Write the entry's colour preview to the .wfc
-    /// under diskKey when no valid one is there: none, or one that does not
-    /// load (an older version left it truncated, AUDIT META-10).  Phase 1
-    /// loads the preview only from a valid .wfc, so a missing or truncated
-    /// one sent a player whose preview only NFS gives (any but a CDJ-3000)
-    /// to NFS for the track in every session (AUDIT META-15).  A valid
-    /// .wfc is kept as it is.
-    void savePreviewIfMissing(const CacheKey& cacheKey, const std::string& diskKey)
+    /// under diskKey when no valid one that fits the player is there
+    /// (wfcFitsPlayer): none, one that does not load (an older version left
+    /// it truncated, AUDIT META-10), or, for a player other than the
+    /// CDJ-3000 class, one of 3 bytes per entry (an Engine DJ overview, or
+    /// a CDJ-3000's PWV6), which phase 1 does not take for it, so the NFS
+    /// PWV4 replaces it.  Phase 1 loads the preview only from such a .wfc,
+    /// so without one a player whose preview only NFS gives (any but a
+    /// CDJ-3000) went to NFS for the track in every session (AUDIT
+    /// META-15).  A valid .wfc that fits is kept as it is.
+    void savePreviewIfMissing(const CacheKey& cacheKey, const std::string& diskKey,
+                              bool cdj3000Class)
     {
-        if (diskKey.empty() || WaveformCache::load(diskKey).valid)
+        if (diskKey.empty())
+            return;
+        const auto onDisk = WaveformCache::load(diskKey);
+        if (onDisk.valid && wfcFitsPlayer(onDisk.bytesPerEntry, cdj3000Class))
             return;
         TrackMetadata preview;
         {
