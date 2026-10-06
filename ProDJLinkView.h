@@ -331,9 +331,10 @@ public:
 
     //--------------------------------------------------------------------------
     // Persist BPM multiplier to TrackMap.
-    // Toggle logic: if TrackMap already has this value, clear it; else set it.
+    // 1x clears the saved value; any other value is saved, and a value
+    // already saved is left as it is (no toggle).
     // After saving, session override is cleared (TrackMap = source of truth).
-    // Creates a new TrackMap entry if the track isn't mapped yet.
+    // Creates a new TrackMap entry if the track isn't mapped yet (not for 1x).
     //--------------------------------------------------------------------------
     void saveBpmToTrackMap(int playerNum, DeckState& ds, int clickedMult)
     {
@@ -1491,10 +1492,9 @@ private:
     // 2-state convention).  Order: 2x2 -> 4x1 -> ALT -> 2x2.
     void updateLayoutButtonLabel()
     {
-        const char* next = "2x2";
-        if (layoutAlternating)         next = "2x2";   // ALT -> 2x2
-        else if (layoutHorizontal)     next = "ALT";   // 4x1 -> ALT
-        else                           next = "4x1";   // 2x2 -> 4x1
+        const char* next = layoutAlternating ? "2x2"    // ALT -> 2x2
+                         : layoutHorizontal  ? "ALT"    // 4x1 -> ALT
+                                             : "4x1";   // 2x2 -> 4x1
         btnLayout.setButtonText(next);
     }
 
@@ -2475,8 +2475,10 @@ private:
 
         // Fill with green-yellow-red gradient
         float fillW = scaled * bar.getWidth();
-        for (float x = 0; x < fillW; x += 2.0f)
+        const int stripes = (int)std::ceil(fillW / 2.0f);   // one every 2 px, from x = 0
+        for (int i = 0; i < stripes; ++i)
         {
+            const float x = 2.0f * (float)i;
             float t = x / bar.getWidth();
             juce::Colour col = (t < 0.65f) ? accentGreen.withAlpha(0.75f)
                              : (t < 0.85f) ? accentAmber.withAlpha(0.80f)
