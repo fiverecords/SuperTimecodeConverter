@@ -428,20 +428,24 @@ public:
 
     /// Set small waveform data for a layer.
     ///
-    /// srcData is the raw waveform bytes from the CDJ. format identifies
-    /// the encoding:
+    /// srcData is the raw waveform bytes the caller has for the track;
+    /// srcBytesPerEntry says how they are read:
     ///   0 = none (clear the cached waveform)
-    ///   3 = ThreeBand (3 bytes/entry: mid, high, low) -- CDJ-3000
-    ///        Each band is 5-bit (0-31), encoded as a byte 0x00-0x1F.
-    ///   6 = ColorNxs2 (6 bytes/entry: d0,d1,d2,R,G,B) -- NXS2 PWV4
-    ///        d0/d1/d2 are 0-31 magnitude, RGB are 0-7 colour intensity.
-    ///   2 = PWV5 pre-encoded (2 bytes/entry: height, color) -- pass through
+    ///   3 = three band heights per entry, each masked to 5 bits: the
+    ///       CDJ-3000's PWV6 preview (mid, high, low) or PWV7 detail, and
+    ///       StageLinQ's overview (reordered to mid, high, low)
+    ///   6 = the NXS2's PWV4 colour preview, d0..d5 (see case 6)
+    ///   2 = the NXS2's PWV5 detail (see case 2)
     ///
-    /// The output is always 2400 bytes in PWV5 format (1200 entries, 2 bytes
-    /// each: height + color). PWV5 colour byte packs (high_band << 4) | mid_band
-    /// with each nibble 0-15 (5-bit -> 4-bit by >> 1). Heights are mapped from
-    /// 5-bit (0-31) to 8-bit (0-255) by left-shift 3 so MagicQ sees full
-    /// amplitudes matching what the Bridge sends.
+    /// The output is always 2400 bytes, 1200 entries of (height, colour):
+    /// STC's reading of TCNet's small waveform.  How each input becomes a
+    /// pair is per case: case 3 packs the colour byte as two 4-bit
+    /// intensities, (high << 4) | mid, and maps the height from 5 bits
+    /// (0-31) to 8 (0-255) as x8 plus a quarter (31 -> 255); case 6 maps
+    /// its height the same way and packs (d4 & 0x0F) << 4 | (d3 & 0x0F);
+    /// case 2 passes bytes 0 and 1 as they are.  Neither the layout nor the
+    /// scaling has been checked against a capture of a TCNet consumer
+    /// (DESIGN D2).
     void setLayerSmallWaveform(int idx, const uint8_t* srcData, int srcEntryCount,
                                int srcBytesPerEntry)
     {
@@ -469,8 +473,16 @@ public:
             uint8_t color = 0;
             switch (srcBytesPerEntry)
             {
-                case 3:  // ThreeBand: bands are 5-bit (0-31). Scale to 0-255.
+                case 3:  // Three bands, each masked to 5 bits (0-31), scaled to 0-255.
                 {
+                    // The references give these bands as whole bytes:
+                    // StageLinQ's overview is Engine DJ's u8 per band, 0-255
+                    // (libdjinterop; StageLinQDbClient passes them on as
+                    // they are), and PWV6/PWV7 are one-byte heights
+                    // (dysentery track_metadata; beat-link reads PWV6's
+                    // unmasked, low x0.49, mid x0.32, high x0.25, stacked).
+                    // The 5-bit mask wraps any value over 31 (200 -> 8).
+                    // Not changed without a capture (DESIGN D2).
                     uint8_t mid = e[0] & 0x1F;
                     uint8_t hi  = e[1] & 0x1F;
                     uint8_t lo  = e[2] & 0x1F;
@@ -479,26 +491,45 @@ public:
                     // a slight saturation toward max instead of simple <<3
                     // which caps at 248 instead of 255.
                     height = (uint8_t)std::min(255, (int)maxBand * 8 + (maxBand >> 2));
-                    // PWV5 color byte: pack high-band and mid-band intensities
-                    // into nibbles. 5-bit -> 4-bit by >>1.
+                    // Colour byte: high-band and mid-band intensities in the
+                    // two nibbles, 5-bit -> 4-bit by >>1.
                     color = (uint8_t)(((hi >> 1) << 4) | (mid >> 1));
                     break;
                 }
-                case 6:  // ColorNxs2: d0-d2 magnitude bands (5-bit), d3-d5 RGB.
+                case 6:  // NXS2 PWV4 colour preview, d0..d5
                 {
+                    // Since AUDIT META-15 an NXS2 deck has this preview and
+                    // comes here; before, it went through the detail
+                    // fallback (case 2).  Read as: the height from the
+                    // largest of d0..d2 (5 bits each), the colour as
+                    // (d4 & 0x0F) << 4 | (d3 & 0x0F).  The references read
+                    // these bytes otherwise: dysentery (track_metadata,
+                    // colour preview analysis) calls d0 and d1 "whiteness",
+                    // d2 the energy in the bottom half of the range, and d3,
+                    // d4, d5 the energy in its low, mid and top parts;
+                    // beat-link's WaveformPreview (RGB) takes the back
+                    // (dimmer) segment's height as max(d3, d4, d5) and the
+                    // front one's as d5, unmasked, and the colour from d3,
+                    // d4, d5 as red, green and blue.  Not changed: what a
+                    // TCNet consumer draws from it is not captured (DESIGN
+                    // D2).
                     uint8_t d0 = e[0] & 0x1F;
                     uint8_t d1 = e[1] & 0x1F;
                     uint8_t d2 = e[2] & 0x1F;
                     uint8_t maxBand = std::max({d0, d1, d2});
                     height = (uint8_t)std::min(255, (int)maxBand * 8 + (maxBand >> 2));
-                    // Encode RGB into PWV5 colour: pack G into upper nibble,
-                    // R into lower nibble. RGB are typically 0-7, fits in 4 bits.
                     uint8_t r = e[3] & 0x0F;
                     uint8_t g = e[4] & 0x0F;
                     color = (uint8_t)((g << 4) | r);
                     break;
                 }
-                case 2:  // already PWV5
+                case 2:  // NXS2 PWV5 detail, the fallback without a preview:
+                         // byte 0 is sent as the height and byte 1 as the
+                         // colour.  PWV5 is a big-endian u16 -- red, green,
+                         // blue in bits 15..7, 3 bits each, the height in
+                         // bits 6..2 (dysentery track_metadata; beat-link
+                         // WaveformDetail; AUDIT META-11) -- so neither byte
+                         // is a height or a colour.  Not changed (DESIGN D2).
                     height = e[0];
                     color = e[1];
                     break;
