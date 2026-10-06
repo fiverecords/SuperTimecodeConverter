@@ -667,7 +667,7 @@ public:
     /// contains "3000", the test of the dbserver preview query) gets 3
     /// (PWV6) or 6 (PWV4) from the dbserver and 6 over NFS: any valid .wfc,
     /// as before.  Any other player gets only NFS's PWV4: 6 (AUDIT META-15).
-    /// Any thread.
+    /// The PDL View's own .wfc fallback applies the same rule.  Any thread.
     static bool wfcFitsPlayer(int bytesPerEntry, bool cdj3000Class)
     {
         return cdj3000Class || bytesPerEntry == 6;

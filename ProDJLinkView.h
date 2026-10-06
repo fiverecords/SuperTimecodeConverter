@@ -814,6 +814,14 @@ public:
                             // Dbserver hasn't returned waveform yet -- try disk cache
                             // Use meta.durationSeconds (same source as save path),
                             // fall back to ds.trackLenSec if dbserver didn't provide it.
+                            // Only a .wfc that fits the source player is drawn,
+                            // the rule phase 1 applies (DbServerClient::
+                            // wfcFitsPlayer): for a player other than the
+                            // CDJ-3000 class a 3-byte file is another source's
+                            // overview (the cue editor's Engine DJ one, or a
+                            // CDJ-3000's PWV6).  Drawn here, it stayed for the
+                            // whole load: the player's own preview that came
+                            // later is not drawn over it (AUDIT META-15).
                             int durForKey = (meta.durationSeconds > 0)
                                 ? meta.durationSeconds : (int)ds.trackLenSec;
                             auto diskKey = TrackMapEntry::makeKey(
@@ -821,7 +829,10 @@ public:
                             if (WaveformCache::exists(diskKey))
                             {
                                 auto cached = WaveformCache::load(diskKey);
-                                if (cached.valid)
+                                const bool cdj3000Class = proDJLink.getPlayerModel((int)srcPlayer)
+                                                              .containsIgnoreCase("3000");
+                                if (cached.valid
+                                    && DbServerClient::wfcFitsPlayer(cached.bytesPerEntry, cdj3000Class))
                                 {
                                     ds.waveform.setColorWaveformData(cached.data,
                                         cached.entryCount, cached.bytesPerEntry);
