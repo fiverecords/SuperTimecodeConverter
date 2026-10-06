@@ -290,7 +290,6 @@ private:
     FrameRate lastDisplayedFps    = FrameRate::FPS_30;
     FrameRate lastDisplayedOutFps = FrameRate::FPS_30;
     double    beatFlashAccumMs    = 0.0;   // accumulates ms for BPM-based beat flash
-    double    lastBeatFlashBpm    = 0.0;   // last BPM used for flash interval
 
     // --- Collapse state (per-view, not per-engine) ---
     bool inputConfigExpanded  = true;
