@@ -270,10 +270,13 @@ private:
         void audioDeviceAboutToStart(juce::AudioIODevice* device) override
         {
             // Sized once, off the audio thread, and generously: four times
-            // the announced buffer and at least 16384 samples, so a driver
-            // that hands over more than it announced (some WASAPI
-            // configurations do) is served in one piece.  A callback bigger
-            // than this is served in chunks of this size (see the fan-out).
+            // the announced buffer and at least 16384 samples.  A driver
+            // block longer than the announced buffer does not get here in
+            // one piece: JUCE 9's AudioDeviceManager cuts it into blocks of
+            // at most getCurrentBufferSizeSamples() before calling us
+            // (CallbackMaxSizeEnforcer, juce_AudioDeviceManager.cpp).  The
+            // margin, and the chunks below for a call bigger than this, are
+            // a second guard that costs nothing.
             scratch.setSize(juce::jmax(1, device->getActiveOutputChannels().countNumberOfSetBits()),
                             juce::jmax(16384, 4 * device->getCurrentBufferSizeSamples()), false, false, true);
             const juce::ScopedLock sl(lock);
@@ -304,8 +307,9 @@ private:
             const juce::ScopedLock sl(lock);
 
             // Output clients render into the scratch buffer, sized in
-            // audioDeviceAboutToStart (no allocation here).  A device that
-            // hands over more samples than it holds is served in
+            // audioDeviceAboutToStart (no allocation here).  A call longer
+            // than the scratch -- which AudioDeviceManager, cutting driver
+            // blocks to the announced buffer, does not make -- is served in
             // scratch-sized chunks, in order, within this callback, so every
             // output client is asked for every sample the device plays.
             // (Clamping to the scratch length left the rest of the buffer
