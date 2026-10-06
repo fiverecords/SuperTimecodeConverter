@@ -523,16 +523,17 @@ public:
     }
 
     //==========================================================================
-    // The media in a player's SD (2) or USB (3) slot was mounted or
-    // unmounted (ProDJLinkInput::onMediaChanged, AUDIT META-4).  rekordbox
-    // IDs are per export, so the metadata and artwork cached for that player
-    // and slot, and the NFS fetcher's export.pdb index and mount handle for
-    // it, describe the media that was there: they are dropped, and the next
-    // request fetches the new media's.  A track still loaded from the old
-    // media (a deck in emergency loop) loses its metadata as well, as
-    // beat-link's MetadataFinder flushes its cache on an unmount.  An NFS
-    // download already running for that slot does not store its result
-    // (slotMediaGeneration).  Any thread (the Pro DJ Link network thread).
+    // A player's SD (2) or USB (3) slot reported empty, or media was mounted
+    // there after it did (ProDJLinkInput::onMediaChanged, AUDIT META-4).
+    // rekordbox IDs are per export, so the metadata and artwork cached for
+    // that player and slot, and the NFS fetcher's export.pdb index and mount
+    // handle for it, describe the media that was there: they are dropped,
+    // and the next request fetches the new media's.  A track still loaded
+    // from the old media (a deck in emergency loop) loses its metadata as
+    // well, as beat-link's MetadataFinder flushes its cache when the slot
+    // reports empty.  An NFS download already running for that slot does
+    // not store its result (slotMediaGeneration).  Any thread (the Pro DJ
+    // Link network thread).
     //==========================================================================
     void mediaChanged(const juce::String& playerIP, uint8_t slot)
     {
