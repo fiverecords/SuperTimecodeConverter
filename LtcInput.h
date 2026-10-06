@@ -870,11 +870,12 @@ private:
             numChannelsAvailable = device->getActiveInputChannels().countNumberOfSetBits();
             // The input latency the driver reports dates every arrival and
             // widens the receive window (isReceivingAt).  It is not clamped
-            // the way LtcOutput clamps its output latency (0-100 ms, DESIGN
-            // D6): a driver at 8192 samples can truly report a period of it
-            // (171 ms at 48 kHz), and a 100 ms cap would date every arrival
-            // there 71 ms late, two or three frames.  A driver that
-            // over-reports dates them early by its error instead.
+            // the way LtcOutput clamps its output latency (0-100 ms,
+            // DESIGN D6): a driver at 8192 samples can truly report a period
+            // of it (171 ms at 48 kHz, 186 ms at 44.1 kHz), and a 100 ms cap
+            // would date every arrival there 71-86 ms late, 1.7 to 2.6
+            // frames depending on the rates.  A driver that over-reports
+            // dates them early by its error instead.
             inputLatencyMs = (double)device->getInputLatencyInSamples() * 1000.0 / currentSampleRate;
             deliveryMs.store((double) currentBufferSize * 1000.0 / currentSampleRate + inputLatencyMs,
                              std::memory_order_relaxed);

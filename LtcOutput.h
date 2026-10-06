@@ -133,7 +133,10 @@ public:
     /// lined up with what STC saw at that instant.
     /// kind: 1 the encoder was ahead, or the publication stopped past the
     /// grace (a frame repeated), 2 behind (a frame skipped), 3 a seek
-    /// (snapped), 4 re-seeded after a hole, 5 re-seeded after a snap.
+    /// (snapped), 4 re-seeded after a hole, 5 re-seeded after a snap.  A
+    /// snap -- a seek, or the catch-up after a hold past the grace -- is
+    /// re-seeded in the same callback, microseconds later, so the log shows
+    /// the 5 with the total up by two, not the 3.
     int      getTrackEventCount() const { return trackEventCount.load(std::memory_order_relaxed); }
     int      getLastTrackKind() const   { return lastTrackKind.load(std::memory_order_relaxed); }
     int64_t  getLastTrackD() const      { return lastTrackD.load(std::memory_order_relaxed); }
@@ -745,7 +748,20 @@ private:
                 std::memset(outputChannelData[ch], 0, sizeof(float) * (size_t)numSamples);
 
         // Wall-clock instant of this callback, used by the phase alignment
-        // and by the gap detector below.  Taken once per callback.
+        // and by the gap detector below.  Taken once per callback.  A driver
+        // that hands over more than the buffer it announced reaches here as
+        // calls back to back -- JUCE's AudioDeviceManager splits its block to
+        // the announced size (CallbackMaxSizeEnforcer), and the hub's
+        // fan-out splits anything past its scratch -- and each is dated by
+        // its own reading, so the later ones are dated early by the samples
+        // before them.  At 480 announced and 25 fps (ltc_enforcer_split,
+        // simulated): blocks of two or three buffers are counted as an
+        // output gap at every block with the wire intact, and blocks of four
+        // are re-seeded at every block.  No such driver is known.  Dating
+        // those calls by the samples before them would date wrong a late
+        // callback followed at once by the next one, which this reading
+        // dates right; only CoreAudio passes the device clock that would
+        // tell the two apart (AudioIODeviceCallbackContext::hostTimeNs).
         const double callbackStartMs = nowMs();
         ++callbackCounter;
 
