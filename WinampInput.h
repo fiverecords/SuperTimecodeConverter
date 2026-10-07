@@ -171,8 +171,14 @@ public:
     // by up to half a buffer even though the audio plays smoothly).
     //
     // While paused or stopped we return the anchor verbatim so timecode
-    // freezes correctly, mirroring what the player itself does.  A stop,
-    // and the Winamp window going away, re-anchor at 0 (see run()).
+    // freezes correctly, mirroring what the player itself does.  A stop
+    // re-anchors at 0 (see run()).  The Winamp window going away does not:
+    // the position is held, so a Winamp that comes back still playing
+    // continues from it.  The cost: closed while playing and reopened
+    // stopped on the same title, the last playing position is returned
+    // until play (the reopened player's first answer is a stop from
+    // Stopped, which does not re-anchor), where Winamp shows 0 (AUDIT
+    // UI-13).
     //
     // A player that stops answering stays "Playing" (an IPC failure is not
     // taken as a stop -- see run()), so the extrapolation runs at most
@@ -302,20 +308,13 @@ private:
 
             if (hwnd == nullptr)
             {
-                // No Winamp window: stopped, and re-anchored at 0 with no
-                // lock (anchor time 0) when it was not, as an IPC_ISPLAYING
-                // stop is (below).
-                // Held instead, a Winamp closed while playing and reopened
-                // stopped on the same title kept the last playing position
-                // until play: the reopened player's first answer is a stop
-                // from Stopped, which does not re-anchor (AUDIT UI-13).
+                // No Winamp window: stopped, the position held (see
+                // getPositionMs).  Re-anchoring at 0 here made a Winamp
+                // that came back still playing read 0 while connected until
+                // its first position answer -- up to about 1 s during its
+                // start-up -- and the return to its position a seek.
                 winampConnected.store(false, std::memory_order_relaxed);
-                if (state.exchange(State::Stopped, std::memory_order_relaxed) != State::Stopped)
-                {
-                    const juce::SpinLock::ScopedLockType lock(anchorLock);
-                    positionAnchorMs   = 0.0;
-                    positionAnchorTime = 0.0;
-                }
+                state.store(State::Stopped, std::memory_order_relaxed);
                 juce::Thread::sleep(kPollIntervalMs);
                 continue;
             }
