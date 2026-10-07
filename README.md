@@ -65,7 +65,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network, announcing
 **Player tracking:**
 - Automatic player discovery on the Pro DJ Link network
 - Absolute position tracking from CDJ-3000 / CDJ-3000X (30Hz, millisecond precision)
-- Beat-derived position for NXS2 and older models
+- Beat-derived position for players that send no absolute position (nexus-generation players, or an NXS2 that has not yet accepted STC's bridge identity)
 - Play state detection: Playing, Paused, Cued, Looping, Seeking, End of Track
 - BPM, pitch fader, actual playback speed (including motor ramp)
 - On-air status, master player detection, beat position
@@ -178,8 +178,8 @@ Per-track timed triggers that fire at specific playhead positions during playbac
 - **Multi-selection:** Ctrl+click and Shift+click to select multiple cues. Delete button removes all selected cues at once.
 - **Manual entry:** add cue points by typing the position (MM:SS.mmm) directly.
 - **Same trigger types as track change:** MIDI Note, MIDI CC, OSC, Art-Net DMX -- any combination per cue point.
-- **Seek-aware:** seeking backward resets cues so they fire again; seeking forward passes the cues it jumps over without firing them. On a Pro DJ Link player that sends no absolute position STC follows the deck beat by beat: a jump into the next beat fires the cues it skips, and a jump back of 4 beats or less is not seen, so cues can fire early, twice or not at all.
-- **Only cues the playhead crosses fire:** when an engine moves to another deck (XF-A / XF-B, MASTER, ON AIR), when a track is loaded at a memory cue, when a paused deck is moved and then played, or when the generator's cues are re-armed, the cues behind the playhead at that moment are passed, not fired. A paused deck moved back by more than 100 ms (on a Pro DJ Link player that sends no absolute position, by more than 4 beats) and then played fires the cues ahead of it again when it crosses them.
+- **Seek-aware:** seeking backward resets cues so they fire again; seeking forward passes the cues it jumps over without firing them. On a Pro DJ Link player that sends no absolute position STC follows the deck beat by beat: a jump into the next beat fires the cues it skips, and a jump back (a loop, a beat jump, a hot cue) is seen at the player's next status, up to about a quarter of a second later -- until then the cues just after the jump-back point can fire early.
+- **Only cues the playhead crosses fire:** when an engine moves to another deck (XF-A / XF-B, MASTER, ON AIR), when a track is loaded at a memory cue, when a paused deck is moved and then played, or when the generator's cues are re-armed, the cues behind the playhead at that moment are passed, not fired. A paused deck moved back by more than 100 ms and then played fires the cues ahead of it again when it crosses them (on a Pro DJ Link player that sends no absolute position, a move back within one beat is not seen).
 - **Playback-only firing:** cue points only fire during actual playback. Scrub, jog, and cue preview do not trigger cues -- DJs can preview tracks freely without causing spurious output.
 - **Live editing:** cue points added or modified while a track is playing take effect immediately without reloading the track.
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
@@ -278,11 +278,11 @@ Useful for vinyl DJs, MIDI controller DJs, live bands, or any scenario where aud
 Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites, madMapper, and other TCNet-compatible lighting and video systems. No intermediate hardware or bridge software required -- STC replaces the PRO DJ LINK Bridge entirely.
 
 **Why TCNet instead of LTC/MTC for video?**
-- **60Hz Time packets** vs 24-30Hz with LTC/MTC -- each carries the layer's latest position (its playback speed goes in the Metrics packets, 30 Hz, to each registered receiver), and Resolume interpolates between them, enabling smooth 60fps video playback even from a 24fps timecode source. This breaks the traditional 30fps ceiling that LTC imposed on Resolume clips. The position itself changes as often as the source reports one: about 30 times a second from a CDJ-3000, once a beat from an NXS2 without absolute position, once a frame from a timecode input or the generator.
+- **60Hz Time packets** vs 24-30Hz with LTC/MTC -- each carries the layer's latest position (its playback speed goes in the Metrics packets, 30 Hz, to each registered receiver); any smoothing between positions is the receiver's. The position itself changes as often as the source reports one: about 30 times a second from a CDJ-3000, once a beat from a player without absolute position, once a frame from a timecode input or the generator.
 - **Automatic clip triggering** -- Resolume assigns clips by track name. When a CDJ loads a track, Resolume can automatically trigger the matching clip. For non-DJ sources, the engine name becomes the track title, allowing pre-mapped clip assignments per engine.
 - **Track metadata** -- artist, title, and album artwork appear in Resolume's deck display. CDJ/Denon tracks show real metadata; non-DJ sources show the input type and engine name.
 - **Play/pause sync** -- Resolume follows the CDJ's transport state in real time. Pause on the CDJ pauses the clip in Resolume.
-- **Millisecond position** -- TCNet carries playhead position in milliseconds. From a DJ deck it is the deck's own position as last reported, not quantized to frames (millisecond precision from a CDJ-3000); from a timecode input or the generator it is the timecode in milliseconds, so it moves in whole frames.
+- **Millisecond position** -- TCNet carries playhead position in milliseconds. From a DJ deck it is the deck's own position as last reported, not quantized to frames (millisecond precision from a CDJ-3000; on a player without absolute position, its beat count x 60000 / BPM, which is not the beat-grid position the timecode outputs use); from a timecode input or the generator it is the timecode in milliseconds, so it moves in whole frames. While a deck is paused it moves only in steps of 33 ms or more.
 - **Fader-controlled opacity** -- when a DJM or Denon mixer is connected, the channel fader position drives clip opacity in Resolume. Pull down the fader, the video fades out. No mixer = always fully visible.
 
 **Architecture:**
