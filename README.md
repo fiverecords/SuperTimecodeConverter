@@ -1,6 +1,6 @@
 # Super Timecode Converter
 
-A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. **Green Hippo Hippotizer** support via HippoNet is in development. Ideal for live events, broadcast, post-production, and AV installations.
+A professional timecode routing and conversion tool built with C++ and [JUCE](https://juce.com/). Run up to **8 independent timecode engines** simultaneously — each with its own input source, output destinations, frame rate, and offset. Connect directly to **Pioneer CDJ/DJM hardware** via native Pro DJ Link integration and to **Denon Engine OS hardware** via StageLinQ — no additional software required. Ideal for live events, broadcast, post-production, and AV installations.
 
 [![Latest Release](https://img.shields.io/github/v/release/fiverecords/SuperTimecodeConverter?label=Release&color=blue)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
 [![Downloads (latest release)](https://img.shields.io/github/downloads/fiverecords/SuperTimecodeConverter/latest/total?label=Downloads%20%28latest%20release%29&color=blue&style=flat-square)](https://github.com/fiverecords/SuperTimecodeConverter/releases/latest)
@@ -41,11 +41,10 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **MTC (MIDI Time Code)** — receive timecode from any MIDI device
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
-- **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net, HippoNet), how long the source still counts as present after the last frame or packet (for MTC, after the last quarter frame; a Full Frame on its own keeps the source present for two frames at most): 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
+- **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net), how long the source still counts as present after the last frame or packet (for MTC, after the last quarter frame; a Full Frame on its own keeps the source present for two frames at most): 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
 - **Generator** — internal timecode generator with two modes: **Clock** (follows the system wall clock continuously, for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. Supports an **A/B loop**: set the loop in and out points at the current position and arm the LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
 - **LA-Net (LaserAnimation Net-Timecode)** — receive Net-Timecode over the network from LaserAnimation systems (configurable interface)
 - **Winamp / WACUP** *(Windows only)* — follow playback position from a running Winamp or WACUP instance. The input attaches automatically as soon as a Winamp window appears, so it can be selected before the player is launched. On macOS and Linux this source falls back to the Generator.
-- **HippoNet** *(coming soon)* — receive timecode from Green Hippo Hippotizer media servers via HippoNet UDP protocol. Supports **multi-layer** packets (TC 1 / TC 2 selectable). Auto-discovery on port 9009. *Currently disabled pending hardware validation.*
 
 ### Outputs (enable any combination per engine)
 
@@ -288,7 +287,7 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 **Architecture:**
 - Broadcast: OptIn + Status on port 60000 (1Hz), Time on port 60001 (60Hz)
 - Unicast: automatic slave discovery, Request/Response negotiation, Metrics streaming at 30Hz, Metadata + Artwork on track change
-- Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector. Every interface selector of the software protocols (TCNet, Art-Net, LA-Net, HippoNet, OSC) also offers "Localhost (127.0.0.1)" for a receiver such as Resolume running on the same PC
+- Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector. Every interface selector of the software protocols (TCNet, Art-Net, LA-Net, OSC) also offers "Localhost (127.0.0.1)" for a receiver such as Resolume running on the same PC
 - Track metadata for the layer: artist and title from the deck (Pro DJ Link, StageLinQ); for the generator, the preset in use as the title, with the artist from the loaded file's tags (or the "Artist - " half of a file named "Artist - Title"), or the file's own title and artist when no preset is selected
 - **Global offset** (-2000 to +2000 ms) applied to every TCNet layer, to compensate for the latency of the receiving system without touching the per-engine frame offsets
 - Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator
@@ -464,7 +463,7 @@ The sections below are for developers who want to build STC from source.
        MICROPHONE_PERMISSION_ENABLED TRUE
        MICROPHONE_PERMISSION_TEXT "STC needs access to your audio interface for LTC input"
        LOCAL_NETWORK_PERMISSION_ENABLED TRUE
-       LOCAL_NETWORK_PERMISSION_TEXT "STC needs the local network for Pro DJ Link, StageLinQ, Art-Net, TCNet, OSC and HippoNet"
+       LOCAL_NETWORK_PERMISSION_TEXT "STC needs the local network for Pro DJ Link, StageLinQ, Art-Net, TCNet and OSC"
        PLIST_TO_MERGE "<plist><dict><key>NSAppSleepDisabled</key><true/></dict></plist>"
    )
 
@@ -698,8 +697,6 @@ The application is built around a modular, header-only architecture:
 | `LANetTimecodeInput.h` | LaserAnimation Net-Timecode receiver (UDP) with bind fallback |
 | `LANetTimecodeOutput.h` | LaserAnimation Net-Timecode broadcaster (UDP) with drift-free timing |
 | `TCNetOutput.h` | Full TCNet server: broadcast + unicast with slave discovery, Metrics streaming, Metadata, Artwork |
-| `HippotizerInput.h` | HippoNet timecode receiver: UDP port 6091, multi-layer (TC1/TC2), auto-discovery on port 9009 |
-| `HippotizerOutput.h` | HippoNet timecode sender (disabled in this version: controls hidden, pending hardware validation) |
 | `StcLogoData.h` | Embedded STC logo JPEG (300x300) for TCNet artwork fallback |
 | `LtcInput.h` | LTC audio decoder with passthrough ring buffer (SPSC), including user bits |
 | `LtcOutput.h` | LTC audio encoder with auto-increment, user bits, and SMPTE 12M binary group flags |
@@ -783,13 +780,11 @@ Ableton Link is a trademark of Ableton AG. This project is not affiliated with, 
 
 ChamSys, Avolites, madMapper, and all other product names, trademarks, and registered trademarks mentioned in this project are the property of their respective owners.
 
-Hippotizer is a trademark of Green Hippo Ltd (a tvONE brand). This project is not affiliated with, endorsed by, or associated with Green Hippo Ltd or tvONE. The HippoNet protocol implementation is based on independent Wireshark capture analysis.
-
 grandMA3 is a trademark of MA Lighting Technology GmbH. This project is not affiliated with, endorsed by, or associated with MA Lighting Technology GmbH.
 
 This project has not been developed using any proprietary documentation, SDK, or confidential information from any of the above companies. The Pro DJ Link and StageLinQ implementations are based on independent community research. The TCNet implementation is based on the [TCNet Link Specification V3.5.1B](https://www.tc-supply.com/tcnet) (open protocol, free to use).
 
-**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ, HippoNet). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
+**Use at your own risk.** This software communicates with DJ hardware and lighting/video systems using a combination of documented open protocols (TCNet) and undocumented protocols (Pro DJ Link, StageLinQ). While it has been tested with the hardware listed above, behaviour may change with future firmware updates or on untested hardware. The authors accept no responsibility for any issues arising from the use of this software.
 
 ---
 
