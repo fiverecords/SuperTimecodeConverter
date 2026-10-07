@@ -12,7 +12,7 @@ public:
     SuperTimecodeConverterApplication() {}
 
     const juce::String getApplicationName() override    { return "Super Timecode Converter"; }
-    const juce::String getApplicationVersion() override { return "1.9.14-beta2"; }
+    const juce::String getApplicationVersion() override { return "1.9.14"; }
     bool moreThanOneInstanceAllowed() override           { return false; }
 
     void initialise(const juce::String&) override
