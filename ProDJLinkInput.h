@@ -3330,11 +3330,12 @@ private:
             // Refusing every count 1-4 beats lower left the position up to 4
             // beats ahead after such a step (AUDIT ENG-2).  Still refused
             // although it is the player's, until a status kStatusAfterBeatMs
-            // or more after the packet: a count after a step back that is not
-            // below the count before the beat packet that followed the step
-            // -- a landing in the beat STC held (a one-beat loop), or the
-            // deck crossing a beat again before the player's first status
-            // after the step.  Taken although stale: a status from before
+            // or more after the packet: a lower count equal to (not below)
+            // the count STC held before the latest beat packet, handled
+            // within kStatusAfterBeatMs of it -- a one-beat loop or a
+            // one-beat jump back landing on the beat, a step back made just
+            // after a beat, or the deck crossing a beat again before the
+            // player's first status after the step.  Taken although stale: a status from before
             // the beat handled kStatusAfterBeatMs or more after the packet
             // (the network thread held up), until the next status corrects
             // it.  Two statuses with the same lower count are not taken as

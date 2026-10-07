@@ -9116,9 +9116,10 @@ void MainComponent::timerCallback()
                     waveformDisplay.setBeatGrid(meta.beatGrid);
                 // Hand the beat grid to the engine (which also fetches its
                 // own, AUDIT ENG-4).  On an NXS2 without absolute position
-                // the grid gives the beat-fallback position, the one sent;
-                // the PLL nudge it also feeds changes nothing sent (AUDIT
-                // ENG-15).
+                // the grid gives the beat-fallback position the timecode
+                // outputs send (TCNet's millisecond position is the input's
+                // own, AUDIT ENG-14); the PLL nudge it also feeds changes
+                // nothing sent (AUDIT ENG-15).
                 if (meta.hasBeatGrid())
                     eng.setBeatGrid(meta.beatGrid, wfTrackId);
             }

@@ -2241,9 +2241,11 @@ public:
                     // early, at every loop pass, and again when the deck
                     // reaches it.  It lasts until the first status 50 ms or
                     // more after the packet (up to about 0.25 s on those
-                    // captures) when the landing is in the beat
-                    // ProDJLinkInput held (a one-beat loop) or the deck
-                    // crosses a beat before the player's first status after
+                    // captures) when the lower count equals the one
+                    // ProDJLinkInput held before the latest beat packet --
+                    // a one-beat loop or one-beat jump back landing on the
+                    // beat, a step back just after a beat, or the deck
+                    // crossing a beat before the player's first status after
                     // the step: that status is refused as possibly stale.
                     // The outputs' resync keeps PlayheadPLL's verdict.
                     const bool cueSeek = pll.seekDetected

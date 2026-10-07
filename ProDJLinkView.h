@@ -2628,9 +2628,12 @@ private:
     // Fill deck pn's Track Map entry with the rekordbox cues of meta when it
     // has none.  Called when the deck's cues are first fed to the detail
     // view: with the detail waveform's first fetch when they came in it (the
-    // disk cache, an NFS download), or later when they arrive on their own.
-    // It ran only in the second case, so an entry stayed empty whenever the
-    // cues came with the detail (AUDIT ENG-18).  Message thread.
+    // disk cache, an NFS download), or later when they arrive on their own;
+    // and when the deck's title is first applied after its cues were already
+    // fed (fed under the placeholder "Track #N", before the dbserver title,
+    // AUDIT META-7).  It ran only in the second case, so an entry stayed
+    // empty whenever the cues came with the detail (AUDIT ENG-18).  Message
+    // thread.
     //==========================================================================
     void autoPopulateRekordboxCues(int pn, DeckState& ds, const TrackMetadata& meta)
     {
