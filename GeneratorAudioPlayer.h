@@ -27,9 +27,11 @@
 // Threading:
 //  - Message thread (UI, OSC handlers dispatched via callAsync, the engine
 //    tick): openDevice / closeDevice / requestLoad / play / pause /
-//    stopAndReset / seekSeconds and the getters.
+//    stopAndReset / seekSeconds / setLoopingWhilePlaying and the getters.
 //  - LoaderThread ("STC Generator Loader"): loadFile / unloadFile /
-//    setLooping, as requestLoad schedules them.
+//    setLooping, as requestLoad schedules them.  setLooping also runs on the
+//    message thread, inside setLoopingWhilePlaying, only while no load is
+//    pending.
 //  - Audio thread: audioDeviceIOCallbackWithContext, called by the hub's
 //    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
 //    adds or removes us or the device restarts (message thread, or the
@@ -480,6 +482,9 @@ public:
     //==========================================================================
     // Loop
     //==========================================================================
+    /// The LoaderThread, for each request (requestLoad); the message thread
+    /// through setLoopingWhilePlaying.  AudioFormatReaderSource's flag is a
+    /// plain bool the read-ahead and audio threads read, as it always was.
     void setLooping(bool shouldLoop)
     {
         loopFlag.store(shouldLoop, std::memory_order_relaxed);
@@ -489,6 +494,45 @@ public:
     }
 
     bool isLooping() const { return loopFlag.load(std::memory_order_relaxed); }
+
+    /// Switch the loop while the file may be playing: TimecodeEngine's
+    /// timecode loop (#24), which loops the file itself when its end is the
+    /// file's end and must stop doing so when that changes.  Message thread,
+    /// and not while a load is pending (the request in flight carries its own
+    /// flag; the engine comes back once it completes).
+    ///  - Off: JUCE's read-ahead position is folded into the file only while
+    ///    the source loops (BufferingAudioSource::getNextReadPosition), so
+    ///    once the file has gone round it lies past the end and the transport
+    ///    would stop at once.  It is folded back here, so the pass that is
+    ///    playing ends at the file's end.
+    ///  - On: a transport that has already stopped at the file's end (the
+    ///    engine's timecode trails the audio by a few ms) is started again;
+    ///    with the loop on, its position reads folded, from the top.
+    /// Both may leave a brief gap: BufferingAudioSource discards its
+    /// read-ahead when the loop changes, and the fold is a seek.
+    void setLoopingWhilePlaying(bool shouldLoop)
+    {
+        if (pendingLoad.load(std::memory_order_acquire)) return;
+        setLooping(shouldLoop);
+        if (! hasFileLoaded()) return;
+
+        const bool wantsSound = shouldPlay.load(std::memory_order_acquire)
+                             && ! userPaused.load(std::memory_order_acquire)
+                             && deviceOpen.load(std::memory_order_relaxed);
+        const double len = fileLengthAtomic.load(std::memory_order_acquire);
+        const juce::ScopedLock sl(sourceLock);
+        if (shouldLoop)
+        {
+            if (wantsSound && ! transport.isPlaying())
+                transport.start();
+            return;
+        }
+        const double pos = transport.getCurrentPosition();
+        if (len <= 0.0 || pos < len) return;
+        transport.setPosition(std::fmod(pos, len));
+        if (wantsSound)
+            transport.start();
+    }
 
     //==========================================================================
     // File channel mode: which channel(s) of the loaded audio file to use.
