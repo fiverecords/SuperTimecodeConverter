@@ -4877,9 +4877,11 @@ private:
     ///     because the next tick advances *past* it without crossing into it
     ///     (the cue's positionMs equals the previous mark, which is excluded
     ///     by the strict-less comparison).
-    ///   - Looping audio that wraps the TC backward -> every loop iteration
-    ///     re-fires the cues inside the loop region.
-    ///   - Backward jumps (seek, loop wrap, stop+restart) just update
+    ///   - The A/B loop wraps the TC back to loop In -> every iteration
+    ///     re-fires the cues inside the loop region.  "Loop audio file when
+    ///     it ends" does not: it loops the audio only, the TC keeps counting
+    ///     past the file's end, so its cues fire on the first pass only.
+    ///   - Backward jumps (seek, A/B loop wrap, stop+restart) just update
     ///     prevMs without firing anything.
     void tickCuePointsCrossing(uint32_t playheadMs)
     {
@@ -4888,7 +4890,7 @@ private:
         const uint32_t prevMs = lastCueCheckMs;
 
         // Backward jump: just take the new mark, don't fire anything.  This
-        // covers seek-back, audio loop wrap, and stop->start (which leaves
+        // covers seek-back, the A/B loop wrap, and stop->start (which leaves
         // genCurrentMs at startMs, often less than where it was before).
         // The inclusive flag survives: it belongs to the transport event
         // that set it, not to this tick.
@@ -5003,8 +5005,8 @@ private:
             // TC and the loop Out fall in the same tick, the loop wins (the
             // user explicitly armed the loop).  We also reseed the cue
             // cursor so cues inside the loop body re-fire on each
-            // iteration, matching the behaviour of the existing
-            // generatorAudioPlayer.isLooping() full-file loop path.
+            // iteration.  ("Loop audio file when it ends" has no such wrap:
+            // the TC never goes back, see the EOF branch below.)
             if (genLoopEnabled && genLoopOutMs > genLoopInMs
                 && genCurrentMs >= genLoopOutMs)
             {
@@ -5026,9 +5028,12 @@ private:
             // Without this, the SMPTE would keep advancing past the file's
             // last sample (the audio transport silently auto-stops at EOF
             // but nothing was relaying that back to the generator state).
-            // Looping files fold around inside seekSeconds() so they do
-            // not reach this branch; a user-defined stop TC takes
-            // precedence (handled by the prior branch).
+            // With "Loop audio file when it ends" this branch is skipped
+            // (isLooping): the player loops the audio, and the TC keeps
+            // counting past the file's end -- until Stop TC, or for ever
+            // without one.  Nothing here folds genCurrentMs; only a seek is
+            // folded into the file (seekSeconds).  A user-defined stop TC
+            // takes precedence (handled by the prior branch).
             //
             // genEndedAtEof is set so that a subsequent click on the
             // waveform timeline (setGeneratorPosition) treats the seek
@@ -5053,8 +5058,9 @@ private:
             // Check armed cue points against the current generated TC.
             // Uses the crossing-based variant: a cue fires whenever the
             // generated TC advances across its position in play.  Seeking
-            // backwards and playing forward will re-fire cues, looping
-            // audio re-fires cues every iteration -- which is what the
+            // backwards and playing forward will re-fire cues, and the A/B
+            // loop re-fires them every iteration ("Loop audio file when it
+            // ends" does not: the TC does not go back) -- which is what the
             // Generator's transport-mode UX wants (vs. the TrackMap path
             // where each cue fires at most once per track to match how a
             // CDJ scratch / jog should behave).
