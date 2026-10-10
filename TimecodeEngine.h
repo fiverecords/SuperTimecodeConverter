@@ -3185,10 +3185,31 @@ public:
     ///
     /// The caller is responsible for any clamping (e.g. against Stop TC or
     /// the audio file's length); this method only enforces newMs >= 0.
+    ///
+    /// A jump of kGenSeekAnnounceMs or more is told to the outputs as a
+    /// seek (genJumpAnnounce, consumed by the next tick's
+    /// routeTimecodeToOutputs): a click on the waveform or an OSC jog that
+    /// far while the generator plays gives the MTC Full Frame, the
+    /// immediate Art-Net / LA-Net / HippoNet frame and the LTC re-seed a
+    /// CDJ hot cue gives (#24).  A shorter step -- each event of a drag on
+    /// the waveform, a stream of small OSC jogs -- is not: announced on
+    /// every event, the Full Frames and re-seeds would follow each other
+    /// faster than an MTC quarter-frame cycle (2 frames) or an LTC frame
+    /// lasts, and nothing whole would go out for as long as the gesture
+    /// lasts; the senders' own value tracking follows such steps, as in
+    /// 1.9.14.  While the generator is paused or stopped the outputs are
+    /// paused and the flag is dropped there, as a DJ source's seek is.
+    /// Only for the generator in transport mode: an OSC jog reaches an
+    /// engine whatever its input, and another source's outputs have
+    /// nothing to announce.  Message thread.
     void setGeneratorPosition(double newMs)
     {
+        const double fromMs = genCurrentMs;
         genCurrentMs    = juce::jmax(0.0, newMs);
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
+        if (activeInput == InputSource::SystemTime && ! genClockMode
+            && std::abs(genCurrentMs - fromMs) >= kGenSeekAnnounceMs)
+            genJumpAnnounce = true;
 
         // Sync the cue check cursor to the seek destination so the next
         // crossing-based tick treats anything <= newMs as "already on the
@@ -3232,6 +3253,11 @@ public:
         if (resumeFromEof)
             generatorAudioPlayer.play();
     }
+
+    /// The smallest jump of the generator's own seek (setGeneratorPosition)
+    /// that is announced to the outputs: the jump a DJ source's PLL takes
+    /// for a seek (pll.seekDetected, an error over 500 ms).
+    static constexpr double kGenSeekAnnounceMs = 500.0;
 
     double getGeneratorStartMs() const { return genStartMs; }
     double getGeneratorStopMs()  const { return genStopMs; }
@@ -3508,12 +3534,14 @@ private:
     // any explicit user transition (Play / Stop / file change / input
     // source change), so it never survives a context switch.
     bool   genEndedAtEof = false;
-    // The generator's timecode jumped -- a loop wrap (wrapGenerator) -- and
+    // The generator's timecode jumped -- a loop wrap (wrapGenerator), or its
+    // own seek of kGenSeekAnnounceMs or more (setGeneratorPosition) -- and
     // the outputs are to be told as for a seek: routeTimecodeToOutputs
     // consumes it exactly like a DJ source's pll.seekDetected (MTC Full
     // Frame, an immediate Art-Net / LA-Net / HippoNet frame, LTC re-seed),
     // instead of each sender finding the jump with its own value tracking
-    // (#24).  Set and consumed on the message thread (the tick).
+    // (#24).  Set and consumed on the message thread (the tick, the UI,
+    // OSC).
     bool   genJumpAnnounce = false;
 
     // Generator audio playback (per-engine, optional)
@@ -5631,8 +5659,9 @@ private:
             // --- Seek/Hot Cue resync ---
             // PLL detected a position jump >500ms (seek, hot cue, track load),
             // or the generator's timecode jumped (genJumpAnnounce: a loop
-            // wrap, #24).  Force immediate resync on all digital outputs so
-            // receivers know the new position instantly:
+            // wrap, or its own seek of 500 ms or more, #24).  Force
+            // immediate resync on all digital outputs so receivers know the
+            // new position instantly:
             //   MTC:    Full Frame message (instant vs 8 QFs = 2 frames)
             //   ArtNet: immediate frame (vs waiting for next timer tick)
             //   LTC:    reseed encoder (clean frame start at new position)
