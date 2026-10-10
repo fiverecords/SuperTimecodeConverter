@@ -807,8 +807,9 @@ private:
     void populateGenPresetCombo();
     // Generator presets (GO, the preset combo, OSC /stc/N/gen/preset):
     // the engine side, static so the three paths share it, then the panel.
-    // "Loop timecode" (#24) and "Loop audio file when it ends" reach the
-    // engine only with the audio file.  Message thread.
+    // A preset's "Loop timecode" (#24) and "Loop audio file when it ends"
+    // reach the engine only with the audio file (or, live, OSC
+    // /stc/N/gen/looptc).  Message thread.
     static void applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset, bool withAudioFile);
     static void browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset);
     static void goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset);

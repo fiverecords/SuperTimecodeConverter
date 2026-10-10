@@ -6667,7 +6667,8 @@ void MainComponent::updateStatusLabels()
     // The STOP TC label says when the preset's "Loop timecode" (#24) is
     // what runs at the end: STOP TC (LOOP) while the loop acts, the same
     // test as the waveform window's LOOP TC.  There is no control on the
-    // panel: the preset carries the option.
+    // panel: the preset carries the option (and OSC /stc/N/gen/looptc
+    // turns it on or off live).
     lblGenStopTC.setText(GeneratorWaveformWindow::loopTimecodeShown(eng) ? "STOP TC (LOOP):" : "STOP TC (0=FREE):",
                          juce::dontSendNotification);
 
@@ -6945,11 +6946,14 @@ void MainComponent::cycleGenPreset(int direction)
 // paths share one copy of it (the OSC path had a copy of its own, which
 // did not name the preset in use for the TCNet metadata nor show it in the
 // combo); the members after it add the panel.  "Loop timecode" (#24) and
-// "Loop audio file when it ends" follow the audio file: they reach the
-// engine with it, in applyGenPresetToEngine, and nowhere else, so the
-// player's loop is set in the same load request as the flags the engine
-// holds for that file (TimecodeEngine::setGeneratorAudioFile).  A browse
-// that leaves the playing file alone leaves its flags alone too.
+// "Loop audio file when it ends" follow the audio file: a preset's flags
+// reach the engine with it, in applyGenPresetToEngine, and nowhere else,
+// so the player's loop is set in the same load request as the flags the
+// engine holds for that file (TimecodeEngine::setGeneratorAudioFile).
+// Only OSC /stc/N/gen/looptc changes them live, for the file playing: it
+// sets the engine's Loop timecode and, turning it on, clears the engine's
+// Loop audio.  A browse that leaves the playing file alone leaves its
+// flags alone too.
 // Everything here runs on the message thread (OSC through callAsync).
 
 /// Apply `preset` to `eng`: preset name, Start/Stop TC, cue points, and --
@@ -7138,7 +7142,7 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
     auto& eng = *engines[(size_t)targetEngine];
 
     // Show Lock does not gate these commands, the configuration ones
-    // included (clock, start, stoptime, preset): it guards the panel
+    // included (clock, looptc, start, stoptime, preset): it guards the panel
     // against a stray click, and OSC IN is the show's own remote control,
     // where loading a preset or setting Start TC is a cue.  OSC IN itself
     // is switched on and set up (port, interface) only while unlocked
@@ -7179,6 +7183,21 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
                 resized();
             }
         }
+    }
+    else if (cmd == "/stc/gen/looptc")
+    {
+        // "Loop timecode" (#24) on (1) or off (0), live, as /clock: an int
+        // (a float or a numeric string is read as one; T/F are not).  It
+        // sets the engine's copy, held with the file it plays, not the
+        // preset: the next time a preset's file is applied (GO,
+        // /gen/preset, a browse with no audio playing) the preset's flags
+        // come back.  Off while it plays: the pass in progress runs to the
+        // loop's end and the generator stops there.  On also turns the
+        // engine's copy of "Loop audio file when it ends" off
+        // (TimecodeEngine::setGeneratorLoopTimecode).
+        int val = msg.getInt(0, -1);
+        if (val >= 0)
+            eng.setGeneratorLoopTimecode(val != 0);
     }
     else if (cmd == "/stc/gen/start")
     {

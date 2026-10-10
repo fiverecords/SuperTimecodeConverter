@@ -979,9 +979,13 @@ private:
         help << "TRANSPORT\n";
         help << "  /stc/N/gen/play\n";
         help << "  /stc/N/gen/pause\n";
-        help << "  /stc/N/gen/stop\n\n";
+        help << "  /stc/N/gen/stop\n";
+        help << "  /stc/N/gen/jog (float)    move by seconds (- = back)\n\n";
         help << "MODE\n";
-        help << "  /stc/N/gen/clock (int)    0=transport, 1=clock\n\n";
+        help << "  /stc/N/gen/clock (int)    0=transport, 1=clock\n";
+        help << "  /stc/N/gen/looptc (int)   0=off, 1=Loop timecode (until the\n";
+        help << "                            next GO / preset load; off stops at\n";
+        help << "                            the end)\n\n";
         help << "TIMECODE\n";
         help << "  /stc/N/gen/start (string)     \"HH:MM:SS:FF\"\n";
         help << "  /stc/N/gen/stoptime (string)  \"HH:MM:SS:FF\"\n\n";
