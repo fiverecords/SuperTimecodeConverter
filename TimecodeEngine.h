@@ -3488,7 +3488,8 @@ private:
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
 
     // A/B loop: when genLoopEnabled and genLoopOutMs > genLoopInMs, the tick
-    // wraps genCurrentMs from loopOutMs to loopInMs.  Pressing Play with loop
+    // wraps genCurrentMs from loopOutMs back to loopInMs, keeping what the
+    // tick ran past Out (wrapGenerator).  Pressing Play with loop
     // enabled snaps position to loopInMs first (standard DAW / CDJ loop).
     // Set and cleared on the message thread, which also runs the tick, so
     // no lock is needed.
@@ -3507,6 +3508,13 @@ private:
     // any explicit user transition (Play / Stop / file change / input
     // source change), so it never survives a context switch.
     bool   genEndedAtEof = false;
+    // The generator's timecode jumped -- a loop wrap (wrapGenerator) -- and
+    // the outputs are to be told as for a seek: routeTimecodeToOutputs
+    // consumes it exactly like a DJ source's pll.seekDetected (MTC Full
+    // Frame, an immediate Art-Net / LA-Net / HippoNet frame, LTC re-seed),
+    // instead of each sender finding the jump with its own value tracking
+    // (#24).  Set and consumed on the message thread (the tick).
+    bool   genJumpAnnounce = false;
 
     // Generator audio playback (per-engine, optional)
     GeneratorAudioPlayer generatorAudioPlayer;
@@ -4881,8 +4889,9 @@ private:
     ///     re-fires the cues inside the loop region.  "Loop audio file when
     ///     it ends" does not: it loops the audio only, the TC keeps counting
     ///     past the file's end, so its cues fire on the first pass only.
-    ///   - Backward jumps (seek, A/B loop wrap, stop+restart) just update
-    ///     prevMs without firing anything.
+    ///   - Backward jumps (seek back, stop+restart) just update prevMs
+    ///     without firing anything; a loop wrap moves the cursor itself
+    ///     (wrapGenerator).
     void tickCuePointsCrossing(uint32_t playheadMs)
     {
         if (armedCues.empty()) { lastCueCheckMs = playheadMs; cueCursorInclusive = false; return; }
@@ -4890,19 +4899,27 @@ private:
         const uint32_t prevMs = lastCueCheckMs;
 
         // Backward jump: just take the new mark, don't fire anything.  This
-        // covers seek-back, the A/B loop wrap, and stop->start (which leaves
-        // genCurrentMs at startMs, often less than where it was before).
-        // The inclusive flag survives: it belongs to the transport event
-        // that set it, not to this tick.
-        if (playheadMs <= prevMs) { lastCueCheckMs = playheadMs; return; }
+        // covers seek-back and stop->start (which leaves genCurrentMs at
+        // startMs, often less than where it was before); a loop wrap moves
+        // the cursor back itself (wrapGenerator).  The inclusive flag
+        // survives: it belongs to the transport event that set it, not to
+        // this tick.  Standing still with the cursor inclusive is not a step
+        // back: the cue exactly there fires now -- a wrap that landed in the
+        // loop's first millisecond, or a start whose first tick has not
+        // moved, fired it a tick late.
+        if (playheadMs < prevMs || (playheadMs == prevMs && ! cueCursorInclusive))
+        {
+            lastCueCheckMs = playheadMs;
+            return;
+        }
 
         // Forward advance.  Fire any cue whose position is strictly greater
         // than where we were and at most where we are now -- except on the
-        // first tick after the transport started or the loop wrapped, where
-        // the cursor is inclusive so that a cue placed exactly at the start
-        // TC (or at loop In) fires.  "At 00:00:00:00, go" is the obvious way
-        // to ask for something at the top of a cue, and it used to fire
-        // never.
+        // first check after the transport started or a loop wrapped (the
+        // wrap's own tick, wrapGenerator), where the cursor is inclusive so
+        // that a cue placed exactly at the start TC (or at loop In) fires.
+        // "At 00:00:00:00, go" is the obvious way to ask for something at
+        // the top of a cue, and it used to fire never.
         const bool inclusive = cueCursorInclusive;
         cueCursorInclusive = false;
         for (auto& ac : armedCues)
@@ -4932,6 +4949,82 @@ private:
 
         lastCueCheckMs = playheadMs;
     }
+
+    /// One wrap for the generator's loops (#24): the A/B loop now, from
+    /// loop Out back to loop In.  updateGenerator calls it, on the message
+    /// thread, once genCurrentMs has reached endMs.  It
+    ///  - fires the cues the tick crossed up to the end, (cursor, endMs], so
+    ///    a cue in the last tick before the end, and one exactly at it, fire
+    ///    on every pass (the end one just before the begin one).  Folding
+    ///    first, as the A/B wrap did, made that window a step back, where
+    ///    tickCuePointsCrossing fires nothing;
+    ///  - folds the position back keeping what the tick ran past the end,
+    ///    beginMs + fmod(genCurrentMs - beginMs, endMs - beginMs): a pass
+    ///    lasts exactly endMs - beginMs (the A/B wrap dropped the excess,
+    ///    up to a tick per pass);
+    ///  - leaves the cue cursor at beginMs, inclusive, so the tick's own
+    ///    tickCuePointsCrossing fires the cues in [beginMs, position] -- the
+    ///    begin cue in the wrap's tick, not a tick later;
+    ///  - seeks the audio to the new position (audio = timecode - Start
+    ///    TC, as every generator seek) when seekAudio;
+    ///  - has the outputs told, as for a seek (genJumpAnnounce).
+    /// A position within kGenLoopEndEpsMs below a multiple of the length
+    /// folds to the beginning, as it counts as the end (kGenLoopEndEpsMs).
+    /// A tick longer than a whole pass (the message thread stalled) fires
+    /// the cues the old pass had left up to the end, then those of the new
+    /// pass up to where it lands: a cue in both stretches fires twice in
+    /// that tick, once for each pass, never twice in one pass (DESIGN
+    /// D36), and the passes the tick skipped whole fire nothing.
+    ///
+    /// When the cursor was already at or past the end, nothing was played
+    /// up to it: a seek past the end, an end moved behind the playhead, the
+    /// A/B loop armed with the playhead past Out.  No cue fires up to the
+    /// end then, and the position lands on beginMs, the cursor there and
+    /// inclusive, so In's cue fires -- what the A/B loop did there before
+    /// #24, what a CDJ's reloop does, and where Play from Stopped starts.
+    void wrapGenerator(double beginMs, double endMs, bool seekAudio)
+    {
+        const double lenMs = endMs - beginMs;
+        if (lenMs <= 0.0)
+            return;
+
+        const auto fold = [beginMs, lenMs](double ms)
+        {
+            const double inLoopMs = std::fmod(ms - beginMs, lenMs);
+            return beginMs + (inLoopMs > lenMs - kGenLoopEndEpsMs ? 0.0 : inLoopMs);
+        };
+        const double cursorMs = (double) lastCueCheckMs;
+        if (cursorMs < endMs)
+        {
+            tickCuePointsCrossing((uint32_t) juce::jmax(0.0, endMs));
+            genCurrentMs = fold(genCurrentMs);
+            lastCueCheckMs = (uint32_t) juce::jmax(0.0, beginMs);
+            cueCursorInclusive = true;
+        }
+        else
+        {
+            genCurrentMs = beginMs;
+            lastCueCheckMs = (uint32_t) juce::jmax(0.0, beginMs);
+            cueCursorInclusive = true;
+        }
+
+        if (seekAudio)
+            generatorAudioPlayer.seekSeconds(juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0));
+
+        genJumpAnnounce = true;
+    }
+
+    /// A loop wraps from this close below its end, so the end frame is
+    /// never published.  Within 1e-9 of a frame below a boundary (4.2e-8 ms
+    /// at most) wallClockToTimecode already reads the next frame, here the
+    /// end's, and a timer in step with the loop lands a few dozen ulps
+    /// short of the end, by the rounding of its sums; the margin covers
+    /// both.  Further below, up to the margin, a position still reads the
+    /// frame before, and the loop wraps there at most 1 ns early.  A tick
+    /// landing this close to the end is rare with a real timer, and did
+    /// happen with one exactly in step with the loop (loop_tc_sim, group
+    /// S).
+    static constexpr double kGenLoopEndEpsMs = 1e-6;
 
     //--------------------------------------------------------------------------
     void updateGenerator()
@@ -5000,22 +5093,17 @@ private:
                     genCurrentMs += err * 0.02;
             }
 
-            // A/B loop: when active and we cross loopOutMs, wrap back to
-            // loopInMs.  Checked BEFORE stop TC and EOF -- if both the stop
-            // TC and the loop Out fall in the same tick, the loop wins (the
-            // user explicitly armed the loop).  We also reseed the cue
-            // cursor so cues inside the loop body re-fire on each
-            // iteration.  ("Loop audio file when it ends" has no such wrap:
+            // A/B loop: when active and we reach loopOutMs, wrap back to
+            // loopInMs (wrapGenerator: the cues up to Out fire, the position
+            // folds keeping what the tick ran past Out, the cues from In fire
+            // in this tick, the audio seeks, the outputs are told; a jump
+            // past Out, such as LOOP armed there, lands on In).  Checked
+            // BEFORE stop TC and EOF -- if both the stop TC and the loop Out
+            // fall in the same tick, the loop wins (the user explicitly armed
+            // the loop).  ("Loop audio file when it ends" has no such wrap:
             // the TC never goes back, see the EOF branch below.)
-            if (genLoopEnabled && genLoopOutMs > genLoopInMs
-                && genCurrentMs >= genLoopOutMs)
-            {
-                genCurrentMs = genLoopInMs;
-                lastCueCheckMs = (uint32_t) juce::jmax(0.0, genLoopInMs);
-                cueCursorInclusive = true;   // a cue exactly at loop In fires on every iteration
-                const double audioPosSec = juce::jmax(0.0, (genLoopInMs - genStartMs) / 1000.0);
-                generatorAudioPlayer.seekSeconds(audioPosSec);
-            }
+            if (isGeneratorLoopActive() && genCurrentMs >= genLoopOutMs - kGenLoopEndEpsMs)
+                wrapGenerator(genLoopInMs, genLoopOutMs, true);
 
             // Auto-stop at stop TC (if set and not zero)
             if (genStopMs > 0.0 && genCurrentMs >= genStopMs)
@@ -5541,15 +5629,17 @@ private:
             }
 
             // --- Seek/Hot Cue resync ---
-            // PLL detected a position jump >500ms (seek, hot cue, track load).
-            // Force immediate resync on all digital outputs so receivers know
-            // the new position instantly:
+            // PLL detected a position jump >500ms (seek, hot cue, track load),
+            // or the generator's timecode jumped (genJumpAnnounce: a loop
+            // wrap, #24).  Force immediate resync on all digital outputs so
+            // receivers know the new position instantly:
             //   MTC:    Full Frame message (instant vs 8 QFs = 2 frames)
             //   ArtNet: immediate frame (vs waiting for next timer tick)
             //   LTC:    reseed encoder (clean frame start at new position)
-            if (pll.seekDetected)
+            if (pll.seekDetected || genJumpAnnounce)
             {
                 pll.seekDetected = false;
+                genJumpAnnounce = false;
                 if (outputMtcEnabled && mtcOutput.getIsRunning())
                     mtcOutput.forceResync();
                 if (outputArtnetEnabled && artnetOutput.getIsRunning())
@@ -5636,6 +5726,7 @@ private:
 
             // Clear seek flag if it was set during transition to inactive
             pll.seekDetected = false;
+            genJumpAnnounce = false;
 
             if (outputMtcEnabled && mtcOutput.getIsRunning()) mtcOutput.setPaused(true);
             if (outputArtnetEnabled && artnetOutput.getIsRunning()) artnetOutput.setPaused(true);
