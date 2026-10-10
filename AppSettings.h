@@ -1262,16 +1262,22 @@ struct GeneratorPreset
 {
     juce::String name;                          // unique key, e.g. "INTRO"
     juce::String startTC = "00:00:00:00";       // HH:MM:SS:FF
+    // A preset with an audio file runs to the file's end: its Stop TC is
+    // not applied.  When a file missing from the disk counts as none (at
+    // GO, which then runs the preset to its Stop TC) and when the path
+    // alone decides: MainComponent::applyGenPresetToEngine.
     juce::String stopTC  = "00:00:00:00";       // HH:MM:SS:FF (0 = freerun)
     juce::String audioFilePath;                 // empty = no audio playback
     bool         audioLoop = false;             // the audio file loops at its end; the timecode counts on
-    // "Loop timecode" (#24): where the generator would stop (Stop TC, or the
-    // end of the audio file, whichever comes first) the timecode, the audio
-    // and the cues go back to Start TC instead.  The preset editor keeps it
-    // and audioLoop from both being set; a file that has both is run with
-    // this one (TimecodeEngine::setGeneratorAudioFile).  Written only when
-    // true, so the file of a user who never sets it is the same as 1.9.14's,
-    // and 1.9.14 reads a file that has it (it ignores the key).
+    // "Loop timecode" (#24): where the generator would stop -- the end of
+    // the audio file, or Stop TC for a preset without one (a Stop TC set
+    // from the panel or by OSC after the preset counts too), whichever
+    // comes first -- the timecode, the audio and the cues go back to Start
+    // TC instead.  The preset editor keeps it and audioLoop from both being
+    // set; a file that has both is run with this one
+    // (TimecodeEngine::setGeneratorAudioFile).  Written only when true, so
+    // the file of a user who never sets it is the same as 1.9.14's, and
+    // 1.9.14 reads a file that has it (it ignores the key).
     bool         loopTimecode = false;
 
     // Cue points -- triggers that fire when the generated TC reaches each

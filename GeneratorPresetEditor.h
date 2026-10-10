@@ -137,8 +137,8 @@ public:
         // other.  "Loop audio file when it ends" loops only the audio (the
         // timecode counts on past the file's end); "Loop timecode" (#24)
         // takes the timecode, the audio and the cues back to Start TC where
-        // the generator would stop: at Stop TC, or at the end of the audio
-        // file, whichever comes first.
+        // the generator would stop: at the end of the audio file, or at
+        // Stop TC for a preset without one.
         addAndMakeVisible(btnLoopAudio);
         btnLoopAudio.setButtonText("Loop audio file when it ends");
         btnLoopAudio.setColour(juce::ToggleButton::textColourId, textBright);
@@ -236,7 +236,9 @@ public:
         // When the preset carries an audio file, the Stop TC field is
         // ignored at runtime in favour of the file's actual length.  Render
         // it muted in the list so the user sees that the stored value is
-        // not the one being applied.
+        // not the one being applied.  This goes by the path alone: GO
+        // applies the Stop TC of a preset whose file is missing on disk
+        // (MainComponent::applyGenPresetToEngine).
         const bool stopOverriddenByAudio = (columnId == ColStop) && p.audioFilePath.isNotEmpty();
         const juce::Font font(juce::FontOptions(11.0f));
         g.setColour(stopOverriddenByAudio ? textMid : textBright);
