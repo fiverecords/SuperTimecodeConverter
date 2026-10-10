@@ -685,8 +685,16 @@ private:
                             settled = true;
                         }
                     }
+                    //
+                    // A copy goes to callAsync: it takes its argument by
+                    // forwarding reference and moves from it (JUCE 8 and 9),
+                    // so handing it the member itself left the member empty
+                    // after the first load.  Every later load then went
+                    // without the catch-up, and attachReaderToTransport,
+                    // which reads the member, started each new file at 0
+                    // itself -- the late audio AUDIT LTC-4 had fixed.
                     if (settled && owner.onLoadCompleted)
-                        juce::MessageManager::callAsync(owner.onLoadCompleted);
+                        juce::MessageManager::callAsync(std::function<void()>(owner.onLoadCompleted));
                 }
             }
         }
