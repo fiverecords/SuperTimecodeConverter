@@ -10,9 +10,11 @@
 //==============================================================================
 // GeneratorPresetEditor -- Table editor for named timecode generator presets.
 //
-// Each preset has a Name, Start TC, Stop TC, an optional audio file, and cue
-// points (edited in their own window, Cues...).  The editor mirrors the
-// TrackMapEditor UX: table + form at the bottom for add/edit.
+// Each preset has a Name, Start TC, Stop TC, an optional audio file, what
+// happens at the end ("Loop audio file when it ends", or "Loop timecode",
+// #24 -- one or neither), and cue points (edited in their own window,
+// Cues...).  The editor mirrors the TrackMapEditor UX: table + form at the
+// bottom for add/edit.
 // Calls onChange() whenever the preset map is modified.
 //==============================================================================
 class GeneratorPresetEditor : public juce::Component,
@@ -22,7 +24,7 @@ public:
     GeneratorPresetEditor(GeneratorPresetMap& map)
         : presetMap(map)
     {
-        setSize(560, 440);
+        setSize(600, 440);   // room for the columns' default widths (560 px)
         rebuildRows();
 
         // --- Table ---
@@ -35,10 +37,13 @@ public:
         table.setHeaderHeight(22);
         table.getHeader().setStretchToFitActive(true);
 
+        // Stop TC is wider than Start TC: after the Stop TC, or after
+        // "(audio length)", it shows "  (loop TC)" for a Loop timecode preset
+        // (#24, paintCell), which needs about 120 px in all.
         auto& hdr = table.getHeader();
         hdr.addColumn("Name",     ColName,    140, 80, 300, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Start TC", ColStart,   100, 80, 180, juce::TableHeaderComponent::notSortable);
-        hdr.addColumn("Stop TC",  ColStop,    100, 80, 180, juce::TableHeaderComponent::notSortable);
+        hdr.addColumn("Stop TC",  ColStop,    140, 80, 220, juce::TableHeaderComponent::notSortable);
         hdr.addColumn("Audio",    ColAudio,   180,  0, 600, juce::TableHeaderComponent::notSortable);
 
         // --- Buttons ---
@@ -128,9 +133,31 @@ public:
         btnClearAudio.setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFFF6666));
         btnClearAudio.onClick = [this] { clearAudioField(); };
 
+        // The two end options exclude each other: ticking one unticks the
+        // other.  "Loop audio file when it ends" loops only the audio (the
+        // timecode counts on past the file's end); "Loop timecode" (#24)
+        // takes the timecode, the audio and the cues back to Start TC where
+        // the generator would stop: at Stop TC, or at the end of the audio
+        // file, whichever comes first.
         addAndMakeVisible(btnLoopAudio);
         btnLoopAudio.setButtonText("Loop audio file when it ends");
         btnLoopAudio.setColour(juce::ToggleButton::textColourId, textBright);
+        btnLoopAudio.onClick = [this]
+        {
+            if (btnLoopAudio.getToggleState())
+                btnLoopTimecode.setToggleState(false, juce::dontSendNotification);
+        };
+
+        addAndMakeVisible(btnLoopTimecode);
+        btnLoopTimecode.setButtonText("Loop timecode (back to Start TC at the end)");
+        btnLoopTimecode.setColour(juce::ToggleButton::textColourId, textBright);
+        btnLoopTimecode.setTooltip("At Stop TC, or at the end of the audio file, the timecode "
+                                   "and the audio go back to Start TC.");
+        btnLoopTimecode.onClick = [this]
+        {
+            if (btnLoopTimecode.getToggleState())
+                btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+        };
 
         // Enter on any form field commits the form.  If a preset is
         // selected, Enter saves it (matches the natural reading of "I'm
@@ -211,8 +238,9 @@ public:
         // it muted in the list so the user sees that the stored value is
         // not the one being applied.
         const bool stopOverriddenByAudio = (columnId == ColStop) && p.audioFilePath.isNotEmpty();
+        const juce::Font font(juce::FontOptions(11.0f));
         g.setColour(stopOverriddenByAudio ? textMid : textBright);
-        g.setFont(juce::Font(juce::FontOptions(11.0f)));
+        g.setFont(font);
         juce::String text;
         switch (columnId)
         {
@@ -225,11 +253,33 @@ public:
                 if (p.audioFilePath.isNotEmpty())
                 {
                     text = juce::File(p.audioFilePath).getFileName();
-                    if (p.audioLoop) text += "  (loop)";
+                    // A file with both flags runs "Loop timecode" (the engine's
+                    // rule, TimecodeEngine::setGeneratorAudioFile).
+                    if (p.audioLoop && ! p.loopTimecode) text += "  (loop)";
                 }
                 break;
         }
         g.drawText(text, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
+
+        // "Loop timecode" (#24) after the Stop TC: bright, or muted when a
+        // preset without an audio file gives the loop nothing to act on --
+        // no Stop TC, so no end to loop at and the generator runs on; or a
+        // Stop TC less than kMinLoopTimecodeMs after the Start TC (at or
+        // before it included), where the option does nothing and the
+        // generator stops there as without it (TimecodeEngine::
+        // loopTimecodeEnd).  With an audio file the end is the file's, whose
+        // length the table does not know.
+        if (columnId == ColStop && p.loopTimecode)
+        {
+            const FrameRate fps = frameRateFromDouble(currentFpsForCueEditor);
+            const double stopMs = parseTimecodeTextToMs(p.stopTC, fps);
+            const bool noEnd = p.audioFilePath.isEmpty()
+                && (stopMs <= 0.0 || stopMs - parseTimecodeTextToMs(p.startTC, fps) < kMinLoopTimecodeMs);
+            const int x = 4 + juce::roundToInt(juce::GlyphArrangement::getStringWidth(font, text));
+            g.setColour(noEnd ? textMid : textBright);
+            g.drawText("  (loop TC)", x, 0, juce::jmax(0, width - 4 - x), height,
+                       juce::Justification::centredLeft, true);
+        }
     }
 
     void selectedRowsChanged(int lastRowSelected) override
@@ -242,7 +292,10 @@ public:
             edStartTC.setText(p.startTC, false);
             edStopTC.setText(p.stopTC, false);
             edAudio.setText(p.audioFilePath, false);
-            btnLoopAudio.setToggleState(p.audioLoop, juce::dontSendNotification);
+            // A preset file with both flags (only a hand edit makes one) is
+            // shown, and saved back, as the engine runs it: Loop timecode.
+            btnLoopAudio.setToggleState(p.audioLoop && ! p.loopTimecode, juce::dontSendNotification);
+            btnLoopTimecode.setToggleState(p.loopTimecode, juce::dontSendNotification);
             updateStopTCEnabledState();
         }
         else
@@ -307,7 +360,7 @@ public:
     {
         auto area = getLocalBounds().reduced(8);
 
-        // Bottom form: 5 rows of label+editor + loop row + 2 button rows
+        // Bottom form: 4 rows of label+editor + 2 loop rows + 2 button rows
         auto formArea = area.removeFromBottom(210);
         area.removeFromBottom(6);
 
@@ -356,11 +409,15 @@ public:
             formArea.removeFromTop(3);
         }
 
-        // Loop checkbox row (offset from labels for alignment)
+        // Loop checkbox rows (offset from labels for alignment)
         {
             auto row = formArea.removeFromTop(22);
             row.removeFromLeft(64);
             btnLoopAudio.setBounds(row);
+            formArea.removeFromTop(3);
+            row = formArea.removeFromTop(22);
+            row.removeFromLeft(64);
+            btnLoopTimecode.setBounds(row);
         }
 
         // Table fills the rest
@@ -387,7 +444,7 @@ private:
     juce::TextButton btnAdd, btnSave, btnDelete, btnCues, btnClearAll;
     juce::TextButton btnImport, btnExport, btnOscHelp;
     juce::TextButton btnBrowseAudio, btnClearAudio;
-    juce::ToggleButton btnLoopAudio;
+    juce::ToggleButton btnLoopAudio, btnLoopTimecode;   // never both ticked
 
     // Form
     juce::Label      lblName, lblStartTC, lblStopTC, lblAudio;
@@ -404,6 +461,11 @@ private:
     // the selected engine's current fps) via setCurrentFpsForCueEditor.
     // Default 30 if never set.
     double currentFpsForCueEditor = 30.0;
+
+    // TimecodeEngine::kMinLoopTimecodeMs (#24), the shortest loop "Loop
+    // timecode" makes, for the table's "(loop TC)"; repeated here so this
+    // header does not include the engine's.
+    static constexpr double kMinLoopTimecodeMs = 1000.0;
 
     // Playhead getter forwarded to the cue editor when opened.  Set by
     // MainComponent: the waveform strip's red cursor shows the selected
@@ -477,9 +539,9 @@ private:
         return formatTimecodeText(parseTimecodeText(tc, frameRateFromDouble(currentFpsForCueEditor)));
     }
 
-    /// Put the form fields (name, Start/Stop TC, audio file, loop) into
-    /// `p` and return it; whatever the form does not show -- the cue
-    /// points -- is left as `p` has it.  SAVE passes the stored preset
+    /// Put the form fields (name, Start/Stop TC, audio file, the two loop
+    /// options) into `p` and return it; whatever the form does not show --
+    /// the cue points -- is left as `p` has it.  SAVE passes the stored preset
     /// (AUDIT SET-2); ADD a blank one carrying only the Start/Stop TC of
     /// the preset the form was loaded from, if any (addNewPreset).
     /// A Start/Stop TC field that still holds `p`'s text is kept as it is;
@@ -503,6 +565,7 @@ private:
         p.stopTC  = formTC(edStopTC, p.stopTC);
         p.audioFilePath = edAudio.getText().trim();
         p.audioLoop     = btnLoopAudio.getToggleState();
+        p.loopTimecode  = btnLoopTimecode.getToggleState();
         edStartTC.setText(p.startTC, false);
         edStopTC.setText(p.stopTC, false);
         return p;
@@ -679,6 +742,7 @@ private:
         edStopTC.setText("00:00:00:00", false);
         edAudio.clear();
         btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+        btnLoopTimecode.setToggleState(false, juce::dontSendNotification);
         updateButtonStates();
     }
 
@@ -770,6 +834,7 @@ private:
                     edStopTC.setText("00:00:00:00", false);
                     edAudio.clear();
                     btnLoopAudio.setToggleState(false, juce::dontSendNotification);
+                    btnLoopTimecode.setToggleState(false, juce::dontSendNotification);
                 }
             });
     }
@@ -817,6 +882,9 @@ private:
             });
     }
 
+    /// Clearing the audio file unticks "Loop audio file when it ends",
+    /// which needs one; "Loop timecode" stays as it is, as it also loops at
+    /// a Stop TC without a file.
     void clearAudioField()
     {
         edAudio.clear();

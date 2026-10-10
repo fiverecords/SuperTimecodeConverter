@@ -6664,6 +6664,13 @@ void MainComponent::updateStatusLabels()
         lblOutputThruStatus.setText(thruStatus, juce::dontSendNotification);
     }
 
+    // The STOP TC label says when the preset's "Loop timecode" (#24) is
+    // what runs at the end: STOP TC (LOOP) while the loop acts, the same
+    // test as the waveform window's LOOP TC.  There is no control on the
+    // panel: the preset carries the option.
+    lblGenStopTC.setText(GeneratorWaveformWindow::loopTimecodeShown(eng) ? "STOP TC (LOOP):" : "STOP TC (0=FREE):",
+                         juce::dontSendNotification);
+
     // Generator audio playback status
     if (btnGenAudioOut.getToggleState())
     {
@@ -6931,79 +6938,145 @@ void MainComponent::cycleGenPreset(int direction)
     }
 }
 
-void MainComponent::activateGenPreset(const juce::String& name)
+//==============================================================================
+// Generator presets: GO, the preset combo and OSC /stc/N/gen/preset.
+//
+// The engine side is static and works on the engine alone, so the three
+// paths share one copy of it (the OSC path had a copy of its own, which
+// did not name the preset in use for the TCNet metadata nor show it in the
+// combo); the members after it add the panel.  "Loop timecode" (#24) and
+// "Loop audio file when it ends" follow the audio file: they reach the
+// engine with it, in applyGenPresetToEngine, and nowhere else, so the
+// player's loop is set in the same load request as the flags the engine
+// holds for that file (TimecodeEngine::setGeneratorAudioFile).  A browse
+// that leaves the playing file alone leaves its flags alone too.
+// Everything here runs on the message thread (OSC through callAsync).
+
+/// Apply `preset` to `eng`: preset name, Start/Stop TC, cue points, and --
+/// with `withAudioFile` -- the audio file with its two end flags.
+void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
+                                           bool withAudioFile)
 {
-    loadGenPresetToFields(name);
+    const auto fps = eng.getCurrentFps();
+    eng.setGeneratorPresetName(preset.name);   // the preset is the track (TCNet metadata, #20)
+    // Stop TC before Start TC.  Under a running Loop timecode preset Stop
+    // TC can move the loop's end and switch its path, and a new Start TC
+    // re-seeks the audio to where the timecode now is in the loop, on
+    // either path (TimecodeEngine::setGeneratorStartMs): set last, it does
+    // so against the path the loop ends on.  GO stops the generator first:
+    // nothing is re-seeked, and the order does not matter.
+    eng.setGeneratorStopMs(parseTimecodeToMs(preset.stopTC, fps));
+    eng.setGeneratorStartMs(parseTimecodeToMs(preset.startTC, fps));
+    // Cue points fire MIDI / OSC / Art-Net triggers when the generated TC
+    // reaches each cue's positionTC.  setGeneratorCuePoints converts TC ->
+    // ms at the engine's current fps.
+    eng.setGeneratorCuePoints(preset.cuePoints);
 
-    auto& eng = currentEngine();
+    // The file after Start and Stop TC: for a Loop timecode preset the
+    // engine sets the player's loop with the file from Stop TC (gapless at
+    // the file's end without one), and settles it when the load completes.
+    if (withAudioFile)
+    {
+        const juce::File audioFile = preset.audioFilePath.isNotEmpty()
+                                       ? juce::File(preset.audioFilePath) : juce::File();
+        eng.setGeneratorAudioFile(audioFile, preset.audioLoop, preset.loopTimecode);
+    }
+}
 
-    // Switch to transport mode if in clock mode
+/// A browse of the preset combo: apply `preset` to `eng` without starting
+/// it.  With the generator's audio playing, the file is left alone --
+/// choosing the next preset must not cut the audio on air -- and so are
+/// its two end flags, which go with the file; Start/Stop TC and the cues
+/// are applied, as in 1.9.14.  Under a running Loop timecode preset the
+/// loop goes on with the playing file and the browsed Start and Stop TC;
+/// a Stop TC may move its end and switch it between its two paths.  A
+/// different Start TC re-seeks the audio to where the timecode now is in
+/// the new loop -- an audible jump of the Start TC difference -- and
+/// timecode and audio stay together, on the gapless path modulo the
+/// file's length (Stop TC is set first, so that Start TC sees the path the
+/// loop ends on: applyGenPresetToEngine, TimecodeEngine::
+/// setGeneratorStartMs).  The timecode itself does not jump to the new
+/// loop: a browsed Start TC later than the timecode lets it run up to the
+/// new Start TC first, outside the loop, for as long as the difference
+/// (up to the whole distance from the old Start TC to the new one), as a
+/// browse does in 1.9.14 -- on the seek path (a Stop TC before the
+/// playing file's end, set after GO or browsed) with the audio from the
+/// file's top meanwhile, ahead of the timecode until DESIGN D18 pulls the
+/// two together (under a second apart) or the next wrap does; a loop
+/// whose new end is behind the timecode wraps at the next tick.  With no
+/// audio playing (stopped, paused, or a preset without a file running)
+/// the file is applied too, with its flags.
+void MainComponent::browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset)
+{
+    applyGenPresetToEngine(eng, preset, ! eng.isGeneratorAudioPlaying());
+}
+
+/// GO: `eng` leaves Clock mode, stops, takes `preset` with its audio file
+/// (stopping first releases the previous file before the new one loads)
+/// and plays from Start TC.
+void MainComponent::goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset)
+{
     if (eng.getGeneratorClockMode())
-    {
         eng.setGeneratorClockMode(false);
-        btnGenClock.setToggleState(false, juce::dontSendNotification);
-        updateDeviceSelectorVisibility();
-        resized();
-    }
-
-    auto fps = eng.getCurrentFps();
-    double startMs = parseTimecodeToMs(txtGenStartTC.getText(), fps);
-    double stopMs  = parseTimecodeToMs(txtGenStopTC.getText(), fps);
-
     eng.generatorStop();
-    eng.setGeneratorStartMs(startMs);
-    eng.setGeneratorStopMs(stopMs);
-
-    // Push the preset's audio file (or empty for "no audio") to the engine.
-    // Done after generatorStop() so the previous file (if any) is cleanly
-    // released before the new one is loaded.
-    if (auto* preset = settings.generatorPresets.find(name))
-    {
-        juce::File audioFile = preset->audioFilePath.isNotEmpty()
-                                 ? juce::File(preset->audioFilePath) : juce::File();
-        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
-    }
-
+    applyGenPresetToEngine(eng, preset, true);
     eng.generatorPlay();
+}
+
+/// GO on engine `engineIndex` (goGenPresetOnEngine), the panel following
+/// when it is the selected engine.  GO, PREV/NEXT while audio plays, and
+/// OSC /stc/N/gen/preset.
+void MainComponent::goGenPreset(int engineIndex, const GeneratorPreset& preset)
+{
+    auto& eng = *engines[(size_t) engineIndex];
+    const bool wasClock = eng.getGeneratorClockMode();
+    goGenPresetOnEngine(eng, preset);
+    if (engineIndex == selectedEngine)
+    {
+        showGenPresetInPanel(eng);
+        if (wasClock)
+        {
+            btnGenClock.setToggleState(false, juce::dontSendNotification);
+            updateDeviceSelectorVisibility();
+            resized();
+        }
+    }
     saveSettings();
 }
 
+/// The panel's Start/Stop TC fields as `eng` (the selected engine) now
+/// has them, and its preset in use selected in the combo without
+/// re-applying it.
+void MainComponent::showGenPresetInPanel(TimecodeEngine& eng)
+{
+    const auto fps = eng.getCurrentFps();
+    txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), fps), false);
+    txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), fps), false);
+    for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
+        if (cmbGenPreset.getItemText(i) == eng.getGeneratorPresetName())
+        {
+            cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
+            break;
+        }
+}
+
+void MainComponent::activateGenPreset(const juce::String& name)
+{
+    if (auto* preset = settings.generatorPresets.find(name))
+        goGenPreset(selectedEngine, *preset);
+}
+
+/// The preset combo's selection changed (a browse): apply the preset to the
+/// selected engine without starting it (browseGenPresetOnEngine) and show
+/// it in the panel.
 void MainComponent::loadGenPresetToFields(const juce::String& name)
 {
     auto* preset = settings.generatorPresets.find(name);
     if (!preset) return;
 
     auto& eng = currentEngine();
-    auto fps = eng.getCurrentFps();
-    eng.setGeneratorPresetName(preset->name);   // the preset is the track (TCNet metadata, #20)
-
-    // Fill TC editors with normalized values
-    juce::String startNorm = msToTimecodeString(parseTimecodeToMs(preset->startTC, fps), fps);
-    juce::String stopNorm  = msToTimecodeString(parseTimecodeToMs(preset->stopTC, fps), fps);
-    txtGenStartTC.setText(startNorm, false);
-    txtGenStopTC.setText(stopNorm, false);
-
-    // Apply to engine (without starting playback).  Audio file handling:
-    // if the engine is currently playing audio, we leave it alone -- changing
-    // the selection should not interrupt audio that is on air.  But if the
-    // engine is idle, we DO push the new audio file so the waveform view
-    // immediately reflects the selected preset (and is ready when the user
-    // hits GO).
-    eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
-    eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
-    // Push cue points into the engine so they fire MIDI / OSC / Art-Net
-    // triggers when the generated TC reaches each cue's positionTC.
-    // setGeneratorCuePoints converts TC -> ms using the engine's current
-    // fps, so it must run after setFrameRate / setGeneratorStartMs above.
-    eng.setGeneratorCuePoints(preset->cuePoints);
-
-    if (! eng.isGeneratorAudioPlaying())
-    {
-        juce::File audioFile = preset->audioFilePath.isNotEmpty()
-                                 ? juce::File(preset->audioFilePath) : juce::File();
-        eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
-    }
-
+    browseGenPresetOnEngine(eng, *preset);
+    showGenPresetInPanel(eng);
     saveSettings();
 }
 
@@ -7133,43 +7206,11 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
     }
     else if (cmd == "/stc/gen/preset")
     {
+        // GO on engine N, as the panel's GO (goGenPreset).
         auto name = msg.getString(0);
         if (name.isNotEmpty())
-        {
-            auto* preset = settings.generatorPresets.find(name);
-            if (preset)
-            {
-                auto fps = eng.getCurrentFps();
-                if (eng.getGeneratorClockMode())
-                    eng.setGeneratorClockMode(false);
-                eng.generatorStop();
-                eng.setGeneratorStartMs(parseTimecodeToMs(preset->startTC, fps));
-                eng.setGeneratorStopMs(parseTimecodeToMs(preset->stopTC, fps));
-                // Push cue points into the engine (same as the UI
-                // applyGeneratorPreset path).  Without this, OSC-
-                // triggered preset loads would inherit no cues from
-                // the preset.
-                eng.setGeneratorCuePoints(preset->cuePoints);
-
-                // Audio file from the preset (empty path = no audio)
-                juce::File audioFile = preset->audioFilePath.isNotEmpty()
-                                         ? juce::File(preset->audioFilePath) : juce::File();
-                eng.setGeneratorAudioFile(audioFile, preset->audioLoop);
-
-                eng.generatorPlay();
-
-                // Update UI if this is the selected engine
-                if (targetEngine == selectedEngine)
-                {
-                    btnGenClock.setToggleState(false, juce::dontSendNotification);
-                    txtGenStartTC.setText(preset->startTC, false);
-                    txtGenStopTC.setText(preset->stopTC, false);
-                    updateDeviceSelectorVisibility();
-                    resized();
-                }
-                saveSettings();
-            }
-        }
+            if (auto* preset = settings.generatorPresets.find(name))
+                goGenPreset(targetEngine, *preset);
     }
 }
 

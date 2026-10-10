@@ -12,7 +12,8 @@
 //==============================================================================
 // GeneratorWaveformWindow -- Content component for the floating waveform
 // window.  Combines:
-//   - Header: filename + file-time / total-time
+//   - Header: filename + file-time / total-time, and LOOP TC while the
+//     preset's "Loop timecode" (#24) acts (loopTimecodeShown)
 //   - Big absolute TC display (HH:MM:SS:FF)
 //   - GeneratorWaveformView in Full mode (markers + click-to-seek)
 //   - Transport buttons (PLAY / PAUSE / STOP)
@@ -37,6 +38,15 @@ public:
         lblFileTime.setFont(juce::Font(juce::FontOptions(13.0f)));
         lblFileTime.setColour(juce::Label::textColourId, textMid);
         lblFileTime.setJustificationType(juce::Justification::centredRight);
+
+        // The timecode loop's indicator.  This window's own loop controls
+        // (LOOP, [ ], L) are the A/B loop's, so the header says when the
+        // other loop, the preset's, is the one running.
+        addChildComponent(lblLoopTc);
+        lblLoopTc.setText("LOOP TC", juce::dontSendNotification);
+        lblLoopTc.setFont(juce::Font(juce::FontOptions(13.0f).withStyle("Bold")));
+        lblLoopTc.setColour(juce::Label::textColourId, accentCyan);
+        lblLoopTc.setJustificationType(juce::Justification::centredRight);
 
         // --- Big absolute TC ---
         addAndMakeVisible(lblAbsoluteTC);
@@ -168,6 +178,19 @@ public:
         stopTimer();
     }
 
+    /// True when `e`'s generator runs the preset's timecode loop (#24): in
+    /// transport mode (not Clock mode, which never loops), with "Loop
+    /// timecode" acting (TimecodeEngine::isGeneratorLoopTimecodeActive: the
+    /// flag on and an end at least 1 s after Start TC; with no Stop TC it
+    /// reads false while the file is still loading).  What this window's
+    /// LOOP TC and the panel's STOP TC (LOOP) label show.  Message thread.
+    static bool loopTimecodeShown(const TimecodeEngine& e)
+    {
+        return e.getActiveInput() == TimecodeEngine::InputSource::SystemTime
+            && ! e.getGeneratorClockMode()
+            && e.isGeneratorLoopTimecodeActive();
+    }
+
     //==========================================================================
     void setAudioPlayer(GeneratorAudioPlayer* p)
     {
@@ -207,9 +230,10 @@ public:
     {
         auto area = getLocalBounds().reduced(10);
 
-        // Header row: filename left, file-time right.
+        // Header row: filename left, file-time right, LOOP TC before it.
         auto headerRow = area.removeFromTop(20);
         lblFileTime.setBounds(headerRow.removeFromRight(180));
+        lblLoopTc.setBounds(headerRow.removeFromRight(80));
         lblFilename.setBounds(headerRow);
         area.removeFromTop(2);
 
@@ -276,6 +300,9 @@ private:
             if (btnLoopOn.getToggleState() != wanted)
                 btnLoopOn.setToggleState(wanted, juce::dontSendNotification);
         }
+        const bool loopTc = engine != nullptr && loopTimecodeShown(*engine);
+        if (lblLoopTc.isVisible() != loopTc)
+            lblLoopTc.setVisible(loopTc);
     }
 
     void updateLabels()
@@ -334,12 +361,14 @@ private:
     juce::Colour textBright  { 0xFFDDDDDD };
     juce::Colour textMid     { 0xFF999999 };
     juce::Colour accentAmber { 0xFFCC8844 };
+    juce::Colour accentCyan  { 0xFF00AAFF };
 
     GeneratorAudioPlayer* player = nullptr;
     TimecodeEngine*       engine = nullptr;
 
     GeneratorWaveformView waveform;
     juce::Label   lblFilename, lblFileTime, lblAbsoluteTC, lblVolume;
+    juce::Label   lblLoopTc;   // "LOOP TC", shown while loopTimecodeShown()
     juce::TextButton btnPlay, btnPause, btnStop;
     juce::TextButton btnPrev, btnNext, btnEdit;
     juce::TextButton   btnLoopIn, btnLoopOut;

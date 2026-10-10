@@ -805,8 +805,17 @@ private:
     static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);
     static juce::String msToTimecodeString(double ms, FrameRate fps);
     void populateGenPresetCombo();
-    void activateGenPreset(const juce::String& name);
-    void loadGenPresetToFields(const juce::String& name);
+    // Generator presets (GO, the preset combo, OSC /stc/N/gen/preset):
+    // the engine side, static so the three paths share it, then the panel.
+    // "Loop timecode" (#24) and "Loop audio file when it ends" reach the
+    // engine only with the audio file.  Message thread.
+    static void applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset, bool withAudioFile);
+    static void browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset);
+    static void goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset);
+    void goGenPreset(int engineIndex, const GeneratorPreset& preset);
+    void showGenPresetInPanel(TimecodeEngine& eng);
+    void activateGenPreset(const juce::String& name);      // GO on the selected engine
+    void loadGenPresetToFields(const juce::String& name);  // the combo's browse
     // Direction: -1 = previous, +1 = next.  Cycles cmbGenPreset and chooses
     // between browse semantics (idle: just update fields) and hot-swap
     // semantics (playing: activate immediately, like a CDJ deck-flip).  Used
