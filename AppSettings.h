@@ -1264,7 +1264,15 @@ struct GeneratorPreset
     juce::String startTC = "00:00:00:00";       // HH:MM:SS:FF
     juce::String stopTC  = "00:00:00:00";       // HH:MM:SS:FF (0 = freerun)
     juce::String audioFilePath;                 // empty = no audio playback
-    bool         audioLoop = false;             // loop file when reaching its end
+    bool         audioLoop = false;             // the audio file loops at its end; the timecode counts on
+    // "Loop timecode" (#24): where the generator would stop (Stop TC, or the
+    // end of the audio file, whichever comes first) the timecode, the audio
+    // and the cues go back to Start TC instead.  The preset editor keeps it
+    // and audioLoop from both being set; a file that has both is run with
+    // this one (TimecodeEngine::setGeneratorAudioFile).  Written only when
+    // true, so the file of a user who never sets it is the same as 1.9.14's,
+    // and 1.9.14 reads a file that has it (it ignores the key).
+    bool         loopTimecode = false;
 
     // Cue points -- triggers that fire when the generated TC reaches each
     // cue's positionTC.  Sorted by positionTC (compared as ms) so the
@@ -1294,6 +1302,8 @@ struct GeneratorPreset
         obj->setProperty("stopTC",        stopTC);
         obj->setProperty("audioFilePath", audioFilePath);
         obj->setProperty("audioLoop",     audioLoop);
+        if (loopTimecode)
+            obj->setProperty("loopTimecode", true);
 
         if (! cuePoints.empty())
         {
@@ -1314,6 +1324,7 @@ struct GeneratorPreset
         stopTC        = obj->getProperty("stopTC").toString();
         audioFilePath = obj->getProperty("audioFilePath").toString();
         audioLoop     = (bool) obj->getProperty("audioLoop");
+        loopTimecode  = (bool) obj->getProperty("loopTimecode");   // absent (1.9.14 and earlier) = false
         if (startTC.isEmpty()) startTC = "00:00:00:00";
         if (stopTC.isEmpty())  stopTC  = "00:00:00:00";
 
