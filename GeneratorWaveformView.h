@@ -286,16 +286,21 @@ private:
 
         // --- A/B loop range (drawn under cues but above waveform body) ---
         // Tinted overlay between In and Out + two distinctive vertical
-        // markers.  Active when loop is enabled and Out > In; otherwise
+        // markers.  Drawn armed -- the brighter tint -- only while the
+        // generator follows the loop (isGeneratorAbLoopFollowed); otherwise
         // markers are still drawn if individual points are placed, so the
         // operator can see where they would land before arming the loop.
-        // Each point is drawn where it falls in the file (fileSecondsAt), so
-        // under "Loop audio" one set in a later pass shows too.
+        // An A/B armed but ignored by the preset's timecode loop (#24: not
+        // inside it) gets the dim tint and dashed markers, while the toggle
+        // stays on as the operator set it.  Each point is drawn where it
+        // falls in the file (fileSecondsAt), so under "Loop audio" one set
+        // in a later pass shows too.
         if (engine != nullptr)
         {
             const double loopInMs      = engine->getGeneratorLoopInMs();
             const double loopOutMs     = engine->getGeneratorLoopOutMs();
-            const bool   loopActive    = engine->isGeneratorLoopActive();
+            const bool   loopFollowed  = engine->isGeneratorAbLoopFollowed();
+            const bool   loopIgnored   = engine->isGeneratorLoopActive() && ! loopFollowed;
 
             auto secToX = [&](double posSec) -> int
             {
@@ -309,14 +314,17 @@ private:
             const int outX = (loopOutMs > 0.0) ? secToX(fileEndSecondsAt(loopOutMs, totalLen)) : INT_MIN;
 
             // Range fill -- amber tint between In and Out, lighter when
-            // loop is armed, dimmer when only markers are set.  Under "Loop
-            // audio" an A/B over the file's end (Out folded before In) is
-            // drawn in two parts, In to the right edge and the left edge to
-            // Out, and one a file's length or longer covers the whole file.
+            // the loop is followed, dimmer otherwise.  Under "Loop audio"
+            // an A/B over the file's end (Out folded at or before In,
+            // compared in seconds, not pixels, so one less than a pixel
+            // short of the file's length still shows) is drawn in two parts,
+            // In to the right edge and the left edge to Out, and one a
+            // file's length or longer (within kPassEdgeSec, so rounding at
+            // large timecodes does not lose it) covers the whole file.
             if (inX != INT_MIN && outX != INT_MIN)
             {
-                g.setColour(loopActive ? juce::Colour(0x33FFA500)   // amber 20%
-                                       : juce::Colour(0x14FFA500)); // amber 8%
+                g.setColour(loopFollowed ? juce::Colour(0x33FFA500)   // amber 20%
+                                         : juce::Colour(0x14FFA500)); // amber 8%
                 const int bandY = waveArea.getY(), bandH = waveArea.getHeight();
                 if (player->isLooping() && loopOutMs - loopInMs >= (totalLen - kPassEdgeSec) * 1000.0)
                     g.fillRect(waveArea);
@@ -330,19 +338,25 @@ private:
                     g.fillRect(inX, bandY, outX - inX, bandH);
             }
 
-            // In marker -- amber line, slightly thicker than cues.
-            if (inX != INT_MIN)
+            // A marker: a 2-px amber line, slightly thicker than cues;
+            // dashed (4 px on, 4 off) while the loop is ignored.
+            auto marker = [&](int x)
             {
                 g.setColour(juce::Colour(0xFFFFAA00));
-                g.fillRect(inX, waveArea.getY(), 2, waveArea.getHeight());
-            }
+                if (! loopIgnored)
+                {
+                    g.fillRect(x, waveArea.getY(), 2, waveArea.getHeight());
+                    return;
+                }
+                for (int y = waveArea.getY(); y < waveArea.getBottom(); y += 8)
+                    g.fillRect(x, y, 2, juce::jmin(4, waveArea.getBottom() - y));
+            };
+            if (inX != INT_MIN)
+                marker(inX);
             // Out marker -- same colour, distinguishable by being the right
             // edge of the tinted band.
             if (outX != INT_MIN)
-            {
-                g.setColour(juce::Colour(0xFFFFAA00));
-                g.fillRect(outX - 1, waveArea.getY(), 2, waveArea.getHeight());
-            }
+                marker(outX - 1);
         }
 
         // --- Cue markers (drawn before the cursor so the cursor stays

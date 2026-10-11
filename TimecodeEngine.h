@@ -3295,6 +3295,18 @@ public:
         return genLoopEnabled && genLoopOutMs > genLoopInMs;
     }
 
+    /// True when the generator follows the A/B loop: armed
+    /// (isGeneratorLoopActive) and not ignored by the timecode loop (#24,
+    /// generatorAbLoopFollowed), as the tick decides.  What the waveform
+    /// draws as armed.  Message thread.
+    bool isGeneratorAbLoopFollowed() const
+    {
+        double endMs = 0.0;
+        bool gapless = false;
+        const bool loopTimecode = loopTimecodeEnd(endMs, gapless);
+        return generatorAbLoopFollowed(loopTimecode, endMs, gapless);
+    }
+
     /// Load Generator preset cues into the engine's armed-cue list.  Cue
     /// positions are converted from SMPTE TC strings to absolute ms (using
     /// the engine's current fps) so the existing tickCuePoints logic --
