@@ -356,7 +356,8 @@ public:
         setupBtn(btnAdd,    "Add",    accentGreen.withAlpha(0.2f), accentGreen);
         setupBtn(btnDelete, "Delete", accentRed.withAlpha(0.2f),   accentRed);
 
-        btnAdd.setTooltip("Add a new cue point.  Defaults to the preset's Start TC.");
+        btnAdd.setTooltip("Add a cue point at the waveform's edit cursor (click the waveform "
+                          "to place it), or at the preset's Start TC when there is none.");
         btnDelete.setTooltip("Delete the selected cue point(s).");
 
         btnAdd.onClick = [this]

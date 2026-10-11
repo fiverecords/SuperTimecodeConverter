@@ -1550,6 +1550,11 @@ MainComponent::MainComponent()
         ledBeat.setVisible(false);
         ledBeat.setLedColour(bpmAccent);
 
+        // Its reset is the gain sliders' 100%, not its 50% default: said so
+        // here, before styleGainSlider creates the value box that copies it.
+        // The hint names the slider: on its value box, which shows the
+        // same tooltip, these gestures do not reset.
+        sldBpmSmoothing.setTooltip("Right-click or double-click the slider to set 100%");
         leftContent.addAndMakeVisible(sldBpmSmoothing); styleGainSlider(sldBpmSmoothing);
         leftContent.addAndMakeVisible(lblBpmSmoothing); lblBpmSmoothing.setText("BPM SMOOTHING:", juce::dontSendNotification); styleLabel(lblBpmSmoothing);
         sldBpmSmoothing.setRange(0.0, 100.0, 1.0);

@@ -34,7 +34,9 @@ public:
     GainSlider()
     {
         setDoubleClickReturnValue(true, 100.0);
-        setTooltip("Right-click or double-click to reset");
+        // The hint names the slider: JUCE gives the value box the slider's
+        // tooltip, and a right-click or double-click there does not reset.
+        setTooltip("Right-click or double-click the slider to reset");
     }
     void mouseDown(const juce::MouseEvent& e) override
     {
@@ -188,6 +190,18 @@ private:
 
     // --- Custom Look & Feel ---
     CustomLookAndFeel customLookAndFeel;
+
+    // --- Tooltips ---
+    // JUCE shows a component's tooltip (setTooltip) only through a
+    // juce::TooltipWindow, and before 1.9.15-beta2 there was none: no
+    // tooltip ever appeared (#24).  One for the whole application: created
+    // with no parent, it goes on the desktop by itself, 700 ms after the
+    // mouse stops, with the tooltip of whatever component of this process
+    // is under the mouse, in any top-level window (this one, the floating
+    // waveform window, the editors).  It draws with JUCE's default look and
+    // feel (LookAndFeel_V4's dark scheme: white bold text on 0xFF181F22).
+    // Its own 123 ms timer, on the message thread.
+    juce::TooltipWindow tooltipWindow { nullptr, 700 };
 
     // --- Colours ---
     juce::Colour bgDark      { 0xFF12141A };
