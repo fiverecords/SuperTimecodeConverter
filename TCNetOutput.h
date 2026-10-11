@@ -266,7 +266,17 @@ public:
 
         // Jog anti-jitter deadband.
         // During playback: pass through directly (position advances monotonically).
-        // On play->pause transition: commit current position as anchor.
+        // On play->pause transition: the new position becomes the anchor.  The
+        // layer time moves to it when it is kJogDeadband or more away from the
+        // last played value (#24): a jump that came with the pause -- a
+        // generator STOP back to Start TC, a CDJ CUE return -- and, for a
+        // source given as a timecode (no playheadMs, so whole frames), a
+        // pause that lands a frame on: the layer then shows the frame the
+        // other outputs' clean stop carries.  Closer than that (a CDJ's
+        // position one 60 Hz tick on, about 17 ms at normal speed) the layer
+        // time stays on the last played value, as before.  Either way the
+        // layer reads PAUSED: kStateStopped is never sent, no capture shows
+        // what a receiver does with it (DESIGN D2).
         // While paused/jogging: only update if movement exceeds one video frame
         // (~33ms).  This suppresses the +/-few-ms oscillation from the CDJ's jog
         // wheel that causes visible frame vibration in Resolume.
@@ -279,9 +289,16 @@ public:
         }
         else
         {
-            // Transition from play to pause: anchor at current position
+            // Transition from play to pause: anchor at the new position, and
+            // move there when the pause came with a jump (above).
             if (L.wasPlaying)
+            {
+                int64_t jump = (int64_t)newMs - (int64_t)L.currentTimeMs;
+                if (jump < 0) jump = -jump;
                 L.committedMs = newMs;
+                if ((uint64_t)jump >= kJogDeadband)
+                    L.currentTimeMs = newMs;
+            }
 
             int64_t delta = (int64_t)newMs - (int64_t)L.committedMs;
             if (delta < 0) delta = -delta;
