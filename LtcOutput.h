@@ -480,10 +480,12 @@ private:
         }
         else if (paused.load(std::memory_order_relaxed))
         {
-            // Hold on pause: the engine froze pendingTc at the stop point, and
-            // the signal must carry exactly that value on every frame.  No
-            // auto-increment here -- with it, the resync rule below pulled the
-            // value back every other frame and the output alternated V / V+1.
+            // Hold on pause: pendingTc is the engine's last published value --
+            // the stop value, or a later locate while stopped (the parked
+            // branch of routeTimecodeToOutputs) -- and the signal must carry
+            // exactly that value on every frame.  No auto-increment here --
+            // with it, the resync rule below pulled the value back every
+            // other frame and the output alternated V / V+1.
             encoderTc = pendingTc;
             heldPastGrace = false;
         }

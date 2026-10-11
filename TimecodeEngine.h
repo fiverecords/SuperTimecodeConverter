@@ -6267,12 +6267,15 @@ private:
                 // LA-Net frame.  Those two send only while not paused, so
                 // each is let out for the one frame and paused again (the
                 // frame goes out at setPaused(true) at the latest).  LTC OUT
-                // stays silent.  HippoNet is not sent: no capture shows what
-                // a Hippotizer does with a position while stopped, and a new
-                // message needs one (DESIGN D2).  (The MTC source: until
-                // AUDIT LTC-13 made the locate a locate, the source ran
-                // through the freewheel from it and the clean stop at the end
-                // sent that run-on value.)
+                // gets the value as at the clean stop: with HOLD ON PAUSE the
+                // held frame carries it from the next frame boundary, without
+                // HOLD the output stays silent (#24; a held frame used to
+                // stay on the stop value).  HippoNet is not sent: no capture
+                // shows what a Hippotizer does with a position while
+                // stopped, and a new message needs one (DESIGN D2).  (The
+                // MTC source: until AUDIT LTC-13 made the locate a locate,
+                // the source ran through the freewheel from it and the clean
+                // stop at the end sent that run-on value.)
                 if (outputMtcEnabled && mtcOutput.getIsRunning())
                 {
                     mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));
@@ -6292,6 +6295,8 @@ private:
                     laNetTCOutput.forceResync();
                     laNetTCOutput.setPaused(true);
                 }
+                if (outputLtcEnabled && ltcOutput.getIsRunning())
+                    ltcOutput.setTimecode(offsetTimecode(baseTc, ltcOutputOffset, outRate));
             }
             forwardParkedLocate = false;
 
