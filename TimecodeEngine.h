@@ -190,6 +190,10 @@ public:
         userOverrodeLtcFps = false;
         mtcParkedValid = false;
         forwardParkedLocate = false;
+        // The generator's parked locate starts afresh with the new source:
+        // nothing is told for the switch itself (updateGeneratorParkedLocate).
+        genParkedPending = false;
+        genParkedGivenValid = false;
         activeInput = source;
         sourceActive = false;
         // Switching the input source is an explicit user transition; any
@@ -1657,6 +1661,9 @@ public:
                 else
                 {
                     sourceActive = (genState == GeneratorState::Playing);
+                    // A position changed while paused or stopped is told to
+                    // the paused outputs once it has rested (#24).
+                    updateGeneratorParkedLocate();
                     if (statusTextVisible)
                     {
                         switch (genState)
@@ -3004,7 +3011,13 @@ public:
             const bool loopTimecode = loopTimecodeEnd(loopEndMs, loopGapless, true);
             const double playFromMs = generatorAbLoopFollowed(loopTimecode, loopEndMs, loopGapless)
                                         ? genLoopInMs : genStartMs;
+            const double fromMs = genCurrentMs;
             genCurrentMs = playFromMs;
+            // A move made while the outputs are paused: the first playing
+            // tick drops the mark, but a PAUSE before any tick (OSC play,
+            // then pause) leaves the outputs paused on the old value, and
+            // the mark then gives them this one (#24).
+            markGeneratorParkedLocate(fromMs);
             // Sync the cue cursor too: the (prev, now] window for the very
             // first cue check after play-from-stopped should begin at the
             // play-from position, otherwise a leftover lastCueCheckMs from
@@ -3040,8 +3053,14 @@ public:
         }
     }
 
+    /// Stop: back to Start TC.  From playing, the next tick's clean stop
+    /// gives the outputs Start TC (routeTimecodeToOutputs).  Already paused
+    /// or stopped elsewhere -- STOP after PAUSE, or after a stop at Stop TC
+    /// or at the file's end -- the outputs are paused and get Start TC as a
+    /// parked locate (markGeneratorParkedLocate, #24).  Message thread.
     void generatorStop()
     {
+        const double fromMs = genCurrentMs;
         genState = GeneratorState::Stopped;
         // Explicit user transition; clear the natural-EOF marker so a
         // subsequent click on the timeline does NOT auto-resume.
@@ -3058,6 +3077,7 @@ public:
             setFramePhaseFromPosition(genCurrentMs, currentFps);
         }
         generatorAudioPlayer.stopAndReset();
+        markGeneratorParkedLocate(fromMs);
     }
 
     /// Freewheel (AUDIT D10): how long the signal inputs (LTC, Art-Net,
@@ -3096,16 +3116,20 @@ public:
     /// relation (under a second apart) or leave the two apart (a second or
     /// more) -- until the next wrap on the seek path, for good on the
     /// gapless path, where no wrap seeks the audio.  Without the loop
-    /// nothing is sought, as in 1.9.14.  Message thread.
+    /// nothing is sought, as in 1.9.14.  Stopped, the position moves to the
+    /// new Start TC, and the paused outputs get it as a parked locate
+    /// (markGeneratorParkedLocate, #24).  Message thread.
     void setGeneratorStartMs(double ms)
     {
         const double prevStartMs = genStartMs;
         genStartMs = juce::jmax(0.0, ms);
         if (genState == GeneratorState::Stopped && activeInput == InputSource::SystemTime)
         {
+            const double fromMs = genCurrentMs;
             genCurrentMs = genStartMs;
             currentTimecode = wallClockToTimecode(genCurrentMs, currentFps);
             setFramePhaseFromPosition(genCurrentMs, currentFps);
+            markGeneratorParkedLocate(fromMs);
         }
 
         if (genStartMs == prevStartMs)
@@ -3359,7 +3383,10 @@ public:
     /// lasts, and nothing whole would go out for as long as the gesture
     /// lasts; the senders' own value tracking follows such steps, as in
     /// 1.9.14.  While the generator is paused or stopped the outputs are
-    /// paused and the flag is dropped there, as a DJ source's seek is.
+    /// paused and the flag is dropped there, as a DJ source's seek is; the
+    /// new position goes to them instead as a parked locate, once it has
+    /// rested for kGenParkedSettleMs, so a drag or a stream of jogs is told
+    /// once, where it ends (markGeneratorParkedLocate, #24).
     /// Only for the generator in transport mode: an OSC jog reaches an
     /// engine whatever its input, and another source's outputs have
     /// nothing to announce.  Message thread.
@@ -3390,6 +3417,7 @@ public:
         if (genState == GeneratorState::Stopped)
             genState = resumeFromEof ? GeneratorState::Playing
                                       : GeneratorState::Paused;
+        markGeneratorParkedLocate(fromMs);
 
         // Consume the flag once acted on so the same click never
         // resumes twice.  Cleared regardless of whether we used it
@@ -3440,6 +3468,11 @@ public:
         if (useSystemClock && !genClockMode)
             generatorStop();  // stop transport when switching to clock mode
         if (useSystemClock && ! genClockMode) clockFollower.reset();
+        // A parked locate the stop above marks is left to the ticks (#24):
+        // in Clock mode the outputs run from the next tick, and the first
+        // tick back in transport mode is a clean stop, which clears it.
+        // Switched on and off before a tick, the outputs never ran, and the
+        // locate gives them Start TC.
         genClockMode = useSystemClock;
     }
     bool getGeneratorClockMode() const { return genClockMode; }
@@ -3670,10 +3703,29 @@ private:
     // Art-Net and LA-Net honour it too (AUDIT NET-4).
     bool userOverrodeLtcFps = false;
     // MTC locate while stopped (AUDIT LTC-13): the frozen value of the last
-    // inactive tick, and a one-shot request to pass a new one on.
+    // inactive tick.  forwardParkedLocate is the one-shot request to pass a
+    // new position on to the paused outputs (routeTimecodeToOutputs), set
+    // for the MTC source's locate (tick) and the generator's
+    // (updateGeneratorParkedLocate, #24).
     Timecode mtcParkedTc;
     bool mtcParkedValid = false;
     bool forwardParkedLocate = false;
+    // The generator's parked locate (#24): a position change made while the
+    // generator (transport mode) is paused or stopped and its outputs are
+    // paused.  genParkedPending and genParkedChangedMs (hi-res ms of the
+    // last change) are set by the generator functions
+    // (markGeneratorParkedLocate); genParkedGivenMs is the position the
+    // outputs were last given -- the clean stop's or the last parked
+    // locate's, or where the outputs were found paused at start-up or
+    // after an input switch -- valid while genParkedGivenValid.  One value
+    // for every output: an output that was off when a locate went out, or
+    // is switched on while paused, gets the position at the next locate or
+    // PLAY.  Message thread: the generator functions (UI, OSC) and the tick
+    // both run there.
+    bool   genParkedPending    = false;
+    double genParkedChangedMs  = 0.0;
+    double genParkedGivenMs    = 0.0;
+    bool   genParkedGivenValid = false;
 
     // Generator state (internal timecode source)
     GeneratorState genState = GeneratorState::Stopped;
@@ -5568,6 +5620,102 @@ private:
         setFramePhaseFromPosition(genCurrentMs, currentFps);
     }
 
+    //--------------------------------------------------------------------------
+    // The generator's parked locate (#24).  While the generator (transport
+    // mode) is paused or stopped its outputs are paused, and a position
+    // changed then -- STOP after PAUSE, or after a stop at Stop TC or at the
+    // file's end; Start TC changed while stopped (panel, OSC /start, a
+    // preset browsed); a click or drag on the waveform; an OSC jog -- reached
+    // only the display and TCNet.  It goes out as an MTC source's locate
+    // while stopped does (forwardParkedLocate, AUDIT LTC-13): an MTC Full
+    // Frame, one Art-Net and one LA-Net frame, the outputs staying paused.
+    //
+    // A trailing debounce: the generator functions mark each change
+    // (markGeneratorParkedLocate) and the tick passes the position on once
+    // it has not changed for kGenParkedSettleMs, and only if the outputs
+    // would get another frame than they were last given, at the output rate
+    // (updateGeneratorParkedLocate).  A drag on the waveform seeks on every
+    // mouse event and an OSC jog stream on every message; told each time,
+    // the outputs would get a Full Frame and an Art-Net frame per event, a
+    // stream of changing positions a receiver can take for running
+    // timecode.  Told once it rests, a gesture gives one locate, where it
+    // ends.  Nothing is sent for start-up, an input switch, a frame-rate
+    // change or Clock mode.  The first tick that finds the generator
+    // playing drops a pending mark, so GO (stop, preset and play in one
+    // call) and a PLAY within the settle time send nothing extra.  A PLAY
+    // and a PAUSE before a tick (OSC /stc/N/gen/preset, then
+    // /stc/N/gen/pause) keep it -- PLAY from a stop marks its own move to
+    // Start TC or the A/B's In -- since the outputs never ran.  Message
+    // thread, like the tick.
+    //
+    // 150 ms: a click goes out 150-167 ms after it (the first tick past the
+    // settle time).  JUCE sends a drag event only when the mouse moves (the
+    // waveform view asks for no auto-repeat), so a drag sends nothing while
+    // its events keep coming within 150 ms of each other, and sends where
+    // the hand rests once it has been still that long (at the first tick
+    // past it).  OSC jogs closer together than that (loop_out_sim's
+    // streams, 15 to 60 a second) go out once, at the end; further apart (2
+    // a second), once each.  Shorter, a slow drag's hesitations would send
+    // locates mid-gesture; longer, a click would reach the outputs later.
+    static constexpr double kGenParkedSettleMs = 150.0;
+
+    /// A generator function moved the position from fromMs: while the
+    /// generator is paused or stopped in transport mode, mark a parked
+    /// locate, restarting the settle time.  Playing or in Clock mode the
+    /// outputs run and carry the position themselves.  Message thread.
+    void markGeneratorParkedLocate(double fromMs)
+    {
+        if (activeInput != InputSource::SystemTime || genClockMode
+            || genState == GeneratorState::Playing || genCurrentMs == fromMs)
+            return;
+        genParkedPending   = true;
+        genParkedChangedMs = juce::Time::getMillisecondCounterHiRes();
+    }
+
+    /// Once per tick with the generator in transport mode, sourceActive
+    /// known, before routeTimecodeToOutputs: asks for the parked locate
+    /// (forwardParkedLocate) when a marked position has rested for
+    /// kGenParkedSettleMs, the outputs are still paused, and they would get
+    /// another frame than they were last given.  Message thread.
+    void updateGeneratorParkedLocate()
+    {
+        if (sourceActive)
+        {
+            // Playing: the outputs run from this tick and carry the
+            // position themselves (GO, or PLAY within the settle time).
+            genParkedPending = false;
+            return;
+        }
+        if (outputsWereActive)
+            return;   // this tick's clean stop gives the position and clears the mark
+        if (! genParkedGivenValid)
+        {
+            // Start-up, or an input switch from a source that was not
+            // active: the outputs were given nothing.  Where they were found
+            // paused is the reference; nothing is sent for it.
+            genParkedGivenMs    = genCurrentMs;
+            genParkedGivenValid = true;
+            genParkedPending    = false;
+            return;
+        }
+        if (! genParkedPending
+            || juce::Time::getMillisecondCounterHiRes() - genParkedChangedMs < kGenParkedSettleMs)
+            return;
+        genParkedPending = false;
+        // Compared as the outputs get it (routeTimecodeToOutputs' baseTc):
+        // with FPS CONVERT, two input frames can give one output frame.
+        const FrameRate outRate = getEffectiveOutputFps();
+        auto onOutputs = [&](double ms)
+        {
+            const Timecode tc = wallClockToTimecode(ms, currentFps);
+            return fpsConvertEnabled ? convertTimecodeRate(tc, currentFps, outRate) : tc;
+        };
+        if (sameTimecode(onOutputs(genCurrentMs), onOutputs(genParkedGivenMs)))
+            return;   // back on the frame the outputs hold
+        genParkedGivenMs    = genCurrentMs;
+        forwardParkedLocate = true;
+    }
+
     //==========================================================================
     // MixerMap-driven parameter forwarding
     //
@@ -6097,21 +6245,34 @@ private:
                     hippotizerOutput.setTimecode(baseTc);
                     hippotizerOutput.forceResync();
                 }
+                // The generator's parked locate (#24): this is the position
+                // the outputs now hold, and a change marked before this tick
+                // is in it.
+                if (activeInput == InputSource::SystemTime)
+                {
+                    genParkedGivenMs = genCurrentMs;
+                    genParkedGivenValid = true;
+                }
+                genParkedPending = false;
             }
             else if (forwardParkedLocate)
             {
-                // A locate made while the MTC source was stopped (see the MTC
-                // branch of tick): the outputs stay paused, and receivers get
-                // the new position the way the clean stop gives the stop --
-                // an MTC Full Frame (the MTC spec's locate), one Art-Net and
-                // one LA-Net frame.  Those two send only while not paused, so
+                // A locate made while the source is stopped: an MTC source's
+                // Full Frame (see the MTC branch of tick, AUDIT LTC-13), or
+                // the generator's own position changed while paused or
+                // stopped, once it has rested (updateGeneratorParkedLocate,
+                // #24).  The outputs stay paused, and receivers get the new
+                // position the way the clean stop gives the stop -- an MTC
+                // Full Frame (the MTC spec's locate), one Art-Net and one
+                // LA-Net frame.  Those two send only while not paused, so
                 // each is let out for the one frame and paused again (the
                 // frame goes out at setPaused(true) at the latest).  LTC OUT
                 // stays silent.  HippoNet is not sent: no capture shows what
                 // a Hippotizer does with a position while stopped, and a new
-                // message needs one (DESIGN D2).  Until AUDIT LTC-13 made the
-                // locate a locate, the source ran through the freewheel from
-                // it and the clean stop at the end sent that run-on value.
+                // message needs one (DESIGN D2).  (The MTC source: until
+                // AUDIT LTC-13 made the locate a locate, the source ran
+                // through the freewheel from it and the clean stop at the end
+                // sent that run-on value.)
                 if (outputMtcEnabled && mtcOutput.getIsRunning())
                 {
                     mtcOutput.setTimecode(offsetTimecode(baseTc, mtcOutputOffset, outRate));
