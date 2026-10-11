@@ -7438,6 +7438,13 @@ void MainComponent::openGeneratorWaveformWindow()
     win->setTitleBarHeight(20);
     win->setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
     win->setResizable(true, true);
+    // At least 640 x 180 (the window, its 1-px border included).  The
+    // content's transport row (GeneratorWaveformWindow::resized) needs 626
+    // px: the buttons up to A/B LOOP take 542, then a 4-px gap and EDIT's
+    // 60, within 10-px margins.  Narrower, EDIT was squeezed (below 622)
+    // and gone (562 and below).  180: the least height saved bounds are
+    // restored at.  Saved bounds narrower than 640 (from 400) open at 640.
+    win->setResizeLimits(640, 180, 0x3fffffff, 0x3fffffff);
     win->centreWithSize(content->getWidth(), content->getHeight());
     if (settings.genWaveformBounds.isNotEmpty())
     {
@@ -7450,7 +7457,7 @@ void MainComponent::openGeneratorWaveformWindow()
             {
                 auto c = b.getCentre();
                 for (auto& d : juce::Desktop::getInstance().getDisplays().displays)
-                    if (d.logicalBounds.contains(c.toFloat())) { win->setBounds(b); break; }
+                    if (d.logicalBounds.contains(c.toFloat())) { win->setBoundsConstrained(b); break; }
             }
         }
     }
@@ -9825,7 +9832,7 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
         }
         if (code == 'L')
         {
-            // The LOOP toggle stays ungated: toggling an already-armed
+            // The A/B LOOP toggle stays ungated: toggling an already-armed
             // loop on / off is an operational gesture (performance), not
             // configuration.  Same rationale as the panel's transport
             // controls remaining active during Show Lock.

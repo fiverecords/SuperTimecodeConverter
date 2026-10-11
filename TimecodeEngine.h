@@ -3559,8 +3559,8 @@ public:
     {
         // Same rationale as setGeneratorAudioFile on file change:
         // loop positions are tied to the loaded file, so unloading
-        // also clears the loop.  Without this, the LOOP toggle and
-        // any saved In/Out would carry over to whatever file the
+        // also clears the loop.  Without this, the A/B LOOP toggle
+        // and any saved In/Out would carry over to whatever file the
         // user loads next.
         genLoopInMs    = 0.0;
         genLoopOutMs   = 0.0;
@@ -5551,7 +5551,7 @@ private:
             // loopInMs (wrapGenerator: the cues up to Out fire, the position
             // folds keeping what the tick ran past Out, the cues from In fire
             // in this tick, the audio seeks, the outputs are told; a jump
-            // past Out, such as LOOP armed there, lands on In).  Checked
+            // past Out, such as A/B LOOP armed there, lands on In).  Checked
             // BEFORE stop TC and EOF -- if both the stop TC and the loop Out
             // fall in the same tick, the loop wins (the user explicitly armed
             // the loop).  ("Loop audio file when it ends" has no such wrap:

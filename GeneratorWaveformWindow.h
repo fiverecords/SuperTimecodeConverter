@@ -40,13 +40,18 @@ public:
         lblFileTime.setJustificationType(juce::Justification::centredRight);
 
         // The timecode loop's indicator.  This window's own loop controls
-        // (LOOP, [ ], L) are the A/B loop's, so the header says when the
+        // (A/B LOOP, [ ], L) are the A/B loop's, so the header says when the
         // other loop, the preset's, is the one running.
         addChildComponent(lblLoopTc);
         lblLoopTc.setText("LOOP TC", juce::dontSendNotification);
         lblLoopTc.setFont(juce::Font(juce::FontOptions(13.0f).withStyle("Bold")));
         lblLoopTc.setColour(juce::Label::textColourId, accentCyan);
         lblLoopTc.setJustificationType(juce::Justification::centredRight);
+        lblLoopTc.setTooltip("Loop timecode is on for this preset (set in Generator Presets, "
+                             "or with the OSC command looptc): at its end the timecode and "
+                             "the audio go back to Start TC.  With an audio file, the cyan "
+                             "line on the waveform marks that end.  A/B LOOP is a separate "
+                             "rehearsal loop.");
 
         // --- Big absolute TC ---
         addAndMakeVisible(lblAbsoluteTC);
@@ -84,8 +89,10 @@ public:
         // A/B loop transport (programming aid).  Lives here next to the
         // waveform so the operator sets In / Out / toggle in the same visual
         // context where the loop markers are drawn.  Standard DAW / Pioneer
-        // CDJ semantics: Play snaps to In when armed; tick wraps Out -> In;
-        // manual seek allowed but next Play snaps back to In.
+        // CDJ semantics: PLAY from STOP starts at In when armed; tick wraps
+        // Out -> In; a seek moves the playhead (from STOP to PAUSE) and PLAY
+        // resumes there.  The preset's timecode loop ignores an A/B not
+        // inside it (#24, TimecodeEngine::isGeneratorAbLoopFollowed).
         //----------------------------------------------------------------------
         for (auto* btn : { &btnLoopIn, &btnLoopOut })
         {
@@ -95,14 +102,19 @@ public:
         }
         btnLoopIn .setButtonText("[");
         btnLoopOut.setButtonText("]");
-        btnLoopIn .setTooltip("Set loop In at current playhead (keyboard: [)");
-        btnLoopOut.setTooltip("Set loop Out at current playhead (keyboard: ])");
+        btnLoopIn .setTooltip("A/B loop: set In at the playhead (keyboard, in the main window: [)");
+        btnLoopOut.setTooltip("A/B loop: set Out at the playhead (keyboard, in the main window: ])");
 
+        // "A/B LOOP", not "LOOP": the preset's Loop timecode is the other
+        // loop (#24).
         addAndMakeVisible(btnLoopOn);
-        btnLoopOn.setButtonText("LOOP");
+        btnLoopOn.setButtonText("A/B LOOP");
         btnLoopOn.setColour(juce::ToggleButton::textColourId, textBright);
-        btnLoopOn.setTooltip("Toggle A/B loop on / off (keyboard: L).  When on, Play snaps "
-                             "to In and playback wraps from Out back to In.");
+        btnLoopOn.setTooltip("A/B loop on / off (keyboard, in the main window: L).  When on, "
+                             "playback goes back from Out to In, and PLAY from STOP starts at "
+                             "In.  A rehearsal loop, separate from the preset's Loop timecode "
+                             "(LOOP TC), which ignores an A/B not inside its own loop (drawn "
+                             "dashed).");
 
         btnLoopIn.onClick = [this] {
             if (engine == nullptr) return;
@@ -250,8 +262,11 @@ public:
         btnNext .setBounds(transportRow.removeFromLeft(navW));
 
         // Loop group, immediately after NEXT with a small visual break.
+        // The toggle leaves "A/B LOOP" a 72 px text area: this window draws
+        // with LookAndFeel_V4 (15 px text after a 28 px tick box and gaps),
+        // with room for a font wider than Arial (Windows draws it in Verdana).
         transportRow.removeFromLeft(gap * 3);
-        const int loopBtnW = 28, loopTogW = 60;
+        const int loopBtnW = 28, loopTogW = 100;
         btnLoopIn .setBounds(transportRow.removeFromLeft(loopBtnW)); transportRow.removeFromLeft(gap);
         btnLoopOut.setBounds(transportRow.removeFromLeft(loopBtnW)); transportRow.removeFromLeft(gap);
         btnLoopOn .setBounds(transportRow.removeFromLeft(loopTogW));
