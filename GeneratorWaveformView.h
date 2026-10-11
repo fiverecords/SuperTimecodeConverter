@@ -5,6 +5,8 @@
 #pragma once
 #include <JuceHeader.h>
 #include <climits>
+#include <cmath>
+#include <optional>
 #include "GeneratorAudioPlayer.h"
 #include "TimecodeEngine.h"
 #include "TimecodeCore.h"
@@ -30,6 +32,16 @@
 //   - Cursor is repainted at ~30Hz via a Timer.
 //   - Waveform peaks repaint on AudioThumbnail change notifications (JUCE
 //     emits these as the background peak generation progresses).
+//
+// The view shows the file once.  With "Loop audio file when it ends" the
+// timecode counts on past the file's end while the player loops the file,
+// so the cursor and the A/B points are folded by the file's length
+// (cursorFileSeconds, fileSecondsAt), and a point of the view stands for the
+// pass of the file the generator is in (pointMs): click-to-seek, drag, the
+// hover readout and the TC ruler (#24).  Both come from one split of the
+// timecode into a pass and a place in it (placeInFile), so they agree at a
+// pass boundary.  Under "Loop timecode" a point stands for the first pass
+// (currentPass).
 //==============================================================================
 class GeneratorWaveformView : public juce::Component,
                               private juce::ChangeListener,
@@ -73,6 +85,60 @@ public:
     /// The engine drives both cursor position (via getGeneratorCurrentMs) and
     /// the seek action on click (via setGeneratorPosition).
     void setEngine(TimecodeEngine* e) { engine = e; repaint(); }
+
+    /// Where a point `sec` seconds after Start TC falls in a file `len`
+    /// seconds long (> 0), with `looping` the player looping the file
+    /// ("Loop audio file when it ends", or the timecode loop's gapless
+    /// path; #24): the pass of the file (0 = the first) and the seconds
+    /// into that pass.  While the player loops, both come from one floor,
+    /// so they never disagree at a pass boundary: a point within
+    /// kPassEdgeSec of one belongs to the pass it begins.  Otherwise pass 0
+    /// and `sec` as it is (past the file's end, or below 0 before Start
+    /// TC).  What this view's cursor and A/B points use, the pass its seeks
+    /// take under "Loop audio" (currentPass), and GeneratorWaveformWindow's
+    /// file-time label (the cursor and the label through
+    /// cursorFileSeconds).  Pure (any thread).
+    struct FilePlace { double pass; double sec; };
+    static FilePlace placeInFile(double sec, double len, bool looping)
+    {
+        if (! looping || sec < len - kPassEdgeSec)
+            return { 0.0, sec };
+        double pass   = std::floor(sec / len);
+        double inPass = sec - pass * len;
+        if (inPass < 0.0)                 { pass -= 1.0; inPass += len; }
+        if (inPass >= len - kPassEdgeSec) { pass += 1.0; inPass = 0.0; }
+        return { pass, inPass };
+    }
+
+    /// How near a pass boundary a point counts as on it: 1 us.  A click at
+    /// the waveform's left edge in a later pass puts the timecode on Start
+    /// TC + pass * the file's length, which (timecode - Start TC) / 1000
+    /// gives back a few ulps off either way (under 1e-10 s at any time of
+    /// day); 1 us is far above that and far below a sample (21 us at
+    /// 48 kHz) or a frame.
+    static constexpr double kPassEdgeSec = 1.0e-6;
+
+    /// Where the cursor of `e`'s generator goes, in seconds into a file
+    /// `len` seconds long (> 0), with `looping` the player looping the
+    /// file: placeInFile's place, except for a position at or past Stop TC
+    /// on a pass boundary from the second pass on -- a stop at Stop TC a
+    /// whole number of file lengths after Start TC under "Loop audio file
+    /// when it ends".  That is drawn at the end of the pass before, the
+    /// right edge, as a stop at a file's end is, and not at the start of a
+    /// pass the generator does not play (PLAY there stops at once; a click
+    /// takes the pass before, pointMs).  Not while the timecode loop acts:
+    /// it goes round instead of stopping.  What this view's cursor and
+    /// GeneratorWaveformWindow's file-time label use.  Message thread.
+    static double cursorFileSeconds(const TimecodeEngine& e, double len, bool looping)
+    {
+        const double curMs  = e.getGeneratorCurrentMs();
+        const double stopMs = e.getGeneratorStopMs();
+        const auto   place  = placeInFile((curMs - e.getGeneratorStartMs()) / 1000.0, len, looping);
+        if (place.pass > 0.0 && place.sec < kPassEdgeSec && stopMs > 0.0
+            && curMs >= stopMs - kPassEdgeSec * 1000.0 && ! e.isGeneratorLoopTimecodeActive())
+            return len;
+        return place.sec;
+    }
 
     /// Optional click handler called when the user clicks the waveform in
     /// Mini mode.  Allows the parent to react (e.g. open the full window).
@@ -191,10 +257,11 @@ private:
             g.setColour(hoverCursorCol);
             g.fillRect(hx, waveArea.getY(), 1, waveArea.getHeight());
 
-            // Time tooltip: "M:SS  HH:MM:SS:FF"  next to the cursor.
+            // Time tooltip: "M:SS  HH:MM:SS:FF"  next to the cursor: the
+            // TC a click there gives, in the pass the generator is in.
             const double frac    = (double)(hx - waveArea.getX()) / (double) waveArea.getWidth();
             const double hoverSec = juce::jlimit(0.0, totalLen, frac * totalLen);
-            const double hoverAbsMs = engine->getGeneratorStartMs() + hoverSec * 1000.0;
+            const double hoverAbsMs = pointMs(hoverSec, currentPass(totalLen), totalLen);
             const Timecode hoverTc  = wallClockToTimecode(hoverAbsMs, engine->getCurrentFps());
             const juce::String label = formatFileTime(hoverSec) + "  " + hoverTc.toString();
 
@@ -222,30 +289,45 @@ private:
         // markers.  Active when loop is enabled and Out > In; otherwise
         // markers are still drawn if individual points are placed, so the
         // operator can see where they would land before arming the loop.
+        // Each point is drawn where it falls in the file (fileSecondsAt), so
+        // under "Loop audio" one set in a later pass shows too.
         if (engine != nullptr)
         {
-            const double startMs       = engine->getGeneratorStartMs();
             const double loopInMs      = engine->getGeneratorLoopInMs();
             const double loopOutMs     = engine->getGeneratorLoopOutMs();
             const bool   loopActive    = engine->isGeneratorLoopActive();
 
-            auto msToX = [&](double absMs) -> int
+            auto secToX = [&](double posSec) -> int
             {
-                const double posSec = (absMs - startMs) / 1000.0;
                 if (posSec < 0.0 || posSec > totalLen) return INT_MIN;
                 return waveArea.getX() + (int)((posSec / totalLen) * waveArea.getWidth());
             };
 
-            const int inX  = (loopInMs  > 0.0) ? msToX(loopInMs)  : INT_MIN;
-            const int outX = (loopOutMs > 0.0) ? msToX(loopOutMs) : INT_MIN;
+            // Out is the loop's exclusive end: on a pass boundary it ends the
+            // band at the right edge (fileEndSecondsAt).
+            const int inX  = (loopInMs  > 0.0) ? secToX(fileSecondsAt(loopInMs, totalLen))     : INT_MIN;
+            const int outX = (loopOutMs > 0.0) ? secToX(fileEndSecondsAt(loopOutMs, totalLen)) : INT_MIN;
 
             // Range fill -- amber tint between In and Out, lighter when
-            // loop is armed, dimmer when only markers are set.
-            if (inX != INT_MIN && outX != INT_MIN && outX > inX)
+            // loop is armed, dimmer when only markers are set.  Under "Loop
+            // audio" an A/B over the file's end (Out folded before In) is
+            // drawn in two parts, In to the right edge and the left edge to
+            // Out, and one a file's length or longer covers the whole file.
+            if (inX != INT_MIN && outX != INT_MIN)
             {
                 g.setColour(loopActive ? juce::Colour(0x33FFA500)   // amber 20%
                                        : juce::Colour(0x14FFA500)); // amber 8%
-                g.fillRect(inX, waveArea.getY(), outX - inX, waveArea.getHeight());
+                const int bandY = waveArea.getY(), bandH = waveArea.getHeight();
+                if (player->isLooping() && loopOutMs - loopInMs >= (totalLen - kPassEdgeSec) * 1000.0)
+                    g.fillRect(waveArea);
+                else if (player->isLooping() && loopOutMs > loopInMs
+                         && fileEndSecondsAt(loopOutMs, totalLen) <= fileSecondsAt(loopInMs, totalLen))
+                {
+                    g.fillRect(inX, bandY, waveArea.getRight() - inX, bandH);
+                    g.fillRect(waveArea.getX(), bandY, outX - waveArea.getX(), bandH);
+                }
+                else if (outX > inX)
+                    g.fillRect(inX, bandY, outX - inX, bandH);
             }
 
             // In marker -- amber line, slightly thicker than cues.
@@ -276,7 +358,9 @@ private:
                 // timeline.  Cues that fall outside [startMs, startMs +
                 // audioLength*1000] just don't have a visible marker --
                 // they still fire correctly at runtime; this is purely
-                // a visual.
+                // a visual.  Not folded by the file's length: under "Loop
+                // audio file when it ends" cues fire on the first pass
+                // only.
                 const double cuePosMs = (double) gc.positionMs(fps);
                 const double posSec   = (cuePosMs - startMs) / 1000.0;
                 if (posSec < 0.0 || posSec > totalLen) continue;
@@ -294,9 +378,8 @@ private:
         // --- Cursor (drawn last so it stays visible over ticks) ---
         if (engine != nullptr)
         {
-            const double startMs   = engine->getGeneratorStartMs();
-            const double currentMs = engine->getGeneratorCurrentMs();
-            const double curPosSec = juce::jlimit(0.0, totalLen, (currentMs - startMs) / 1000.0);
+            const double curPosSec = juce::jlimit(0.0, totalLen,
+                                                  cursorFileSeconds(*engine, totalLen, player->isLooping()));
 
             int cursorX = waveArea.getX()
                         + (int)((curPosSec / totalLen) * waveArea.getWidth());
@@ -305,6 +388,90 @@ private:
             g.setColour(cursorCol);
             g.fillRect(cursorX, waveArea.getY(), 1, waveArea.getHeight());
         }
+    }
+
+    //==========================================================================
+    // Passes of the file (#24).  With "Loop audio file when it ends" the
+    // player loops the file and the timecode counts on past its end, so
+    // timecode - Start TC (the relation every seek uses) passes the file's
+    // length from the second pass on: the cursor sat at the right edge, and
+    // a click took the timecode back to the first pass.  The cursor, the
+    // A/B points and the window's label are folded whenever the player
+    // loops the file (cursorFileSeconds, fileSecondsAt), so also on the
+    // timecode loop's gapless path.  There the timecode itself is folded
+    // and stays in the file while it plays, but two things can still lie
+    // past the file's end, and are drawn folded where before #24 they were
+    // drawn at the right edge or not at all: an A/B point set under "Loop
+    // audio", and the timecode left past the loop's end while paused
+    // (Start TC moved back, an OSC jog), the cursor then drawn where PLAY
+    // folds the timecode to.
+    // Passes (currentPass) are for "Loop audio" only: with "Loop timecode"
+    // on, a click, a drag, the hover readout and the ruler take the first
+    // pass, inside the timecode loop, as before #24.  Without a loop the
+    // player does not loop and nothing changes.  totalLen is the file's
+    // length in seconds (> 0); engine and player are set.  Message thread
+    // (paint, the mouse callbacks; the engine's tick writes the timecode
+    // there too); isLooping is an atomic.
+
+    /// Where absMs (ms from midnight, the generator's timeline) falls in the
+    /// file, in seconds: absMs - Start TC, folded by the file's length while
+    /// the player loops the file (placeInFile).  Below 0: before the file.
+    double fileSecondsAt(double absMs, double totalLen) const
+    {
+        return placeInFile((absMs - engine->getGeneratorStartMs()) / 1000.0,
+                           totalLen, player->isLooping()).sec;
+    }
+
+    /// The same for an exclusive end, the A/B's Out: one on a pass
+    /// boundary (within kPassEdgeSec) ends the pass before, at the file's
+    /// length (the right edge), where fileSecondsAt begins the next at 0.
+    double fileEndSecondsAt(double absMs, double totalLen) const
+    {
+        const auto place = placeInFile((absMs - engine->getGeneratorStartMs()) / 1000.0,
+                                       totalLen, player->isLooping());
+        return (place.pass > 0.0 && place.sec < kPassEdgeSec) ? totalLen : place.sec;
+    }
+
+    /// The pass of the file the generator is in under "Loop audio file
+    /// when it ends" (placeInFile; 0 = the first).  Always 0 while the
+    /// player does not loop the file, and with "Loop timecode" on: the
+    /// engine then keeps "Loop audio" off and the player loops only on the
+    /// timecode loop's gapless path, where a pass past the first is only
+    /// ever a timecode left past the loop's end while paused, and a click
+    /// there would leave the loop.
+    double currentPass(double totalLen) const
+    {
+        if (engine->getGeneratorLoopTimecode())
+            return 0.0;
+        return placeInFile((engine->getGeneratorCurrentMs() - engine->getGeneratorStartMs()) / 1000.0,
+                           totalLen, player->isLooping()).pass;
+    }
+
+    /// The timecode (ms from midnight) that the point fileSec seconds into
+    /// the file stands for in pass `pass`: Start TC + (pass * the file's
+    /// length + fileSec) * 1000.  From the second pass on, with a Stop TC
+    /// (the panel or OSC /stoptime; "Loop audio" stops there), a point at
+    /// or past Stop TC stands for the latest earlier pass in which it is
+    /// before it: the generator never gets past Stop TC in a later pass,
+    /// and from Stop TC or a timecode past it PLAY stops at once.  The
+    /// file's end (the ruler's last tick) is the end of its pass, not the
+    /// start of the next, and may be Stop TC itself.  In the first pass a
+    /// point past Stop TC is taken as it is, as before #24.
+    double pointMs(double fileSec, double pass, double totalLen) const
+    {
+        const double startMs = engine->getGeneratorStartMs();
+        const double stopMs  = engine->getGeneratorStopMs();
+        // A point PLAY would start from must lie more than kPassEdgeSec
+        // before Stop TC; the file's end, which ends its pass, may be Stop
+        // TC itself (within kPassEdgeSec).
+        const double edgeSec = fileSec >= totalLen - kPassEdgeSec ? kPassEdgeSec : -kPassEdgeSec;
+        if (pass > 0.0 && stopMs > 0.0
+            && startMs + (pass * totalLen + fileSec) * 1000.0 > stopMs + edgeSec * 1000.0)
+        {
+            const double latest = std::floor(((stopMs - startMs) / 1000.0 - fileSec + edgeSec) / totalLen);
+            pass = juce::jlimit(0.0, pass - 1.0, latest);
+        }
+        return startMs + (pass * totalLen + fileSec) * 1000.0;
     }
 
     //==========================================================================
@@ -332,15 +499,16 @@ private:
             if (c >= ideal) break;
         }
 
-        const double startMs = engine->getGeneratorStartMs();
-        const FrameRate fps  = engine->getCurrentFps();
+        const double pass   = currentPass(totalLen);
+        const FrameRate fps = engine->getCurrentFps();
 
         g.setFont(juce::Font(juce::FontOptions(9.5f)));
 
         // Top strip: file time (0:00, 1:00, ...)
         auto topStrip    = juce::Rectangle<int>(waveArea.getX(), waveArea.getY() - kMarkerAreaH,
                                                  waveArea.getWidth(), kMarkerAreaH);
-        // Bottom strip: absolute TC
+        // Bottom strip: absolute TC, in the pass the generator is in (the TC
+        // a click there gives, pointMs)
         auto bottomStrip = juce::Rectangle<int>(waveArea.getX(), waveArea.getBottom(),
                                                  waveArea.getWidth(), kMarkerAreaH);
 
@@ -363,7 +531,7 @@ private:
                        juce::Justification::centredTop, false);
 
             // Absolute TC label (bottom)
-            const Timecode tc = wallClockToTimecode(startMs + t * 1000.0, fps);
+            const Timecode tc = wallClockToTimecode(pointMs(t, pass, totalLen), fps);
             const juce::String tcLabel = tc.toString();
             g.drawText(tcLabel, x - 40, bottomStrip.getY() + 1, 80, kMarkerAreaH - 2,
                        juce::Justification::centredTop, false);
@@ -393,6 +561,26 @@ private:
             return;
         }
 
+        gesturePass.reset();   // a new gesture: its pass is taken at its first seek
+        seekTo(e);
+    }
+
+    void mouseDrag(const juce::MouseEvent& e) override
+    {
+        // Treat drag as continuous click so the user can position precisely
+        // without releasing.  Skipped in Mini mode and when locked.
+        if (mode == Mode::Mini) return;
+        if (isLockedFn && isLockedFn()) return;
+        seekTo(e);
+    }
+
+    /// Full mode: move the generator to the point of the file under the
+    /// mouse, in the pass of the file the gesture began in (pointMs; the
+    /// pass is taken at its first seek and kept for the rest of a drag, so
+    /// a drag while the generator plays does not jump a whole file length
+    /// when the timecode enters the next pass).
+    void seekTo(const juce::MouseEvent& e)
+    {
         // Full mode below requires player + engine + a loaded file to seek.
         if (player == nullptr || engine == nullptr) return;
         if (! player->hasFileLoaded()) return;
@@ -410,18 +598,11 @@ private:
                                           (double)(e.x - waveArea.getX()) / (double) waveArea.getWidth());
         const double seekSec = frac * totalLen;
 
-        const double newGenMs = engine->getGeneratorStartMs() + seekSec * 1000.0;
+        if (! gesturePass.has_value())
+            gesturePass = currentPass(totalLen);
+        const double newGenMs = pointMs(seekSec, *gesturePass, totalLen);
         engine->setGeneratorPosition(newGenMs);
         repaint();
-    }
-
-    void mouseDrag(const juce::MouseEvent& e) override
-    {
-        // Treat drag as continuous click so the user can position precisely
-        // without releasing.  Skipped in Mini mode and when locked.
-        if (mode == Mode::Mini) return;
-        if (isLockedFn && isLockedFn()) return;
-        mouseDown(e);
     }
 
     void mouseMove(const juce::MouseEvent& e) override
@@ -464,6 +645,7 @@ private:
     TimecodeEngine*       engine = nullptr;
     Mode                  mode   = Mode::Full;
     int                   hoverX = -1;     // -1 = mouse outside wave area
+    std::optional<double> gesturePass;     // the pass a click / drag seeks in (seekTo)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(GeneratorWaveformView)
 };

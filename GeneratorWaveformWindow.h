@@ -322,15 +322,17 @@ private:
         else
             lblFilename.setText(file.getFileName(), juce::dontSendNotification);
 
-        // File time / total time
-        const double startMs    = engine->getGeneratorStartMs();
+        // File time / total time: where the cursor is in the file, folded by
+        // the file's length while the player loops it, as the waveform's
+        // cursor is (GeneratorWaveformView::cursorFileSeconds, #24).
         const double curMs      = engine->getGeneratorCurrentMs();
         const double totalSec   = player->getFileLengthSeconds();
-        const double curFileSec = juce::jmax(0.0, (curMs - startMs) / 1000.0);
 
         if (totalSec > 0.0)
         {
-            const double clamped = juce::jmin(curFileSec, totalSec);
+            const double curFileSec = GeneratorWaveformView::cursorFileSeconds(*engine, totalSec,
+                                                                               player->isLooping());
+            const double clamped = juce::jlimit(0.0, totalSec, curFileSec);
             lblFileTime.setText(formatTime(clamped) + " / " + formatTime(totalSec),
                                  juce::dontSendNotification);
         }
