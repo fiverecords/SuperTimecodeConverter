@@ -150,6 +150,21 @@ public:
     /// Empty / not set = always allow.
     std::function<bool()> isLockedFn;
 
+    /// True when `e`'s generator runs the preset's timecode loop (#24): in
+    /// transport mode (not Clock mode, which never loops), with "Loop
+    /// timecode" acting (TimecodeEngine::isGeneratorLoopTimecodeActive: the
+    /// flag on and an end at least 1 s after Start TC; with no Stop TC it
+    /// reads false while the file is still loading).  What the waveform
+    /// window's LOOP TC, the panel's STOP TC (LOOP) label and this view's
+    /// end mark show (GeneratorWaveformWindow::loopTimecodeShown).
+    /// Message thread.
+    static bool loopTimecodeShown(const TimecodeEngine& e)
+    {
+        return e.getActiveInput() == TimecodeEngine::InputSource::SystemTime
+            && ! e.getGeneratorClockMode()
+            && e.isGeneratorLoopTimecodeActive();
+    }
+
 private:
     //==========================================================================
     void changeListenerCallback(juce::ChangeBroadcaster*) override
@@ -247,41 +262,36 @@ private:
         if (mode == Mode::Full)
             paintTimeMarkers(g, waveArea, totalLen);
 
-        // --- Hover cursor (Full mode only, drawn under the playhead) ---
+        // --- Hover cursor (Full mode only): the line under the A/B, the cues
+        // and the playhead, its readout over everything (drawn last) ---
         // Shows where a click would land while the mouse is over the wave area.
-        if (mode == Mode::Full && hoverX >= 0 && engine != nullptr)
+        const bool hovering = mode == Mode::Full && hoverX >= 0 && engine != nullptr;
+        const int  hx       = juce::jlimit(waveArea.getX(), waveArea.getRight() - 1, hoverX);
+        if (hovering)
         {
-            const int hx = juce::jlimit(waveArea.getX(), waveArea.getRight() - 1, hoverX);
-
             // Vertical hover line (semi-transparent grey).
             g.setColour(hoverCursorCol);
             g.fillRect(hx, waveArea.getY(), 1, waveArea.getHeight());
+        }
 
-            // Time tooltip: "M:SS  HH:MM:SS:FF"  next to the cursor: the
-            // TC a click there gives, in the pass the generator is in.
-            const double frac    = (double)(hx - waveArea.getX()) / (double) waveArea.getWidth();
-            const double hoverSec = juce::jlimit(0.0, totalLen, frac * totalLen);
-            const double hoverAbsMs = pointMs(hoverSec, currentPass(totalLen), totalLen);
-            const Timecode hoverTc  = wallClockToTimecode(hoverAbsMs, engine->getCurrentFps());
-            const juce::String label = formatFileTime(hoverSec) + "  " + hoverTc.toString();
-
-            const int   labelW    = 140;
-            const int   labelH    = 18;
-            const int   margin    = 6;
-            // Place to the right of the line; flip to the left at the right edge.
-            int labelX = hx + margin;
-            if (labelX + labelW > waveArea.getRight())
-                labelX = hx - margin - labelW;
-            const int labelY = waveArea.getY() + 2;
-
-            g.setColour(juce::Colour(0xCC000000));
-            g.fillRect(labelX, labelY, labelW, labelH);
-            g.setColour(hoverTooltipBorderCol);
-            g.drawRect(labelX, labelY, labelW, labelH, 1);
-            g.setColour(hoverTooltipTextCol);
-            g.setFont(juce::Font(juce::FontOptions(10.5f)));
-            g.drawText(label, labelX + 4, labelY, labelW - 8, labelH,
-                       juce::Justification::centredLeft, false);
+        // --- Where the timecode loop ends (#24), in the cyan of the
+        // window's LOOP TC, while that shows: the file's end (the right
+        // edge) on the gapless path, Stop TC on the seek path.  A 2-px line
+        // ending at the end's pixel, under the A/B, the cues and the cursor.
+        // Not folded (fileSecondsAt): on the gapless path the end is the
+        // file's length, which the player's loop would fold to 0.
+        if (engine != nullptr && loopTimecodeShown(*engine))
+        {
+            const double endSec = (engine->getGeneratorLoopTimecodeEndMs()
+                                   - engine->getGeneratorStartMs()) / 1000.0;
+            if (endSec > 0.0)
+            {
+                const int endX = waveArea.getX()
+                               + (int)((juce::jmin(endSec, totalLen) / totalLen) * waveArea.getWidth());
+                g.setColour(loopTcEndCol);
+                g.fillRect(juce::jlimit(waveArea.getX(), waveArea.getRight() - 2, endX - 1),
+                           waveArea.getY(), 2, waveArea.getHeight());
+            }
         }
 
         // --- A/B loop range (drawn under cues but above waveform body) ---
@@ -389,7 +399,8 @@ private:
             }
         }
 
-        // --- Cursor (drawn last so it stays visible over ticks) ---
+        // --- Cursor (drawn after the ticks, the A/B and the cues so it stays
+        // visible over them; only the hover readout goes over it) ---
         if (engine != nullptr)
         {
             const double curPosSec = juce::jlimit(0.0, totalLen,
@@ -401,6 +412,37 @@ private:
             cursorX = juce::jlimit(waveArea.getX(), waveArea.getRight() - 1, cursorX);
             g.setColour(cursorCol);
             g.fillRect(cursorX, waveArea.getY(), 1, waveArea.getHeight());
+        }
+
+        // --- Hover readout, last: over the timecode loop's end, the A/B, the
+        // cues and the cursor, so none of them crosses its text ---
+        if (hovering)
+        {
+            // Time tooltip: "M:SS  HH:MM:SS:FF"  next to the cursor: the
+            // TC a click there gives, in the pass the generator is in.
+            const double frac    = (double)(hx - waveArea.getX()) / (double) waveArea.getWidth();
+            const double hoverSec = juce::jlimit(0.0, totalLen, frac * totalLen);
+            const double hoverAbsMs = pointMs(hoverSec, currentPass(totalLen), totalLen);
+            const Timecode hoverTc  = wallClockToTimecode(hoverAbsMs, engine->getCurrentFps());
+            const juce::String label = formatFileTime(hoverSec) + "  " + hoverTc.toString();
+
+            const int   labelW    = 140;
+            const int   labelH    = 18;
+            const int   margin    = 6;
+            // Place to the right of the line; flip to the left at the right edge.
+            int labelX = hx + margin;
+            if (labelX + labelW > waveArea.getRight())
+                labelX = hx - margin - labelW;
+            const int labelY = waveArea.getY() + 2;
+
+            g.setColour(juce::Colour(0xCC000000));
+            g.fillRect(labelX, labelY, labelW, labelH);
+            g.setColour(hoverTooltipBorderCol);
+            g.drawRect(labelX, labelY, labelW, labelH, 1);
+            g.setColour(hoverTooltipTextCol);
+            g.setFont(juce::Font(juce::FontOptions(10.5f)));
+            g.drawText(label, labelX + 4, labelY, labelW - 8, labelH,
+                       juce::Justification::centredLeft, false);
         }
     }
 
@@ -654,6 +696,7 @@ private:
     juce::Colour tickCol                { 0xFF333333 };
     juce::Colour markerTextCol          { 0xFF999999 };
     juce::Colour emptyTextCol           { 0xFF666666 };
+    juce::Colour loopTcEndCol           { 0xFF00AAFF };  // the window's LOOP TC (accentCyan)
 
     GeneratorAudioPlayer* player = nullptr;
     TimecodeEngine*       engine = nullptr;

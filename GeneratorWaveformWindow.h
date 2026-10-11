@@ -178,17 +178,13 @@ public:
         stopTimer();
     }
 
-    /// True when `e`'s generator runs the preset's timecode loop (#24): in
-    /// transport mode (not Clock mode, which never loops), with "Loop
-    /// timecode" acting (TimecodeEngine::isGeneratorLoopTimecodeActive: the
-    /// flag on and an end at least 1 s after Start TC; with no Stop TC it
-    /// reads false while the file is still loading).  What this window's
-    /// LOOP TC and the panel's STOP TC (LOOP) label show.  Message thread.
+    /// True when `e`'s generator runs the preset's timecode loop (#24); see
+    /// GeneratorWaveformView::loopTimecodeShown, which the waveform's end
+    /// mark uses too.  What this window's LOOP TC and the panel's STOP TC
+    /// (LOOP) label show.  Message thread.
     static bool loopTimecodeShown(const TimecodeEngine& e)
     {
-        return e.getActiveInput() == TimecodeEngine::InputSource::SystemTime
-            && ! e.getGeneratorClockMode()
-            && e.isGeneratorLoopTimecodeActive();
+        return GeneratorWaveformView::loopTimecodeShown(e);
     }
 
     //==========================================================================
