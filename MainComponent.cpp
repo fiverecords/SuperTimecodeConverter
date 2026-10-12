@@ -7429,12 +7429,22 @@ void MainComponent::openGeneratorWaveformWindow()
         saveSettings();
     };
 
+    // A key reaches the window frame when nothing below it used it (JUCE
+    // offers a key to the focused component, then to each parent up to
+    // the frame, which has the focus itself after a click on its title
+    // bar).  onKey hands it to the main window's A/B loop keys, [ ] L, and
+    // to nothing else: the main window's other shortcuts stay there.
     struct FloatingWindow : juce::DocumentWindow
     {
         FloatingWindow(const juce::String& t, juce::Colour bg)
             : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
         void closeButtonPressed() override { if (onClose) onClose(); delete this; }
+        bool keyPressed(const juce::KeyPress& key) override
+        {
+            return (onKey != nullptr && onKey(key)) || DocumentWindow::keyPressed(key);
+        }
         std::function<void()> onClose;
+        std::function<bool(const juce::KeyPress&)> onKey;
     };
 
     auto* win = new FloatingWindow("Generator Waveform", juce::Colour(0xFF12141A));
@@ -7473,6 +7483,7 @@ void MainComponent::openGeneratorWaveformWindow()
                                    + " " + juce::String(b.getWidth()) + " " + juce::String(b.getHeight());
         saveSettings();
     };
+    win->onKey = [this](const juce::KeyPress& key) { return handleGeneratorLoopKey(key); };
     win->setVisible(true);
     genWaveformWindow = win;
 }
@@ -9784,6 +9795,11 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
         return true;
     }
 
+    return handleGeneratorLoopKey(key);
+}
+
+bool MainComponent::handleGeneratorLoopKey(const juce::KeyPress& key)
+{
     // Generator A/B loop shortcuts: only fire when the Generator transport
     // is visible (input source = Generator, transport mode = true) and no
     // text editor has keyboard focus (so typing in a TC field is not
@@ -9795,6 +9811,10 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
     // Routed directly to the engine (rather than triggering buttons in the
     // waveform window) so the shortcuts work even when that window is
     // closed.  Validation mirrors what the waveform window's buttons do.
+    // Called by keyPressed, and by the floating waveform window for a key
+    // none of its controls used (openGeneratorWaveformWindow): one path for
+    // both windows, with the checks above and Show Lock's gates below.
+    // Message thread.
     if (btnGenPlay.isVisible() && ! key.getModifiers().isAnyModifierKeyDown())
     {
         // Skip if a text editor or combo's text edit currently owns focus.

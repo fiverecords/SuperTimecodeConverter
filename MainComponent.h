@@ -840,6 +840,9 @@ private:
     void openGeneratorPresetEditor();
     void pushFpsToGenPresetEditor();   // the selected engine's rate, to an open preset editor
     void openGeneratorWaveformWindow();
+    // The A/B loop's keys ([ ] L): keyPressed's and the floating waveform
+    // window's one path.  Message thread.
+    bool handleGeneratorLoopKey(const juce::KeyPress& key);
     void setupOscInputServer();
     void handleOscMessage(const OscInputServer::Message& msg);   // message thread
     void startOscInput();

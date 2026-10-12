@@ -102,15 +102,18 @@ public:
         }
         btnLoopIn .setButtonText("[");
         btnLoopOut.setButtonText("]");
-        btnLoopIn .setTooltip("A/B loop: set In at the playhead (keyboard, in the main window: [)");
-        btnLoopOut.setTooltip("A/B loop: set Out at the playhead (keyboard, in the main window: ])");
+        // The keys work in this window too: the frame MainComponent puts
+        // this content in hands [ ] L to the main window's handler
+        // (MainComponent::handleGeneratorLoopKey).
+        btnLoopIn .setTooltip("A/B loop: set In at the playhead (keyboard: [, in this window or the main window)");
+        btnLoopOut.setTooltip("A/B loop: set Out at the playhead (keyboard: ], in this window or the main window)");
 
         // "A/B LOOP", not "LOOP": the preset's Loop timecode is the other
         // loop (#24).
         addAndMakeVisible(btnLoopOn);
         btnLoopOn.setButtonText("A/B LOOP");
         btnLoopOn.setColour(juce::ToggleButton::textColourId, textBright);
-        btnLoopOn.setTooltip("A/B loop on / off (keyboard, in the main window: L).  When on, "
+        btnLoopOn.setTooltip("A/B loop on / off (keyboard: L, in this window or the main window).  When on, "
                              "playback goes back from Out to In, and PLAY from STOP starts at "
                              "In.  A rehearsal loop, separate from the preset's Loop timecode "
                              "(LOOP TC), which ignores an A/B not inside its own loop (drawn "
