@@ -265,8 +265,8 @@ Real-time beat tracking from a live audio input, enabling BPM output for non-DJ 
 
 - **BPM display** with colour-coded confidence: green (locked), orange (tracking), dim orange (uncertain), grey (no signal)
 - **Beat LED** flashes at the detected BPM rate
-- **Smoothing slider** (0-100%) controls stability vs responsiveness — combines EMA output smoothing with BTT internal histogram tuning
-- **Gain control** for the audio input level
+- **Smoothing slider** (0-100%, 50% by default) controls stability vs responsiveness — combines EMA output smoothing with BTT internal histogram tuning; a right-click or a double-click on the slider, or on its value box, puts it back to 50%
+- **Gain control** for the audio input level; a right-click or a double-click on its slider, or on its value box, resets it to 100%
 - **Smart UI**: when LTC is the active source, Audio BPM shows its own separate device/channel/gain controls. For other sources, it shares the standard audio settings section.
 - **Device markers** show which engines are using which audio devices for BPM detection (same pattern as LTC markers)
 
@@ -289,7 +289,7 @@ Full TCNet server for direct integration with Resolume Arena, ChamSys, Avolites,
 - Unicast: automatic slave discovery, Request/Response negotiation, Metrics streaming at 30Hz, Metadata + Artwork on track change
 - Per-engine toggle "TCNET OUT" in the outputs panel with layer selector (1-4) and network interface selector. Every interface selector of the software protocols (TCNet, Art-Net, LA-Net, OSC) also offers "Localhost (127.0.0.1)" for a receiver such as Resolume running on the same PC
 - Track metadata for the layer: artist and title from the deck (Pro DJ Link, StageLinQ); for the generator, the preset in use as the title, with the artist from the loaded file's tags (or the "Artist - " half of a file named "Artist - Title"), or the file's own title and artist when no preset is selected
-- **Global offset** (-2000 to +2000 ms) applied to every TCNet layer, to compensate for the latency of the receiving system without touching the per-engine frame offsets
+- **Global offset** (-2000 to +2000 ms) applied to every TCNet layer, to compensate for the latency of the receiving system without touching the per-engine frame offsets; a right-click or a double-click on its slider, or on its value box, resets it to zero
 - Works with all input sources: Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator
 
 Protocol reference: https://www.tc-supply.com/tcnet
@@ -301,7 +301,7 @@ The internal Generator can play an audio file synchronised with the timecode it 
 - **Per-preset audio file** — each Generator preset stores an absolute path to a WAV / AIFF / FLAC / OGG / MP3 file plus what happens at its end (below). Activating the preset (GO button or `/stc/N/gen/preset` OSC) loads the file and starts playback at the preset's Start TC. The audio file association is global to the preset, so any engine that activates it loads the same file. A preset with an audio file runs to the end of the file: the Stop TC stored in the preset is not used (the preset editor greys it out and shows `(audio length)`), and the panel shows 00:00:00:00. A Stop TC typed in the panel, or sent with `/stc/N/gen/stoptime`, after GO still applies. If the file is missing on disk, GO runs the preset as one without audio, to its Stop TC.
 - **At the end of the file** — two boxes in the preset editor, which untick each other:
   - neither: the generator stops at the end of the file;
-  - **Loop audio file when it ends**: only the audio loops. The timecode keeps counting past the end of the file — up to a Stop TC set after GO, or for ever — and the cue points fire on the first pass only. For a music bed under a longer timecode. On the waveform the cursor, the A/B loop's points and the window's file time go round with the audio, pass after pass, and a click, a drag, the hover readout and the TC ruler below the waveform stand for the pass the timecode is in, so a click moves the timecode by less than the file's length instead of back to the first pass (with a Stop TC, a point that would be at or past it in this pass stands for the last pass in which it comes before Stop TC). The cue markers stay those of the first pass. From the second pass on, the timecode no longer follows the audio interface's clock: over a long run it, and the cursor with it, drift from the audio by that clock's error (at 50-100 ppm, 0.2-0.4 s an hour);
+  - **Loop audio file when it ends**: only the audio loops. The timecode keeps counting past the end of the file — up to a Stop TC set after GO, or for ever — and the cue points fire on the first pass only. For a music bed under a longer timecode. On the waveform the cursor, the A/B loop's points and the window's file time go round with the audio, pass after pass, and a click, a drag, the hover readout and the TC ruler below the waveform stand for the pass the timecode is in, so a click moves the timecode by less than the file's length instead of back to the first pass (with a Stop TC, a point that would be at or past it in this pass stands for the last pass in which it comes before Stop TC). The cue markers stay those of the first pass. The timecode follows the audio interface's clock in every pass, as with Loop timecode, so over a long run it, and the cursor with it, stay with what is heard as in the first pass instead of drifting from it (with a file shorter than about two audio buffers the timecode can settle up to the file's length away from it, and with one of a buffer or less it is in effect not corrected: it runs on the computer's clock and drifts from what is heard). A Start TC changed while the file plays, a jog to before Start TC or a stall of the audio device leaves the timecode off the audio; it is pulled back into step gradually, the shortest way round the file, when that way is less than a second;
   - **Loop timecode (back to Start TC at the end)**: the timecode, the audio and the cue points go back to Start TC together, below.
 - **Loop timecode** — where the generator would stop, it goes back to Start TC instead, for as long as it plays:
   - **Where the end is:** the end of the audio file. For a preset without audio, its Stop TC. A Stop TC set after GO that comes before the end of the file ends the loop there instead (one less than a frame before the end counts as the end of the file). With neither a file nor a Stop TC there is no end and the option does nothing; a loop shorter than one second does nothing either. In both cases the generator stops as it would without the option.
@@ -336,7 +336,7 @@ A visual companion to the Generator audio playback: a waveform view of the loade
 - **DAW-style stereo rendering** — left channel above the centreline, right channel below (Ableton / Logic / Reaper convention).
 - **Click-to-seek and drag-to-scrub** — clicking the waveform seeks both the audio and the generated timecode to that position. Dragging continuously seeks (scrubbing). A semi-transparent hover line previews where a click would land, with a readout of the file time and the absolute TC a click there gives. While the generator plays, a click (or an OSC `/stc/N/gen/jog`) that moves it half a second or more goes out to the receivers as an instant resync, as for a CDJ hot cue: an MTC Full Frame, an immediate Art-Net and LA-Net frame, and the LTC encoder restarted at the new position. Shorter steps — the steps of a drag, a stream of short jogs — go out without a resync, each output following them as it follows the timecode, so MTC and LTC keep sending whole frames while you scrub. Paused or stopped, a click or a drag reaches the receivers once it has rested (see _Transport sync_ above).
 - **State-aware seek** — Playing keeps playing from the new position; Paused stays paused at the new position; Stopped transitions to Paused (preserves the seek so the next Play resumes from there instead of resetting to Start TC).
-- **A/B loop** — `[` and `]` (the buttons, or the keys in the main window) set loop In and Out at the playhead, and A/B LOOP (or `L`) arms it: at Out the timecode and the audio go back to In together. Every pass lasts exactly Out − In, and the cue points between fire on every pass, including one exactly on Out (just before In's) and one on In, which fires as the loop jumps back. Each jump back, however short the loop, goes out to the receivers as an instant resync (above). Arming A/B LOOP with the playhead past Out, or seeking past Out while it plays, lands on In. This loop is a programming aid set from the playhead; the preset's _Loop timecode_ is the other one, shown as `LOOP TC` in the window's header and by a cyan line on the waveform. Hold the mouse over `[`, `]`, A/B LOOP or `LOOP TC` for a tooltip that says which loop each belongs to.
+- **A/B loop** — `[` and `]` (the buttons, or the keys) set loop In and Out at the playhead, and A/B LOOP (or `L`) arms it: at Out the timecode and the audio go back to In together. The keys act with the keyboard focus anywhere in the waveform window or in the main window's content; just after STC starts, or after a click on the main window's title bar, click inside the main window first. A text box being edited takes them as text, and `L` held down toggles the loop at the keyboard's repeat rate. Every pass lasts exactly Out − In, and the cue points between fire on every pass, including one exactly on Out (just before In's) and one on In, which fires as the loop jumps back. Each jump back, however short the loop, goes out to the receivers as an instant resync (above). Arming A/B LOOP with the playhead past Out, or seeking past Out while it plays, lands on In. This loop is a programming aid set from the playhead; the preset's _Loop timecode_ is the other one, shown as `LOOP TC` in the window's header and by a cyan line on the waveform. Hold the mouse over `[`, `]`, A/B LOOP or `LOOP TC` for a tooltip that says which loop each belongs to.
 - **Show Lock** — seek, the loop In / Out points and the EDIT button are blocked under Show Lock; transport, navigation, A/B LOOP on/off and volume remain operational.
 
 ### Shared MIDI Output
@@ -377,13 +377,13 @@ User bits are specific to LTC. The Art-Net and TCNet timecode packets have no eq
 ### Audio Monitoring
 
 - **VU Meters** — real-time level metering for all audio paths (LTC input, LTC output, Audio Thru input, Audio Thru output) with colour-coded feedback (green → yellow → red)
-- **Per-channel gain control** — independent input/output gain for LTC and Audio Thru paths
+- **Per-channel gain control** — independent input/output gain for LTC and Audio Thru paths; a right-click or a double-click on a gain slider, or on its value box, resets it to 100%
 
 ### Synchronization
 
 - **LTC bit-clock phase lock** — the LTC output aligns its frame boundaries with the source and holds them there by trimming its bit clock, rather than by jumping. A correction of a few milliseconds is absorbed over a second or two with every frame left whole and every frame number intact
 - **Output frame offsets** — independent offset per output (MTC, Art-Net, LTC) from -30 to +30 frames, to compensate for device latency or synchronization differences
-- **TCNet output offset** — independent offset in milliseconds (-1000 to +1000 ms) for the TCNet output, separate from the frame-based offsets used by MTC/Art-Net/LTC
+- **TCNet output offset** — independent offset in milliseconds (-1000 to +1000 ms) for the TCNet output, separate from the frame-based offsets used by MTC/Art-Net/LTC; a right-click or a double-click on its slider, or on its value box, resets it to zero
 
 ### Show Lock
 
@@ -584,7 +584,7 @@ Enable **FPS Convert** to re-stamp outgoing timecode at a different frame rate f
 
 ### Output Frame Offsets
 
-Each output (MTC, Art-Net, LTC) has an independent frame offset control (−30 to +30 frames). Use this to compensate for device latency or to intentionally advance/delay timecode to specific destinations. Double-click the offset slider to reset to zero.
+Each output (MTC, Art-Net, LTC) has an independent frame offset control (−30 to +30 frames). Use this to compensate for device latency or to intentionally advance/delay timecode to specific destinations. A right-click or a double-click on the offset slider, or on the value box beside it, resets it to zero; a single click on the value box opens it to type a value.
 
 ### Audio Thru
 
