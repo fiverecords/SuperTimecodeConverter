@@ -14,9 +14,10 @@
 // window.  Combines:
 //   - Header: filename + file-time / total-time, and the loop in charge
 //     (#24, loopInCharge): LOOP A/B, LOOP TC or LOOP AUDIO
-//   - Big absolute TC display (HH:MM:SS:FF)
+//   - Big absolute TC display (HH:MM:SS:FF), and on its right the preset
+//     GO starts (#24, PRESET: the main window's preset list selection)
 //   - GeneratorWaveformView in Full mode (markers + click-to-seek)
-//   - Transport buttons (PLAY / PAUSE / STOP)
+//   - Transport buttons (GO / PLAY / PAUSE / STOP)
 //
 // The actual juce::DocumentWindow is created and owned by MainComponent
 // (consistent with the other floating windows in STC).  This Component is
@@ -55,17 +56,41 @@ public:
         lblAbsoluteTC.setJustificationType(juce::Justification::centredLeft);
         lblAbsoluteTC.setText("--:--:--:--", juce::dontSendNotification);
 
+        // The preset GO starts (#24): the one selected in the main window's
+        // preset list, which this window does not show otherwise -- two
+        // presets with the same file look alike here, and the list is
+        // hidden while the main window's input section is collapsed
+        // (updatePresetForGo).
+        addAndMakeVisible(lblPreset);
+        lblPreset.setFont(juce::Font(juce::FontOptions(13.0f)));
+        lblPreset.setColour(juce::Label::textColourId, textMid);
+        lblPreset.setJustificationType(juce::Justification::centredRight);
+        lblPreset.setText(kNoPresetText, juce::dontSendNotification);
+        lblPreset.setTooltip("The preset selected in the main window's preset list: the one GO starts.");
+
         // --- Waveform ---
         addAndMakeVisible(waveform);
         waveform.setMode(GeneratorWaveformView::Mode::Full);
 
         // --- Transport ---
-        for (auto* btn : { &btnPlay, &btnPause, &btnStop, &btnPrev, &btnNext, &btnEdit })
+        for (auto* btn : { &btnGo, &btnPlay, &btnPause, &btnStop, &btnPrev, &btnNext, &btnEdit })
         {
             addAndMakeVisible(btn);
             btn->setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
             btn->setColour(juce::TextButton::textColourOffId, textBright);
         }
+        // GO as the panel's, in its green (#24): MainComponent's onGo is the
+        // panel's GO for this window's engine, the selected one, and it is
+        // greyed out with another input or in Clock mode (goAvailable,
+        // timerCallback).
+        btnGo.setButtonText("GO");
+        btnGo.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF22AA44));
+        btnGo.setTooltip("GO: start the preset selected in the main window's preset list (PRESET, "
+                         "above on the right), with its audio file and loop options, as the panel's "
+                         "GO does: from its Start TC, or, with its file already loaded, from the In "
+                         "of an A/B loop it follows.  Greyed out while no preset is selected, and, as "
+                         "the panel's GO is hidden, while the input is not the generator or the "
+                         "generator is in Clock mode.");
         btnPlay.setButtonText("PLAY");
         btnPause.setButtonText("PAUSE");
         btnStop.setButtonText("STOP");
@@ -73,6 +98,7 @@ public:
         btnNext.setButtonText(">");
         btnEdit.setButtonText("EDIT");
 
+        btnGo.onClick    = [this] { if (onGo) onGo(); };
         btnPlay.onClick  = [this] { if (engine) engine->generatorPlay();  };
         btnPause.onClick = [this] { if (engine) engine->generatorPause(); };
         btnStop.onClick  = [this] { if (engine) engine->generatorStop();  };
@@ -199,6 +225,20 @@ public:
         return GeneratorWaveformView::loopTimecodeShown(e);
     }
 
+    /// Whether GO is available for `e` (#24): with the generator as the
+    /// input, in transport mode -- where the main window shows the panel's
+    /// GO while its input section is expanded
+    /// (MainComponent::updateDeviceSelectorVisibility).  GO leaves Clock
+    /// mode, a switch the panel's CLOCK toggle refuses under Show Lock.
+    /// The window's GO is greyed out otherwise, and MainComponent::
+    /// goPanelGenPreset refuses it.  With the input section collapsed the
+    /// panel also hides its GO and the preset list, and the window's GO
+    /// still starts the preset selected there.  Message thread.
+    static bool goAvailable(const TimecodeEngine& e)
+    {
+        return e.getActiveInput() == TimecodeEngine::InputSource::SystemTime && ! e.getGeneratorClockMode();
+    }
+
     /// The loop in charge of `e`'s generator (#24): what this window's
     /// header and the panel's STOP TC label show; see
     /// GeneratorWaveformView::loopInCharge for the order.  Message thread.
@@ -258,17 +298,29 @@ public:
         lblFilename.setBounds(headerRow);
         area.removeFromTop(2);
 
-        // Big absolute TC.
-        lblAbsoluteTC.setBounds(area.removeFromTop(34));
+        // Big absolute TC, the preset GO starts on its right (#24): at the
+        // window's 640-px minimum the TC keeps 360 px.
+        auto tcRow = area.removeFromTop(34);
+        lblPreset.setBounds(tcRow.removeFromRight(juce::jmin(260, tcRow.getWidth() / 2)));
+        lblAbsoluteTC.setBounds(tcRow);
         area.removeFromTop(8);
 
         // Transport row at bottom.
-        // Layout: [PREV]  [PLAY] [PAUSE] [STOP]  [NEXT] | VOL [slider]  ...gap... [EDIT]
+        // Layout: [PREV] [GO] [PLAY] [PAUSE] [STOP] [NEXT] | VOL [slider]  ...gap... [EDIT]
+        // GO (#24) is paid for by PLAY / PAUSE / STOP, 76 px instead of 90,
+        // so the row still fits the window's 640-px minimum
+        // (MainComponent::openGeneratorWaveformWindow).  JUCE's
+        // LookAndFeel_V4 draws a button's text 16 px high within 9-px
+        // indents on these 28-px buttons: PAUSE, the widest, is 47.5 px in
+        // Liberation Sans (Arial's widths) and 44.3 in DejaVu Sans, GO 22.3
+        // and 21.5, so 58 and 26 px of text room are enough, and a font
+        // wider than those is squeezed, not cut.
         auto transportRow = area.removeFromBottom(28);
-        const int btnW = 90, gap = 4, navW = 40, editW = 60;
+        const int btnW = 76, gap = 4, navW = 40, goW = 44, editW = 60;
         const int volLabelW = 28, volSliderMinW = 140;
 
         btnPrev .setBounds(transportRow.removeFromLeft(navW)); transportRow.removeFromLeft(gap);
+        btnGo   .setBounds(transportRow.removeFromLeft(goW));  transportRow.removeFromLeft(gap);
         btnPlay .setBounds(transportRow.removeFromLeft(btnW)); transportRow.removeFromLeft(gap);
         btnPause.setBounds(transportRow.removeFromLeft(btnW)); transportRow.removeFromLeft(gap);
         btnStop .setBounds(transportRow.removeFromLeft(btnW)); transportRow.removeFromLeft(gap);
@@ -324,7 +376,25 @@ private:
             if (btnLoopOn.getToggleState() != wanted)
                 btnLoopOn.setToggleState(wanted, juce::dontSendNotification);
         }
+        // GO with the generator as the input, in transport mode (#24,
+        // goAvailable), and a preset selected to start.
+        const bool presetSelected = updatePresetForGo();
+        const bool go = engine != nullptr && goAvailable(*engine) && presetSelected;
+        if (btnGo.isEnabled() != go)
+            btnGo.setEnabled(go);
         updateLoopState(engine != nullptr ? loopInCharge(*engine) : LoopInCharge::none);
+    }
+
+    /// The PRESET label: the preset selected in the main window's list
+    /// (selectedPresetName), which GO starts, changed only when it changes.
+    /// Returns whether one is selected.
+    bool updatePresetForGo()
+    {
+        const juce::String name = selectedPresetName ? selectedPresetName() : juce::String();
+        const juce::String text = name.isNotEmpty() ? "PRESET: " + name : juce::String(kNoPresetText);
+        if (lblPreset.getText() != text)
+            lblPreset.setText(text, juce::dontSendNotification);
+        return name.isNotEmpty();
     }
 
     /// The header's loop label for `state`, changed only when it changes.
@@ -438,8 +508,10 @@ private:
     GeneratorWaveformView waveform;
     juce::Label   lblFilename, lblFileTime, lblAbsoluteTC, lblVolume;
     juce::Label   lblLoopState;   // the loop in charge (updateLoopState)
+    juce::Label   lblPreset;      // the preset GO starts (updatePresetForGo)
+    static constexpr const char* kNoPresetText = "PRESET: none selected";
     LoopInCharge  shownLoopState = LoopInCharge::none;
-    juce::TextButton btnPlay, btnPause, btnStop;
+    juce::TextButton btnGo, btnPlay, btnPause, btnStop;
     juce::TextButton btnPrev, btnNext, btnEdit;
     juce::TextButton   btnLoopIn, btnLoopOut;
     juce::ToggleButton btnLoopOn;
@@ -458,6 +530,15 @@ public:
     std::function<void()> onPrev;
     std::function<void()> onNext;
     std::function<void()> onEdit;
+    /// GO (#24): MainComponent runs the panel's GO, which is this window's
+    /// engine's (the window follows the selected engine), the same under
+    /// Show Lock, and only with the generator as the input, in transport
+    /// mode (goAvailable), and a preset selected.
+    std::function<void()> onGo;
+    /// The name of the preset selected in the main window's preset list,
+    /// empty with none (#24): what GO starts, shown as PRESET; GO is greyed
+    /// out without one.  Polled by the 30 Hz timer.  Message thread.
+    std::function<juce::String()> selectedPresetName;
 
     /// Called when the user moves the volume slider.  MainComponent uses
     /// this to update the panel's slider so both stay in sync.

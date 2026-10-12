@@ -863,11 +863,7 @@ MainComponent::MainComponent()
         leftContent.addAndMakeVisible(btnGenGo);
         btnGenGo.setVisible(false);
         btnGenGo.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF22AA44));
-        btnGenGo.onClick = [this] {
-            int sel = cmbGenPreset.getSelectedId();
-            if (sel > 0)
-                activateGenPreset(selectedGenPresetName());
-        };
+        btnGenGo.onClick = [this] { goPanelGenPreset(); };
 
         leftContent.addAndMakeVisible(btnGenPresetEdit);
         btnGenPresetEdit.setVisible(false);
@@ -7419,6 +7415,20 @@ void MainComponent::applyGenPresetLoopBoxesLive(const GeneratorPreset& preset)
             e->setGeneratorLoopFlags(preset.audioLoop, preset.loopTimecode);
 }
 
+/// The panel's GO, and the waveform window's (#24): GO with the preset
+/// selected in the combo, on the selected engine; nothing with none
+/// selected, nor with another input or in Clock mode
+/// (GeneratorWaveformWindow::goAvailable), which GO would leave, also
+/// under Show Lock, where the CLOCK toggle is refused.  The window's GO
+/// also works while the input section is collapsed, where the panel hides
+/// its GO and the combo.  Otherwise not gated by Show Lock (an operational
+/// control).  Message thread.
+void MainComponent::goPanelGenPreset()
+{
+    if (cmbGenPreset.getSelectedId() > 0 && GeneratorWaveformWindow::goAvailable(currentEngine()))
+        activateGenPreset(selectedGenPresetName());
+}
+
 void MainComponent::activateGenPreset(const juce::String& name)
 {
     if (auto* preset = settings.generatorPresets.find(name))
@@ -7740,6 +7750,8 @@ void MainComponent::openGeneratorWaveformWindow()
     // the browse-vs-swap split.
     content->onPrev = [this] { cycleGenPreset(-1); };
     content->onNext = [this] { cycleGenPreset(+1); };
+    content->onGo   = [this] { goPanelGenPreset(); };   // #24: the panel's GO
+    content->selectedPresetName = [this] { return selectedGenPresetName(); };   // #24: what GO starts
     content->onEdit = [this] {
         // Match the panel's EDIT button: blocked under Show Lock so a
         // distracted operator cannot reshuffle presets mid-show.
@@ -7785,10 +7797,11 @@ void MainComponent::openGeneratorWaveformWindow()
     win->setColour(juce::DocumentWindow::textColourId, juce::Colour(0xFF546E7A));
     win->setResizable(true, true);
     // At least 640 x 180 (the window, its 1-px border included).  The
-    // content's transport row (GeneratorWaveformWindow::resized) needs 626
-    // px: the buttons up to A/B LOOP take 542, then a 4-px gap and EDIT's
-    // 60, within 10-px margins.  Narrower, EDIT was squeezed (below 622)
-    // and gone (562 and below).  180: the least height saved bounds are
+    // content's transport row (GeneratorWaveformWindow::resized) needs 632
+    // px: the buttons up to A/B LOOP take 548 (GO's 48 since #24, PLAY /
+    // PAUSE / STOP 14 px narrower each), then a 4-px gap and EDIT's 60,
+    // within 10-px margins.  Narrower, EDIT is squeezed (below 628) and
+    // gone (568 and below).  180: the least height saved bounds are
     // restored at.  Saved bounds narrower than 640 (from 400) open at 640.
     win->setResizeLimits(640, 180, 0x3fffffff, 0x3fffffff);
     win->centreWithSize(content->getWidth(), content->getHeight());

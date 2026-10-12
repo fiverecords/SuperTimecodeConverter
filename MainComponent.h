@@ -977,6 +977,7 @@ private:
     void goGenPreset(int engineIndex, const GeneratorPreset& preset);
     void showGenPresetInPanel(TimecodeEngine& eng);
     void activateGenPreset(const juce::String& name);      // GO on the selected engine
+    void goPanelGenPreset();                               // the panel's GO and the waveform window's
     void loadGenPresetToFields(const juce::String& name);  // the combo's browse
     // Direction: -1 = previous, +1 = next.  Cycles cmbGenPreset and chooses
     // between browse semantics (idle: just update fields) and hot-swap
