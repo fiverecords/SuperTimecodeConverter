@@ -3065,6 +3065,7 @@ public:
         // Explicit user transition; clear the natural-EOF marker so a
         // subsequent click on the timeline does NOT auto-resume.
         genEndedAtEof = false;
+        genAudioLoopLastPassEndMs = 0.0;
         genCurrentMs = genStartMs;
         // Reset the crossing-based cue cursor too -- the next play will
         // start from genStartMs and we want the first tick's (prev, now]
@@ -3116,12 +3117,23 @@ public:
     /// relation (under a second apart) or leave the two apart (a second or
     /// more) -- until the next wrap on the seek path, for good on the
     /// gapless path, where no wrap seeks the audio.  Without the loop
-    /// nothing is sought, as in 1.9.14.  Stopped, the position moves to the
-    /// new Start TC, and the paused outputs get it as a parked locate
-    /// (markGeneratorParkedLocate, #24).  Message thread.
+    /// nothing is sought, as in 1.9.14, but for the player's loop held by
+    /// syncGeneratorPlayerLooping (the timecode loop's last pass after it
+    /// was turned off with the timecode before Start TC, or "Loop audio"
+    /// turned off with the audio a whole pass ahead and in step): there the
+    /// audio is folded the same way, Start TC + the file's length as the
+    /// end, so it stays a whole pass ahead and in step with the new Start
+    /// TC, the hold goes on and the pass is heard.  Left where it was, the
+    /// audio would be as far out of step as Start TC moved, and the hold,
+    /// which keeps only audio in step, would let go: the file would play to
+    /// its end before the new Start TC and the pass would be silent.
+    /// Stopped, the position moves to the new Start TC, and the paused
+    /// outputs get it as a parked locate (markGeneratorParkedLocate, #24).
+    /// Message thread.
     void setGeneratorStartMs(double ms)
     {
         const double prevStartMs = genStartMs;
+        const bool wasHeld = generatorPlayerLoopHeld();
         genStartMs = juce::jmax(0.0, ms);
         if (genState == GeneratorState::Stopped && activeInput == InputSource::SystemTime)
         {
@@ -3134,10 +3146,14 @@ public:
 
         if (genStartMs == prevStartMs)
             return;
-        syncGeneratorPlayerLooping();
+        retargetGeneratorAudioLastPass();
         double endMs = 0.0;
         bool gapless = false;
-        if (genState != GeneratorState::Stopped && loopTimecodeEnd(endMs, gapless))
+        const bool loopActs = loopTimecodeEnd(endMs, gapless);
+        if (wasHeld && ! loopActs)
+            seekGeneratorAudioIntoLoop(genStartMs + generatorAudioPlayer.getFileLengthSeconds() * 1000.0, true);
+        syncGeneratorPlayerLooping();
+        if (genState != GeneratorState::Stopped && loopActs)
             seekGeneratorAudioIntoLoop(endMs, gapless);
     }
 
@@ -3203,31 +3219,153 @@ public:
     //
     // The flag follows the audio file, not the preset selection: it is set
     // with the file (setGeneratorAudioFile), so the player's loop is carried
-    // with the file in the same request, or by OSC (setGeneratorLoopTimecode).
-    // In memory only; the preset holds it.  Everything here runs on the
+    // with the file in the same request; for the file that is loaded it is
+    // also switched live, with "Loop audio" (setGeneratorLoopFlags: the
+    // preset editor's Update; setGeneratorLoopTimecode: OSC looptc).  In
+    // memory only; the preset holds it.  Everything here runs on the
     // message thread (the 60 Hz tick, the UI, OSC).
 
-    /// Turn the timecode loop on or off live (OSC /stc/N/gen/looptc).  On,
-    /// it also turns off the engine's copy of "Loop audio file when it ends"
-    /// (the two exclude each other; this wins), so that off while it plays
-    /// always gives a last pass, whatever the preset's "Loop audio" says:
-    /// the pass in progress runs to the end and the generator stops there,
-    /// as without the loop (the player stops looping and its position is
-    /// folded back into the file, GeneratorAudioPlayer::
-    /// setLoopingWhilePlaying).  "Loop audio" comes back with the next
-    /// setGeneratorAudioFile (GO, the combo, OSC /gen/preset).  Off when it
-    /// was not on changes nothing.  Message thread.
-    void setGeneratorLoopTimecode(bool shouldLoop)
+    /// The two end options of the file that is loaded, switched live (#24):
+    /// "Loop audio file when it ends" (audioLoop) and "Loop timecode"
+    /// (loopTimecode), with the rules they have at GO
+    /// (setGeneratorAudioFile): they exclude each other and, both given,
+    /// loopTimecode wins.  The preset editor's Update calls it with a
+    /// preset's two boxes for the engine that has that preset loaded, so
+    /// they take effect without GO.  Nothing else changes: the file, Start
+    /// and Stop TC, the cues, the A/B loop and the transport state stay as
+    /// they are.  Playing or paused (paused, from the next PLAY):
+    ///  - none or Loop audio -> Loop timecode: the loop acts from the next
+    ///    tick, as OSC looptc 1 does: a timecode past its end folds into it
+    ///    (wrapGenerator); on the gapless path the player loops the file
+    ///    (under Loop audio it already does), on the seek path it does not;
+    ///  - Loop timecode -> none: its last pass, then a stop at its end, as
+    ///    OSC looptc 0 does (syncGeneratorPlayerLooping holds the player's
+    ///    loop while the audio finishes the pass before);
+    ///  - Loop timecode -> Loop audio: the pass in progress plays on, and at
+    ///    the file's end the audio goes round while the timecode counts on,
+    ///    with no stop and no jump.  On the seek path -- a Stop TC set after
+    ///    GO, before the file's end -- the player starts to loop and the
+    ///    generator stops at that Stop TC, as Loop audio does with one;
+    ///  - none -> Loop audio: the player loops the file from the pass in
+    ///    progress on, and the generator no longer stops at its end;
+    ///  - Loop audio -> none: the pass in progress ends at the file's end
+    ///    and the generator stops there, as without the option.  In the
+    ///    first pass, or before Start TC, the player stops looping at once,
+    ///    unless the audio is then a whole pass ahead of the timecode and
+    ///    in step with it: syncGeneratorPlayerLooping holds the loop until
+    ///    the audio goes round, and the pass plays in step.  What decides is
+    ///    where the audio is when the switch comes.  A jog before Start TC
+    ///    under Loop audio (the audio then at the file's top), or a Start TC
+    ///    moved later, leaves the audio ahead of the timecode and in general
+    ///    out of step; DESIGN D18, comparing modulo the file's length in
+    ///    Loop audio's first pass too, brings a remainder under a second
+    ///    into step in the second or two after it, so a switch then is held
+    ///    and the pass plays in step.  A switch soon after it, or with a
+    ///    remainder of a second or more, finds the audio out of step: the
+    ///    file plays on to its end, ahead of the timecode, and stops there,
+    ///    as without the option.  From the second pass on
+    ///    the timecode is past Start TC + the file's length, where the
+    ///    generator would stop at once: the player keeps looping and the
+    ///    generator stops at the end of the pass the timecode is in
+    ///    (genAudioLoopLastPassEndMs), at the file's end of that pass.  A
+    ///    seek, an A/B wrap or a Start TC change moves that end to the pass
+    ///    the timecode is then in; into the first pass or before Start TC
+    ///    there is none, as above (retargetGeneratorAudioLastPass).
+    /// A switch that has the player loop the file -- onto the timecode
+    /// loop's gapless path, or onto Loop audio with the timecode at or past
+    /// Start TC -- brings audio more than kGenAudioInStepMs out of step to
+    /// where the timecode puts it, (timecode - Start TC) modulo the file's
+    /// length (seekGeneratorAudioIntoLoop), as a Stop TC that moves the loop
+    /// to its gapless path does; audio in step is left where it is.  So
+    /// audio left at the file's end by a jog past it while the file did not
+    /// loop, or, onto the gapless path, at its top by a jog before Start TC,
+    /// no longer stays apart from the timecode (DESIGN D18 pulls only a
+    /// difference under a second).  The seek also takes a difference D18 is
+    /// still closing, in the second or so after a jog or a Start TC change
+    /// of under a second: the audio then jumps, repeating or skipping up to
+    /// about a second, instead of D18 pulling the timecode, and the outputs
+    /// with it, at up to 20 ms a tick.  Stopped, only the flags change and
+    /// PLAY starts with them; the player's loop follows at once.  While a
+    /// file load is pending the flags are set, there is no last pass (the
+    /// length may still be the previous file's), the player's loop follows
+    /// when the load completes (syncGeneratorPlayerLooping,
+    /// onLoadCompleted), and meanwhile, with either option on, the end of
+    /// the file being replaced does not stop the generator
+    /// (updateGenerator).  Message thread.
+    void setGeneratorLoopFlags(bool audioLoop, bool loopTimecode)
     {
-        genLoopTimecode = shouldLoop;
-        if (shouldLoop)
-            genAudioLoop = false;
+        double endMs = 0.0;
+        bool gapless = false;
+        const bool wasGapless   = loopTimecodeEnd(endMs, gapless) && gapless;
+        const bool wasAudioLoop = genAudioLoop;
+        genLoopTimecode = loopTimecode;
+        genAudioLoop    = audioLoop && ! loopTimecode;
+        // Loop audio off, or still off with its last pass under way (the
+        // same boxes pushed again): the last pass, if the timecode is past
+        // the first.
+        const bool lastPass = ! genAudioLoop && ! genLoopTimecode && genState != GeneratorState::Stopped
+                              && (wasAudioLoop || genAudioLoopLastPassEndMs > 0.0);
+        genAudioLoopLastPassEndMs = lastPass ? generatorAudioLastPassEndMs() : 0.0;
         syncGeneratorPlayerLooping();
+        if (genState == GeneratorState::Stopped)
+            return;
+        if (! wasGapless && loopTimecodeEnd(endMs, gapless) && gapless)
+            seekGeneratorAudioIntoLoop(endMs, true, true);
+        else if (! wasAudioLoop && genAudioLoop && genCurrentMs >= genStartMs
+                 && generatorAudioPlayer.hasFileLoaded() && ! generatorAudioPlayer.isLoadPending()
+                 && generatorAudioPlayer.getFileLengthSeconds() > 0.0)
+            seekGeneratorAudioIntoLoop(genStartMs + generatorAudioPlayer.getFileLengthSeconds() * 1000.0,
+                                       true, true);
     }
 
-    /// The flag as last set (with the file or by OSC), whether or not the
-    /// loop can act.
+    /// "Loop audio file when it ends" alone, live (setGeneratorLoopFlags).
+    /// On, it turns the timecode loop off, as ticking its box in the preset
+    /// editor unticks the other; off when it was not on changes nothing.
+    /// Message thread.
+    void setGeneratorAudioLoop(bool shouldLoop)
+    {
+        setGeneratorLoopFlags(shouldLoop, shouldLoop ? false : genLoopTimecode);
+    }
+
+    /// Turn the timecode loop on or off live (OSC /stc/N/gen/looptc;
+    /// setGeneratorLoopFlags).  On, it also turns off the engine's copy of
+    /// "Loop audio file when it ends" (the two exclude each other; this
+    /// wins), so that off while it plays always gives a last pass, whatever
+    /// the preset's "Loop audio" says: the pass in progress runs to the end
+    /// and the generator stops there, as without the loop (the player stops
+    /// looping and its position is folded back into the file,
+    /// GeneratorAudioPlayer::setLoopingWhilePlaying).  "Loop audio" comes
+    /// back with the next setGeneratorAudioFile (GO, the combo, OSC
+    /// /gen/preset) or setGeneratorLoopFlags (the preset editor's Update).
+    /// Off when it was not on changes nothing.  Message thread.
+    void setGeneratorLoopTimecode(bool shouldLoop)
+    {
+        setGeneratorLoopFlags(shouldLoop ? false : genAudioLoop, shouldLoop);
+    }
+
+    /// The flag as last set (with the file, by OSC or by
+    /// setGeneratorLoopFlags), whether or not the loop can act.
     bool getGeneratorLoopTimecode() const { return genLoopTimecode; }
+
+    /// The engine's "Loop audio file when it ends" as last set (with the
+    /// file or by setGeneratorLoopFlags; off while the timecode loop is on),
+    /// whether or not a file is loaded.
+    bool getGeneratorAudioLoop() const { return genAudioLoop; }
+
+    /// True while "Loop audio file when it ends" runs: the flag is on and
+    /// the player loops the loaded file, no load pending.  For the
+    /// indicators, next to isGeneratorLoopTimecodeActive and
+    /// isGeneratorAbLoopFollowed.  False with no file
+    /// (a preset whose file is missing), while a load is pending, under the
+    /// timecode loop (the two exclude each other), and after Loop audio is
+    /// turned off live, where the player may still loop to the end of its
+    /// last pass, or until the audio goes round (setGeneratorLoopFlags).
+    /// Message thread.
+    bool isGeneratorLoopAudioActive() const
+    {
+        return genAudioLoop && generatorAudioPlayer.hasFileLoaded()
+            && ! generatorAudioPlayer.isLoadPending() && generatorAudioPlayer.isLooping();
+    }
 
     /// True when the timecode loop acts: the flag is on and there is an end
     /// at least kMinLoopTimecodeMs after Start TC.  While a file load is
@@ -3436,6 +3574,7 @@ public:
         // (a click while Playing/Paused also implies the user has
         // moved on from the natural-end state).
         genEndedAtEof = false;
+        retargetGeneratorAudioLastPass();
 
         if (activeInput == InputSource::SystemTime)
         {
@@ -3512,16 +3651,18 @@ public:
     /// Returns immediately -- the actual load runs on a dedicated I/O thread.
     ///
     /// shouldLoop is the preset's "Loop audio file when it ends";
-    /// loopTimecode its "Loop timecode" (#24), which follows the file: it
-    /// is set here and only here (and by OSC, setGeneratorLoopTimecode), and
-    /// the player's loop goes with the file in the same request.  That loop
-    /// depends on the file's length when the timecode loop is on (on only
-    /// for its gapless path), so the request carries a guess -- gapless
-    /// unless a Stop TC is set -- which the load's completion settles
-    /// (syncGeneratorPlayerLooping).  With both flags set, loopTimecode
-    /// wins and the engine keeps shouldLoop off, as the preset editor's two
-    /// boxes untick each other: turning the loop off later (OSC) then gives
-    /// its last pass rather than "Loop audio".  Message thread.
+    /// loopTimecode its "Loop timecode" (#24).  Both follow the file: they
+    /// are set here, or live for the file that is loaded
+    /// (setGeneratorLoopFlags, the preset editor's Update; OSC looptc,
+    /// setGeneratorLoopTimecode), and the player's loop goes with the file
+    /// in the same request.  That loop depends on the file's length when
+    /// the timecode loop is on (on only for its gapless path), so the
+    /// request carries a guess -- gapless unless a Stop TC is set -- which
+    /// the load's completion settles (syncGeneratorPlayerLooping).  With
+    /// both flags set, loopTimecode wins and the engine keeps shouldLoop
+    /// off, as the preset editor's two boxes untick each other: turning the
+    /// loop off later (OSC) then gives its last pass rather than "Loop
+    /// audio".  Message thread.
     void setGeneratorAudioFile(const juce::File& file, bool shouldLoop, bool loopTimecode = false)
     {
         const juce::File f = (file == juce::File() || ! file.existsAsFile()) ? juce::File() : file;
@@ -3551,6 +3692,7 @@ public:
         genEndedAtEof = false;
         genAudioLoop    = shouldLoop && ! loopTimecode;
         genLoopTimecode = loopTimecode;
+        genAudioLoopLastPassEndMs = 0.0;
         const bool playerLoops = loopTimecode ? (f != juce::File() && genStopMs <= 0.0) : shouldLoop;
         generatorAudioPlayer.requestLoad(f, playerLoops);
     }
@@ -3568,6 +3710,7 @@ public:
         genEndedAtEof  = false;
         genAudioLoop    = false;   // as setGeneratorAudioFile(File(), false)
         genLoopTimecode = false;
+        genAudioLoopLastPassEndMs = 0.0;
         generatorAudioPlayer.requestLoad(juce::File(), false);
     }
 
@@ -3756,10 +3899,16 @@ private:
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
     // Timecode loop (#24; see "Generator timecode loop" above): the preset's
     // "Loop timecode" and "Loop audio file when it ends" as given with the
-    // file (setGeneratorAudioFile; the first also by OSC).  Never both true:
-    // setting the first clears the second.  Message thread.
+    // file (setGeneratorAudioFile) or live (setGeneratorLoopFlags; the first
+    // also by OSC).  Never both true: setting the first clears the second.
+    // genAudioLoopLastPassEndMs: Loop audio turned off live from its second
+    // pass on, where its last pass ends -- the end of the pass the timecode
+    // is in, a file's end in ms from midnight -- and the generator stops; 0
+    // otherwise (setGeneratorLoopFlags, generatorAudioLastPassEndMs).
+    // Message thread.
     bool   genLoopTimecode = false;
     bool   genAudioLoop    = false;
+    double genAudioLoopLastPassEndMs = 0.0;
 
     // A/B loop: when genLoopEnabled and genLoopOutMs > genLoopInMs, the tick
     // wraps genCurrentMs from loopOutMs back to loopInMs, keeping what the
@@ -5298,6 +5447,7 @@ private:
             lastCueCheckMs = (uint32_t) juce::jmax(0.0, fold(cursorMs));
             cueCursorInclusive = false;
         }
+        retargetGeneratorAudioLastPass();
 
         if (seekAudio)
             generatorAudioPlayer.seekSeconds(juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0));
@@ -5368,8 +5518,11 @@ private:
 
     /// Seek the audio to where the timecode is in the timecode loop (#24),
     /// after Start TC or the path has changed under a running loop
-    /// (setGeneratorStartMs, setGeneratorStopMs): (timecode - Start TC)
-    /// folded into [0, endMs - Start TC), the place a wrap would give it.
+    /// (setGeneratorStartMs, setGeneratorStopMs, setGeneratorLoopFlags):
+    /// (timecode - Start TC) folded into [0, endMs - Start TC), the place a
+    /// wrap would give it.  setGeneratorLoopFlags also brings the audio to
+    /// its place under Loop audio this way, with endMs Start TC + the
+    /// file's length and gapless, for a timecode at or past Start TC.
     /// Below Start TC -- a Start TC moved past the timecode, which first
     /// runs up to it, outside the loop, as in 1.9.14 -- the gapless path
     /// folds too, the player looping from the file's tail into its top as
@@ -5405,6 +5558,11 @@ private:
     /// last tick left it, so audio in step reads up to about a tick plus
     /// half a block from there, around DESIGN D18's few ms: some 65 ms with
     /// blocks of 4096 samples at 44.1 kHz, 17-19 ms with 480 at 48 kHz.
+    /// That holds for blocks of up to about 4096 samples.  With 8192, the
+    /// largest BUFFER SIZE offered, audio in step can read up to about
+    /// 115 ms off (106-114 ms measured at 48 kHz), and a switch that has
+    /// the player loop the file then seeks it: a skip or repeat of about
+    /// that much, in about one switch in twelve.
     static constexpr double kGenAudioInStepMs = 100.0;
 
     /// Whether the generator follows the armed A/B loop: always without the
@@ -5425,46 +5583,166 @@ private:
         return genLoopInMs >= genStartMs && genLoopOutMs <= outLimitMs;
     }
 
+    /// Where Loop audio's last pass ends when it is turned off live
+    /// (setGeneratorLoopFlags): the end of the pass the timecode is in,
+    /// Start TC + a whole number of file lengths, from the second pass on.
+    /// 0 -- the file's end stops the generator, as without the option -- in
+    /// the first pass or before Start TC, with no file, or while a load is
+    /// pending (the length may still be the previous file's).  Message
+    /// thread.
+    double generatorAudioLastPassEndMs() const
+    {
+        if (! generatorAudioPlayer.hasFileLoaded() || generatorAudioPlayer.isLoadPending())
+            return 0.0;
+        const double lenMs = generatorAudioPlayer.getFileLengthSeconds() * 1000.0;
+        const double relMs = genCurrentMs - genStartMs;
+        if (lenMs <= 0.0 || relMs < lenMs)
+            return 0.0;
+        return genStartMs + (std::floor(relMs / lenMs) + 1.0) * lenMs;
+    }
+
+    /// Loop audio's last pass under way (genAudioLoopLastPassEndMs) and the
+    /// timecode moved -- a seek, an A/B wrap, a Start TC change: the last
+    /// pass is the one the timecode is in now.  Moved into the first pass
+    /// or before Start TC, there is none: the file's end stops the
+    /// generator, as without the option, and the player stops looping at
+    /// the next tick (syncGeneratorPlayerLooping) -- unless the audio is
+    /// then a whole pass ahead of the timecode and in step with it, as
+    /// after a jog to about a whole number of file lengths before Start
+    /// TC, when the loop is held until the audio goes round.  Message
+    /// thread.
+    void retargetGeneratorAudioLastPass()
+    {
+        if (genAudioLoopLastPassEndMs > 0.0)
+            genAudioLoopLastPassEndMs = generatorAudioLastPassEndMs();
+    }
+
     /// Bring the player's own loop in line (#24): on for the timecode loop's
     /// gapless path, off for its seek path and when it does not act, "Loop
-    /// audio file when it ends" when the flag is off.  Called by the setters
-    /// that move the loop, the load's completion and every tick (a frame
-    /// rate change moves the "last frame" threshold); it calls the player
-    /// only on a change, so without the timecode loop it never does.  Not
-    /// while a load is pending: the request in flight carries the flag, and
-    /// the completion comes back here.
+    /// audio file when it ends" when the flag is off -- on also for the
+    /// last pass after Loop audio is turned off live, until it ends
+    /// (genAudioLoopLastPassEndMs).  Called by the setters that move the
+    /// loop or switch the flags, the load's completion and every tick (a
+    /// frame rate change moves the "last frame" threshold; a last pass
+    /// ends); it calls the player only when the player's loop differs from
+    /// the one wanted.  Not while a load is pending: the request in flight
+    /// carries the flag, and the completion comes back here.
     ///
-    /// Switching off on the gapless path is held for the tick or two in
-    /// which the timecode has folded and the audio has not yet (the two go
-    /// round a few ms apart, DESIGN D18): off there, the audio would stop at
-    /// the file's end and the timecode run its last pass in silence.  Once
-    /// the audio has gone round too, both are in the same pass.  The other
-    /// way round -- the audio gone round a few ms before the timecode -- is
-    /// not held, as the timecode no longer folds once the flag is off: the
-    /// audio the device has taken from the file's top, and takes until the
-    /// next tick stops the generator at the pass's end, sounds before that
-    /// stop cuts it -- about one device block, or one tick with small
-    /// blocks.
+    /// Switching off is held while the audio is still finishing the
+    /// previous pass: more than half the file ahead of the timecode's place
+    /// (timecode - Start TC) and in step with it modulo the file's length,
+    /// within kGenPlayerLoopHoldMs.  Off there, the audio would stop at the
+    /// file's end and the timecode run its pass in silence.  That is the
+    /// timecode loop turned off on its gapless path, or no longer acting
+    /// there, in the tick or two in which the timecode has folded and the
+    /// audio has not yet (the two go round a few ms apart, DESIGN D18), or
+    /// with the timecode before Start TC and the audio in the file's tail,
+    /// where the loop folds it (seekGeneratorAudioIntoLoop), until the
+    /// audio goes round at Start TC, up to a file's length later; and "Loop
+    /// audio" turned off in its first pass or before Start TC with the
+    /// audio so.  The test is made when the switch comes, and at every
+    /// tick after it (generatorAudioPassAheadInStep), on where the audio is
+    /// then.  A jog before Start TC under "Loop audio" (the audio then at
+    /// the file's top), or a Start TC moved later, leaves the audio ahead
+    /// of the timecode and in general out of step, and DESIGN D18,
+    /// comparing modulo the length in Loop audio's first pass too, brings a
+    /// remainder under a second into step in the second or two after it: a
+    /// switch then is held and the pass plays in step, as is one soon after
+    /// a jog of about a whole number of file lengths.  Once the audio has
+    /// gone round, both are in the same pass.  While the loop is held, a
+    /// Start TC change folds the audio again, so it stays a whole pass
+    /// ahead and in step (setGeneratorStartMs).  Audio ahead but not in
+    /// step when the switch comes -- soon after such a jog or Start TC
+    /// change, before D18 has pulled the two in, or with a remainder of a
+    /// second or more, which D18 leaves -- is not held: the player stops
+    /// looping at once, and the file plays to its end and stops there, as
+    /// without the option, D18 comparing the two as they are.  (Held, as it
+    /// was, it went round and played the file again from its top until the
+    /// generator stopped, while D18, comparing modulo the length, could
+    /// pull the timecode, and the outputs with it, backwards.)  Within a
+    /// device block and a tick of kGenPlayerLoopHoldMs, a loop held at the
+    /// switch can be let go at a later tick, before the audio has gone
+    /// round, as the position read moves a block at a time: the pass then
+    /// ends silent, as without the option.  The other way round -- the
+    /// audio gone round a few ms before the timecode -- is not held, as
+    /// the timecode no longer folds once the flag is off: the audio the
+    /// device has taken from the file's top, and takes until the next tick
+    /// stops the generator at the pass's end, sounds before that stop cuts
+    /// it -- about one device block, or one tick with small blocks.
+    /// Message thread.
     void syncGeneratorPlayerLooping()
     {
         if (generatorAudioPlayer.isLoadPending())
             return;
 
+        const bool want = generatorPlayerLoopWanted();
+        if (want == generatorAudioPlayer.isLooping())
+            return;
+        if (! want && generatorAudioPassAheadInStep())
+            return;   // the audio is still finishing the previous pass
+        generatorAudioPlayer.setLoopingWhilePlaying(want);
+    }
+
+    /// How far, modulo the file's length, audio more than half the file
+    /// ahead of the timecode's place may read from it and still count as a
+    /// whole pass ahead and in step (syncGeneratorPlayerLooping's hold).
+    /// Wider than kGenAudioInStepMs, as the costs differ: audio in step not
+    /// held stops at the file's end and leaves a pass silent, while audio
+    /// held a little out of step is pulled in by DESIGN D18, by about 2 %
+    /// of this (5 ms) a tick at most -- 5.3 ms measured, as the hold reads
+    /// the remainder before the tick moves the timecode, and D18 up to a
+    /// tick later.  Audio in step, held with the timecode before Start TC,
+    /// read up to 25.9 ms from it with device blocks of 480 samples, 64.2 ms
+    /// with 4096 and 151.2 ms with 8192, the largest BUFFER SIZE offered
+    /// (the timecode loop turned off on its gapless path after a jog or a
+    /// later Start TC, a Start TC change during the hold, "Loop audio"
+    /// turned off after a jog of one file length).  Near the edge the
+    /// position read, a block at a time, can cross it at a later tick and
+    /// let the hold go.  With a file of 0.5 s or less every remainder is
+    /// within it, and the hold is the half-file rule alone.
+    static constexpr double kGenPlayerLoopHoldMs = 250.0;
+
+    /// The player's own loop as the options want it, the hold aside
+    /// (syncGeneratorPlayerLooping): on for the timecode loop's gapless
+    /// path; with the timecode loop off, on for "Loop audio file when it
+    /// ends" and for its last pass after it is turned off live.  Message
+    /// thread.
+    bool generatorPlayerLoopWanted() const
+    {
         double endMs = 0.0;
         bool gapless = false;
         const bool loopActive = loopTimecodeEnd(endMs, gapless);
-        const bool want = genLoopTimecode ? (loopActive && gapless) : genAudioLoop;
-        if (want == generatorAudioPlayer.isLooping())
-            return;
+        return genLoopTimecode ? (loopActive && gapless)
+                               : (genAudioLoop || genAudioLoopLastPassEndMs > 0.0);
+    }
 
-        if (! want && genState != GeneratorState::Stopped && generatorAudioPlayer.hasFileLoaded())
-        {
-            const double lenMs   = generatorAudioPlayer.getFileLengthSeconds() * 1000.0;
-            const double audioMs = generatorAudioPlayer.getCurrentPositionSeconds() * 1000.0;   // folded: still looping
-            if (lenMs > 0.0 && audioMs - (genCurrentMs - genStartMs) > lenMs / 2.0)
-                return;   // the audio is still finishing the previous pass
-        }
-        generatorAudioPlayer.setLoopingWhilePlaying(want);
+    /// The hold's test (syncGeneratorPlayerLooping): playing or paused with
+    /// a file loaded, the audio more than half the file ahead of the
+    /// timecode's place (timecode - Start TC) and within
+    /// kGenPlayerLoopHoldMs of a whole number of file lengths ahead -- a
+    /// whole pass ahead and in step, still finishing the previous pass.
+    /// The position reads folded into the file while the player loops.
+    /// Message thread.
+    bool generatorAudioPassAheadInStep() const
+    {
+        if (genState == GeneratorState::Stopped || ! generatorAudioPlayer.hasFileLoaded())
+            return false;
+        const double lenMs   = generatorAudioPlayer.getFileLengthSeconds() * 1000.0;
+        const double audioMs = generatorAudioPlayer.getCurrentPositionSeconds() * 1000.0;
+        const double aheadMs = audioMs - (genCurrentMs - genStartMs);
+        return lenMs > 0.0 && aheadMs > lenMs / 2.0
+            && std::abs(std::remainder(aheadMs, lenMs)) <= kGenPlayerLoopHoldMs;
+    }
+
+    /// True when syncGeneratorPlayerLooping holds the player's loop, or
+    /// would at its next call: no load pending, the player loops the file
+    /// though the options no longer want it to, and the audio is a whole
+    /// pass ahead and in step (generatorAudioPassAheadInStep).  Message
+    /// thread.
+    bool generatorPlayerLoopHeld() const
+    {
+        return ! generatorAudioPlayer.isLoadPending() && generatorAudioPlayer.isLooping()
+            && ! generatorPlayerLoopWanted() && generatorAudioPassAheadInStep();
     }
 
     //--------------------------------------------------------------------------
@@ -5556,11 +5834,26 @@ private:
             //    leaves the position read unchanged, so the stall guard
             //    below keeps this off): the timecode runs on the system
             //    clock;
-            //  - the same in the tick or few in which the timecode loop,
-            //    turned off on its gapless path or no longer acting there
-            //    (e.g. a Stop TC set less than kMinLoopTimecodeMs after Start
-            //    TC), leaves the player looping until the audio has gone
-            //    round (syncGeneratorPlayerLooping).
+            //  - the same while the player's loop is held, the audio a whole
+            //    pass ahead of the timecode and in step with it, until the
+            //    audio has gone round (syncGeneratorPlayerLooping): after the
+            //    timecode loop is turned off on its gapless path or no longer
+            //    acts there (e.g. a Stop TC set less than kMinLoopTimecodeMs
+            //    after Start TC), a tick or few at its seam and up to a file
+            //    length with the timecode before Start TC, and after "Loop
+            //    audio" is turned off before Start TC with the audio so --
+            //    which, after a jog there or a later Start TC, it is once the
+            //    first-pass comparison below has pulled a remainder under a
+            //    second in, a second or two later, or at once after a jog of
+            //    about a whole number of file lengths; within about
+            //    kGenPlayerLoopHoldMs of in step (the hold reads it before
+            //    the tick moves the timecode, this up to a tick later), so a
+            //    pull of about 5 ms a tick at most (5.3 measured).  Audio not
+            //    in step when the switch comes is not held: the player stops
+            //    looping and the two are compared as they are, as without
+            //    the option.  And in the last pass after "Loop audio" is
+            //    turned off live from its second pass on, which the player
+            //    loops to its end (genAudioLoopLastPassEndMs).
             // On the seek path they are compared as they are, also in the
             // ticks in which the player's loop is still held that way after
             // a Stop TC set at the seam has moved the loop there: with a
@@ -5627,6 +5920,7 @@ private:
             {
                 genCurrentMs = genStopMs;
                 genState = GeneratorState::Stopped;
+                genAudioLoopLastPassEndMs = 0.0;
                 generatorAudioPlayer.stopAndReset();
             }
             // Auto-stop when the loaded audio file has played to its end.
@@ -5646,21 +5940,33 @@ private:
             // cueing.  See setGeneratorPosition for the consumer side.
             //
             // Not while the timecode loop acts either.  And with "Loop
-            // timecode" on while a file load is pending, the file's end is
-            // not evaluated at all (the length may still be the previous
-            // file's): the timecode loop does not count it yet
-            // (loopTimecodeEnd), and neither does this stop.
-            else if (! loopTimecode && ! (genLoopTimecode && generatorAudioPlayer.isLoadPending()))
+            // timecode" or "Loop audio" on while a file load is pending, the
+            // file's end is not evaluated at all (the length may still be
+            // the previous file's): the timecode loop does not count it yet
+            // (loopTimecodeEnd), and neither does this stop.  The player's
+            // loop is then the request's until the load completes
+            // (syncGeneratorPlayerLooping), so "Loop audio" switched on live
+            // during the load (setGeneratorLoopFlags) would otherwise let
+            // the previous file's end stop the generator.
+            //
+            // "Loop audio" turned off live from its second pass on: the
+            // player loops on to the end of the pass the timecode is in,
+            // and the generator stops there as at the file's end
+            // (genAudioLoopLastPassEndMs, setGeneratorLoopFlags).
+            else if (! loopTimecode && ! ((genLoopTimecode || genAudioLoop) && generatorAudioPlayer.isLoadPending()))
             {
                 const double fileLenSec = generatorAudioPlayer.getFileLengthSeconds();
-                if (fileLenSec > 0.0 && ! generatorAudioPlayer.isLooping())
+                const bool lastPass = genAudioLoopLastPassEndMs > 0.0;
+                if (fileLenSec > 0.0 && (lastPass || ! generatorAudioPlayer.isLooping()))
                 {
-                    const double endMs = genStartMs + fileLenSec * 1000.0;
+                    const double endMs = lastPass ? genAudioLoopLastPassEndMs
+                                                  : genStartMs + fileLenSec * 1000.0;
                     if (genCurrentMs >= endMs)
                     {
                         genCurrentMs = endMs;
                         genState = GeneratorState::Stopped;
                         genEndedAtEof = true;
+                        genAudioLoopLastPassEndMs = 0.0;
                         generatorAudioPlayer.stopAndReset();
                     }
                 }
