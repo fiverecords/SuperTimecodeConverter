@@ -28,22 +28,134 @@
 #include <map>
 
 //==============================================================================
+// The panels' horizontal sliders with a value box ("100%", "0 ms") on their
+// right: gains, BPM SMOOTHING, the offsets.  A right-click or a double-click
+// resets one to its double-click return value, on the track and the same on
+// the value box.  JUCE gives the box the slider's tooltip but, for this
+// style, none of its mouse events, and deletes the box and creates a new one
+// in Slider::lookAndFeelChanged (a look-and-feel or colour change,
+// setTextBoxStyle), so lookAndFeelChanged hands each new box to
+// valueBoxReset.  On the box:
+//   - a right-click resets, as on the track; inside the box's open editor it
+//     is the editor's own (its cut / copy / paste menu);
+//   - a double-click resets, as on the track, when both its clicks landed on
+//     the box, the first on the closed box.  That first click opened the
+//     box's editor (a single click does, to type a value): the editor is
+//     closed, what it held discarded, and the slider reset.  A third click
+//     of the same run on the box resets again (a triple-click).  A
+//     double-click whose first click landed elsewhere (JUCE also counts one
+//     from the track, a few px to the left, onto the box) or inside an
+//     editor opened by an earlier click is the box's own (the editor opens,
+//     or selects text);
+//   - a single click opens the editor, as before: type a value and Enter.
+// JUCE also resets the track on an Alt+click (Option+click on macOS), the
+// default modifier of setDoubleClickReturnValue; the box does not copy that
+// (an Alt+click there opens the editor).
+// Message thread, as all mouse handling.
 class GainSlider : public juce::Slider
 {
 public:
     GainSlider()
     {
         setDoubleClickReturnValue(true, 100.0);
-        // The hint names the slider: JUCE gives the value box the slider's
-        // tooltip, and a right-click or double-click there does not reset.
-        setTooltip("Right-click or double-click the slider to reset");
+        setTooltip("Right-click or double-click to reset");
+        attachValueBoxReset();
+    }
+    ~GainSlider() override
+    {
+        if (auto* box = valueBox())
+            box->removeMouseListener(&valueBoxReset);
     }
     void mouseDown(const juce::MouseEvent& e) override
     {
-        if (e.mods.isRightButtonDown() || e.mods.isPopupMenu())
-        { setValue(getDoubleClickReturnValue(), juce::sendNotificationAsync); return; }
+        if (isResetClick(e)) { resetFromRightClick(); return; }
         juce::Slider::mouseDown(e);
     }
+    void lookAndFeelChanged() override
+    {
+        juce::Slider::lookAndFeelChanged();
+        attachValueBoxReset();
+    }
+
+private:
+    static bool isResetClick(const juce::MouseEvent& e)
+    {
+        return e.mods.isRightButtonDown() || e.mods.isPopupMenu();
+    }
+    void resetFromRightClick() { setValue(getDoubleClickReturnValue(), juce::sendNotificationAsync); }
+
+    // The value box: the slider's one Label child (JUCE's valueBox).
+    juce::Label* valueBox() const
+    {
+        for (auto* c : getChildren())
+            if (auto* l = dynamic_cast<juce::Label*>(c))
+                return l;
+        return nullptr;
+    }
+    void attachValueBoxReset()
+    {
+        if (auto* box = valueBox())
+            box->addMouseListener(&valueBoxReset, true);   // and its editor's events
+    }
+
+    // Notes each mouse-down on the box or its editor.  JUCE counts the clicks
+    // of a mouse wherever they land: a press is the n-th click of a run when
+    // each of the n - 1 presses before it lies within 8 px (25 for touch) of
+    // it, the previous one within 400 ms (its double-click time) and older
+    // ones within 800 ms, with the same buttons, in the same window.  A click
+    // continues a run on the box when the last one noted here was counted
+    // one click less, lies within 400 ms and 8 px of it with the same
+    // buttons, and itself began the run on the closed box or continued it.
+    // A click elsewhere in between (the track, a few px left of the box) is
+    // counted too, so the counts do not follow and the run on the box ends
+    // there -- unless JUCE drops the run's first click from the next press's
+    // count (it lies 8 px or more from that press): in four quick clicks
+    // zig-zagging over the box's edge, box, box, track, box, the fourth then
+    // continues the run and resets.
+    struct ValueBoxReset : juce::MouseListener
+    {
+        explicit ValueBoxReset(GainSlider& s) : owner(s) {}
+        void mouseDown(const juce::MouseEvent& e) override
+        {
+            auto* box = owner.valueBox();
+            if (box == nullptr) return;
+            const bool editing = box->isBeingEdited();
+            const bool onBox = e.getNumberOfClicks() == 1 ? ! editing : continuesRun(e);
+            last = { e.mouseDownTime, e.source.getLastMouseDownPosition(),
+                     e.mods.withOnlyMouseButtons(), e.getNumberOfClicks(), onBox };
+            if (isResetClick(e) && ! editing)
+                owner.resetFromRightClick();
+        }
+        void mouseDoubleClick(const juce::MouseEvent& e) override
+        {
+            auto* box = owner.valueBox();
+            if (box == nullptr || ! last.runOnBox || last.time != e.mouseDownTime) return;
+            box->hideEditor(true);               // the editor the first click opened
+            owner.Slider::mouseDoubleClick(e);   // the track's double-click reset
+        }
+        bool continuesRun(const juce::MouseEvent& e) const
+        {
+            const auto d = (e.source.getLastMouseDownPosition() - last.pos)
+                         * juce::Desktop::getInstance().getGlobalScaleFactor();   // JUCE compares unscaled
+            const float tolerance = e.source.isTouch() ? 25.0f : 8.0f;
+            return last.runOnBox
+                && last.clicks == e.getNumberOfClicks() - 1
+                && e.mouseDownTime - last.time < juce::RelativeTime::milliseconds(juce::MouseEvent::getDoubleClickTimeout())
+                && std::abs(d.x) < tolerance && std::abs(d.y) < tolerance
+                && last.buttons == e.mods.withOnlyMouseButtons();
+        }
+        struct Down
+        {
+            juce::Time time;
+            juce::Point<float> pos;
+            juce::ModifierKeys buttons;
+            int clicks = 0;
+            bool runOnBox = false;   // all of its run on this box, the first click on the closed box
+        };
+        GainSlider& owner;
+        Down last;
+    };
+    ValueBoxReset valueBoxReset { *this };
 };
 
 //==============================================================================

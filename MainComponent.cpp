@@ -1553,9 +1553,7 @@ MainComponent::MainComponent()
         // Its reset is its own 50% default, set below over the gain
         // sliders' 100% that styleGainSlider gives it.  The tooltip is set
         // here, before styleGainSlider creates the value box that copies it.
-        // The hint names the slider: on its value box, which shows the
-        // same tooltip, these gestures do not reset.
-        sldBpmSmoothing.setTooltip("Right-click or double-click the slider to reset to 50%");
+        sldBpmSmoothing.setTooltip("Right-click or double-click to reset to 50%");
         leftContent.addAndMakeVisible(sldBpmSmoothing); styleGainSlider(sldBpmSmoothing);
         leftContent.addAndMakeVisible(lblBpmSmoothing); lblBpmSmoothing.setText("BPM SMOOTHING:", juce::dontSendNotification); styleLabel(lblBpmSmoothing);
         sldBpmSmoothing.setRange(0.0, 100.0, 1.0);
