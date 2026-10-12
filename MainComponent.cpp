@@ -8,6 +8,49 @@
 using SrcType = TimecodeEngine::InputSource;
 
 //==============================================================================
+// The Generator Presets window (#24).  Its close button asks first when the
+// form holds what is not saved (GeneratorPresetEditor::hasUnsavedChanges,
+// askToSaveBeforeClose: Save / Discard / Cancel, over the editor and not
+// modal, so the other windows take clicks meanwhile); the window then
+// closes on the answer, a message later.  closeWithoutAsking is the close itself, and
+// Show Lock's forced close: it drops the form's unsaved edits without a
+// word, as every close did before; what was saved stays saved.  onClose
+// keeps the window's bounds.  Message thread.
+//==============================================================================
+namespace
+{
+struct GenPresetWindow : juce::DocumentWindow
+{
+    GenPresetWindow(const juce::String& t, juce::Colour bg)
+        : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
+
+    void closeButtonPressed() override
+    {
+        auto* editor = dynamic_cast<GeneratorPresetEditor*>(getContentComponent());
+        if (editor == nullptr || ! editor->hasUnsavedChanges())
+        {
+            closeWithoutAsking();
+            return;
+        }
+        juce::Component::SafePointer<GenPresetWindow> self(this);
+        editor->askToSaveBeforeClose([self] {
+            // Called by the editor, which the window owns: the close goes a
+            // message later.
+            juce::MessageManager::callAsync([self] { if (self != nullptr) self->closeWithoutAsking(); });
+        });
+    }
+
+    void closeWithoutAsking()
+    {
+        if (onClose) onClose();
+        delete this;
+    }
+
+    std::function<void()> onClose;
+};
+}
+
+//==============================================================================
 // Remove " *" or " [Engine N]" markers from combo item text to get the
 // underlying device name.  Used when saving device names to settings.
 //==============================================================================
@@ -1286,12 +1329,16 @@ MainComponent::MainComponent()
             // show: their edits change what goes out (Track Map offsets and
             // triggers, mixer forwarding, generator cues), and none of them
             // checks Show Lock itself (AUDIT UI-3).  The floating ones close
-            // as from their close button, which keeps their bounds.
+            // as from their close button, which keeps their bounds;
+            // Generator Presets without its question about unsaved changes
+            // (#24, GenPresetWindow::closeWithoutAsking): the form's edits
+            // not saved are dropped, as every close did before.
             if (cuePointWindow != nullptr) { cuePointWindow.reset(); cuePointTrackKey.clear(); cuePointEditedArtist.clear(); cuePointEditedTitle.clear(); }
-            for (auto* w : { trackMapWindow.getComponent(), mixerMapWindow.getComponent(),
-                             genPresetWindow.getComponent() })
+            for (auto* w : { trackMapWindow.getComponent(), mixerMapWindow.getComponent() })
                 if (w != nullptr)
                     w->closeButtonPressed();
+            if (auto* w = dynamic_cast<GenPresetWindow*>(genPresetWindow.getComponent()))
+                w->closeWithoutAsking();
             updateShowLockVisuals();
             saveSettings();
         }
@@ -7629,15 +7676,7 @@ void MainComponent::openGeneratorPresetEditor()
         applyGenPresetLoopBoxesLive(stored);
     };
 
-    struct FloatingWindow : juce::DocumentWindow
-    {
-        FloatingWindow(const juce::String& t, juce::Colour bg)
-            : DocumentWindow(t, bg, DocumentWindow::closeButton | DocumentWindow::maximiseButton) {}
-        void closeButtonPressed() override { if (onClose) onClose(); delete this; }
-        std::function<void()> onClose;
-    };
-
-    auto* win = new FloatingWindow("Generator Presets", juce::Colour(0xFF12141A));
+    auto* win = new GenPresetWindow("Generator Presets", juce::Colour(0xFF12141A));
     win->setContentOwned(editor, true);
     win->setUsingNativeTitleBar(false);
     win->setTitleBarHeight(20);

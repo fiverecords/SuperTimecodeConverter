@@ -65,7 +65,8 @@ public:
         addBtn(btnExport,   "Export");
         addBtn(btnOscHelp,  "OSC ?");
 
-        btnAdd.setTooltip("Create a new preset from the form fields. "
+        btnAdd.setTooltip("Create a NEW preset from the form fields; the selected preset is not "
+                          "changed (to change it, use Save). "
                           "If a preset with the same name already exists, "
                           "the new one is auto-numbered (e.g. \"My preset (2)\").");
         // The live part of Save (#24): MainComponent::applyGenPresetLoopBoxesLive.
@@ -209,6 +210,172 @@ public:
     /// its file, so a renamed preset, or one given another file, is left to
     /// GO.  Not called by Add, which makes a new preset.  Message thread.
     std::function<void(const GeneratorPreset& stored)> onPresetUpdated;
+
+    /// True when the form holds what Save (or Add) has not stored (#24,
+    /// Joaky's field test: a box ticked and the window closed without Save
+    /// was lost without a word).  With a preset selected, the form differs
+    /// from it; with none, from the preset of the form's name if there is
+    /// one, otherwise from an empty form: a new preset with content.  A
+    /// Start or Stop TC compares as Save would store it (normalizeTC), and
+    /// the loop boxes as selectedRowsChanged shows a preset.  Message thread.
+    bool hasUnsavedChanges() const
+    {
+        const auto* stored = editingName.isNotEmpty() ? presetMap.find(editingName)
+                                                      : presetMap.find(edName.getText().trim());
+        if (stored == nullptr)
+            return edName.getText().trim().isNotEmpty() || edAudio.getText().trim().isNotEmpty()
+                || formTCDiffers(edStartTC, "00:00:00:00") || formTCDiffers(edStopTC, "00:00:00:00")
+                || btnLoopAudio.getToggleState() || btnLoopTimecode.getToggleState();
+        return edName.getText().trim() != stored->name
+            || formTCDiffers(edStartTC, stored->startTC) || formTCDiffers(edStopTC, stored->stopTC)
+            || edAudio.getText().trim() != stored->audioFilePath
+            || btnLoopAudio.getToggleState() != (stored->audioLoop && ! stored->loopTimecode)
+            || btnLoopTimecode.getToggleState() != stored->loopTimecode;
+    }
+
+    /// The window's close button with unsaved changes (hasUnsavedChanges):
+    /// ask Save / Discard / Cancel.  Save is the form's commit, as Enter in
+    /// a field: Save (the Update of the selected preset, whose loop boxes
+    /// then reach an engine that has it loaded, onPresetUpdated) or, with
+    /// none selected, Add; then `closeWindow` -- unless it stored nothing (an
+    /// empty name, or a name another preset has: the form stays, as with
+    /// the button).  Discard calls `closeWindow` and drops the form;
+    /// Cancel, or Escape, keeps the window.  The question covers the editor
+    /// (ClosePrompt) and is not modal: the other windows -- the waveform
+    /// window's STOP and PLAY, the panel -- take clicks while it is up, as
+    /// the music may be playing (the modal AlertWindow first used here
+    /// swallowed them until answered, as the waveform window's [ and ] did
+    /// before #24).  Asked again while it is up, it stays as it is.  It goes
+    /// with the editor (closePrompt), and its answer then never comes.  The
+    /// answer is acted on in the button's click; the prompt is deleted, and
+    /// the window closed, a message later.  Show Lock's forced close does
+    /// not ask (MainComponent).  Message thread.
+    void askToSaveBeforeClose(std::function<void()> closeWindow)
+    {
+        if (closePrompt != nullptr)
+        {
+            closePrompt->grabKeyboardFocus();
+            return;
+        }
+        const bool update = editingName.isNotEmpty();
+        const juce::String message = update ? "The form has changes that are not saved in the preset \""
+                                              + editingName + "\".  Save them before closing?"
+                                            : juce::String("The form holds a new preset that is not saved.  "
+                                                           "Save it before closing?");
+        closePrompt = std::make_unique<ClosePrompt>(message,
+            [this, update, closeWindow = std::move(closeWindow)](int result)
+            {
+                // Inside the button's click: the answer is acted on at once
+                // (Save stores the preset, and its loop boxes reach the
+                // engines, as the Save button does), while the prompt, whose
+                // button this is, goes a message later, and the window with
+                // it after Save or Discard.
+                bool close = result == ClosePrompt::discard;
+                if (result == ClosePrompt::save)
+                    close = update ? saveSelectedPreset() : addNewPreset();
+                juce::Component::SafePointer<GeneratorPresetEditor> self(this);
+                juce::MessageManager::callAsync([self, close, closeWindow]
+                {
+                    if (auto* editor = self.getComponent())
+                    {
+                        editor->closePrompt.reset();
+                        if (close)
+                            closeWindow();
+                    }
+                });
+            });
+        addAndMakeVisible(*closePrompt);
+        closePrompt->setBounds(getLocalBounds());
+        closePrompt->grabKeyboardFocus();
+    }
+
+    /// The question askToSaveBeforeClose asks, over the whole editor: a
+    /// dimmed backdrop that takes the editor's clicks, and a panel with the
+    /// message and Save / Discard / Cancel.  Escape is Cancel.  `answer`
+    /// gets the first button pressed (save, discard or cancel), once.  Not
+    /// modal: windows other than the editor's are not blocked.  Message
+    /// thread.
+    class ClosePrompt : public juce::Component
+    {
+    public:
+        enum { save = 1, discard = 2, cancel = 3 };
+
+        ClosePrompt(const juce::String& message, std::function<void(int)> answer)
+            : onAnswer(std::move(answer))
+        {
+            addAndMakeVisible(lblTitle);
+            lblTitle.setText("Unsaved changes", juce::dontSendNotification);
+            lblTitle.setFont(juce::Font(juce::FontOptions(15.0f).withStyle("Bold")));
+            lblTitle.setColour(juce::Label::textColourId, juce::Colour(0xFFDDDDDD));
+            addAndMakeVisible(lblMessage);
+            lblMessage.setText(message, juce::dontSendNotification);
+            lblMessage.setFont(juce::Font(juce::FontOptions(13.0f)));
+            lblMessage.setColour(juce::Label::textColourId, juce::Colour(0xFFDDDDDD));
+            lblMessage.setJustificationType(juce::Justification::topLeft);
+            lblMessage.setMinimumHorizontalScale(1.0f);
+            int result = save;
+            for (auto* b : { &btnSave, &btnDiscard, &btnCancel })
+            {
+                addAndMakeVisible(b);
+                b->setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
+                b->setColour(juce::TextButton::textColourOffId, juce::Colour(0xFFDDDDDD));
+                b->onClick = [this, r = result++] { give(r); };
+            }
+            btnSave.setButtonText("Save");
+            btnDiscard.setButtonText("Discard");
+            btnCancel.setButtonText("Cancel");
+            setWantsKeyboardFocus(true);
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colours::black.withAlpha(0.55f));
+            g.setColour(juce::Colour(0xFF2A2A2A));
+            g.fillRoundedRectangle(panel.toFloat(), 6.0f);
+            g.setColour(juce::Colour(0xFFFFB74D));
+            g.drawRoundedRectangle(panel.toFloat().reduced(0.5f), 6.0f, 1.0f);
+        }
+
+        void resized() override
+        {
+            panel = getLocalBounds().withSizeKeepingCentre(juce::jmin(420, getWidth() - 20), 150);
+            auto area = panel.reduced(14, 10);
+            lblTitle.setBounds(area.removeFromTop(22));
+            auto buttons = area.removeFromBottom(26);
+            area.removeFromBottom(8);
+            lblMessage.setBounds(area);
+            const int w = 80, gap = 6;
+            btnCancel .setBounds(buttons.removeFromRight(w)); buttons.removeFromRight(gap);
+            btnDiscard.setBounds(buttons.removeFromRight(w)); buttons.removeFromRight(gap);
+            btnSave   .setBounds(buttons.removeFromRight(w));
+        }
+
+        bool keyPressed(const juce::KeyPress& key) override
+        {
+            if (key == juce::KeyPress::escapeKey)
+            {
+                give(cancel);
+                return true;
+            }
+            return false;
+        }
+
+    private:
+        void give(int result)
+        {
+            if (answered)
+                return;
+            answered = true;
+            if (onAnswer)
+                onAnswer(result);
+        }
+
+        std::function<void(int)> onAnswer;
+        bool answered = false;
+        juce::Rectangle<int> panel;
+        juce::Label lblTitle, lblMessage;
+        juce::TextButton btnSave, btnDiscard, btnCancel;
+    };
 
     /// Set the selected engine's fps: the rate the Start/Stop TC fields are
     /// normalised at, and the one the cue editor converts cue TC to ms (and
@@ -466,6 +633,9 @@ public:
 
         // Table fills the rest
         table.setBounds(area);
+
+        if (closePrompt != nullptr)
+            closePrompt->setBounds(getLocalBounds());
     }
 
 private:
@@ -590,6 +760,16 @@ private:
         return formatTimecodeText(parseTimecodeText(tc, frameRateFromDouble(currentFpsForCueEditor)));
     }
 
+    /// Whether the Start/Stop TC field `ed` would store something other
+    /// than `stored`, as readFormToPreset stores it (hasUnsavedChanges).
+    bool formTCDiffers(const juce::TextEditor& ed, const juce::String& stored) const
+    {
+        const juce::String typed = ed.getText().trim();
+        if (typed.isNotEmpty() && typed == stored)
+            return false;
+        return normalizeTC(typed.isEmpty() ? juce::String("00:00:00:00") : typed) != stored;
+    }
+
     /// Put the form fields (name, Start/Stop TC, audio file, the two loop
     /// options) into `p` and return it; whatever the form does not show --
     /// the cue points -- is left as `p` has it.  SAVE passes the stored preset
@@ -648,13 +828,14 @@ private:
     /// ADD always creates a new preset.  If the typed name is already in
     /// use, the new preset is auto-renamed "Name (2)", "Name (3)", etc.
     /// The form is repopulated so the user sees the actual name used.
-    void addNewPreset()
+    /// False, storing nothing, with no name.
+    bool addNewPreset()
     {
         auto name = edName.getText().trim();
         if (name.isEmpty())
         {
             edName.grabKeyboardFocus();
-            return;
+            return false;
         }
 
         auto uniqueName = makeUniqueName(name);
@@ -695,6 +876,7 @@ private:
                 break;
             }
         }
+        return true;
     }
 
     /// SAVE updates the preset the form was loaded from (editingName) in
@@ -705,13 +887,14 @@ private:
     /// a no-op (the button is disabled in that state, but we double-check
     /// defensively).  Stored, the preset goes to onPresetUpdated, so its
     /// two loop boxes reach an engine that has it loaded at once (#24).
-    void saveSelectedPreset()
+    /// Returns whether it stored the preset.
+    bool saveSelectedPreset()
     {
         auto name = edName.getText().trim();
         if (name.isEmpty())
         {
             edName.grabKeyboardFocus();
-            return;
+            return false;
         }
 
         // The preset the form shows, by name -- not rows[selected row],
@@ -719,7 +902,7 @@ private:
         // changes editingName.
         const juce::String oldName = editingName;
         if (oldName.isEmpty())
-            return;  // nothing selected; UI should already prevent this
+            return false;  // nothing selected; UI should already prevent this
         const bool nameChanged = ! oldName.equalsIgnoreCase(name);
 
         // If the user typed a name that belongs to a *different* preset,
@@ -739,7 +922,7 @@ private:
                 "Choose a different name, or select that preset and Save to overwrite it.",
                 "OK");
             edName.grabKeyboardFocus();
-            return;
+            return false;
         }
 
         // Start from the stored preset, copied before the map is touched:
@@ -775,6 +958,7 @@ private:
         if (const int row = rowOfPreset(name); row >= 0)
             table.scrollToEnsureRowIsOnscreen(row);
         if (onPresetUpdated) onPresetUpdated(p);
+        return true;
     }
 
     void deleteSelected()
@@ -893,6 +1077,7 @@ private:
     }
 
     juce::ScopedMessageBox confirmBox;
+    std::unique_ptr<ClosePrompt> closePrompt;   // askToSaveBeforeClose, while it asks
 
     void browseForAudio()
     {
