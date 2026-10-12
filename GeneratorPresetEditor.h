@@ -428,10 +428,14 @@ public:
         // When the preset carries an audio file, the Stop TC field is
         // ignored at runtime in favour of the file's actual length.  Render
         // it muted in the list so the user sees that the stored value is
-        // not the one being applied.  This goes by the path alone: GO
-        // applies the Stop TC of a preset whose file is missing on disk
-        // (MainComponent::applyGenPresetToEngine).
-        const bool stopOverriddenByAudio = (columnId == ColStop) && p.audioFilePath.isNotEmpty();
+        // not the one being applied.  A preset whose file is not on disk
+        // (audioFileMissing, #24) shows its stored Stop TC instead, which GO
+        // applies to it (MainComponent::applyGenPresetToEngine).  Going by
+        // the path alone, as 1.9.15-beta2 did, it read "(audio length)" too,
+        // and such a preset with a Stop TC looked like one whose file is on
+        // disk, though GO runs it to that Stop TC.
+        const bool stopOverriddenByAudio = (columnId == ColStop) && p.audioFilePath.isNotEmpty()
+                                           && ! audioFileMissing(p.audioFilePath);
         const juce::Font font(juce::FontOptions(11.0f));
         g.setColour(stopOverriddenByAudio ? textMid : textBright);
         g.setFont(font);
@@ -478,13 +482,17 @@ public:
         // Stop TC less than kMinLoopTimecodeMs after the Start TC (at or
         // before it included), where the option does nothing and the
         // generator stops there as without it (TimecodeEngine::
-        // loopTimecodeEnd).  With an audio file the end is the file's, whose
+        // loopTimecodeEnd).  A preset whose audio file is not on disk
+        // (audioFileMissing) counts as one without: GO runs it so, to its
+        // stored Stop TC (MainComponent::applyGenPresetToEngine), and
+        // 1.9.15-beta2 showed it bright where the loop did nothing (Joaky's
+        // field test).  With an audio file the end is the file's, whose
         // length the table does not know.
         if (columnId == ColStop && p.loopTimecode)
         {
             const FrameRate fps = frameRateFromDouble(currentFpsForCueEditor);
             const double stopMs = parseTimecodeTextToMs(p.stopTC, fps);
-            const bool noEnd = p.audioFilePath.isEmpty()
+            const bool noEnd = (p.audioFilePath.isEmpty() || audioFileMissing(p.audioFilePath))
                 && (stopMs <= 0.0 || stopMs - parseTimecodeTextToMs(p.startTC, fps) < kMinLoopTimecodeMs);
             const int x = 4 + juce::roundToInt(juce::GlyphArrangement::getStringWidth(font, text));
             g.setColour(noEnd ? textMid : textBright);
@@ -707,6 +715,74 @@ private:
     void rebuildRows()
     {
         rows = presetMap.getAllSorted();
+        checkAudioFilesOnDisk();
+    }
+
+    //--------------------------------------------------------------------------
+    // Which presets' audio files are on disk, for the table's "(loop TC)"
+    // (#24, paintCell).  Asked when the rows are rebuilt (the editor opens,
+    // Add, Save, Delete, Import, a cue edit), never while painting, and off
+    // the message thread: a path on a network share that does not answer
+    // can block a disk query for many seconds, and the message thread also
+    // runs the generator's tick.  Until a path's answer comes it counts as
+    // on disk, as the table had it before (by the path alone); a file
+    // added or removed while the editor is open shows at the next rebuild.
+    // One query at a time; a rebuild meanwhile asks again when it ends.
+    // The query thread holds only copies of the paths and posts its answer
+    // back to the message thread, where an editor already closed takes no
+    // answer (a SafePointer made on the message thread; the thread only
+    // copies it).
+    //--------------------------------------------------------------------------
+    std::map<juce::String, bool> audioFileOnDisk;   // path -> answer of the last query
+    bool diskQueryRunning = false, diskQueryAgain = false;
+
+    bool audioFileMissing(const juce::String& path) const
+    {
+        const auto it = audioFileOnDisk.find(path);
+        return it != audioFileOnDisk.end() && ! it->second;
+    }
+
+    void checkAudioFilesOnDisk()
+    {
+        if (diskQueryRunning)
+        {
+            diskQueryAgain = true;
+            return;
+        }
+        juce::StringArray paths;
+        for (auto& p : rows)
+            if (p.audioFilePath.isNotEmpty())
+                paths.addIfNotAlreadyThere(p.audioFilePath);
+        if (paths.isEmpty())
+            return;
+        // The answer is posted to this thread, so it cannot come before
+        // the flag is set; a thread that cannot start leaves it unset.
+        juce::Component::SafePointer<GeneratorPresetEditor> self(this);
+        diskQueryRunning = juce::Thread::launch([self, paths]
+        {
+            juce::StringArray missing;
+            for (auto& path : paths)
+                if (! juce::File(path).existsAsFile())
+                    missing.add(path);
+            juce::MessageManager::callAsync([self, paths, missing]
+            {
+                if (auto* editor = self.getComponent())
+                    editor->takeAudioFilesOnDisk(paths, missing);
+            });
+        });
+    }
+
+    void takeAudioFilesOnDisk(const juce::StringArray& paths, const juce::StringArray& missing)
+    {
+        diskQueryRunning = false;
+        for (auto& path : paths)
+            audioFileOnDisk[path] = ! missing.contains(path);
+        table.repaint();
+        if (diskQueryAgain)
+        {
+            diskQueryAgain = false;
+            checkAudioFilesOnDisk();
+        }
     }
 
     void notifyChange()
