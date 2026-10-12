@@ -9807,7 +9807,8 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
 
         // JUCE reports these keys with key code '[' / ']' where the
         // keyboard layout types them without a modifier (on Windows the
-        // key code is the key's unmodified character).
+        // key code is the key's unmodified character, on macOS the
+        // character typed without modifiers, on Linux the character typed).
         if (code == '[')
         {
             // Loop In is a config-style timestamp-setting gesture; gated
@@ -9835,7 +9836,11 @@ bool MainComponent::keyPressed(const juce::KeyPress& key)
             saveSettings();
             return true;
         }
-        if (code == 'L')
+        // The L key in either case: JUCE gives a letter its upper-case
+        // character as the key code on Windows and macOS, but on Linux the
+        // character the key types -- 'l', or 'L' with Caps Lock on.  (With
+        // Shift it is refused above, as a modifier.)
+        if (code == 'L' || code == 'l')
         {
             // The A/B LOOP toggle stays ungated: toggling an already-armed
             // loop on / off is an operational gesture (performance), not
