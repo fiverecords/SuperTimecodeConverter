@@ -52,6 +52,15 @@ inline float measureStringWidth(const juce::Font& font, const juce::String& text
 class CustomLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
+    // The A/B marker of a combo item (#24): MainComponent's generator preset
+    // list ends with it the item of the preset loaded on the engine shown
+    // while that engine has an A/B loop armed (MainComponent::
+    // updateGenPresetAbMarker).  The open list draws it as any bracket tag
+    // at the end of an item, in amber (drawPopupMenuItem); the closed box,
+    // which on the panel is too narrow to show it whole, drops it from the
+    // text and draws an amber edge instead (drawComboBox).
+    static constexpr const char* kComboAbMarker = "  [A/B]";
+
     CustomLookAndFeel()
     {
         // Pre-cache the monospace font name so the first paint() call
@@ -198,9 +207,6 @@ public:
         g.setColour(bgCol);
         g.fillRoundedRectangle(bounds.reduced(0.5f), cornerSize);
 
-        g.setColour(box.findColour(juce::ComboBox::outlineColourId));
-        g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, 1.0f);
-
         // Get the RAW item text to detect dot marker
         static const juce::String dotChar = juce::String::charToString(0x25CF);
         static const juce::String dotWithSpace = juce::String(" ") + dotChar;
@@ -217,11 +223,27 @@ public:
                 displayText = displayText.dropLastCharacters(dotChar.length());
         }
 
+        // The A/B marker (kComboAbMarker, #24): at the end of the text it
+        // was the first thing the ellipsis cut, and the panel's preset list
+        // never showed it whole.  Dropped from the text, it is an amber
+        // outline and an amber bar at the left, as the open list's accent
+        // bar for a tagged item, which costs the name 3 px.
+        static const juce::String abMarker(kComboAbMarker);
+        const bool hasAbMarker = ! hasDot && displayText.endsWith(abMarker);
+        if (hasAbMarker)
+            displayText = displayText.dropLastCharacters(abMarker.length());
+
+        g.setColour(hasAbMarker ? tagAmber : box.findColour(juce::ComboBox::outlineColourId));
+        g.drawRoundedRectangle(bounds.reduced(0.5f), cornerSize, 1.0f);
+        if (hasAbMarker)
+            g.fillRoundedRectangle(2.0f, 3.0f, 3.0f, (float) height - 6.0f, 1.5f);
+
         // Draw the display text ourselves (the JUCE label is hidden via positionComboBoxText)
         auto font = juce::Font(juce::FontOptions(getMonoFontName(), 11.0f, juce::Font::plain));
         g.setFont(font);
         g.setColour(box.findColour(juce::ComboBox::textColourId));
-        auto textArea = juce::Rectangle<int>(6, 0, width - 28, height);
+        const int textX = hasAbMarker ? 9 : 6;
+        auto textArea = juce::Rectangle<int>(textX, 0, width - 22 - textX, height);
         g.drawText(displayText, textArea, juce::Justification::centredLeft, true);
 
         // Draw cyan dot indicator next to the arrow
@@ -472,6 +494,7 @@ private:
     juce::Colour textDim   { 0xFF546E7A };
     juce::Colour textMid   { 0xFF78909C };
     juce::Colour textBright{ 0xFFCFD8DC };
+    juce::Colour tagAmber  { 0xFFFFB74D };   // the open list's bracket tags; the closed box's A/B marker
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(CustomLookAndFeel)
 };

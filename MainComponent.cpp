@@ -335,7 +335,7 @@ MainComponent::MainComponent()
             // for cues to fire after switching back from another input.
             if (cmbGenPreset.isVisible() && cmbGenPreset.getSelectedId() > 0)
             {
-                if (auto* preset = settings.generatorPresets.find(cmbGenPreset.getText()))
+                if (auto* preset = settings.generatorPresets.find(selectedGenPresetName()))
                     eng.setGeneratorCuePoints(preset->cuePoints);
             }
             updateInputButtonStates(); updateDeviceSelectorVisibility(); resized();
@@ -794,10 +794,17 @@ MainComponent::MainComponent()
         leftContent.addAndMakeVisible(cmbGenPreset);
         cmbGenPreset.setVisible(false);
         cmbGenPreset.setTextWhenNothingSelected("(select preset)");
+        // The A/B marker (#24, updateGenPresetAbMarker): an amber edge on
+        // the closed box, "[A/B]" in the open list.
+        cmbGenPreset.setTooltip("The generator's presets: GO starts the one chosen here.  An amber "
+                                "edge on this box, and [A/B] after the name in the open list, mark the "
+                                "preset loaded on this engine while the engine has an A/B loop armed "
+                                "(set in the waveform window).  GO on a preset with the same audio file "
+                                "keeps that A/B; turn A/B LOOP off to clear the mark.");
         cmbGenPreset.onChange = [this] {
             int sel = cmbGenPreset.getSelectedId();
             if (sel > 0)
-                loadGenPresetToFields(cmbGenPreset.getText());
+                loadGenPresetToFields(selectedGenPresetName());
         };
 
         leftContent.addAndMakeVisible(btnGenPrev);
@@ -816,7 +823,7 @@ MainComponent::MainComponent()
         btnGenGo.onClick = [this] {
             int sel = cmbGenPreset.getSelectedId();
             if (sel > 0)
-                activateGenPreset(cmbGenPreset.getText());
+                activateGenPreset(selectedGenPresetName());
         };
 
         leftContent.addAndMakeVisible(btnGenPresetEdit);
@@ -2571,6 +2578,7 @@ void MainComponent::removeEngine(int index)
 
     forgetNicMoves(engines[(size_t)index].get());   // keyed by the engine about to go
     genPresetFileGiven.erase(engines[(size_t)index].get());
+    genPresetFileNotLoaded.erase(engines[(size_t)index].get());
     engines.erase(engines.begin() + index);
 
     // Re-index remaining engines so isPrimary() and getIndex() stay correct.
@@ -2793,12 +2801,7 @@ void MainComponent::syncUIFromEngine()
     // or none: the selection populateGenPresetCombo keeps is the previous
     // engine's, and GO would apply it to this one.
     cmbGenPreset.setSelectedId(0, juce::dontSendNotification);
-    for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
-        if (cmbGenPreset.getItemText(i) == eng.getGeneratorPresetName())
-        {
-            cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
-            break;
-        }
+    selectGenPresetInCombo(eng.getGeneratorPresetName());
 
     // OSC Input (global)
     btnOscIn.setToggleState(oscInputServer.getIsRunning(), juce::dontSendNotification);
@@ -5366,17 +5369,40 @@ void MainComponent::loadAndApplyNonAudioSettings()
         eng.setGeneratorPresetName(es.generatorPresetName);
         // The settings keep the preset's name, not its file, and load none:
         // the engine is taken to have been given that preset's file (#24,
-        // genPresetFileGiven), so a Save of the preset reaches it.
-        {
-            const auto* restored = settings.generatorPresets.find(es.generatorPresetName);
-            genPresetFileGiven[&eng] = restored != nullptr ? genPresetAudioFile(*restored) : juce::File();
-        }
+        // genPresetFileGiven), so a Save of the preset reaches it and GO on
+        // it keeps the A/B restored below -- which settings saved by this
+        // build keep only when that was the file the engine had been given
+        // (saveGenAbLoopSettings).
+        const auto* restoredPreset = settings.generatorPresets.find(es.generatorPresetName);
+        genPresetFileGiven[&eng] = restoredPreset != nullptr ? genPresetAudioFile(*restoredPreset) : juce::File();
+        if (restoredPreset != nullptr && restoredPreset->audioFilePath.isNotEmpty())
+            genPresetFileNotLoaded.insert(&eng);
+        else
+            genPresetFileNotLoaded.erase(&eng);
         eng.setGeneratorStartMs(es.generatorStartMs);
         eng.setGeneratorStopMs(es.generatorStopMs);
         // Restore A/B loop (programming aid; standard DAW semantics).
-        eng.setGeneratorLoopInMs(es.generatorLoopInMs);
-        eng.setGeneratorLoopOutMs(es.generatorLoopOutMs);
-        eng.setGeneratorLoopEnabled(es.generatorLoopEnabled);
+        // Settings saved by an earlier build (1.9.15-beta2 as first sent
+        // out, and before) keep the A/B whatever file it was set on (#24):
+        // after a browse to another preset while the audio played, they
+        // name that preset and keep the A/B of the file that played.  Its
+        // points are absolute timecode and GO on the named preset keeps
+        // it, so an A/B with a point set and its In before the named
+        // preset's Start TC is restored cleared -- In and Out 0, off: kept,
+        // GO on that preset took the timecode from the A/B's Out back to
+        // that In, before Start TC.  This also clears an A/B set on the
+        // preset itself before its Start TC was moved past the In.  An earlier build's A/B of another
+        // file whose In is at or after that Start TC -- the preset given
+        // another file by Save without GO, or a browse to a preset with the
+        // same Start TC -- is restored, and the preset list marks it
+        // (updateGenPresetAbMarker).  The disk is not asked.
+        const bool abBeforePresetStart =
+            restoredPreset != nullptr
+            && (es.generatorLoopInMs > 0.0 || es.generatorLoopOutMs > 0.0)
+            && es.generatorLoopInMs < parseTimecodeToMs(restoredPreset->startTC, eng.getCurrentFps());
+        eng.setGeneratorLoopInMs(abBeforePresetStart ? 0.0 : es.generatorLoopInMs);
+        eng.setGeneratorLoopOutMs(abBeforePresetStart ? 0.0 : es.generatorLoopOutMs);
+        eng.setGeneratorLoopEnabled(! abBeforePresetStart && es.generatorLoopEnabled);
 
         // TrackMap -- wire pointer and restore enabled state; the per-engine
         // override layer lives in this engine's settings block.
@@ -5687,9 +5713,7 @@ void MainComponent::flushSettings()
         es.generatorPresetName = eng.getGeneratorPresetName();
         es.generatorStartMs = eng.getGeneratorStartMs();
         es.generatorStopMs  = eng.getGeneratorStopMs();
-        es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
-        es.generatorLoopOutMs   = eng.getGeneratorLoopOutMs();
-        es.generatorLoopEnabled = eng.getGeneratorLoopEnabled();
+        saveGenAbLoopSettings(eng, es);
 
         es.mtcOutputOffset = eng.getMtcOutputOffset();
         es.artnetOutputOffset = eng.getArtnetOutputOffset();
@@ -5738,9 +5762,7 @@ void MainComponent::flushSettings()
         es.generatorPresetName = eng.getGeneratorPresetName();
             es.generatorStartMs = eng.getGeneratorStartMs();
             es.generatorStopMs  = eng.getGeneratorStopMs();
-            es.generatorLoopInMs    = eng.getGeneratorLoopInMs();
-            es.generatorLoopOutMs   = eng.getGeneratorLoopOutMs();
-            es.generatorLoopEnabled = eng.getGeneratorLoopEnabled();
+            saveGenAbLoopSettings(eng, es);
             saveNicSetting(es.artnetOutputInterface,  cmbArtnetOutputInterface,  1, &eng, kNicArtnetOut);
             saveNicSetting(es.laNetTCOutputInterface, cmbLANetTCOutputInterface, 1, &eng, kNicLANetOut);
             es.trackMapEnabled = eng.isTrackMapEnabled();
@@ -6676,6 +6698,7 @@ void MainComponent::updateStatusLabels()
     }
 
     updateGenStopTcLabel(eng);
+    updateGenPresetAbMarker();
 
     // Generator audio playback status
     if (btnGenAudioOut.getToggleState())
@@ -6708,10 +6731,16 @@ void MainComponent::updateStatusLabels()
                 }
                 else
                 {
-                    auto presetName = cmbGenPreset.getText();
+                    auto presetName = selectedGenPresetName();
                     auto* preset = presetName.isNotEmpty() ? settings.generatorPresets.find(presetName) : nullptr;
+                    // After a restart the settings name the preset but load
+                    // no file until GO (#24, genPresetFileNotLoaded): its file
+                    // is not loaded, which does not mean it is not on disk.
+                    // The disk is not asked here (the 60 Hz timer).
                     if (preset != nullptr && preset->audioFilePath.isNotEmpty())
-                        s = "FILE NOT FOUND: " + juce::File(preset->audioFilePath).getFileName();
+                        s = (genPresetFileNotLoaded.count(&eng) > 0 && genEngineHasPresetLoaded(eng, *preset)
+                                 ? "NOT LOADED (press GO): " : "FILE NOT FOUND: ")
+                            + juce::File(preset->audioFilePath).getFileName();
                     else
                         s = "DEVICE OPEN (no audio file)";
                 }
@@ -6932,20 +6961,99 @@ void MainComponent::updateGenStopTcLabel(const TimecodeEngine& eng)
 void MainComponent::populateGenPresetCombo()
 {
     // The selected preset stays selected, by name, if it still exists: the
-    // list is rebuilt after every preset edit and after a restore.
-    const juce::String selected = cmbGenPreset.getSelectedId() > 0 ? cmbGenPreset.getText() : juce::String();
+    // list is rebuilt after every preset edit and after a restore.  Item i
+    // has the id i + 1 and the preset name genPresetComboNames[i]; its text
+    // can carry the A/B marker (updateGenPresetAbMarker), put back here.
+    const juce::String selected = selectedGenPresetName();
     cmbGenPreset.clear(juce::dontSendNotification);
+    genPresetComboNames.clearQuick();
+    genPresetAbMarkedId = 0;
     auto presets = settings.generatorPresets.getAllSorted();
     int id = 1;
     for (auto& p : presets)
+    {
         cmbGenPreset.addItem(p.name, id++);
+        genPresetComboNames.add(p.name);
+    }
     if (selected.isNotEmpty())
-        for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
-            if (cmbGenPreset.getItemText(i) == selected)
-            {
-                cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
-                break;
-            }
+        selectGenPresetInCombo(selected);
+    updateGenPresetAbMarker();
+}
+
+/// The preset name of the combo's selected item (its text without the A/B
+/// marker), or empty when none is selected.
+juce::String MainComponent::selectedGenPresetName() const
+{
+    const int id = cmbGenPreset.getSelectedId();
+    return id > 0 && id <= genPresetComboNames.size() ? genPresetComboNames[id - 1] : juce::String();
+}
+
+/// Select the item of preset `name` in the combo, without onChange (so
+/// without applying it); nothing when the list has no such preset.  Names
+/// match without case, as the preset list keys its presets: an engine
+/// still names a preset whose name Save changed only in case.
+void MainComponent::selectGenPresetInCombo(const juce::String& name)
+{
+    const int index = genPresetComboNames.indexOf(name, true);
+    if (index >= 0)
+        cmbGenPreset.setSelectedId(index + 1, juce::dontSendNotification);
+}
+
+/// The A/B marker on the preset list (#24; Joaky, 2026-10-12: GO keeps an
+/// armed A/B -- the operator who left one there must be able to call it
+/// from another preset, and takes it off himself -- "pero quiza en la lista
+/// de preset ... el nombre del preset podria tener un [indicador] si tiene
+/// el A/B activado").  The item of the preset the engine on screen has
+/// loaded -- it names the preset and was given its file
+/// (genEngineHasPresetLoaded) -- reads "Name  [A/B]" while that engine has
+/// an A/B loop armed, which the open list shows with "[A/B]" as an amber
+/// tag, and the closed box, too narrow on the panel for the whole text, as
+/// an amber edge (CustomLookAndFeel::kComboAbMarker): A/B LOOP on with an
+/// Out after the In
+/// (TimecodeEngine::isGeneratorLoopActive; the toggle on without them
+/// loops nothing).  GO on the marked preset keeps that A/B
+/// (applyGenPresetToEngine).  So it shows after GO on the same file, after
+/// a restart (the A/B comes back with the engine's settings and the engine
+/// is taken to have the file of the preset they name:
+/// loadAndApplyNonAudioSettings, saveGenAbLoopSettings) and after
+/// switching engines.  A browse while the audio plays names the browsed
+/// preset and keeps the file and the A/B.  To a preset with another file,
+/// no item is marked, as GO on it gives the engine that file, which clears
+/// the A/B; to a preset with the playing file, the browsed preset is loaded
+/// and marked, and GO on it keeps the A/B -- so an A/B left on one preset
+/// can be called from another with the same file.  The A/B belongs to the
+/// engine and the file it was given -- another file, or none where it had
+/// one, clears it (applyGenPresetToEngine) -- and the marker follows the
+/// engine; nothing is stored in the presets.  The item's text changes
+/// without a notification: onChange does not fire, the
+/// preset is not applied again and the selection stays (the selected item
+/// is set again, dontSendNotification, only to show its new text: the combo
+/// takes an item as selected only while its text is the item's).  Called
+/// on every tick of the 60 Hz timer and when the list is rebuilt; it
+/// changes the combo only when the marked item changes.  Message thread.
+void MainComponent::updateGenPresetAbMarker()
+{
+    auto& eng = currentEngine();
+    int wanted = 0;
+    if (eng.isGeneratorLoopActive())
+    {
+        const int index = genPresetComboNames.indexOf(eng.getGeneratorPresetName(), true);
+        if (index >= 0)
+            if (const auto* preset = settings.generatorPresets.find(genPresetComboNames[index]))
+                if (genEngineHasPresetLoaded(eng, *preset))
+                    wanted = index + 1;
+    }
+    if (wanted == genPresetAbMarkedId)
+        return;
+    const int selected = cmbGenPreset.getSelectedId();
+    const int previous = genPresetAbMarkedId;
+    genPresetAbMarkedId = wanted;
+    if (previous > 0)
+        cmbGenPreset.changeItemText(previous, genPresetComboNames[previous - 1]);
+    if (wanted > 0)
+        cmbGenPreset.changeItemText(wanted, genPresetComboNames[wanted - 1] + kGenPresetAbMarker);
+    if (selected > 0 && (selected == previous || selected == wanted))
+        cmbGenPreset.setSelectedId(selected, juce::dontSendNotification);
 }
 
 void MainComponent::cycleGenPreset(int direction)
@@ -6979,7 +7087,7 @@ void MainComponent::cycleGenPreset(int direction)
         // generatorPlay, so playback continues against the new
         // preset's track from its startMs.
         cmbGenPreset.setSelectedId(newSel, juce::dontSendNotification);
-        const juce::String name = cmbGenPreset.getText();
+        const juce::String name = selectedGenPresetName();
         if (name.isNotEmpty())
             activateGenPreset(name);
     }
@@ -7032,7 +7140,11 @@ void MainComponent::cycleGenPreset(int direction)
 /// in the panel or sent with /stc/N/gen/stoptime after this still
 /// applies.  With its file, the preset's path goes to `fileGiven`, the
 /// engine's genPresetFileGiven (#24), whether the file is on disk or not.
-void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
+///
+/// Returns true when it kept the engine's A/B loop for a file the engine's
+/// player does not hold (see below): GO then arms it only once it has
+/// started (goGenPresetOnEngine).
+bool MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
                                            bool withAudioFile, juce::File& fileGiven)
 {
     const auto fps = eng.getCurrentFps();
@@ -7064,11 +7176,35 @@ void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorP
     // The file after Start and Stop TC: for a Loop timecode preset the
     // engine sets the player's loop with the file from Stop TC (gapless at
     // the file's end without one), and settles it when the load completes.
+    //
+    // The A/B loop goes with the file the engine was given (#24; Joaky,
+    // 2026-10-12: GO does not clear the A/B the operator left, he takes it
+    // off himself): kept for the file it was given before (fileGiven),
+    // none for a preset without one, and cleared for another file.
+    // setGeneratorAudioFile goes by the file the player holds instead, so
+    // the A/B is set here after it either way: kept also while the player
+    // does not hold that file -- after a restart, whose settings bring
+    // back the preset's name and its A/B (saveGenAbLoopSettings) but load
+    // no file; while the load of a GO before is pending; and when that GO
+    // found the file missing on disk -- and cleared for another file also
+    // where the player holds none, as after a restart, for a preset
+    // without a file or with its file missing.
+    bool abWaitsForFile = false;
     if (withAudioFile)
     {
+        const juce::File given = genPresetAudioFile(preset);
+        const bool sameFile = given == fileGiven;
+        const bool held = eng.getGeneratorAudioFile() == given;
+        const double abIn = eng.getGeneratorLoopInMs(), abOut = eng.getGeneratorLoopOutMs();
+        const bool abOn = eng.getGeneratorLoopEnabled();
         eng.setGeneratorAudioFile(hasAudio ? audioFile : juce::File(), preset.audioLoop, preset.loopTimecode);
-        fileGiven = genPresetAudioFile(preset);
+        eng.setGeneratorLoopInMs(sameFile ? abIn : 0.0);
+        eng.setGeneratorLoopOutMs(sameFile ? abOut : 0.0);
+        eng.setGeneratorLoopEnabled(sameFile && abOn);
+        abWaitsForFile = sameFile && abOn && ! held;
+        fileGiven = given;
     }
+    return abWaitsForFile;
 }
 
 /// A browse of the preset combo: apply `preset` to `eng` without starting
@@ -7102,15 +7238,30 @@ void MainComponent::browseGenPresetOnEngine(TimecodeEngine& eng, const Generator
 
 /// GO: `eng` leaves Clock mode, stops, takes `preset` with its audio file
 /// (stopping first releases the previous file before the new one loads)
-/// and plays from Start TC.
+/// and plays from Start TC -- from the A/B loop's In when the engine
+/// follows an A/B it kept (TimecodeEngine::generatorPlay).
+///
+/// An A/B kept for a file the player does not hold yet (#24: after a
+/// restart, while the load of a GO before is pending, or with the file
+/// missing on disk) is armed only after the start, so GO plays from Start
+/// TC and into the A/B.  generatorPlay decides between In and Start TC
+/// with the length of the file the player holds, and before the load
+/// there is none: under Loop timecode it took an A/B that the timecode
+/// loop ignores once the file is loaded -- an Out past the file's end --
+/// as followed, and started the first pass at its In, past Start TC and
+/// the cues before it.
 void MainComponent::goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
                                         juce::File& fileGiven)
 {
     if (eng.getGeneratorClockMode())
         eng.setGeneratorClockMode(false);
     eng.generatorStop();
-    applyGenPresetToEngine(eng, preset, true, fileGiven);
+    const bool armAfterStart = applyGenPresetToEngine(eng, preset, true, fileGiven);
+    if (armAfterStart)
+        eng.setGeneratorLoopEnabled(false);
     eng.generatorPlay();
+    if (armAfterStart)
+        eng.setGeneratorLoopEnabled(true);
 }
 
 /// GO on engine `engineIndex` (goGenPresetOnEngine), the panel following
@@ -7121,6 +7272,7 @@ void MainComponent::goGenPreset(int engineIndex, const GeneratorPreset& preset)
     auto& eng = *engines[(size_t) engineIndex];
     const bool wasClock = eng.getGeneratorClockMode();
     goGenPresetOnEngine(eng, preset, genPresetFileGiven[&eng]);
+    genPresetFileNotLoaded.erase(&eng);
     if (engineIndex == selectedEngine)
     {
         showGenPresetInPanel(eng);
@@ -7142,12 +7294,8 @@ void MainComponent::showGenPresetInPanel(TimecodeEngine& eng)
     const auto fps = eng.getCurrentFps();
     txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), fps), false);
     txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), fps), false);
-    for (int i = 0; i < cmbGenPreset.getNumItems(); ++i)
-        if (cmbGenPreset.getItemText(i) == eng.getGeneratorPresetName())
-        {
-            cmbGenPreset.setSelectedItemIndex(i, juce::dontSendNotification);
-            break;
-        }
+    selectGenPresetInCombo(eng.getGeneratorPresetName());
+    updateGenPresetAbMarker();
 }
 
 /// The preset's audio file as a preset application gives it to an engine
@@ -7175,6 +7323,35 @@ bool MainComponent::genEngineHasPresetLoaded(const TimecodeEngine& eng, const Ge
         return false;
     const auto it = genPresetFileGiven.find(&eng);
     return (it != genPresetFileGiven.end() ? it->second : juce::File()) == genPresetAudioFile(preset);
+}
+
+/// The engine's A/B loop as the settings keep it (#24).  They keep the
+/// engine's preset by name, not its file, and at start-up the engine is
+/// taken to have been given the file of the preset they name, none for a
+/// name no preset has (loadAndApplyNonAudioSettings), so that GO on that
+/// preset keeps the A/B restored with it (applyGenPresetToEngine).  The
+/// A/B is kept only when that is the file the engine was given
+/// (genPresetFileGiven); otherwise it is kept cleared -- In and Out 0,
+/// off -- as GO on the named preset would clear it: after a browse, while
+/// the audio played, to a preset with another file, which names the
+/// browsed preset and keeps the playing file and its A/B; after a Save
+/// that gave the preset another file, or renamed it, without GO.  The A/B
+/// is absolute timecode: kept, GO on the named preset would run the other
+/// file's A/B with this preset's Start TC and file.  A browse to a preset
+/// with the playing file names a preset that has the file: the A/B is
+/// kept, and GO on that preset after the restart keeps it.  Settings saved
+/// by an earlier build keep the A/B whatever its file; start-up clears one
+/// that begins before the named preset's Start TC
+/// (loadAndApplyNonAudioSettings).  Message thread (flushSettings).
+void MainComponent::saveGenAbLoopSettings(const TimecodeEngine& eng, EngineSettings& es) const
+{
+    const auto* named = settings.generatorPresets.find(eng.getGeneratorPresetName());
+    const auto it = genPresetFileGiven.find(&eng);
+    const juce::File given = it != genPresetFileGiven.end() ? it->second : juce::File();
+    const bool keep = given == (named != nullptr ? genPresetAudioFile(*named) : juce::File());
+    es.generatorLoopInMs    = keep ? eng.getGeneratorLoopInMs()  : 0.0;
+    es.generatorLoopOutMs   = keep ? eng.getGeneratorLoopOutMs() : 0.0;
+    es.generatorLoopEnabled = keep && eng.getGeneratorLoopEnabled();
 }
 
 /// The preset editor's Save stored `preset` (#24; Joaky, 2026-10-12: the
@@ -7210,6 +7387,8 @@ void MainComponent::loadGenPresetToFields(const juce::String& name)
     if (!preset) return;
 
     auto& eng = currentEngine();
+    if (! eng.isGeneratorAudioPlaying())   // the browse gives the engine the preset's file
+        genPresetFileNotLoaded.erase(&eng);
     browseGenPresetOnEngine(eng, *preset, genPresetFileGiven[&eng]);
     showGenPresetInPanel(eng);
     saveSettings();
@@ -7437,9 +7616,13 @@ void MainComponent::openGeneratorPresetEditor()
         return (int64_t) rel;
     });
 
+    // A change to the presets (each is saved at once) also saves the
+    // settings, soon: what they keep of an engine's A/B depends on the
+    // file of the preset the engine names (saveGenAbLoopSettings).
     editor->onChange = [this]
     {
         populateGenPresetCombo();
+        saveSettings();
     };
     editor->onPresetUpdated = [this](const GeneratorPreset& stored)
     {

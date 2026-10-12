@@ -26,6 +26,7 @@
 #include <vector>
 #include <memory>
 #include <map>
+#include <set>
 
 //==============================================================================
 // The panels' horizontal sliders with a value box ("100%", "0 ms") on their
@@ -452,6 +453,9 @@ private:
     juce::Label      lblGenStartTC;
     juce::Label      lblGenStopTC;
     juce::ComboBox   cmbGenPreset;
+    juce::StringArray genPresetComboNames;   // preset name of the item with id i + 1 (populateGenPresetCombo)
+    int              genPresetAbMarkedId = 0;  // the item showing kGenPresetAbMarker, or 0
+    static constexpr const char* kGenPresetAbMarker = CustomLookAndFeel::kComboAbMarker;   // #24, updateGenPresetAbMarker
     juce::Label      lblGenPreset;
     juce::TextButton btnGenPrev   { "<" };
     juce::TextButton btnGenNext   { ">" };
@@ -462,11 +466,19 @@ private:
     // the audio stopped, < > and OSC /stc/N/gen/preset apply it
     // (applyGenPresetToEngine) -- the file it loads, is still loading, or
     // found missing on disk; after a restart, whose settings keep the
-    // preset's name and load no file, the file of that preset.  An engine
+    // preset's name and load no file, the file of that preset (and an A/B
+    // only when that was the file, saveGenAbLoopSettings; an earlier
+    // build's A/B as loadAndApplyNonAudioSettings restores it).  An engine
     // has a preset loaded when it names it and was given its file
     // (genEngineHasPresetLoaded).  Keyed by engine; removeEngine drops the
     // entry, and an engine without one was given none.  Message thread.
     std::map<const TimecodeEngine*, juce::File> genPresetFileGiven;
+    // Engines whose genPresetFileGiven came from the settings, which load no
+    // file (#24): until GO, or a browse with the audio stopped, applies a
+    // preset to the engine, its audio status reads NOT LOADED for that
+    // preset's file, which may well be on disk, instead of FILE NOT FOUND
+    // (updateStatusLabels).  removeEngine drops the entry.  Message thread.
+    std::set<const TimecodeEngine*> genPresetFileNotLoaded;
 
     // Generator audio playback (per-engine output device for preset audio files)
     juce::ToggleButton btnGenAudioOut { "AUDIO PLAYBACK" };
@@ -943,19 +955,25 @@ private:
     static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);
     static juce::String msToTimecodeString(double ms, FrameRate fps);
     void populateGenPresetCombo();
+    // The preset combo by preset name: its items' texts can carry the A/B
+    // marker (#24, updateGenPresetAbMarker).  Message thread.
+    juce::String selectedGenPresetName() const;
+    void selectGenPresetInCombo(const juce::String& name);
+    void updateGenPresetAbMarker();
     // Generator presets (GO, the preset combo, OSC /stc/N/gen/preset):
     // the engine side, static so the three paths share it, then the panel.
     // A preset's "Loop timecode" (#24) and "Loop audio only"
     // reach the engine with the audio file, or live: the preset editor's
     // Save (applyGenPresetLoopBoxesLive) and OSC /stc/N/gen/looptc.
     // fileGiven is the engine's genPresetFileGiven.  Message thread.
-    static void applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset, bool withAudioFile,
+    static bool applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset, bool withAudioFile,
                                        juce::File& fileGiven);
     void applyGenPresetLoopBoxesLive(const GeneratorPreset& preset);
     static void browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset, juce::File& fileGiven);
     static void goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset, juce::File& fileGiven);
     static juce::File genPresetAudioFile(const GeneratorPreset& preset);   // its path as a File, none without one
     bool genEngineHasPresetLoaded(const TimecodeEngine& eng, const GeneratorPreset& preset) const;
+    void saveGenAbLoopSettings(const TimecodeEngine& eng, EngineSettings& es) const;
     void goGenPreset(int engineIndex, const GeneratorPreset& preset);
     void showGenPresetInPanel(TimecodeEngine& eng);
     void activateGenPreset(const juce::String& name);      // GO on the selected engine
