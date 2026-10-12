@@ -154,15 +154,42 @@ public:
     /// transport mode (not Clock mode, which never loops), with "Loop
     /// timecode" acting (TimecodeEngine::isGeneratorLoopTimecodeActive: the
     /// flag on and an end at least 1 s after Start TC; with no Stop TC it
-    /// reads false while the file is still loading).  What the waveform
-    /// window's LOOP TC, the panel's STOP TC (LOOP) label and this view's
-    /// end mark show (GeneratorWaveformWindow::loopTimecodeShown).
-    /// Message thread.
+    /// reads false while the file is still loading).  This view's end mark
+    /// is drawn while it holds, also while an A/B loop inside the timecode
+    /// loop is what runs: it marks where the timecode loop ends.  The
+    /// waveform window's LOOP TC and the panel's STOP TC (LOOP) label go by
+    /// loopInCharge, which gives way to that A/B.  Message thread.
     static bool loopTimecodeShown(const TimecodeEngine& e)
     {
         return e.getActiveInput() == TimecodeEngine::InputSource::SystemTime
             && ! e.getGeneratorClockMode()
             && e.isGeneratorLoopTimecodeActive();
+    }
+
+    /// Which loop is in charge of `e`'s generator (#24), for the
+    /// indicators: the waveform window's header (LOOP A/B, LOOP TC, LOOP
+    /// AUDIO) and the panel's STOP TC label.  In transport mode only, as
+    /// loopTimecodeShown.  The A/B loop first: while the generator follows
+    /// it (TimecodeEngine::isGeneratorAbLoopFollowed: armed, and inside the
+    /// timecode loop when that acts) it goes back from Out to In before
+    /// either of the others can act.  Then the timecode loop
+    /// (loopTimecodeShown), then "Loop audio only"
+    /// (TimecodeEngine::isGeneratorLoopAudioActive), which the engine never
+    /// runs together with the timecode loop.  1.9.15-beta2 showed LOOP TC
+    /// and STOP TC (LOOP) while an A/B inside the loop was what ran, and
+    /// nothing for Loop audio (Joaky's field test).  Message thread.
+    enum class LoopInCharge { none, abLoop, timecodeLoop, audioLoop };
+    static LoopInCharge loopInCharge(const TimecodeEngine& e)
+    {
+        if (e.getActiveInput() != TimecodeEngine::InputSource::SystemTime || e.getGeneratorClockMode())
+            return LoopInCharge::none;
+        if (e.isGeneratorAbLoopFollowed())
+            return LoopInCharge::abLoop;
+        if (e.isGeneratorLoopTimecodeActive())
+            return LoopInCharge::timecodeLoop;
+        if (e.isGeneratorLoopAudioActive())
+            return LoopInCharge::audioLoop;
+        return LoopInCharge::none;
     }
 
 private:
@@ -300,17 +327,20 @@ private:
         // generator follows the loop (isGeneratorAbLoopFollowed); otherwise
         // markers are still drawn if individual points are placed, so the
         // operator can see where they would land before arming the loop.
-        // An A/B armed but ignored by the preset's timecode loop (#24: not
-        // inside it) gets the dim tint and dashed markers, while the toggle
-        // stays on as the operator set it.  Each point is drawn where it
-        // falls in the file (fileSecondsAt), so under "Loop audio" one set
-        // in a later pass shows too.
+        // An A/B armed but ignored (#24, TimecodeEngine::
+        // generatorAbLoopFollowed: not inside the preset's timecode loop, or
+        // without it past where the generator stops) gets the dim tint and
+        // dashed markers, while the toggle stays on as the operator set it.
+        // Each point is drawn where it falls in the file (abPointSeconds):
+        // under "Loop audio" folded, so one set in a later pass shows in
+        // place; otherwise one past the file's end at the right edge.
         if (engine != nullptr)
         {
             const double loopInMs      = engine->getGeneratorLoopInMs();
             const double loopOutMs     = engine->getGeneratorLoopOutMs();
             const bool   loopFollowed  = engine->isGeneratorAbLoopFollowed();
             const bool   loopIgnored   = engine->isGeneratorLoopActive() && ! loopFollowed;
+            const bool   abFolded      = abPointsFolded();
 
             auto secToX = [&](double posSec) -> int
             {
@@ -320,8 +350,8 @@ private:
 
             // Out is the loop's exclusive end: on a pass boundary it ends the
             // band at the right edge (fileEndSecondsAt).
-            const int inX  = (loopInMs  > 0.0) ? secToX(fileSecondsAt(loopInMs, totalLen))     : INT_MIN;
-            const int outX = (loopOutMs > 0.0) ? secToX(fileEndSecondsAt(loopOutMs, totalLen)) : INT_MIN;
+            const int inX  = (loopInMs  > 0.0) ? secToX(abPointSeconds(loopInMs, totalLen, false)) : INT_MIN;
+            const int outX = (loopOutMs > 0.0) ? secToX(abPointSeconds(loopOutMs, totalLen, true)) : INT_MIN;
 
             // Range fill -- amber tint between In and Out, lighter when
             // the loop is followed, dimmer otherwise.  Under "Loop audio"
@@ -336,9 +366,9 @@ private:
                 g.setColour(loopFollowed ? juce::Colour(0x33FFA500)   // amber 20%
                                          : juce::Colour(0x14FFA500)); // amber 8%
                 const int bandY = waveArea.getY(), bandH = waveArea.getHeight();
-                if (player->isLooping() && loopOutMs - loopInMs >= (totalLen - kPassEdgeSec) * 1000.0)
+                if (abFolded && loopOutMs - loopInMs >= (totalLen - kPassEdgeSec) * 1000.0)
                     g.fillRect(waveArea);
-                else if (player->isLooping() && loopOutMs > loopInMs
+                else if (abFolded && loopOutMs > loopInMs
                          && fileEndSecondsAt(loopOutMs, totalLen) <= fileSecondsAt(loopInMs, totalLen))
                 {
                     g.fillRect(inX, bandY, waveArea.getRight() - inX, bandH);
@@ -450,16 +480,18 @@ private:
     // player loops the file and the timecode counts on past its end, so
     // timecode - Start TC (the relation every seek uses) passes the file's
     // length from the second pass on: the cursor sat at the right edge, and
-    // a click took the timecode back to the first pass.  The cursor, the
-    // A/B points and the window's label are folded whenever the player
-    // loops the file (cursorFileSeconds, fileSecondsAt), so also on the
-    // timecode loop's gapless path.  There the timecode itself is folded
-    // and stays in the file while it plays, but two things can still lie
-    // past the file's end, and are drawn folded where before #24 they were
-    // drawn at the right edge or not at all: an A/B point set under "Loop
-    // audio", and the timecode left past the loop's end while paused
-    // (Start TC moved back, an OSC jog), the cursor then drawn where PLAY
-    // folds the timecode to.
+    // a click took the timecode back to the first pass.  The cursor and
+    // the window's label are folded whenever the player loops the file
+    // (cursorFileSeconds), so also on the timecode loop's gapless path, and
+    // the A/B points under "Loop audio" (abPointSeconds, fileSecondsAt).
+    // On the timecode loop's gapless path the timecode itself is
+    // folded and stays in the file while it plays, but two things can
+    // still lie past the file's end: the timecode left past the loop's end
+    // while paused (Start TC moved back, an OSC jog), the cursor then drawn
+    // folded, where PLAY folds the timecode to; and an A/B point set under
+    // "Loop audio" in a later pass, which the timecode loop ignores, drawn
+    // at the right edge (abPointSeconds) -- drawn folded, it showed inside
+    // the loop as if it ran.
     // Passes (currentPass) are for "Loop audio" only: with "Loop timecode"
     // on, a click, a drag, the hover readout and the ruler take the first
     // pass, inside the timecode loop, as before #24.  Without a loop the
@@ -485,6 +517,34 @@ private:
         const auto place = placeInFile((absMs - engine->getGeneratorStartMs()) / 1000.0,
                                        totalLen, player->isLooping());
         return (place.pass > 0.0 && place.sec < kPassEdgeSec) ? totalLen : place.sec;
+    }
+
+    /// Whether the A/B points are drawn folded by the file's length (#24):
+    /// while the player loops the file without the timecode loop -- under
+    /// "Loop audio only", where the timecode counts on and an A/B set in a
+    /// later pass runs there, and in its last pass after it is turned off
+    /// live.  Not on the timecode loop's gapless path, where the player
+    /// loops the file too: there a point past the file's end lies outside
+    /// the loop, which ignores the A/B, and drawn folded it showed inside
+    /// the loop, where it was set, as if it ran (Joaky's field test: an A/B
+    /// set in Loop audio's third pass, then Loop timecode saved).
+    bool abPointsFolded() const
+    {
+        return player->isLooping() && ! engine->getGeneratorLoopTimecode();
+    }
+
+    /// Where an A/B point (absMs, ms from midnight) is drawn, in seconds into
+    /// the file: folded while abPointsFolded (fileSecondsAt, or for the
+    /// exclusive Out fileEndSecondsAt); otherwise absMs - Start TC, at the
+    /// right edge (the file's length) when past the file's end -- an A/B
+    /// that lies there is ignored (TimecodeEngine::generatorAbLoopFollowed)
+    /// and shows dashed at the edge.  Below 0 (before Start TC) it is not
+    /// drawn.
+    double abPointSeconds(double absMs, double totalLen, bool isOut) const
+    {
+        if (abPointsFolded())
+            return isOut ? fileEndSecondsAt(absMs, totalLen) : fileSecondsAt(absMs, totalLen);
+        return juce::jmin((absMs - engine->getGeneratorStartMs()) / 1000.0, totalLen);
     }
 
     /// The pass of the file the generator is in under "Loop audio only"

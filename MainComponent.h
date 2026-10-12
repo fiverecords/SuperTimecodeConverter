@@ -938,6 +938,8 @@ private:
     void updateOnAirQuietVisibility();   // OFF AIR AT: StageLinQ with ON AIR selected (DESIGN D34)
     void updateStatusLabels();
     void updateNextCueLabel(TimecodeEngine& eng);
+    void updateGenStopTcLabel(const TimecodeEngine& eng);   // STOP TC (0=FREE) / (LOOP) / (A/B), #24
+    static juce::String genStopTcLabelTooltip(GeneratorWaveformWindow::LoopInCharge state);
     static double parseTimecodeToMs(const juce::String& tc, FrameRate fps);
     static juce::String msToTimecodeString(double ms, FrameRate fps);
     void populateGenPresetCombo();

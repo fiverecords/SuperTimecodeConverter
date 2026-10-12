@@ -12,8 +12,8 @@
 //==============================================================================
 // GeneratorWaveformWindow -- Content component for the floating waveform
 // window.  Combines:
-//   - Header: filename + file-time / total-time, and LOOP TC while the
-//     preset's "Loop timecode" (#24) acts (loopTimecodeShown)
+//   - Header: filename + file-time / total-time, and the loop in charge
+//     (#24, loopInCharge): LOOP A/B, LOOP TC or LOOP AUDIO
 //   - Big absolute TC display (HH:MM:SS:FF)
 //   - GeneratorWaveformView in Full mode (markers + click-to-seek)
 //   - Transport buttons (PLAY / PAUSE / STOP)
@@ -39,19 +39,14 @@ public:
         lblFileTime.setColour(juce::Label::textColourId, textMid);
         lblFileTime.setJustificationType(juce::Justification::centredRight);
 
-        // The timecode loop's indicator.  This window's own loop controls
-        // (A/B LOOP, [ ], L) are the A/B loop's, so the header says when the
-        // other loop, the preset's, is the one running.
-        addChildComponent(lblLoopTc);
-        lblLoopTc.setText("LOOP TC", juce::dontSendNotification);
-        lblLoopTc.setFont(juce::Font(juce::FontOptions(13.0f).withStyle("Bold")));
-        lblLoopTc.setColour(juce::Label::textColourId, accentCyan);
-        lblLoopTc.setJustificationType(juce::Justification::centredRight);
-        lblLoopTc.setTooltip("Loop timecode is on for this preset (set in Generator Presets, "
-                             "or with the OSC command looptc): at its end the timecode and "
-                             "the audio go back to Start TC.  With an audio file, the cyan "
-                             "line on the waveform marks that end.  A/B LOOP is a separate "
-                             "rehearsal loop.");
+        // Which loop is in charge (#24, loopInCharge), one text at a time:
+        // LOOP A/B, LOOP TC or LOOP AUDIO, each with a tooltip that says
+        // what it means (updateLoopState).  This window's own loop controls
+        // (A/B LOOP, [ ], L) are the A/B loop's; the other two are the
+        // preset's.
+        addChildComponent(lblLoopState);
+        lblLoopState.setFont(juce::Font(juce::FontOptions(13.0f).withStyle("Bold")));
+        lblLoopState.setJustificationType(juce::Justification::centredRight);
 
         // --- Big absolute TC ---
         addAndMakeVisible(lblAbsoluteTC);
@@ -116,8 +111,11 @@ public:
         btnLoopOn.setTooltip("A/B loop on / off (keyboard: L, in this window or the main window).  When on, "
                              "playback goes back from Out to In, and PLAY from STOP starts at "
                              "In.  A rehearsal loop, separate from the preset's Loop timecode "
-                             "(LOOP TC), which ignores an A/B not inside its own loop (drawn "
-                             "dashed).");
+                             "(LOOP TC), which ignores an A/B not inside its own loop.  Without "
+                             "that loop, an A/B past the end of a file that does not loop is "
+                             "ignored too.  An ignored A/B is drawn dashed, at the right edge when "
+                             "it lies past the end of the file (one set in a later pass of Loop "
+                             "audio only, which runs only under Loop audio).");
 
         btnLoopIn.onClick = [this] {
             if (engine == nullptr) return;
@@ -195,11 +193,19 @@ public:
 
     /// True when `e`'s generator runs the preset's timecode loop (#24); see
     /// GeneratorWaveformView::loopTimecodeShown, which the waveform's end
-    /// mark uses too.  What this window's LOOP TC and the panel's STOP TC
-    /// (LOOP) label show.  Message thread.
+    /// mark uses.  Message thread.
     static bool loopTimecodeShown(const TimecodeEngine& e)
     {
         return GeneratorWaveformView::loopTimecodeShown(e);
+    }
+
+    /// The loop in charge of `e`'s generator (#24): what this window's
+    /// header and the panel's STOP TC label show; see
+    /// GeneratorWaveformView::loopInCharge for the order.  Message thread.
+    using LoopInCharge = GeneratorWaveformView::LoopInCharge;
+    static LoopInCharge loopInCharge(const TimecodeEngine& e)
+    {
+        return GeneratorWaveformView::loopInCharge(e);
     }
 
     //==========================================================================
@@ -241,10 +247,14 @@ public:
     {
         auto area = getLocalBounds().reduced(10);
 
-        // Header row: filename left, file-time right, LOOP TC before it.
+        // Header row: filename left, file-time right, the loop in charge
+        // before it.  110 px: "LOOP AUDIO" is 73 px in this 13-px bold font
+        // in Liberation Sans (Arial's widths) and 78 px in DejaVu Sans (close
+        // to Verdana, which LookAndFeel_V4 uses on Windows), within the
+        // label's 5-px borders.
         auto headerRow = area.removeFromTop(20);
         lblFileTime.setBounds(headerRow.removeFromRight(180));
-        lblLoopTc.setBounds(headerRow.removeFromRight(80));
+        lblLoopState.setBounds(headerRow.removeFromRight(110));
         lblFilename.setBounds(headerRow);
         area.removeFromTop(2);
 
@@ -314,9 +324,51 @@ private:
             if (btnLoopOn.getToggleState() != wanted)
                 btnLoopOn.setToggleState(wanted, juce::dontSendNotification);
         }
-        const bool loopTc = engine != nullptr && loopTimecodeShown(*engine);
-        if (lblLoopTc.isVisible() != loopTc)
-            lblLoopTc.setVisible(loopTc);
+        updateLoopState(engine != nullptr ? loopInCharge(*engine) : LoopInCharge::none);
+    }
+
+    /// The header's loop label for `state`, changed only when it changes.
+    /// Colours: the A/B markers' amber, the cyan of the timecode loop's end
+    /// mark, the waveform's amber.
+    void updateLoopState(LoopInCharge state)
+    {
+        if (state == shownLoopState)
+            return;
+        shownLoopState = state;
+        switch (state)
+        {
+            case LoopInCharge::abLoop:
+                lblLoopState.setText("LOOP A/B", juce::dontSendNotification);
+                lblLoopState.setColour(juce::Label::textColourId, abMarkerAmber);
+                lblLoopState.setTooltip("The A/B loop is what runs: at Out the timecode and the audio go "
+                                        "back to In.  It takes over from the preset's Loop timecode when "
+                                        "it lies inside that loop, and from Loop audio.  It stays armed "
+                                        "through GO on the same audio file (another file, or none where the "
+                                        "engine had one, clears it); turn A/B LOOP off (or press L) to hand "
+                                        "back to the preset.");
+                break;
+            case LoopInCharge::timecodeLoop:
+                lblLoopState.setText("LOOP TC", juce::dontSendNotification);
+                lblLoopState.setColour(juce::Label::textColourId, accentCyan);
+                lblLoopState.setTooltip("Loop timecode is on for this preset (set in Generator Presets, "
+                                        "or with the OSC command looptc): at its end the timecode and "
+                                        "the audio go back to Start TC.  With an audio file, the cyan "
+                                        "line on the waveform marks that end.  A/B LOOP is a separate "
+                                        "rehearsal loop: armed inside this loop it takes over, and this "
+                                        "reads LOOP A/B.");
+                break;
+            case LoopInCharge::audioLoop:
+                lblLoopState.setText("LOOP AUDIO", juce::dontSendNotification);
+                lblLoopState.setColour(juce::Label::textColourId, accentAmber);
+                lblLoopState.setTooltip("Loop audio only is on for this preset (set in Generator Presets): "
+                                        "at the end of the file the audio starts again from the top while "
+                                        "the timecode keeps counting, up to a Stop TC or for ever; the cue "
+                                        "points fire on the first pass only.");
+                break;
+            case LoopInCharge::none:
+                break;
+        }
+        lblLoopState.setVisible(state != LoopInCharge::none);
     }
 
     void updateLabels()
@@ -378,13 +430,15 @@ private:
     juce::Colour textMid     { 0xFF999999 };
     juce::Colour accentAmber { 0xFFCC8844 };
     juce::Colour accentCyan  { 0xFF00AAFF };
+    juce::Colour abMarkerAmber { 0xFFFFAA00 };   // GeneratorWaveformView's A/B markers
 
     GeneratorAudioPlayer* player = nullptr;
     TimecodeEngine*       engine = nullptr;
 
     GeneratorWaveformView waveform;
     juce::Label   lblFilename, lblFileTime, lblAbsoluteTC, lblVolume;
-    juce::Label   lblLoopTc;   // "LOOP TC", shown while loopTimecodeShown()
+    juce::Label   lblLoopState;   // the loop in charge (updateLoopState)
+    LoopInCharge  shownLoopState = LoopInCharge::none;
     juce::TextButton btnPlay, btnPause, btnStop;
     juce::TextButton btnPrev, btnNext, btnEdit;
     juce::TextButton   btnLoopIn, btnLoopOut;

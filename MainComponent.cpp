@@ -758,6 +758,7 @@ MainComponent::MainComponent()
 
         setupTcEditor(txtGenStartTC, lblGenStartTC, "START TC:");
         setupTcEditor(txtGenStopTC,  lblGenStopTC,  "STOP TC (0=FREE):");
+        lblGenStopTC.setTooltip(genStopTcLabelTooltip(GeneratorWaveformWindow::LoopInCharge::none));
 
         // Callbacks use member pointers directly (no dangling reference)
         // Locked: the field shows the engine's value again rather than the
@@ -6674,13 +6675,7 @@ void MainComponent::updateStatusLabels()
         lblOutputThruStatus.setText(thruStatus, juce::dontSendNotification);
     }
 
-    // The STOP TC label says when the preset's "Loop timecode" (#24) is
-    // what runs at the end: STOP TC (LOOP) while the loop acts, the same
-    // test as the waveform window's LOOP TC.  There is no control on the
-    // panel: the preset carries the option (and the preset editor's Save,
-    // or OSC /stc/N/gen/looptc, turns it on or off live).
-    lblGenStopTC.setText(GeneratorWaveformWindow::loopTimecodeShown(eng) ? "STOP TC (LOOP):" : "STOP TC (0=FREE):",
-                         juce::dontSendNotification);
+    updateGenStopTcLabel(eng);
 
     // Generator audio playback status
     if (btnGenAudioOut.getToggleState())
@@ -6691,10 +6686,14 @@ void MainComponent::updateStatusLabels()
             if (eng.hasGeneratorAudioFile())
             {
                 auto fname = eng.getGeneratorAudioFile().getFileName();
+                // Under "Loop audio only" the audio goes round and the
+                // timecode counts on past the file's end: the panel says so
+                // here (#24), as the waveform window's LOOP AUDIO does.
+                const juce::String loop = eng.isGeneratorLoopAudioActive() ? "(LOOP AUDIO) " : "";
                 if (eng.isGeneratorAudioPlaying())
-                    s = "PLAYING " + fname;
+                    s = "PLAYING " + loop + fname;
                 else
-                    s = "READY " + fname;
+                    s = "READY " + loop + fname;
             }
             else
             {
@@ -6881,6 +6880,53 @@ double MainComponent::parseTimecodeToMs(const juce::String& tc, FrameRate fps)
 juce::String MainComponent::msToTimecodeString(double ms, FrameRate fps)
 {
     return msToTimecodeText(ms, fps);
+}
+
+/// The tooltip of the panel's STOP TC label for each of its texts
+/// (updateGenStopTcLabel).
+juce::String MainComponent::genStopTcLabelTooltip(GeneratorWaveformWindow::LoopInCharge state)
+{
+    using L = GeneratorWaveformWindow::LoopInCharge;
+    if (state == L::timecodeLoop)
+        return "STOP TC (LOOP): the preset's Loop timecode is what runs.  Where the generator "
+               "would stop -- at this Stop TC, or at the end of the audio file -- the timecode "
+               "and the audio go back to Start TC instead.";
+    if (state == L::abLoop)
+        return "STOP TC (A/B): the A/B loop set in the waveform window is what runs.  At its Out "
+               "the timecode and the audio go back to its In; it takes over from the preset's Loop "
+               "timecode when it lies inside that loop, and from Loop audio.  Turn A/B LOOP off (or "
+               "press L) to hand back to the preset.";
+    return "STOP TC (0=FREE): where the generator stops; 00:00:00:00 = no stop (free run).  With an "
+           "audio file it also stops at the end of the file, unless the preset loops it: under Loop "
+           "audio only (LOOP AUDIO in the audio status below) the timecode counts on, to this Stop TC "
+           "or for ever.  Reads STOP TC (LOOP) while the preset's Loop timecode is what runs, and "
+           "STOP TC (A/B) while the A/B loop is.";
+}
+
+/// The panel's STOP TC label says which loop is in charge at the end (#24),
+/// by the waveform window header's test (GeneratorWaveformWindow::
+/// loopInCharge): STOP TC (LOOP) while the preset's Loop timecode is,
+/// STOP TC (A/B) while the A/B loop is -- it takes over from the timecode
+/// loop when inside it, and from Loop audio, and goes back from Out to In
+/// before the end the label otherwise names; STOP TC (0=FREE) otherwise,
+/// Loop audio included, where the timecode counts on to a Stop TC as
+/// without a loop.  1.9.15-beta2 read STOP TC (LOOP) while an A/B inside
+/// the loop was what ran.  The panel has no loop control: the preset
+/// carries its options (the preset editor's Save, or OSC
+/// /stc/N/gen/looptc, switches them live) and the A/B is set in the
+/// waveform window.  Each text has its own tooltip.  Text and tooltip are
+/// set when the text changes.  Message thread (the 60 Hz timer).
+void MainComponent::updateGenStopTcLabel(const TimecodeEngine& eng)
+{
+    using L = GeneratorWaveformWindow::LoopInCharge;
+    const auto state = GeneratorWaveformWindow::loopInCharge(eng);
+    const juce::String text = state == L::timecodeLoop ? "STOP TC (LOOP):"
+                            : state == L::abLoop       ? "STOP TC (A/B):"
+                                                       : "STOP TC (0=FREE):";
+    if (lblGenStopTC.getText() == text)
+        return;
+    lblGenStopTC.setText(text, juce::dontSendNotification);
+    lblGenStopTC.setTooltip(genStopTcLabelTooltip(state));
 }
 
 void MainComponent::populateGenPresetCombo()
