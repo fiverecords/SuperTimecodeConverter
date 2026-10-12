@@ -15,7 +15,8 @@
 // #24 -- one or neither), and cue points (edited in their own window,
 // Cues...).  The editor mirrors the TrackMapEditor UX: table + form at the
 // bottom for add/edit.
-// Calls onChange() whenever the preset map is modified.
+// Calls onChange() whenever the preset map is modified, and
+// onPresetUpdated() after Save has updated a preset.
 //==============================================================================
 class GeneratorPresetEditor : public juce::Component,
                               public juce::TableListBoxModel
@@ -67,9 +68,14 @@ public:
         btnAdd.setTooltip("Create a new preset from the form fields. "
                           "If a preset with the same name already exists, "
                           "the new one is auto-numbered (e.g. \"My preset (2)\").");
+        // The live part of Save (#24): MainComponent::applyGenPresetLoopBoxesLive.
         btnSave.setTooltip("Update the selected preset with the current form fields. "
                            "You can rename it by editing the Name field. "
-                           "Disabled until a preset is selected -- use Add to create a new one.");
+                           "Disabled until a preset is selected -- use Add to create a new one. "
+                           "The two loop boxes take effect at once on an engine that has this "
+                           "preset loaded, also while it plays, unless the name or the audio "
+                           "file changes; everything else takes effect when the preset is next "
+                           "applied (GO).");
         btnDelete.setTooltip("Delete the selected preset. Disabled until a preset is selected.");
         btnCues.setTooltip("Edit cue points for the selected preset. "
                            "Cue points fire MIDI / OSC / Art-Net triggers when the generated TC "
@@ -184,6 +190,14 @@ public:
     ~GeneratorPresetEditor() override = default;
 
     std::function<void()> onChange;
+
+    /// Called after Save (the Update of the selected preset) has stored it,
+    /// after onChange, with the preset as stored.  MainComponent applies
+    /// the preset's two loop boxes to every engine that has it loaded, at
+    /// once (#24, Joaky 2026-10-12): an engine that names it and was given
+    /// its file, so a renamed preset, or one given another file, is left to
+    /// GO.  Not called by Add, which makes a new preset.  Message thread.
+    std::function<void(const GeneratorPreset& stored)> onPresetUpdated;
 
     /// Set the selected engine's fps: the rate the Start/Stop TC fields are
     /// normalised at, and the one the cue editor converts cue TC to ms (and
@@ -654,7 +668,8 @@ private:
     /// that case we refuse and tell the user, so SAVE never silently
     /// overwrites someone else's preset.  When no row is selected, SAVE is
     /// a no-op (the button is disabled in that state, but we double-check
-    /// defensively).
+    /// defensively).  Stored, the preset goes to onPresetUpdated, so its
+    /// two loop boxes reach an engine that has it loaded at once (#24).
     void saveSelectedPreset()
     {
         auto name = edName.getText().trim();
@@ -724,6 +739,7 @@ private:
         notifyChange();
         if (const int row = rowOfPreset(name); row >= 0)
             table.scrollToEnsureRowIsOnscreen(row);
+        if (onPresetUpdated) onPresetUpdated(p);
     }
 
     void deleteSelected()
@@ -986,8 +1002,8 @@ private:
         help << "MODE\n";
         help << "  /stc/N/gen/clock (int)    0=transport, 1=clock\n";
         help << "  /stc/N/gen/looptc (int)   0=off, 1=Loop timecode (until the\n";
-        help << "                            next GO / preset load; off stops at\n";
-        help << "                            the end)\n\n";
+        help << "                            next GO / preset load, or a Save of\n";
+        help << "                            the preset here; off stops at the end)\n\n";
         help << "TIMECODE\n";
         help << "  /stc/N/gen/start (string)     \"HH:MM:SS:FF\"\n";
         help << "  /stc/N/gen/stoptime (string)  \"HH:MM:SS:FF\"\n\n";

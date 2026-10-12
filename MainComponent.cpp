@@ -2569,6 +2569,7 @@ void MainComponent::removeEngine(int index)
     }
 
     forgetNicMoves(engines[(size_t)index].get());   // keyed by the engine about to go
+    genPresetFileGiven.erase(engines[(size_t)index].get());
     engines.erase(engines.begin() + index);
 
     // Re-index remaining engines so isPrimary() and getIndex() stay correct.
@@ -5362,6 +5363,13 @@ void MainComponent::loadAndApplyNonAudioSettings()
         // Generator start/stop TC (applies regardless of current source)
         eng.setGeneratorClockMode(es.generatorClockMode);
         eng.setGeneratorPresetName(es.generatorPresetName);
+        // The settings keep the preset's name, not its file, and load none:
+        // the engine is taken to have been given that preset's file (#24,
+        // genPresetFileGiven), so a Save of the preset reaches it.
+        {
+            const auto* restored = settings.generatorPresets.find(es.generatorPresetName);
+            genPresetFileGiven[&eng] = restored != nullptr ? genPresetAudioFile(*restored) : juce::File();
+        }
         eng.setGeneratorStartMs(es.generatorStartMs);
         eng.setGeneratorStopMs(es.generatorStopMs);
         // Restore A/B loop (programming aid; standard DAW semantics).
@@ -6669,8 +6677,8 @@ void MainComponent::updateStatusLabels()
     // The STOP TC label says when the preset's "Loop timecode" (#24) is
     // what runs at the end: STOP TC (LOOP) while the loop acts, the same
     // test as the waveform window's LOOP TC.  There is no control on the
-    // panel: the preset carries the option (and OSC /stc/N/gen/looptc
-    // turns it on or off live).
+    // panel: the preset carries the option (and the preset editor's Save,
+    // or OSC /stc/N/gen/looptc, turns it on or off live).
     lblGenStopTC.setText(GeneratorWaveformWindow::loopTimecodeShown(eng) ? "STOP TC (LOOP):" : "STOP TC (0=FREE):",
                          juce::dontSendNotification);
 
@@ -6949,13 +6957,15 @@ void MainComponent::cycleGenPreset(int direction)
 // did not name the preset in use for the TCNet metadata nor show it in the
 // combo); the members after it add the panel.  "Loop timecode" (#24) and
 // "Loop audio file when it ends" follow the audio file: a preset's flags
-// reach the engine with it, in applyGenPresetToEngine, and nowhere else,
-// so the player's loop is set in the same load request as the flags the
-// engine holds for that file (TimecodeEngine::setGeneratorAudioFile).
-// Only OSC /stc/N/gen/looptc changes them live, for the file playing: it
-// sets the engine's Loop timecode and, turning it on, clears the engine's
-// Loop audio.  A browse that leaves the playing file alone leaves its
-// flags alone too.
+// reach the engine with it, in applyGenPresetToEngine, so the player's
+// loop is set in the same load request as the flags the engine holds for
+// that file (TimecodeEngine::setGeneratorAudioFile).  Two paths change
+// them live, for the file that is loaded: the preset editor's Save, which
+// gives an engine that has the preset loaded its two boxes
+// (applyGenPresetLoopBoxesLive), and OSC /stc/N/gen/looptc, which sets
+// the engine's Loop timecode and, turning it on, clears the engine's Loop
+// audio.  A browse that leaves the playing file alone leaves its flags
+// alone too.
 // Everything here runs on the message thread (OSC through callAsync).
 
 /// Apply `preset` to `eng`: preset name, Start/Stop TC, cue points, and --
@@ -6974,9 +6984,10 @@ void MainComponent::cycleGenPreset(int direction)
 /// path alone decides, as in the editor, and the disk is not touched: a
 /// preset whose file is missing gets Stop TC 0 then too.  A Stop TC typed
 /// in the panel or sent with /stc/N/gen/stoptime after this still
-/// applies.
+/// applies.  With its file, the preset's path goes to `fileGiven`, the
+/// engine's genPresetFileGiven (#24), whether the file is on disk or not.
 void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
-                                           bool withAudioFile)
+                                           bool withAudioFile, juce::File& fileGiven)
 {
     const auto fps = eng.getCurrentFps();
     const juce::File audioFile = preset.audioFilePath.isNotEmpty()
@@ -7008,7 +7019,10 @@ void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorP
     // engine sets the player's loop with the file from Stop TC (gapless at
     // the file's end without one), and settles it when the load completes.
     if (withAudioFile)
+    {
         eng.setGeneratorAudioFile(hasAudio ? audioFile : juce::File(), preset.audioLoop, preset.loopTimecode);
+        fileGiven = genPresetAudioFile(preset);
+    }
 }
 
 /// A browse of the preset combo: apply `preset` to `eng` without starting
@@ -7034,20 +7048,22 @@ void MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorP
 /// whose new end is behind the timecode wraps at the next tick.  With no
 /// audio playing (stopped, paused, or a preset without a file running)
 /// the file is applied too, with its flags.
-void MainComponent::browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset)
+void MainComponent::browseGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
+                                            juce::File& fileGiven)
 {
-    applyGenPresetToEngine(eng, preset, ! eng.isGeneratorAudioPlaying());
+    applyGenPresetToEngine(eng, preset, ! eng.isGeneratorAudioPlaying(), fileGiven);
 }
 
 /// GO: `eng` leaves Clock mode, stops, takes `preset` with its audio file
 /// (stopping first releases the previous file before the new one loads)
 /// and plays from Start TC.
-void MainComponent::goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset)
+void MainComponent::goGenPresetOnEngine(TimecodeEngine& eng, const GeneratorPreset& preset,
+                                        juce::File& fileGiven)
 {
     if (eng.getGeneratorClockMode())
         eng.setGeneratorClockMode(false);
     eng.generatorStop();
-    applyGenPresetToEngine(eng, preset, true);
+    applyGenPresetToEngine(eng, preset, true, fileGiven);
     eng.generatorPlay();
 }
 
@@ -7058,7 +7074,7 @@ void MainComponent::goGenPreset(int engineIndex, const GeneratorPreset& preset)
 {
     auto& eng = *engines[(size_t) engineIndex];
     const bool wasClock = eng.getGeneratorClockMode();
-    goGenPresetOnEngine(eng, preset);
+    goGenPresetOnEngine(eng, preset, genPresetFileGiven[&eng]);
     if (engineIndex == selectedEngine)
     {
         showGenPresetInPanel(eng);
@@ -7088,6 +7104,51 @@ void MainComponent::showGenPresetInPanel(TimecodeEngine& eng)
         }
 }
 
+/// The preset's audio file as a preset application gives it to an engine
+/// (genPresetFileGiven): its path, or none for a preset without one.  The
+/// disk is not asked.
+juce::File MainComponent::genPresetAudioFile(const GeneratorPreset& preset)
+{
+    return preset.audioFilePath.isNotEmpty() ? juce::File(preset.audioFilePath) : juce::File();
+}
+
+/// Whether `eng` has `preset` loaded (#24): its preset in use
+/// (getGeneratorPresetName) is the preset -- by name, without case, as the
+/// preset list keys its presets -- and the file it was last given with a
+/// preset (genPresetFileGiven) is the preset's: loaded, still loading
+/// after GO, or found missing on disk then (the engine runs it with none,
+/// as GO does).  A browse while the audio plays gives the engine the
+/// browsed name and keeps the file: to a preset with another file, the
+/// engine then has neither preset loaded; to a preset with the playing
+/// file, it has the browsed one loaded.  Not after the preset is renamed
+/// or given another file (GO applies it then).  The disk is not asked.
+/// Message thread.
+bool MainComponent::genEngineHasPresetLoaded(const TimecodeEngine& eng, const GeneratorPreset& preset) const
+{
+    if (! eng.getGeneratorPresetName().trim().equalsIgnoreCase(preset.name.trim()))
+        return false;
+    const auto it = genPresetFileGiven.find(&eng);
+    return (it != genPresetFileGiven.end() ? it->second : juce::File()) == genPresetAudioFile(preset);
+}
+
+/// The preset editor's Save stored `preset` (#24; Joaky, 2026-10-12: the
+/// loop boxes take effect on Update, so the operator hears the change
+/// without GO).  Every engine that has that preset loaded
+/// (genEngineHasPresetLoaded) gets the preset's two loop boxes at once,
+/// through TimecodeEngine::setGeneratorLoopFlags, whatever it is doing:
+/// playing, paused or stopped, with its load still pending after GO, or
+/// running without the file a GO found missing (as GO gives them then).
+/// Nothing else of the preset is applied: Start and Stop TC, the cues and
+/// the file wait until the preset is applied again (GO), as does a
+/// renamed preset (the engine still names the old one) or one given
+/// another file (the engine was given the old one).  Message thread.
+void MainComponent::applyGenPresetLoopBoxesLive(const GeneratorPreset& preset)
+{
+    for (auto& e : engines)
+        if (genEngineHasPresetLoaded(*e, preset))
+            e->setGeneratorLoopFlags(preset.audioLoop, preset.loopTimecode);
+}
+
 void MainComponent::activateGenPreset(const juce::String& name)
 {
     if (auto* preset = settings.generatorPresets.find(name))
@@ -7103,7 +7164,7 @@ void MainComponent::loadGenPresetToFields(const juce::String& name)
     if (!preset) return;
 
     auto& eng = currentEngine();
-    browseGenPresetOnEngine(eng, *preset);
+    browseGenPresetOnEngine(eng, *preset, genPresetFileGiven[&eng]);
     showGenPresetInPanel(eng);
     saveSettings();
 }
@@ -7214,11 +7275,12 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
         // (a float or a numeric string is read as one; T/F are not).  It
         // sets the engine's copy, held with the file it plays, not the
         // preset: the next time a preset's file is applied (GO,
-        // /gen/preset, a browse with no audio playing) the preset's flags
-        // come back.  Off while it plays: the pass in progress runs to the
-        // loop's end and the generator stops there.  On also turns the
-        // engine's copy of "Loop audio file when it ends" off
-        // (TimecodeEngine::setGeneratorLoopTimecode).
+        // /gen/preset, a browse with no audio playing), or the preset is
+        // saved in the preset editor (applyGenPresetLoopBoxesLive), the
+        // preset's flags come back.  Off while it plays: the pass in
+        // progress runs to the loop's end and the generator stops there.
+        // On also turns the engine's copy of "Loop audio file when it
+        // ends" off (TimecodeEngine::setGeneratorLoopTimecode).
         int val = msg.getInt(0, -1);
         if (val >= 0)
             eng.setGeneratorLoopTimecode(val != 0);
@@ -7332,6 +7394,10 @@ void MainComponent::openGeneratorPresetEditor()
     editor->onChange = [this]
     {
         populateGenPresetCombo();
+    };
+    editor->onPresetUpdated = [this](const GeneratorPreset& stored)
+    {
+        applyGenPresetLoopBoxesLive(stored);
     };
 
     struct FloatingWindow : juce::DocumentWindow
