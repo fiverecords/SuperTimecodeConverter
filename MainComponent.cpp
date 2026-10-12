@@ -10183,7 +10183,7 @@ bool MainComponent::handleGeneratorLoopKey(const juce::KeyPress& key)
             const double here = eng.getGeneratorCurrentMs();
             const double existingOut = eng.getGeneratorLoopOutMs();
             if (existingOut > 0.0 && here >= existingOut)
-                return true;  // refuse silently; the visible button shows a dialog
+                return true;  // refuse silently, as the window's [ does (it flashes, #24)
             eng.setGeneratorLoopInMs(here);
             saveSettings();
             return true;

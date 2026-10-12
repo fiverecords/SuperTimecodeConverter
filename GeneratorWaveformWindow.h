@@ -126,8 +126,10 @@ public:
         // The keys work in this window too: the frame MainComponent puts
         // this content in hands [ ] L to the main window's handler
         // (MainComponent::handleGeneratorLoopKey).
-        btnLoopIn .setTooltip("A/B loop: set In at the playhead (keyboard: [, in this window or the main window)");
-        btnLoopOut.setTooltip("A/B loop: set Out at the playhead (keyboard: ], in this window or the main window)");
+        btnLoopIn .setTooltip("A/B loop: set In at the playhead (keyboard: [, in this window or the main window).  "
+                              "At or past Out it is refused: the button flashes red.");
+        btnLoopOut.setTooltip("A/B loop: set Out at the playhead (keyboard: ], in this window or the main window).  "
+                              "At or before In it is refused: the button flashes red.");
 
         // "A/B LOOP", not "LOOP": the preset's Loop timecode is the other
         // loop (#24).
@@ -143,6 +145,13 @@ public:
                              "it lies past the end of the file (one set in a later pass of Loop "
                              "audio only, which runs only under Loop audio).");
 
+        // An In at or past Out, or an Out at or before In, is refused as
+        // the main window's keys refuse it (MainComponent::
+        // handleGeneratorLoopKey), with the button flashing red for 0.4 s
+        // (flashRefused).  Until #24 it opened a modal alert, and until its
+        // OK the other windows took no click, STOP and PLAY included
+        // (Joaky's field test: a ] pressed just after the timecode loop's
+        // jump back, before the In).
         btnLoopIn.onClick = [this] {
             if (engine == nullptr) return;
             // Loop In is a timestamp-setting gesture, gated by Show Lock to
@@ -153,10 +162,7 @@ public:
             const double existingOut = engine->getGeneratorLoopOutMs();
             if (existingOut > 0.0 && here >= existingOut)
             {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::AlertWindow::InfoIcon, "Loop In",
-                    "In point must be earlier than Out.  Move the playhead before "
-                    "the current Out, or clear the Out first.");
+                flashRefused(btnLoopIn, loopInFlashTicks);
                 return;
             }
             engine->setGeneratorLoopInMs(here);
@@ -172,10 +178,7 @@ public:
             const double existingIn = engine->getGeneratorLoopInMs();
             if (here <= existingIn)
             {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::AlertWindow::InfoIcon, "Loop Out",
-                    "Out point must be after In.  Move the playhead after the "
-                    "current In, or set the In first.");
+                flashRefused(btnLoopOut, loopOutFlashTicks);
                 return;
             }
             engine->setGeneratorLoopOutMs(here);
@@ -365,6 +368,8 @@ private:
     void timerCallback() override
     {
         updateLabels();
+        endFlash(btnLoopIn, loopInFlashTicks);
+        endFlash(btnLoopOut, loopOutFlashTicks);
         // Keep the loop toggle visually consistent with engine state.  The
         // user can change the loop via keyboard shortcut even when this
         // window does not have focus, so polling 30 Hz here is the simplest
@@ -483,6 +488,20 @@ private:
         lblAbsoluteTC.setText(tc.toString(), juce::dontSendNotification);
     }
 
+    /// A refused [ or ] (#24): the button red for kRefusedFlashTicks of the
+    /// 30 Hz timer, then its own colour again (endFlash).  Not modal, and no
+    /// focus or keyboard change.
+    void flashRefused(juce::TextButton& b, int& ticks)
+    {
+        b.setColour(juce::TextButton::buttonColourId, refusedRed);
+        ticks = kRefusedFlashTicks;
+    }
+    void endFlash(juce::TextButton& b, int& ticks)
+    {
+        if (ticks > 0 && --ticks == 0)
+            b.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF444444));
+    }
+
     static juce::String formatTime(double seconds)
     {
         const int total = (int) seconds;
@@ -501,6 +520,9 @@ private:
     juce::Colour accentAmber { 0xFFCC8844 };
     juce::Colour accentCyan  { 0xFF00AAFF };
     juce::Colour abMarkerAmber { 0xFFFFAA00 };   // GeneratorWaveformView's A/B markers
+    juce::Colour refusedRed  { 0xFFAA3333 };   // a refused [ or ] (flashRefused)
+    static constexpr int kRefusedFlashTicks = 12;   // 0.4 s of the 30 Hz timer
+    int loopInFlashTicks = 0, loopOutFlashTicks = 0;
 
     GeneratorAudioPlayer* player = nullptr;
     TimecodeEngine*       engine = nullptr;
