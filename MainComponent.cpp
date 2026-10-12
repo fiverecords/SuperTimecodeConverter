@@ -6956,7 +6956,7 @@ void MainComponent::cycleGenPreset(int direction)
 // paths share one copy of it (the OSC path had a copy of its own, which
 // did not name the preset in use for the TCNet metadata nor show it in the
 // combo); the members after it add the panel.  "Loop timecode" (#24) and
-// "Loop audio file when it ends" follow the audio file: a preset's flags
+// "Loop audio only" follow the audio file: a preset's flags
 // reach the engine with it, in applyGenPresetToEngine, so the player's
 // loop is set in the same load request as the flags the engine holds for
 // that file (TimecodeEngine::setGeneratorAudioFile).  Two paths change
@@ -7279,8 +7279,8 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
         // saved in the preset editor (applyGenPresetLoopBoxesLive), the
         // preset's flags come back.  Off while it plays: the pass in
         // progress runs to the loop's end and the generator stops there.
-        // On also turns the engine's copy of "Loop audio file when it
-        // ends" off (TimecodeEngine::setGeneratorLoopTimecode).
+        // On also turns the engine's copy of "Loop audio only" off
+        // (TimecodeEngine::setGeneratorLoopTimecode).
         int val = msg.getInt(0, -1);
         if (val >= 0)
             eng.setGeneratorLoopTimecode(val != 0);

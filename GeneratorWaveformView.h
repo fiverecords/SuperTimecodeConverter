@@ -33,7 +33,7 @@
 //   - Waveform peaks repaint on AudioThumbnail change notifications (JUCE
 //     emits these as the background peak generation progresses).
 //
-// The view shows the file once.  With "Loop audio file when it ends" the
+// The view shows the file once.  With "Loop audio only" the
 // timecode counts on past the file's end while the player loops the file,
 // so the cursor and the A/B points are folded by the file's length
 // (cursorFileSeconds, fileSecondsAt), and a point of the view stands for the
@@ -88,7 +88,7 @@ public:
 
     /// Where a point `sec` seconds after Start TC falls in a file `len`
     /// seconds long (> 0), with `looping` the player looping the file
-    /// ("Loop audio file when it ends", or the timecode loop's gapless
+    /// ("Loop audio only", or the timecode loop's gapless
     /// path; #24): the pass of the file (0 = the first) and the seconds
     /// into that pass.  While the player loops, both come from one floor,
     /// so they never disagree at a pass boundary: a point within
@@ -122,8 +122,8 @@ public:
     /// `len` seconds long (> 0), with `looping` the player looping the
     /// file: placeInFile's place, except for a position at or past Stop TC
     /// on a pass boundary from the second pass on -- a stop at Stop TC a
-    /// whole number of file lengths after Start TC under "Loop audio file
-    /// when it ends".  That is drawn at the end of the pass before, the
+    /// whole number of file lengths after Start TC under "Loop audio
+    /// only".  That is drawn at the end of the pass before, the
     /// right edge, as a stop at a file's end is, and not at the start of a
     /// pass the generator does not play (PLAY there stops at once; a click
     /// takes the pass before, pointMs).  Not while the timecode loop acts:
@@ -383,8 +383,7 @@ private:
                 // audioLength*1000] just don't have a visible marker --
                 // they still fire correctly at runtime; this is purely
                 // a visual.  Not folded by the file's length: under "Loop
-                // audio file when it ends" cues fire on the first pass
-                // only.
+                // audio only" cues fire on the first pass only.
                 const double cuePosMs = (double) gc.positionMs(fps);
                 const double posSec   = (cuePosMs - startMs) / 1000.0;
                 if (posSec < 0.0 || posSec > totalLen) continue;
@@ -447,7 +446,7 @@ private:
     }
 
     //==========================================================================
-    // Passes of the file (#24).  With "Loop audio file when it ends" the
+    // Passes of the file (#24).  With "Loop audio only" the
     // player loops the file and the timecode counts on past its end, so
     // timecode - Start TC (the relation every seek uses) passes the file's
     // length from the second pass on: the cursor sat at the right edge, and
@@ -488,8 +487,8 @@ private:
         return (place.pass > 0.0 && place.sec < kPassEdgeSec) ? totalLen : place.sec;
     }
 
-    /// The pass of the file the generator is in under "Loop audio file
-    /// when it ends" (placeInFile; 0 = the first).  Always 0 while the
+    /// The pass of the file the generator is in under "Loop audio only"
+    /// (placeInFile; 0 = the first).  Always 0 while the
     /// player does not loop the file, and with "Loop timecode" on: the
     /// engine then keeps "Loop audio" off and the player loops only on the
     /// timecode loop's gapless path, where a pass past the first is only

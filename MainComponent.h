@@ -943,7 +943,7 @@ private:
     void populateGenPresetCombo();
     // Generator presets (GO, the preset combo, OSC /stc/N/gen/preset):
     // the engine side, static so the three paths share it, then the panel.
-    // A preset's "Loop timecode" (#24) and "Loop audio file when it ends"
+    // A preset's "Loop timecode" (#24) and "Loop audio only"
     // reach the engine with the audio file, or live: the preset editor's
     // Save (applyGenPresetLoopBoxesLive) and OSC /stc/N/gen/looptc.
     // fileGiven is the engine's genPresetFileGiven.  Message thread.

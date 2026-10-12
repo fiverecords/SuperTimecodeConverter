@@ -11,10 +11,10 @@
 // GeneratorPresetEditor -- Table editor for named timecode generator presets.
 //
 // Each preset has a Name, Start TC, Stop TC, an optional audio file, what
-// happens at the end ("Loop audio file when it ends", or "Loop timecode",
-// #24 -- one or neither), and cue points (edited in their own window,
-// Cues...).  The editor mirrors the TrackMapEditor UX: table + form at the
-// bottom for add/edit.
+// happens at the end ("Loop audio only", or "Loop timecode", #24 -- one or
+// neither), and cue points (edited in their own window, Cues...).  The
+// editor mirrors the TrackMapEditor UX: table + form at the bottom for
+// add/edit.
 // Calls onChange() whenever the preset map is modified, and
 // onPresetUpdated() after Save has updated a preset.
 //==============================================================================
@@ -140,14 +140,24 @@ public:
         btnClearAudio.onClick = [this] { clearAudioField(); };
 
         // The two end options exclude each other: ticking one unticks the
-        // other.  "Loop audio file when it ends" loops only the audio (the
-        // timecode counts on past the file's end); "Loop timecode" (#24)
-        // takes the timecode, the audio and the cues back to Start TC where
-        // the generator would stop: at the end of the audio file, or at
-        // Stop TC for a preset without one.
+        // other.  "Loop audio only" loops only the audio (the timecode
+        // counts on past the file's end); "Loop timecode" (#24) takes the
+        // timecode, the audio and the cues back to Start TC where the
+        // generator would stop: at the end of the audio file, or at Stop TC
+        // for a preset without one.  Save applies both at once to an engine
+        // that has the preset loaded (onPresetUpdated), which each tooltip
+        // says (kLoopBoxSaveNote).  1.9.15-beta2 called the first "Loop
+        // audio file when it ends", which did not say that the timecode
+        // goes on (#24, Joaky's field test).
         addAndMakeVisible(btnLoopAudio);
-        btnLoopAudio.setButtonText("Loop audio file when it ends");
+        btnLoopAudio.setButtonText("Loop audio only (timecode keeps counting)");
         btnLoopAudio.setColour(juce::ToggleButton::textColourId, textBright);
+        btnLoopAudio.setTooltip(juce::String("Only the audio loops: at the end of the file it starts again "
+                                             "from the top, while the timecode keeps counting (up to a Stop "
+                                             "TC set after GO, or for ever) and the cue points fire on the "
+                                             "first pass only. For a music bed under a longer timecode. To "
+                                             "loop the timecode with the audio, tick Loop timecode below. ")
+                                + kLoopBoxSaveNote);
         btnLoopAudio.onClick = [this]
         {
             if (btnLoopAudio.getToggleState())
@@ -157,8 +167,9 @@ public:
         addAndMakeVisible(btnLoopTimecode);
         btnLoopTimecode.setButtonText("Loop timecode (back to Start TC at the end)");
         btnLoopTimecode.setColour(juce::ToggleButton::textColourId, textBright);
-        btnLoopTimecode.setTooltip("At Stop TC, or at the end of the audio file, the timecode "
-                                   "and the audio go back to Start TC.");
+        btnLoopTimecode.setTooltip(juce::String("At Stop TC, or at the end of the audio file, the timecode "
+                                                "and the audio go back to Start TC. ")
+                                   + kLoopBoxSaveNote);
         btnLoopTimecode.onClick = [this]
         {
             if (btnLoopTimecode.getToggleState())
@@ -257,7 +268,7 @@ public:
         const juce::Font font(juce::FontOptions(11.0f));
         g.setColour(stopOverriddenByAudio ? textMid : textBright);
         g.setFont(font);
-        juce::String text;
+        juce::String text, suffix;
         switch (columnId)
         {
             case ColName:  text = p.name;    break;
@@ -270,12 +281,29 @@ public:
                 {
                     text = juce::File(p.audioFilePath).getFileName();
                     // A file with both flags runs "Loop timecode" (the engine's
-                    // rule, TimecodeEngine::setGeneratorAudioFile).
-                    if (p.audioLoop && ! p.loopTimecode) text += "  (loop)";
+                    // rule, TimecodeEngine::setGeneratorAudioFile).  "(loop
+                    // audio)", not "(loop)" as in 1.9.15-beta2: with the
+                    // timecode's "(loop TC)" and the A/B loop there are three
+                    // loops, and this is the one the box and the waveform
+                    // window's LOOP AUDIO name.
+                    if (p.audioLoop && ! p.loopTimecode) suffix = "  (loop audio)";
                 }
                 break;
         }
-        g.drawText(text, 4, 0, width - 8, height, juce::Justification::centredLeft, true);
+        // The suffix is kept whole and the file name cut with an ellipsis
+        // before it: "(loop audio)" is 6 characters longer than beta2's
+        // "(loop)", and at the end of the text it was what the ellipsis cut
+        // first, for file names of ordinary length at the editor's default
+        // width.
+        int textW = width - 8;
+        if (suffix.isNotEmpty())
+            textW = juce::jmax(0, textW - juce::roundToInt(juce::GlyphArrangement::getStringWidth(font, suffix)) - 1);
+        g.drawText(text, 4, 0, textW, height, juce::Justification::centredLeft, true);
+        if (suffix.isNotEmpty())
+        {
+            const int x = 4 + juce::jmin(textW, juce::roundToInt(juce::GlyphArrangement::getStringWidth(font, text)));
+            g.drawText(suffix, x, 0, juce::jmax(0, width - 4 - x), height, juce::Justification::centredLeft, true);
+        }
 
         // "Loop timecode" (#24) after the Stop TC: bright, or muted when a
         // preset without an audio file gives the loop nothing to act on --
@@ -477,6 +505,13 @@ private:
     // the selected engine's current fps) via setCurrentFpsForCueEditor.
     // Default 30 if never set.
     double currentFpsForCueEditor = 30.0;
+
+    // The sentence both loop boxes' tooltips end with (#24): when their
+    // change reaches the engine (MainComponent::applyGenPresetLoopBoxesLive).
+    static constexpr const char* kLoopBoxSaveNote =
+        "It takes effect when you press Save, also on an engine that is playing this "
+        "preset; if the name or the audio file changes, when the preset is next "
+        "applied (GO).";
 
     // TimecodeEngine::kMinLoopTimecodeMs (#24), the shortest loop "Loop
     // timecode" makes, for the table's "(loop TC)"; repeated here so this
@@ -900,9 +935,9 @@ private:
             });
     }
 
-    /// Clearing the audio file unticks "Loop audio file when it ends",
-    /// which needs one; "Loop timecode" stays as it is, as it also loops at
-    /// a Stop TC without a file.
+    /// Clearing the audio file unticks "Loop audio only", which needs one;
+    /// "Loop timecode" stays as it is, as it also loops at a Stop TC
+    /// without a file.
     void clearAudioField()
     {
         edAudio.clear();

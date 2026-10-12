@@ -3210,13 +3210,13 @@ public:
     // starting at Start TC (generatorAbLoopFollowed): In before Start TC,
     // Out past the end, or on the gapless path an Out within a tick
     // (kGenLoopTickMs) of the file's end, where the fold, or the player's
-    // own loop, gets there before the A/B's seek.  "Loop audio file when
-    // it ends" and this exclude each other, as the preset editor's two
-    // boxes untick each other: set together (a preset file with both),
-    // this wins, and turning this on (OSC) turns the engine's copy of the
-    // other off -- so turning it off again always gives the last pass
-    // below, never a return to "Loop audio".  Clock mode is untouched
-    // (updateGenerator returns before any of this).
+    // own loop, gets there before the A/B's seek.  "Loop audio only" and
+    // this exclude each other, as the preset editor's two boxes untick
+    // each other: set together (a preset file with both), this wins, and
+    // turning this on (OSC) turns the engine's copy of the other off -- so
+    // turning it off again always gives the last pass below, never a
+    // return to "Loop audio".  Clock mode is untouched (updateGenerator
+    // returns before any of this).
     //
     // The flag follows the audio file, not the preset selection: it is set
     // with the file (setGeneratorAudioFile), so the player's loop is carried
@@ -3227,7 +3227,7 @@ public:
     // message thread (the 60 Hz tick, the UI, OSC).
 
     /// The two end options of the file that is loaded, switched live (#24):
-    /// "Loop audio file when it ends" (audioLoop) and "Loop timecode"
+    /// "Loop audio only" (audioLoop) and "Loop timecode"
     /// (loopTimecode), with the rules they have at GO
     /// (setGeneratorAudioFile): they exclude each other and, both given,
     /// loopTimecode wins.  The preset editor's Update calls it with a
@@ -3319,7 +3319,7 @@ public:
                                        true, true);
     }
 
-    /// "Loop audio file when it ends" alone, live (setGeneratorLoopFlags).
+    /// "Loop audio only" alone, live (setGeneratorLoopFlags).
     /// On, it turns the timecode loop off, as ticking its box in the preset
     /// editor unticks the other; off when it was not on changes nothing.
     /// Message thread.
@@ -3330,7 +3330,7 @@ public:
 
     /// Turn the timecode loop on or off live (OSC /stc/N/gen/looptc;
     /// setGeneratorLoopFlags).  On, it also turns off the engine's copy of
-    /// "Loop audio file when it ends" (the two exclude each other; this
+    /// "Loop audio only" (the two exclude each other; this
     /// wins), so that off while it plays always gives a last pass, whatever
     /// the preset's "Loop audio" says: the pass in progress runs to the end
     /// and the generator stops there, as without the loop (the player stops
@@ -3348,12 +3348,12 @@ public:
     /// setGeneratorLoopFlags), whether or not the loop can act.
     bool getGeneratorLoopTimecode() const { return genLoopTimecode; }
 
-    /// The engine's "Loop audio file when it ends" as last set (with the
+    /// The engine's "Loop audio only" as last set (with the
     /// file or by setGeneratorLoopFlags; off while the timecode loop is on),
     /// whether or not a file is loaded.
     bool getGeneratorAudioLoop() const { return genAudioLoop; }
 
-    /// True while "Loop audio file when it ends" runs: the flag is on and
+    /// True while "Loop audio only" runs: the flag is on and
     /// the player loops the loaded file, no load pending.  For the
     /// indicators, next to isGeneratorLoopTimecodeActive and
     /// isGeneratorAbLoopFollowed.  False with no file
@@ -3675,7 +3675,7 @@ public:
     /// Loop flag is applied at the same time so subsequent file ends honour it.
     /// Returns immediately -- the actual load runs on a dedicated I/O thread.
     ///
-    /// shouldLoop is the preset's "Loop audio file when it ends";
+    /// shouldLoop is the preset's "Loop audio only";
     /// loopTimecode its "Loop timecode" (#24).  Both follow the file: they
     /// are set here, or live for the file that is loaded
     /// (setGeneratorLoopFlags, the preset editor's Update; OSC looptc,
@@ -3923,7 +3923,7 @@ private:
     double genLastAudioMs = -1.0;       // audio clock discipline (updateGenerator)
     double genLastAudioMoveTs = 0.0;  // hiRes ms for delta calculation
     // Timecode loop (#24; see "Generator timecode loop" above): the preset's
-    // "Loop timecode" and "Loop audio file when it ends" as given with the
+    // "Loop timecode" and "Loop audio only" as given with the
     // file (setGeneratorAudioFile) or live (setGeneratorLoopFlags; the first
     // also by OSC).  Never both true: setting the first clears the second.
     // genAudioLoopLastPassEndMs: Loop audio turned off live from its second
@@ -5336,9 +5336,9 @@ private:
     ///     (the cue's positionMs equals the previous mark, which is excluded
     ///     by the strict-less comparison).
     ///   - The A/B loop wraps the TC back to loop In -> every iteration
-    ///     re-fires the cues inside the loop region.  "Loop audio file when
-    ///     it ends" does not: it loops the audio only, the TC keeps counting
-    ///     past the file's end, so its cues fire on the first pass only.
+    ///     re-fires the cues inside the loop region.  "Loop audio only"
+    ///     does not: it loops the audio only, the TC keeps counting past
+    ///     the file's end, so its cues fire on the first pass only.
     ///   - Backward jumps (seek back, stop+restart) just update prevMs
     ///     without firing anything; a loop wrap moves the cursor itself
     ///     (wrapGenerator).
@@ -5759,9 +5759,8 @@ private:
 
     /// The player's own loop as the options want it, the hold aside
     /// (syncGeneratorPlayerLooping): on for the timecode loop's gapless
-    /// path; with the timecode loop off, on for "Loop audio file when it
-    /// ends" and for its last pass after it is turned off live.  Message
-    /// thread.
+    /// path; with the timecode loop off, on for "Loop audio only" and for
+    /// its last pass after it is turned off live.  Message thread.
     bool generatorPlayerLoopWanted() const
     {
         double endMs = 0.0;
@@ -5865,7 +5864,7 @@ private:
             //    exactly that length, at its own instant -- each fold would
             //    otherwise read as an error of a whole pass and switch this
             //    off;
-            //  - with "Loop audio file when it ends" (the player loops the
+            //  - with "Loop audio only" (the player loops the
             //    file, the timecode loop does not act) the timecode never
             //    folds: it counts on past the file's end, a whole number of
             //    file lengths after the audio's place from the second pass
@@ -5952,7 +5951,7 @@ private:
             // past Out, such as A/B LOOP armed there, lands on In).  Checked
             // BEFORE stop TC and EOF -- if both the stop TC and the loop Out
             // fall in the same tick, the loop wins (the user explicitly armed
-            // the loop).  ("Loop audio file when it ends" has no such wrap:
+            // the loop).  ("Loop audio only" has no such wrap:
             // the TC never goes back, see the EOF branch below.)
             //
             // Then the timecode loop (#24): at its end, back to Start TC
@@ -5982,7 +5981,7 @@ private:
             // Without this, the SMPTE would keep advancing past the file's
             // last sample (the audio transport silently auto-stops at EOF
             // but nothing was relaying that back to the generator state).
-            // With "Loop audio file when it ends" this branch is skipped
+            // With "Loop audio only" this branch is skipped
             // (isLooping): the player loops the audio, and the TC keeps
             // counting past the file's end -- until Stop TC, or for ever
             // without one.  Nothing here folds genCurrentMs; only a seek is
@@ -6031,11 +6030,11 @@ private:
             // Uses the crossing-based variant: a cue fires whenever the
             // generated TC advances across its position in play.  Seeking
             // backwards and playing forward will re-fire cues, and the A/B
-            // loop re-fires them every iteration ("Loop audio file when it
-            // ends" does not: the TC does not go back) -- which is what the
-            // Generator's transport-mode UX wants (vs. the TrackMap path
-            // where each cue fires at most once per track to match how a
-            // CDJ scratch / jog should behave).
+            // loop re-fires them every iteration ("Loop audio only" does
+            // not: the TC does not go back) -- which is what the Generator's
+            // transport-mode UX wants (vs. the TrackMap path where each cue
+            // fires at most once per track to match how a CDJ scratch / jog
+            // should behave).
             tickCuePointsCrossing((uint32_t) juce::jmax(0.0, genCurrentMs));
         }
         // Stopped and Paused: genCurrentMs stays where it is
