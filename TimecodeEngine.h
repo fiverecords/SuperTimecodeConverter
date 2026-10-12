@@ -90,7 +90,10 @@ public:
         //
         // First the player's own loop is settled against the timecode loop
         // (#24): the request could only guess it, the file's length being
-        // unknown until now (syncGeneratorPlayerLooping).
+        // unknown until now (syncGeneratorPlayerLooping).  The seek is
+        // seekGeneratorAudioToTimecode's: on the timecode loop's gapless path
+        // a timecode before Start TC (an OSC jog there while the load was
+        // pending) puts the audio at the file's tail, folded into the loop.
         generatorAudioPlayer.onLoadCompleted =
             [weak = juce::WeakReference<TimecodeEngine>(this)]()
             {
@@ -98,9 +101,7 @@ public:
                 if (self == nullptr) return;
                 self->syncGeneratorPlayerLooping();
                 if (self->genState == GeneratorState::Stopped) return;
-                const double audioPosSec = juce::jmax(0.0,
-                    (self->genCurrentMs - self->genStartMs) / 1000.0);
-                self->generatorAudioPlayer.seekSeconds(audioPosSec);
+                self->seekGeneratorAudioToTimecode();
             };
     }
 
@@ -3520,6 +3521,10 @@ public:
     ///
     /// The caller is responsible for any clamping (e.g. against Stop TC or
     /// the audio file's length); this method only enforces newMs >= 0.
+    /// The audio goes where the timecode puts it
+    /// (seekGeneratorAudioToTimecode): timecode - Start TC, folded into the
+    /// file while the player loops it, and on the timecode loop's gapless
+    /// path also before Start TC (#24).
     ///
     /// A jump of kGenSeekAnnounceMs or more is told to the outputs as a
     /// seek (genJumpAnnounce, consumed by the next tick's
@@ -3582,8 +3587,7 @@ public:
             setFramePhaseFromPosition(genCurrentMs, currentFps);
         }
 
-        const double audioPosSec = juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0);
-        generatorAudioPlayer.seekSeconds(audioPosSec);
+        seekGeneratorAudioToTimecode();
 
         // For the EOF-resume case, the audio player still has shouldPlay
         // cleared (stopAndReset was called when the EOF auto-stop fired),
@@ -3643,6 +3647,27 @@ public:
     }
 
     void stopGeneratorAudio() { generatorAudioPlayer.closeDevice(); }
+
+    /// The generator's audio output was (re)opened (startGeneratorAudio:
+    /// MainComponent::startCurrentGenAudio, for the AUDIO PLAYBACK DEVICE or
+    /// AUDIO CHANNEL changed, or the output turned on), which attaches the
+    /// loaded file at its top: bring the audio to where the timecode puts
+    /// it, as a seek of the generator does (seekGeneratorAudioToTimecode,
+    /// which on the timecode loop's gapless path folds a timecode before
+    /// Start TC into the loop, #24), and start it while the generator
+    /// plays.  Paused, the audio is only positioned, as PLAY from Paused
+    /// does not seek: it used to stay at the file's top, and PLAY started
+    /// it there wherever the timecode was.  Stopped, nothing: PLAY seeks.
+    /// While a load is pending the player ignores the seek, and the load's
+    /// completion brings the audio to the timecode.  Message thread.
+    void resyncGeneratorAudioToTimecode()
+    {
+        if (genState == GeneratorState::Stopped)
+            return;
+        seekGeneratorAudioToTimecode();
+        if (genState == GeneratorState::Playing)
+            generatorAudioPlayer.play();
+    }
 
     bool isGeneratorAudioRunning() const { return generatorAudioPlayer.isDeviceOpen(); }
 
@@ -5564,6 +5589,36 @@ private:
     /// the player loop the file then seeks it: a skip or repeat of about
     /// that much, in about one switch in twelve.
     static constexpr double kGenAudioInStepMs = 100.0;
+
+    /// Seek the audio to where the timecode puts it, for a seek of the
+    /// generator (setGeneratorPosition: a click on the waveform, an OSC jog),
+    /// the load completion's catch-up (onLoadCompleted) and the audio
+    /// output's (re)opening (resyncGeneratorAudioToTimecode): timecode -
+    /// Start TC, which the player folds into the file while it loops the
+    /// file and holds at 0 below its top.  On the timecode loop's gapless
+    /// path a timecode before Start TC -- an OSC jog there, or the timecode
+    /// running up to a later Start TC -- is folded into the loop instead,
+    /// as a Start TC change folds it (seekGeneratorAudioIntoLoop): the audio
+    /// plays the file's tail and goes round into its top as the timecode
+    /// reaches Start TC (#24).  Held at the top, the audio ran ahead of the
+    /// timecode by what was left to Start TC, and DESIGN D18, which compares
+    /// the two modulo the file's length there, pulled the timecode forwards
+    /// when that was under a second, backwards when it was within a second
+    /// of the file's length (the nearer relation then lying across the
+    /// fold), up to 20 ms a tick, and left the two apart for good in
+    /// between.  At or past Start TC the
+    /// player's own fold gives the same place, and the seek is made as
+    /// before.  While a load is pending the player ignores the seek, and
+    /// the completion's catch-up comes back here.  Message thread.
+    void seekGeneratorAudioToTimecode()
+    {
+        double loopEndMs = 0.0;
+        bool loopGapless = false;
+        if (genCurrentMs < genStartMs && loopTimecodeEnd(loopEndMs, loopGapless) && loopGapless)
+            seekGeneratorAudioIntoLoop(loopEndMs, true);
+        else
+            generatorAudioPlayer.seekSeconds(juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0));
+    }
 
     /// Whether the generator follows the armed A/B loop: always without the
     /// timecode loop; with it (#24), only an A/B inside the timecode loop --

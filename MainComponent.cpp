@@ -4262,14 +4262,11 @@ void MainComponent::startCurrentGenAudio()
         // is closed, and attachReaderToTransport() (called from openDevice)
         // re-binds the source to the transport.
 
-        // If the generator is currently playing, resume audio at the current
-        // position rather than waiting for the next play/stop transition.
-        if (eng.getGeneratorState() == TimecodeEngine::GeneratorState::Playing)
-        {
-            double pos = (eng.getGeneratorCurrentMs() - eng.getGeneratorStartMs()) / 1000.0;
-            eng.getGeneratorAudio().seekSeconds(juce::jmax(0.0, pos));
-            eng.getGeneratorAudio().play();
-        }
+        // The device opened with the file at its top: bring the audio to
+        // where the timecode is -- folded into the timecode loop as a seek
+        // is, and also while paused, so PLAY resumes in step -- and resume
+        // it if the generator plays (#24, resyncGeneratorAudioToTimecode).
+        eng.resyncGeneratorAudioToTimecode();
     }
 }
 
