@@ -5524,11 +5524,59 @@ private:
             // during playback (AUDIT LTC-4); the load's onLoadCompleted
             // seek brings the new file to the timecode.
             //
-            // The timecode loop (#24) is worked out first: on its gapless
-            // path the player goes round on its own and the timecode folds
-            // by exactly the file's length, each at its own instant, so the
-            // two are compared modulo that length -- each fold would
-            // otherwise read as an error of a whole pass and switch this off.
+            // The timecode loop (#24) is worked out first.  While the player
+            // loops the file and the timecode loop is not on its seek path,
+            // the two are compared modulo the file's length, as the audio
+            // goes round at the file's end on its own:
+            //  - on the timecode loop's gapless path the timecode folds by
+            //    exactly that length, at its own instant -- each fold would
+            //    otherwise read as an error of a whole pass and switch this
+            //    off;
+            //  - with "Loop audio file when it ends" (the player loops the
+            //    file, the timecode loop does not act) the timecode never
+            //    folds: it counts on past the file's end, a whole number of
+            //    file lengths after the audio's place from the second pass
+            //    on.  Compared as they were, that read as an error of a pass
+            //    or more and switched this off after the first pass: the
+            //    timecode ran on the system clock and drifted from the audio
+            //    by the device's clock error (0.2-0.4 s an hour at 50-100
+            //    ppm), and with a file of about a second or less a pass read
+            //    as drift and held the timecode back, up to 20 ms a tick --
+            //    with one of about 0.3 s or less for good, 0.8-1.0 s past
+            //    Start TC.  Modulo the length the timecode follows the audio
+            //    device's clock in every pass, as in the first, and counts at
+            //    that clock's rate for the whole run, with a file longer than
+            //    about two device blocks.  With a shorter file the position
+            //    read here, up to a block old, can alias modulo the length:
+            //    the timecode still settles at its usual offset from the
+            //    audio modulo the length, but may slide there over tens of
+            //    seconds, by up to a whole file length, at up to about 2 ms a
+            //    tick and without a jump.  A file of a block or less is in
+            //    effect not corrected (one whose length divides the block
+            //    leaves the position read unchanged, so the stall guard
+            //    below keeps this off): the timecode runs on the system
+            //    clock;
+            //  - the same in the tick or few in which the timecode loop,
+            //    turned off on its gapless path or no longer acting there
+            //    (e.g. a Stop TC set less than kMinLoopTimecodeMs after Start
+            //    TC), leaves the player looping until the audio has gone
+            //    round (syncGeneratorPlayerLooping).
+            // On the seek path they are compared as they are, also in the
+            // ticks in which the player's loop is still held that way after
+            // a Stop TC set at the seam has moved the loop there: with a
+            // file little more than a second long and large device blocks,
+            // such a tick can pull the timecode forward by up to 20 ms.
+            // The remainder lies within half the file's length, so the pull
+            // is at most 1 % of that length a tick (and 20 ms, with the
+            // second's limit above), never a whole file.  Under Loop audio
+            // the comparison is modulo the length from the start, the first
+            // pass included: an error of more than half the file's length
+            // -- Start TC moved while the file plays, a jog to before Start
+            // TC, a device stall -- is pulled, when the remainder is under
+            // the second, to the nearest relation modulo the length, which
+            // can be the other way round to the unfolded difference, and
+            // without waiting for the audio to go round.  Not while a load is
+            // pending (above): the length is the loaded file's.
             double loopEndMs = 0.0;
             bool loopGapless = false;
             const bool loopTimecode = loopTimecodeEnd(loopEndMs, loopGapless);
@@ -5543,6 +5591,8 @@ private:
                 double err = audioMs - genCurrentMs;
                 if (loopTimecode && loopGapless)
                     err = std::remainder(err, loopEndMs - genStartMs);
+                else if (! loopTimecode && generatorAudioPlayer.isLooping())
+                    err = std::remainder(err, generatorAudioPlayer.getFileLengthSeconds() * 1000.0);
                 if (std::abs(err) < 1000.0 && (now - genLastAudioMoveTs) < 200.0)
                     genCurrentMs += err * 0.02;
             }
