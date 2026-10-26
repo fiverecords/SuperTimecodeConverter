@@ -13,8 +13,9 @@
 // Flow:
 //   1. Connect to FileTransfer service port (from service handshake)
 //   2. getSources() -> list media locations (USB/SD)
-//   3. Download /{source}/Engine Library/Database2/m.db (or v1 fallback)
-//   4. Open with SQLite, cache track metadata + artwork
+//   3. Download the first source's /{source}/Engine Library/Database2/m.db
+//      (or v1 fallback); another source's when a track on it is asked for
+//   4. Open each with SQLite, cache track metadata + artwork per source
 //   5. On TrackNetworkPath change: lookup Track -> AlbumArt -> juce::Image
 //
 // Requires: sqlite3 amalgamation (sqlite3.h + sqlite3.c) in the project.
@@ -24,8 +25,13 @@
 #include "StageLinQInput.h"
 #include "ImageGuard.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <map>
+#include <memory>
+#include <system_error>
+#include <thread>
 #include <vector>
 #include <cstring>
 
@@ -312,9 +318,25 @@ inline juce::String musicalKeyToString(int keyIndex)
 //==============================================================================
 // StageLinQDbClient -- FileTransfer + SQLite database client
 //==============================================================================
+// One medium of the unit (a source of its list: USB 1, SD, "... (Internal)")
+// and its database in a session
+struct StageLinQSourceDb
+{
+    enum class State { notTried, ready, noLibrary, failed };
+    juce::String name;
+    State state = State::notTried;
+    sqlite3* db = nullptr;              // open while ready
+    juce::File file;                    // the downloaded copy (deleted on close)
+    bool perfDataIsTable = false;       // PerformanceData is an ordinary table
+    int trackCount = 0;
+    juce::String failure;               // why it failed
+};
+
 class StageLinQDbClient : public juce::Thread
 {
 public:
+    using SourceDb = StageLinQSourceDb;
+
     StageLinQDbClient()
         : Thread("SLQ-DB")
     {
@@ -433,50 +455,50 @@ public:
     bool getIsRunning() const { return isRunningFlag.load(); }
 
     //--------------------------------------------------------------------------
-    // Public getters (thread-safe)
+    // Public getters (thread-safe; the message thread calls them)
     //--------------------------------------------------------------------------
+    // Each looks the track up by its TrackNetworkPath in what the database
+    // of its own source gave (net://<uuid>/<source>/...: USB 1, SD, ...); a
+    // streaming track by its URI.  No track is answered from another
+    // source's database.  The uuid in the path (the unit that holds the
+    // medium) is not compared: a track of another unit's USB 1 is looked
+    // up in the served unit's USB 1, as before 1.9.16.
 
     // Lookup track by network path (e.g. from StateMap TrackNetworkPath)
     DenonTrackMeta getTrackByNetworkPath(const juce::String& networkPath) const
     {
-        // Parse network path: net://uuid/source/Engine Library/Music/path
-        auto trackPath = parseNetworkPathToDbPath(networkPath);
-        if (trackPath.isEmpty()) return {};
+        const auto key = parseNetworkPath(networkPath).key();
+        if (key.empty()) return {};
 
         std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = trackCache.find(trackPath.toStdString());
+        auto it = trackCache.find(key);
         if (it != trackCache.end())
             return it->second;
         return {};
     }
 
-    // Get artwork image for a track
-    juce::Image getArtwork(int albumArtId) const
+    // Get artwork image by network path.  Album art ids are per database,
+    // so the artwork is kept per track.
+    juce::Image getArtworkForTrack(const juce::String& networkPath) const
     {
-        if (albumArtId <= 0) return {};
+        const auto key = parseNetworkPath(networkPath).key();
+        if (key.empty()) return {};
+
         std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = artworkCache.find(albumArtId);
+        auto it = artworkCache.find(key);
         if (it != artworkCache.end())
             return it->second;
         return {};
     }
 
-    // Get artwork image by network path (convenience)
-    juce::Image getArtworkForTrack(const juce::String& networkPath) const
-    {
-        auto meta = getTrackByNetworkPath(networkPath);
-        if (!meta.valid || meta.albumArtId <= 0) return {};
-        return getArtwork(meta.albumArtId);
-    }
-
     // Get overview waveform for a track (3 bytes per entry: mid/high/low)
     DenonWaveformData getWaveformForTrack(const juce::String& networkPath) const
     {
-        auto trackPath = parseNetworkPathToDbPath(networkPath);
-        if (trackPath.isEmpty()) return {};
+        const auto key = parseNetworkPath(networkPath).key();
+        if (key.empty()) return {};
 
         std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = waveformCache.find(trackPath.toStdString());
+        auto it = waveformCache.find(key);
         if (it != waveformCache.end())
             return it->second;
         return {};
@@ -485,11 +507,11 @@ public:
     // Get performance data (quick cues, loops, beat grid) for a track
     DenonPerformanceData getPerformanceData(const juce::String& networkPath) const
     {
-        auto trackPath = parseNetworkPathToDbPath(networkPath);
-        if (trackPath.isEmpty()) return {};
+        const auto key = parseNetworkPath(networkPath).key();
+        if (key.empty()) return {};
 
         std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = perfCache.find(trackPath.toStdString());
+        auto it = perfCache.find(key);
         if (it != perfCache.end())
             return it->second;
         return {};
@@ -503,10 +525,34 @@ public:
         pendingRequests.add(networkPath);
     }
 
-    // True if database has been downloaded and opened
+    // True once a source's database has been downloaded and opened in this
+    // session (another source's may still be downloading)
     bool isDatabaseReady() const { return dbReady.load(); }
 
 private:
+    // Threads: everything below runs on the client's thread (SLQ-DB)
+    // unless its comment says otherwise.  The static helpers
+    // (parseNetworkPath, oldFormDbPath, sqliteImmutableUri, the table
+    // checks, the BLOB decoders) keep no state and run on any thread: the
+    // getters call parseNetworkPath on the message thread.
+
+    // A track as its TrackNetworkPath names it (parseNetworkPath)
+    struct TrackRef
+    {
+        juce::String source;                // parts[3]; empty for a streaming track
+        juce::String dbPath;                // Track.path, or Track.uri when streaming
+        bool streaming = false;
+
+        bool valid() const { return dbPath.isNotEmpty(); }
+        // The cache key: the source and the path (one medium's row never
+        // stands for another's)
+        std::string key() const
+        {
+            if (!valid()) return {};
+            return ((streaming ? juce::String("streaming") : source) + "\n" + dbPath).toStdString();
+        }
+    };
+
     //==========================================================================
     // Thread main loop
     //==========================================================================
@@ -539,7 +585,10 @@ private:
 
             fltxReadBuf.clear();            // nothing of the last session's stream
             unansweredStats.clear();
-            lostTransfers.clear();
+            seenRequests.clear();
+            lastSourcesAskMs = 0.0;
+            sourcesAskIntervalMs = kSourcesAskFirstMs;
+            nextConnectMs = 0.0;
             {
                 std::lock_guard<std::mutex> lock(cacheMutex);   // built from the last database
                 trackCache.clear();
@@ -577,57 +626,103 @@ private:
         return threadShouldExit() || targetSerial.load() != servedSerial;
     }
 
+    //==========================================================================
+    // A session: one device and port, as start() asks for.
+    //  - At the start the first source that has a database is downloaded,
+    //    as before 1.9.16, so the first track is not delayed.
+    //  - A track names its source in its TrackNetworkPath (parts[3] of
+    //    net://<uuid>/<source>/...: USB 1, SD, "(Internal)", ...).  A
+    //    request for a source whose database is not loaded yet has that
+    //    database downloaded, and waits meanwhile: it is never answered from
+    //    another medium's database.  Requests the loaded databases can
+    //    answer are answered first, and also while a download runs.
+    //  - A source the last source list did not name has the list asked for
+    //    again, at most once every 5 s, and less often (10, 20, 40, then
+    //    every 60 s) while that brings no new source; a new request starts
+    //    over.  This has no end while such a request waits (a deck holds a
+    //    track of another unit's medium, say): it is how a medium inserted
+    //    later is found.
+    //  - A streaming track is looked up by Track.uri in the database of the
+    //    unit's internal storage (a source named "... (Internal)") when the
+    //    unit lists one and it has a database, else in each one loaded.
+    //  - The databases stay open until the session ends.  When the
+    //    FileTransfer connection closes they stay in use; a connection is
+    //    opened again only when a request needs the device.
+    // A connection on which a request went unanswered is not used again (a
+    // late reply would be taken for the next request's, VERIFY V10): when
+    // that request was a stat, the path is noted as unanswered and the next
+    // connection goes on with the paths not tried yet.  Likewise after a
+    // transfer that did not complete (its chunks could still come, and be
+    // placed in the next file): the source is noted as failed, and while no
+    // database is loaded yet a new connection goes on with the next source,
+    // when the last list names one not tried yet (at most kMaxTransfersLost
+    // times in a session).
+    //==========================================================================
     void runSession()
     {
-        // A connection on which a request went unanswered is not used again
-        // (a late reply would be taken for the next request's, VERIFY V10):
-        // when that request was a stat, the path is noted as unanswered and
-        // a new connection goes on with the paths not tried yet.  Likewise
-        // after a transfer that did not complete (its chunks could still
-        // come, and be placed in the next file): the path is noted, and a
-        // new connection goes on with the next path or source, as before
-        // 1.9.16, where a download that failed moved on to the next one.
-        for (;;)
+        bool firstDone = false;             // the first database is loaded
+        int transfersLost = 0;              // before it was
+        while (!sessionShouldEnd())
         {
-            const DbSearch found = connectAndDownload();
-            if (((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
-                 || (found == DbSearch::transferLost && lostTransfers.size() <= kMaxTransfersLost))
-                && !sessionShouldEnd())
+            if (!firstDone)
             {
-                closeFtSocket();
-                fltxReadBuf.clear();
+                const DbSearch found = connectAndLoadFirst();
+                if ((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
+                    || (found == DbSearch::transferLost && untriedSourceListed()
+                        && ++transfersLost <= kMaxTransfersLost))
+                {
+                    closeFtSocket();        // a new connection goes on with the next path or source
+                    continue;
+                }
+                if (found != DbSearch::found) break;
+                firstDone = true;
                 continue;
             }
-            if (found != DbSearch::found) return;
-            break;
+
+            drainFltx();
+            takeRequests();
+            const Needs needs = answerFromLoaded();
+            if (sessionShouldEnd()) break;
+            if (!doDeviceWork(needs))
+                wait(100);                  // cut short by stop() and start()
         }
-        serveRequests();
+
+        // Left for the next session: a request made just after a restarted
+        // device's start() is for its new database
+        std::lock_guard<std::mutex> lock(requestMutex);
+        for (auto& r : waitingRequests)
+            pendingRequests.addIfNotAlreadyThere(r);
+        waitingRequests.clear();
     }
 
-    // Connects, asks for the sources and downloads and opens the first
-    // database found (as before 1.9.16); found, or why not
+    // What a database search came to
     enum class DbSearch
     {
-        found,              // a database is downloaded and open
+        found,              // a database is loaded
         none,               // none there (or none usable)
         statUnanswered,     // a stat got no reply: the path is noted, the connection is not used again
-        transferLost,       // a transfer did not complete: the path is noted, the connection is not used again
+        transferLost,       // a transfer did not complete: the source is noted as failed (its
+                            // chunks could still come), the connection is not used again
         lost                // the connection failed, or the session ends
     };
 
-    DbSearch connectAndDownload()
+    // Opens a FileTransfer connection, sends the service announcement and
+    // asks for the source list (updateSources); false when any of it fails
+    bool openConnection()
     {
+        closeFtSocket();
+        fltxReadBuf.clear();                // nothing of an earlier connection's stream
         DBG("StageLinQ DB: Connecting to FileTransfer at " + deviceIp + ":" + juce::String(ftPort));
 
         // --- Connect to FileTransfer service ---
         {
-            auto sock = std::make_unique<juce::StreamingSocket>();
-            if (!sock->connect(deviceIp, ftPort, StageLinQ::kSocketTimeoutMs))
+            auto sock = connectToUnit();
+            if (sessionShouldEnd()) return false;   // stop() or start() came during the connect
+            if (sock == nullptr)
             {
                 DBG("StageLinQ DB: FileTransfer connect failed");
-                return DbSearch::lost;
+                return false;
             }
-            if (sessionShouldEnd()) return DbSearch::lost;   // stop() or start() came during the connect
 
             // Send service announcement (same as StateMap/BeatInfo)
             auto announce = StageLinQ::buildServiceAnnouncement(token, "FileTransfer", 0);
@@ -648,155 +743,395 @@ private:
         for (double left; !sessionShouldEnd()
                           && (left = requestsAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
             wait((int)std::ceil(left));
-        if (sessionShouldEnd()) return DbSearch::lost;
+        if (sessionShouldEnd()) return false;
 
-        // --- Get source locations ---
-        juce::StringArray sources = fetchSources();
+        return askSources();
+    }
+
+    //--------------------------------------------------------------------------
+    // A TCP connection to the unit's FileTransfer port, or nullptr.  JUCE's
+    // StreamingSocket::connect() cannot be cut short from another thread
+    // (JUCE 9.0.3 juce_Socket.cpp: the socket's handle is set only once the
+    // connect is done), and to a unit that is gone it takes the whole
+    // kSocketTimeoutMs.  So it runs on a thread of its own, a detached
+    // std::thread that touches nothing of this object, and this thread
+    // waits for it in steps of 10 ms.  At stop(), or when start() wants
+    // another session, it stops waiting and returns nullptr, so stop()
+    // does not wait for the connect (it did, up to 2 s on the message
+    // thread, when it came during a connect to a unit switched off).  An
+    // abandoned connect ends within kSocketTimeoutMs and closes its socket;
+    // a unit that answers meanwhile sees a connection opened and closed
+    // with nothing sent on it, as when stop() came during the connect
+    // before.  This thread.
+    //--------------------------------------------------------------------------
+    std::unique_ptr<juce::StreamingSocket> connectToUnit()
+    {
+        struct Attempt
+        {
+            std::mutex mutex;
+            std::condition_variable doneCv;
+            bool done = false;
+            std::unique_ptr<juce::StreamingSocket> sock;   // connected, or null
+        };
+        auto attempt = std::make_shared<Attempt>();
+        try
+        {
+            std::thread([attempt, ip = deviceIp, port = (int)ftPort]
+            {
+                auto sock = std::make_unique<juce::StreamingSocket>();
+                if (!sock->connect(ip, port, StageLinQ::kSocketTimeoutMs))
+                    sock.reset();
+                std::lock_guard<std::mutex> lock(attempt->mutex);
+                attempt->sock = std::move(sock);
+                attempt->done = true;
+                attempt->doneCv.notify_all();
+            }).detach();
+        }
+        catch (const std::system_error&)
+        {
+            return nullptr;                 // no thread to connect on
+        }
+        std::unique_lock<std::mutex> lock(attempt->mutex);
+        while (!attempt->doneCv.wait_for(lock, std::chrono::milliseconds(10),
+                                         [&attempt] { return attempt->done; }))
+        {
+            if (sessionShouldEnd())
+                return nullptr;             // the connect's thread closes what it opens
+        }
+        return std::move(attempt->sock);
+    }
+
+    // Asks for the source list on the open connection; false when it is not
+    // answered (the connection is then closed) or is empty (it stays open)
+    bool askSources()
+    {
+        lastSourcesAskMs = juce::Time::getMillisecondCounterHiRes();
+        bool answered = false;
+        juce::StringArray sources = fetchSources(answered);
+        if (!answered)
+        {
+            DBG("StageLinQ DB: No source list from the device");
+            closeFtSocket();
+            return false;
+        }
         if (sources.isEmpty())
         {
             DBG("StageLinQ DB: No sources found on device");
-            return DbSearch::none;
+            return false;
         }
-
-        for (int si = 0; si < sources.size(); ++si)
-        {
-            DBG("StageLinQ DB: Source: " + sources[si]);
-        }
-
-        // --- Download database ---
-        juce::File dbFile;
-        const DbSearch found = downloadDatabase(sources, dbFile);
-        if (found != DbSearch::found || !dbFile.existsAsFile())
-        {
-            DBG("StageLinQ DB: Failed to download database");
-            return found == DbSearch::found ? DbSearch::none : found;
-        }
-
-        // --- Open SQLite database ---
-        if (!openDatabase(dbFile))
-        {
-            DBG("StageLinQ DB: Failed to open database");
-            return DbSearch::none;
-        }
-
-        dbReady.store(true);
-        DBG("StageLinQ DB: Database ready (" + dbFile.getFullPathName() + ")");
-        return DbSearch::found;
+        updateSources(sources);
+        return true;
     }
 
-    void serveRequests()
+    // The unit's media as its last list names them; a source no longer
+    // listed keeps its database (loaded ones stay open for the session).
+    // The list comes off the wire: only its first kMaxSources distinct
+    // names are taken, and a session knows at most kMaxSources (a name
+    // past that is not listed).  A unit lists a handful; a list of 50,000
+    // names, each looked up among the others, kept this thread busy past
+    // stop()'s 5 s and the thread was killed (VERIFY-DB-3 Y01).
+    void updateSources(const juce::StringArray& sources)
     {
-        // --- Process metadata requests ---
-        while (!sessionShouldEnd())
+        listedSources.clear();
+        for (auto& name : sources)
         {
-            drainFltx();
-
-            juce::StringArray requests;
+            if (listedSources.size() >= kMaxSources) break;
+            if (listedSources.contains(name)) continue;
+            if (findSource(name) == nullptr)
             {
-                std::lock_guard<std::mutex> lock(requestMutex);
-                requests = pendingRequests;
-                pendingRequests.clear();
+                if ((int)sessionSources.size() >= kMaxSources) continue;
+                SourceDb s;
+                s.name = name;
+                sessionSources.push_back(std::move(s));
             }
-
-            for (int i = 0; i < requests.size(); ++i)
-            {
-                if (sessionShouldEnd())
-                {
-                    // Left for the next session: a request made just after
-                    // a restarted device's start() is for its new database
-                    std::lock_guard<std::mutex> lock(requestMutex);
-                    for (int j = i; j < requests.size(); ++j)
-                        pendingRequests.addIfNotAlreadyThere(requests[j]);
-                    break;
-                }
-                processTrackRequest(requests[i]);
-            }
-
-            wait(100);   // cut short by stop() and start()
+            DBG("StageLinQ DB: Source: " + name);
+            listedSources.add(name);
         }
+    }
+
+    SourceDb* findSource(const juce::String& name)
+    {
+        for (auto& s : sessionSources)
+            if (s.name == name) return &s;
+        return nullptr;
+    }
+
+    // A source of the unit's last list that this session has not tried yet
+    bool untriedSourceListed()
+    {
+        for (auto& name : listedSources)
+            if (auto* s = findSource(name); s != nullptr && s->state == SourceDb::State::notTried)
+                return true;
+        return false;
+    }
+
+    // Connects and loads the first listed source that has a database.  A
+    // source tried earlier in this session (on a connection that ended
+    // with a stat unanswered or a transfer lost) is not tried again here:
+    // the search goes on with the next one, as before 1.9.16, where a
+    // download that failed moved on to the next source.
+    DbSearch connectAndLoadFirst()
+    {
+        if (!openConnection())
+            return DbSearch::none;
+        for (int i = 0; i < listedSources.size(); ++i)
+        {
+            auto* s = findSource(listedSources[i]);
+            if (s == nullptr || s->state != SourceDb::State::notTried) continue;
+            const DbSearch r = loadSource(*s);
+            if (r == DbSearch::none) continue;
+            return r;
+        }
+        DBG("StageLinQ DB: Failed to download database");
+        return DbSearch::none;
+    }
+
+    // Requests made since the last look, after the ones still waiting
+    void takeRequests()
+    {
+        std::lock_guard<std::mutex> lock(requestMutex);
+        for (auto& r : pendingRequests)
+        {
+            if (!seenRequests.contains(r))
+            {
+                // A track not asked for before: the source list may be
+                // asked for again 5 s after the last time
+                seenRequests.add(r);
+                sourcesAskIntervalMs = kSourcesAskFirstMs;
+            }
+            waitingRequests.addIfNotAlreadyThere(r);
+        }
+        pendingRequests.clear();
+    }
+
+    // What the requests still waiting need from the device
+    struct Needs
+    {
+        juce::String source;                // the first source to download
+        bool sources = false;               // the source list, asked again
+    };
+
+    // Answers every waiting request the loaded databases can answer (no
+    // device I/O); the others stay waiting.  It stops between two requests
+    // when the session must end: stop() waits for this thread (5 s, then it
+    // is killed), and one lookup can take over a second: an artwork at
+    // ImageGuard's limits (64 MiB of pixel data) is checked by ImageGuard
+    // and decoded by JUCE, up to 0.8 s each here.  stop() cuts the
+    // check short (queryArtwork), not the decode.  The requests not looked
+    // at stay waiting.
+    Needs answerFromLoaded()
+    {
+        Needs needs;
+        for (int i = 0; i < waitingRequests.size() && !sessionShouldEnd();)
+        {
+            juce::String needSource;
+            bool needSources = false;
+            if (resolveRequest(waitingRequests[i], needSource, needSources))
+            {
+                waitingRequests.remove(i);
+                continue;
+            }
+            if (needSource.isNotEmpty() && needs.source.isEmpty()) needs.source = needSource;
+            needs.sources = needs.sources || needSources;
+            ++i;
+        }
+        return needs;
+    }
+
+    // One request: true when it is answered (found, or not to be found in
+    // this session); else what it waits for
+    bool resolveRequest(const juce::String& networkPath, juce::String& needSource, bool& needSources)
+    {
+        const TrackRef ref = parseNetworkPath(networkPath);
+        if (!ref.valid()) return true;
+        const std::string key = ref.key();
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            if (trackCache.count(key) > 0) return true;
+        }
+
+        if (ref.streaming)
+        {
+            // The unit's internal storage when it lists one ("... (Internal)",
+            // as chrisle's Databases.getDbPath picks it) and it has a database
+            for (auto& name : listedSources)
+            {
+                if (!name.contains("(Internal)")) continue;
+                auto* s = findSource(name);
+                if (s != nullptr && s->state == SourceDb::State::notTried)
+                {
+                    needSource = name;
+                    return false;
+                }
+                if (s != nullptr && s->state == SourceDb::State::ready)
+                {
+                    lookUpTrack(*s, ref, key);
+                    return true;
+                }
+                break;
+            }
+            bool anyLoaded = false;                 // else each database loaded
+            for (auto& s : sessionSources)
+            {
+                if (s.state != SourceDb::State::ready) continue;
+                anyLoaded = true;
+                if (lookUpTrack(s, ref, key)) break;
+            }
+            return anyLoaded;                       // none loaded yet (the first download runs): it waits
+        }
+
+        auto* s = findSource(ref.source);
+        if (s == nullptr || (s->state == SourceDb::State::notTried && !listedSources.contains(ref.source)))
+        {
+            needSources = true;                     // not on the unit's last list
+            return false;
+        }
+        switch (s->state)
+        {
+            case SourceDb::State::ready:
+                lookUpTrack(*s, ref, key);
+                return true;
+            case SourceDb::State::notTried:
+                needSource = s->name;
+                return false;
+            case SourceDb::State::noLibrary:
+            case SourceDb::State::failed:
+            default:
+                return true;                        // its medium has no database here
+        }
+    }
+
+    // Downloads one source's database, or asks for the source list again,
+    // when the requests waiting need it; false when there was nothing to do.
+    // A list that brings no new source doubles the wait before the next
+    // ask, also when it was asked on a new connection (openConnection asks
+    // for it).
+    bool doDeviceWork(const Needs& needs)
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const bool askList = needs.source.isEmpty();
+        if (askList && !(needs.sources && now - lastSourcesAskMs >= sourcesAskIntervalMs))
+            return false;
+        const int sourcesBefore = (int)sessionSources.size();
+        bool listed = false;                        // the list was asked for and answered
+        if (!fltxConnected())
+        {
+            if (now < nextConnectMs) return false;
+            const bool ok = openConnection();
+            if (!ok)
+            {
+                closeFtSocket();
+                nextConnectMs = juce::Time::getMillisecondCounterHiRes() + kReconnectWaitMs;
+                return true;
+            }
+            listed = true;
+        }
+        else if (askList)
+        {
+            listed = askSources();
+        }
+        if (askList)
+        {
+            if (listed && (int)sessionSources.size() == sourcesBefore)   // nothing new: asked less often
+                sourcesAskIntervalMs = juce::jmin(sourcesAskIntervalMs * 2.0, kSourcesAskMaxMs);
+            return true;
+        }
+        if (auto* s = findSource(needs.source))
+        {
+            const DbSearch r = loadSource(*s);
+            if (r != DbSearch::found && r != DbSearch::none)
+                closeFtSocket();                    // no further request on this connection
+        }
+        return true;
+    }
+
+    // Looks for a source's database (v2 path first, then v1), downloads it
+    // and opens it.  A path the device did not answer a stat for earlier in
+    // this session is skipped (unansweredStats).
+    DbSearch loadSource(SourceDb& s)
+    {
+        const juce::String paths[] = {
+            "/" + s.name + "/Engine Library/Database2/m.db",
+            "/" + s.name + "/Engine Library/m.db"
+        };
+        bool skipped = false;
+        for (auto& dbPath : paths)
+        {
+            if (sessionShouldEnd()) return DbSearch::lost;
+            if (unansweredStats.contains(dbPath)) { skipped = true; continue; }
+
+            // Check if file exists (stat)
+            uint32_t fileSize = 0;
+            const Reply stat = fetchFileStat(dbPath, fileSize);
+            if (stat == Reply::lost)
+            {
+                if (!fltxConnected() || sessionShouldEnd()) return DbSearch::lost;
+                DBG("StageLinQ DB: No reply to the stat of " + dbPath + " -- not asked again on this unit");
+                unansweredStats.add(dbPath);
+                return DbSearch::statUnanswered;
+            }
+            if (stat == Reply::refused) continue;
+
+            DBG("StageLinQ DB: Found database " + dbPath + " (" + juce::String(fileSize) + " bytes)");
+
+            // Download the file
+            std::vector<uint8_t> data;
+            const Reply got = downloadFile(dbPath, data);
+            if (got == Reply::lost)
+            {
+                s.state = SourceDb::State::failed;
+                s.failure = "download failed";
+                return sessionShouldEnd() ? DbSearch::lost : DbSearch::transferLost;
+            }
+            if (got == Reply::refused) continue;
+
+            // Save to a temp file of its own, one per source (it was always
+            // STC_Denon/m.db, shared by every STC instance and never
+            // deleted); deleted again by closeDatabase()
+            removeStaleTempCopies();
+            auto tempFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                                .getNonexistentChildFile("STC_Denon_m", ".db", false);
+            if (!tempFile.replaceWithData(data.data(), data.size()))
+            {
+                DBG("StageLinQ DB: Could not write " + tempFile.getFullPathName());
+                tempFile.deleteFile();
+                s.state = SourceDb::State::failed;
+                s.failure = "could not write a copy";
+                return DbSearch::none;
+            }
+            DBG("StageLinQ DB: Downloaded " + juce::String((int)data.size()) + " bytes to " + tempFile.getFullPathName());
+
+            // --- Open SQLite database ---
+            if (!openSourceDatabase(s, tempFile))
+            {
+                DBG("StageLinQ DB: Failed to open database");
+                s.state = SourceDb::State::failed;
+                s.failure = "not a usable Engine database";
+                return DbSearch::none;
+            }
+            s.state = SourceDb::State::ready;
+            dbReady.store(true);
+            DBG("StageLinQ DB: Database of " + s.name + " ready (" + tempFile.getFullPathName() + ")");
+            return DbSearch::found;
+        }
+        s.state = skipped ? SourceDb::State::failed : SourceDb::State::noLibrary;
+        if (skipped) s.failure = "the unit did not answer";
+        return DbSearch::none;
     }
 
     //==========================================================================
     // FileTransfer protocol: fetch sources
     //==========================================================================
-    juce::StringArray fetchSources()
+    // answered: the device replied (an empty list is a reply)
+    juce::StringArray fetchSources(bool& answered)
     {
+        answered = false;
         auto frame = StageLinQ::buildFltxSources();
         if (!fltxWrite(frame)) return {};
 
         auto resp = fltxWaitFor(StageLinQ::kFltxRespSourceLocations, StageLinQ::kFltxReplyWaitMs);
+        answered = resp.received;
         return resp.sources;
-    }
-
-    //==========================================================================
-    // FileTransfer protocol: download database
-    //==========================================================================
-    // The first source's database, v2 path first, then v1.  A path the
-    // device did not answer a stat for, or whose transfer did not complete,
-    // on an earlier connection of this session is skipped (unansweredStats,
-    // lostTransfers); a request it does not answer now ends the search
-    // (statUnanswered or transferLost: the path is noted; or lost).
-    DbSearch downloadDatabase(const juce::StringArray& sources, juce::File& result)
-    {
-        result = juce::File();
-        for (auto& source : sources)
-        {
-            // Try v2 database first, then v1
-            juce::String paths[] = {
-                "/" + source + "/Engine Library/Database2/m.db",
-                "/" + source + "/Engine Library/m.db"
-            };
-
-            for (auto& dbPath : paths)
-            {
-                if (sessionShouldEnd()) return DbSearch::lost;
-                if (unansweredStats.contains(dbPath) || lostTransfers.contains(dbPath)) continue;
-
-                // Check if file exists (stat)
-                uint32_t fileSize = 0;
-                const Reply stat = fetchFileStat(dbPath, fileSize);
-                if (stat == Reply::lost)
-                {
-                    if (!fltxConnected() || sessionShouldEnd()) return DbSearch::lost;
-                    DBG("StageLinQ DB: No reply to the stat of " + dbPath + " -- not asked again on this unit");
-                    unansweredStats.add(dbPath);
-                    return DbSearch::statUnanswered;
-                }
-                if (stat == Reply::refused) continue;
-
-                DBG("StageLinQ DB: Found database " + dbPath + " (" + juce::String(fileSize) + " bytes)");
-
-                // Download the file
-                std::vector<uint8_t> data;
-                const Reply got = downloadFile(dbPath, data);
-                if (got == Reply::lost)
-                {
-                    if (sessionShouldEnd()) return DbSearch::lost;
-                    DBG("StageLinQ DB: The transfer of " + dbPath + " did not complete -- going on with the next one");
-                    lostTransfers.add(dbPath);
-                    return DbSearch::transferLost;
-                }
-                if (got == Reply::refused) continue;
-
-                // Save to a temp file of its own (it was always STC_Denon/m.db,
-                // shared by every STC instance and never deleted); deleted
-                // again by closeDatabase()
-                removeStaleTempCopies();
-                auto tempFile = juce::File::getSpecialLocation(juce::File::tempDirectory)
-                                    .getNonexistentChildFile("STC_Denon_m", ".db", false);
-                if (!tempFile.replaceWithData(data.data(), data.size()))
-                {
-                    DBG("StageLinQ DB: Could not write " + tempFile.getFullPathName());
-                    tempFile.deleteFile();
-                    return DbSearch::none;
-                }
-
-                DBG("StageLinQ DB: Downloaded " + juce::String((int)data.size()) + " bytes to " + tempFile.getFullPathName());
-                result = tempFile;
-                return DbSearch::found;
-            }
-        }
-        return DbSearch::none;
     }
 
     //--------------------------------------------------------------------------
@@ -804,13 +1139,14 @@ private:
     // or crashed, or this thread killed by force): each download has a name
     // of its own, so nothing else deletes them, and Windows never cleans
     // its temp directory.  Removed before each download once they are a day
-    // old.  This client's own copy is closed by then (closeDatabase); a copy
-    // another running STC still has open cannot be deleted on Windows, and
-    // on POSIX stays readable through that STC's handle.  The STC_Denon/m.db
-    // of earlier versions (and any -journal/-wal/-shm beside it) goes the
-    // same way, then its folder if that leaves it empty.  On this thread.
+    // old, except this session's own: the other sources' databases, open
+    // while the session lasts (a day, maybe).  A copy another running STC
+    // still has open cannot be deleted on Windows, and on POSIX stays
+    // readable through that STC's handle.  The STC_Denon/m.db of earlier
+    // versions (and any -journal/-wal/-shm beside it) goes the same way,
+    // then its folder if that leaves it empty.  On this thread.
     //--------------------------------------------------------------------------
-    static void removeStaleTempCopies()
+    void removeStaleTempCopies() const
     {
         const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
         const auto legacyDir = tempDir.getChildFile("STC_Denon");
@@ -819,8 +1155,13 @@ private:
         if (legacyDir.isDirectory())
             copies.addArray(legacyDir.findChildFiles(juce::File::findFiles, false, "m.db*"));
         for (const auto& f : copies)
-            if (f.getLastModificationTime() < dayAgo)
+        {
+            bool ours = false;
+            for (const auto& s : sessionSources)
+                ours = ours || (s.file != juce::File() && f == s.file);
+            if (!ours && f.getLastModificationTime() < dayAgo)
                 f.deleteFile();
+        }
         if (legacyDir.isDirectory())
             legacyDir.deleteFile();   // removes the folder only when empty
     }
@@ -900,10 +1241,19 @@ private:
         // sends after a reply (after the source list in the capture).  The
         // download ends when the file is complete, when no chunk has come for
         // 10 s, at the deadline above, or when the device disconnects.
+        double lastAnswerMs = juce::Time::getMillisecondCounterHiRes();
         while (bytesReceived < fileSize
                && juce::Time::getMillisecondCounterHiRes() < deadline
                && !sessionShouldEnd())
         {
+            // Requests the databases already loaded can answer are answered
+            // while the download runs (that needs no device I/O)
+            if (juce::Time::getMillisecondCounterHiRes() - lastAnswerMs > 250.0)
+            {
+                lastAnswerMs = juce::Time::getMillisecondCounterHiRes();
+                takeRequests();
+                answerFromLoaded();
+            }
             auto chunkResp = fltxReadResponse(1000);
             if (chunkResp.received && chunkResp.code == 0
                 && chunkResp.messageId == StageLinQ::kFltxRespChunk && !chunkResp.chunkData.empty())
@@ -1069,21 +1419,37 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    // Once the database is open nothing more is asked of the device, but it
-    // keeps sending its code != 0 message every 4 s.  Read and drop what
-    // comes so the socket's receive buffer never fills: before, nothing read
-    // the connection again, and in a few hours the device's sends would have
-    // blocked.  A failed read or the device's close closes the socket.
+    // Once a database is open, the connection carries a request only when a
+    // waiting track needs one (another source's stat and download, the
+    // source list asked again: doDeviceWork); in between the device keeps
+    // sending its code != 0 message every 4 s.  Read and drop what comes
+    // between requests so the socket's receive buffer never fills: before,
+    // nothing read the connection again, and in a few hours the device's
+    // sends would have blocked.  A failed read or the device's close closes
+    // the socket.  What is read goes to fltxReadBuf and only whole messages
+    // are dropped: a message split across reads keeps its head there for
+    // the next read, as fltxReadResponse expects (dropping raw bytes left
+    // the next reply read out of frame, and a source failed as "the unit
+    // did not answer", VERIFY-DB-3 Y02).  At most 512 KiB a call.
     //--------------------------------------------------------------------------
     void drainFltx()
     {
-        std::lock_guard<std::mutex> lock(sockMutex);
-        if (!ftSocket || !ftSocket->isConnected()) return;
-        const int ready = ftSocket->waitUntilReady(true, 0);
-        if (ready == 0) return;
-        uint8_t tmp[4096];
-        if (ready < 0 || ftSocket->read(tmp, sizeof(tmp), false) <= 0)
-            ftSocket->close();
+        for (int i = 0; i < 64; ++i)
+        {
+            std::lock_guard<std::mutex> lock(sockMutex);
+            if (!ftSocket || !ftSocket->isConnected()) break;
+            const int ready = ftSocket->waitUntilReady(true, 0);
+            if (ready == 0) break;
+            uint8_t tmp[8192];
+            const int n = ready > 0 ? ftSocket->read(tmp, sizeof(tmp), false) : -1;
+            if (n <= 0)
+            {
+                ftSocket->close();
+                break;
+            }
+            fltxReadBuf.insert(fltxReadBuf.end(), tmp, tmp + n);
+        }
+        while (fltxReadResponse(0).received) {}   // parses what is buffered; waits for nothing
     }
 
     FltxResponse parseFltxBody(const uint8_t* body, uint32_t bodyLen)
@@ -1264,10 +1630,10 @@ private:
         return found && ok;
     }
 
-    bool openDatabase(const juce::File& dbFile)
+    // Opens a source's downloaded copy (it is deleted if refused)
+    bool openSourceDatabase(SourceDb& src, const juce::File& dbFile)
     {
-        closeDatabase();
-
+        sqlite3* db = nullptr;
         int rc = sqlite3_open_v2(sqliteImmutableUri(dbFile).c_str(), &db,
                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
         if (rc != SQLITE_OK)
@@ -1289,14 +1655,14 @@ private:
             DBG("StageLinQ DB: " + (rc != SQLITE_OK ? "SQLite open error: " + juce::String(sqlite3_errmsg(db))
                                                     : juce::String("Track/AlbumArt are not plain tables -- refused")));
             sqlite3_close(db);
-            db = nullptr;
             dbFile.deleteFile();
             return false;
         }
-        dbTempFile = dbFile;
-        perfDataIsTable = isPlainTable(db, "performancedata");
+        src.db = db;
+        src.file = dbFile;
+        src.perfDataIsTable = isPlainTable(db, "performancedata");
         DBG(juce::String("StageLinQ DB: PerformanceData ")
-            + (perfDataIsTable ? "is an ordinary table" : "absent, or not an ordinary table -- not queried"));
+            + (src.perfDataIsTable ? "is an ordinary table" : "absent, or not an ordinary table -- not queried"));
 
         // Count tracks for logging
         sqlite3_stmt* stmt = nullptr;
@@ -1304,7 +1670,8 @@ private:
         {
             if (sqlite3_step(stmt) == SQLITE_ROW)
             {
-                DBG("StageLinQ DB: " + juce::String(sqlite3_column_int(stmt, 0)) + " tracks in database");
+                src.trackCount = sqlite3_column_int(stmt, 0);
+                DBG("StageLinQ DB: " + juce::String(src.trackCount) + " tracks in database");
             }
             sqlite3_finalize(stmt);
         }
@@ -1312,93 +1679,90 @@ private:
         return true;
     }
 
+    // Closes every source's database and deletes its copy (this thread, or
+    // stop() once the thread is gone); each handle is closed once
     void closeDatabase()
     {
-        if (db)
-        {
-            sqlite3_close(db);
-            db = nullptr;
-        }
-        perfDataIsTable = false;
-        if (dbTempFile != juce::File())
-        {
-            dbTempFile.deleteFile();
-            dbTempFile = juce::File();
-        }
         dbReady.store(false);
+        for (auto& s : sessionSources)
+        {
+            if (s.db != nullptr)
+            {
+                sqlite3_close(s.db);
+                s.db = nullptr;
+            }
+            if (s.file != juce::File())
+            {
+                s.file.deleteFile();
+                s.file = juce::File();
+            }
+        }
+        sessionSources.clear();
+        listedSources.clear();
     }
 
     //==========================================================================
-    // Process a track metadata request
+    // Looks a track up in one source's database and caches what it has;
+    // false when that database has no such track
     //==========================================================================
-    void processTrackRequest(const juce::String& networkPath)
+    bool lookUpTrack(const SourceDb& src, const TrackRef& ref, const std::string& key)
     {
-        if (!db) return;
-
-        auto trackPath = parseNetworkPathToDbPath(networkPath);
-        if (trackPath.isEmpty()) return;
-
-        // Check cache (quick, under lock)
-        {
-            std::lock_guard<std::mutex> lock(cacheMutex);
-            if (trackCache.count(trackPath.toStdString()) > 0) return;
-        }
-
         // --- All DB queries OUTSIDE the lock (may take time) ---
 
         // Query Track table: by the path relative to Engine Library, then
-        // in STC's old form (oldFormDbPath).  The caches stay keyed by
-        // trackPath, which is what the getters compute; the queries use
-        // the path that found the row.
-        juce::String dbPath = trackPath;
+        // in STC's old form (oldFormDbPath).  The caches are keyed by the
+        // source and the first form, which is what the getters compute; the
+        // queries use the path that found the row.
+        juce::String dbPath = ref.dbPath;
         juce::int64 trackId = 0;
-        DenonTrackMeta meta = queryTrack(dbPath, trackId);
-        if (!meta.valid && oldFormDbPath(trackPath).isNotEmpty())
+        DenonTrackMeta meta = queryTrack(src, dbPath, trackId);
+        if (!meta.valid && !ref.streaming && oldFormDbPath(ref.dbPath).isNotEmpty())
         {
-            dbPath = oldFormDbPath(trackPath);
-            meta = queryTrack(dbPath, trackId);
+            dbPath = oldFormDbPath(ref.dbPath);
+            meta = queryTrack(src, dbPath, trackId);
         }
-        if (!meta.valid) return;
+        if (!meta.valid) return false;
 
         // Query artwork (no lock held during I/O)
         juce::Image artImg;
         if (meta.albumArtId > 0)
-            artImg = queryArtwork(meta.albumArtId);
+            artImg = queryArtwork(src, meta.albumArtId);
 
         // Query overview waveform
-        auto wf = queryOverviewWaveform(dbPath, trackId);
+        auto wf = queryOverviewWaveform(src, dbPath, trackId);
 
         // Query performance data (cues, loops, beat grid)
-        auto perf = queryPerformanceData(dbPath, trackId);
+        auto perf = queryPerformanceData(src, dbPath, trackId);
 
         // --- Insert results into caches (lock once) ---
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
-            trackCache[trackPath.toStdString()] = meta;
+            trackCache[key] = meta;
 
-            if (meta.albumArtId > 0 && artImg.isValid()
-                && artworkCache.count(meta.albumArtId) == 0)
-                artworkCache[meta.albumArtId] = artImg;
+            if (artImg.isValid() && artworkCache.count(key) == 0)
+                artworkCache[key] = artImg;
 
-            if (wf.valid && waveformCache.count(trackPath.toStdString()) == 0)
-                waveformCache[trackPath.toStdString()] = std::move(wf);
+            if (wf.valid && waveformCache.count(key) == 0)
+                waveformCache[key] = std::move(wf);
 
-            if (perf.valid && perfCache.count(trackPath.toStdString()) == 0)
-                perfCache[trackPath.toStdString()] = std::move(perf);
+            if (perf.valid && perfCache.count(key) == 0)
+                perfCache[key] = std::move(perf);
         }
 
         DBG("StageLinQ DB: Loaded metadata for " + meta.artist + " - " + meta.title
-            + " (art=" + juce::String(meta.albumArtId) + ")");
+            + " (art=" + juce::String(meta.albumArtId) + ", from " + src.name + ")");
+        return true;
     }
 
     //==========================================================================
     // SQLite query: Track table
     //==========================================================================
     // trackId: the row's Track.id, which PerformanceData is keyed by
-    DenonTrackMeta queryTrack(const juce::String& trackPath, juce::int64& trackId)
+    DenonTrackMeta queryTrack(const SourceDb& src, const juce::String& trackPath, juce::int64& trackId)
     {
         DenonTrackMeta meta;
         trackId = 0;
+        sqlite3* const db = src.db;
         if (!db) return meta;
 
         // Streaming tracks (Beatsource/Tidal) are queried by "uri" column
@@ -1462,8 +1826,9 @@ private:
     //==========================================================================
     // SQLite query: AlbumArt table -> juce::Image
     //==========================================================================
-    juce::Image queryArtwork(int albumArtId)
+    juce::Image queryArtwork(const SourceDb& src, int albumArtId)
     {
+        sqlite3* const db = src.db;
         if (!db || albumArtId <= 0) return {};
 
         const char* sql = "SELECT albumArt FROM AlbumArt WHERE id = ? AND albumArt IS NOT NULL LIMIT 1";
@@ -1496,18 +1861,19 @@ private:
     // A BLOB of the track: its Track column (Engine schema 2.x), or else --
     // Track has no such column, or it is NULL or empty for this row -- the
     // same column of PerformanceData by trackId, if PerformanceData is an
-    // ordinary table (openDatabase).  Schema 3.x (Engine DJ 4.5 and 5.x:
+    // ordinary table (openSourceDatabase).  Schema 3.x (Engine DJ 4.5 and 5.x:
     // chrisle/StageLinq 3.5.0 types/models/Track.ts, engine-dj-mcp
     // tools/performance.js) moved overviewWaveFormData, beatData, quickCues
     // and loops out of Track into PerformanceData.  The bytes are copied
     // out (SQLite's pointer lives only as long as the statement).
     // rowFound: the track has a row in the table the bytes were read from.
     //==========================================================================
-    std::vector<uint8_t> queryTrackBlob(const char* column, const juce::String& trackPath,
+    std::vector<uint8_t> queryTrackBlob(const SourceDb& src, const char* column, const juce::String& trackPath,
                                         juce::int64 trackId, bool& rowFound)
     {
         rowFound = false;
         std::vector<uint8_t> out;
+        sqlite3* const db = src.db;
         if (!db) return out;
 
         auto readOne = [&](const juce::String& sql, bool byTrackId)
@@ -1534,7 +1900,7 @@ private:
 
         const char* col = trackPath.startsWith("streaming://") ? "uri" : "path";
         rowFound = readOne(juce::String("SELECT ") + column + " FROM Track WHERE " + col + " = ? LIMIT 1", false);
-        if (out.empty() && perfDataIsTable && trackId > 0)
+        if (out.empty() && src.perfDataIsTable && trackId > 0)
         {
             const bool perfRow = readOne(juce::String("SELECT ") + column
                                          + " FROM PerformanceData WHERE trackId = ? LIMIT 1", true);
@@ -1559,10 +1925,10 @@ private:
     // We reorder bytes to mid/high/low per entry to match our
     // WaveformDisplay::renderThreeBandBars() (Pioneer CDJ-3000 order).
     //==========================================================================
-    DenonWaveformData queryOverviewWaveform(const juce::String& trackPath, juce::int64 trackId)
+    DenonWaveformData queryOverviewWaveform(const SourceDb& src, const juce::String& trackPath, juce::int64 trackId)
     {
         bool rowFound = false;
-        const auto blob = queryTrackBlob("overviewWaveFormData", trackPath, trackId, rowFound);
+        const auto blob = queryTrackBlob(src, "overviewWaveFormData", trackPath, trackId, rowFound);
         if (blob.size() > 4)
             return decodeOverviewWaveform(blob.data(), (int)blob.size());
         return {};
@@ -1624,23 +1990,23 @@ private:
     // each from Track or PerformanceData (queryTrackBlob).  valid: the
     // track has a row with these columns.
     //==========================================================================
-    DenonPerformanceData queryPerformanceData(const juce::String& trackPath, juce::int64 trackId)
+    DenonPerformanceData queryPerformanceData(const SourceDb& src, const juce::String& trackPath, juce::int64 trackId)
     {
         DenonPerformanceData result;
         bool cueRow = false, loopRow = false, beatRow = false;
 
         // Quick cues (zlib compressed)
-        const auto cueBlob = queryTrackBlob("quickCues", trackPath, trackId, cueRow);
+        const auto cueBlob = queryTrackBlob(src, "quickCues", trackPath, trackId, cueRow);
         if (cueBlob.size() > 4)
             decodeQuickCues(cueBlob.data(), (int)cueBlob.size(), result);
 
         // Loops (NOT compressed -- raw binary)
-        const auto loopBlob = queryTrackBlob("loops", trackPath, trackId, loopRow);
+        const auto loopBlob = queryTrackBlob(src, "loops", trackPath, trackId, loopRow);
         if (loopBlob.size() >= 8)
             decodeLoops(loopBlob.data(), (int)loopBlob.size(), result);
 
         // Beat data (zlib compressed)
-        const auto beatBlob = queryTrackBlob("beatData", trackPath, trackId, beatRow);
+        const auto beatBlob = queryTrackBlob(src, "beatData", trackPath, trackId, beatRow);
         if (beatBlob.size() > 4)
             decodeBeatData(beatBlob.data(), (int)beatBlob.size(), result);
 
@@ -1832,10 +2198,11 @@ private:
     }
 
     //==========================================================================
-    // Parse TrackNetworkPath to DB-compatible track path
+    // A TrackNetworkPath as the source that holds the track and its Track.path
     //
     // Format: net://uuid/source/Engine Library/Music/Artist/Track.mp3
-    //   -> DB path: Music/Artist/Track.mp3  (relative to Engine Library)
+    //   -> source "source", DB path Music/Artist/Track.mp3 (relative to
+    //      Engine Library)
     //
     // Engine keeps Track.path relative to the Engine Library folder
     // (engine-dj-mcp dist/paths.js; chrisle/StageLinq Player.ts keeps
@@ -1845,41 +2212,58 @@ private:
     //     before (chrisle's utils/trackPath.ts strips "Music/") is tried
     //     second: oldFormDbPath().
     //   - Outside Engine Library: prefix with "../"
+    //   - Streaming (Beatsource, Tidal, SoundCloud): "streaming://..." as it
+    //     comes, or chrisle's net://uuid/(Unknown)streaming://... form
+    //     (Player.ts), looked up by Track.uri; no source.
     //==========================================================================
-    static juce::String parseNetworkPathToDbPath(const juce::String& networkPath)
+    static TrackRef parseNetworkPath(const juce::String& networkPath)
     {
-        if (networkPath.isEmpty()) return {};
+        TrackRef ref;
+        if (networkPath.isEmpty()) return ref;
 
-        // Streaming tracks (Beatsource, Tidal, SoundCloud) use "streaming://" prefix.
-        // chrisle/StageLinq queries these by URI column instead of path.
-        // We return the raw streaming URL and queryTrack handles the WHERE clause.
         if (networkPath.startsWith("streaming://"))
-            return networkPath;
+        {
+            ref.dbPath = networkPath;
+            ref.streaming = true;
+            return ref;
+        }
 
         if (!networkPath.startsWith("net://"))
-            return {};
+            return ref;
 
         auto parts = juce::StringArray::fromTokens(networkPath, "/", "");
         // parts[0]="net:", [1]="", [2]=uuid, [3]=source, [4+]=path
 
-        if (parts.size() < 5) return {};
+        if (parts.size() < 5) return ref;
 
+        if (parts[3].startsWith("(Unknown)streaming:"))
+        {
+            const int at = networkPath.indexOf("streaming://");
+            if (at > 0)
+            {
+                ref.dbPath = networkPath.substring(at);
+                ref.streaming = true;
+            }
+            return ref;
+        }
+
+        ref.source = parts[3];
+        juce::StringArray trackParts;
         if (parts.size() > 5 && parts[4] == "Engine Library")
         {
             // Inside Engine Library (Music/ or another folder): relative to it
-            juce::StringArray trackParts;
             for (int i = 5; i < parts.size(); ++i)
                 trackParts.add(parts[i]);
-            return trackParts.joinIntoString("/");
+            ref.dbPath = trackParts.joinIntoString("/");
         }
         else
         {
             // Outside Engine Library
-            juce::StringArray trackParts;
             for (int i = 4; i < parts.size(); ++i)
                 trackParts.add(parts[i]);
-            return "../" + trackParts.joinIntoString("/");
+            ref.dbPath = "../" + trackParts.joinIntoString("/");
         }
+        return ref;
     }
 
     // The same track in the form STC looked up before 1.9.16 (relative to
@@ -1924,21 +2308,36 @@ private:
     // (this thread only; cleared when another device or port is served)
     juce::StringArray unansweredStats;
     static constexpr int kMaxUnansweredStats = 16;
-    // Database paths whose transfer did not complete in this session, each
-    // followed by a new connection (this thread only; cleared likewise)
-    juce::StringArray lostTransfers;
+    // Connections opened again, in one session, after a transfer was lost
+    // before the first database was loaded (runSession); each one goes on
+    // with a source the last list named and this session had not tried
     static constexpr int kMaxTransfersLost = 16;
 
-    // SQLite handle, and the downloaded copy it reads (deleted on close)
-    sqlite3* db = nullptr;
-    juce::File dbTempFile;
-    bool perfDataIsTable = false;        // PerformanceData is an ordinary table (openDatabase)
-    std::atomic<bool> dbReady { false };
+    // The session's media (this thread only; closeDatabase): every source
+    // listed so far, in the unit's order, with its database once loaded,
+    // and the source list as the unit last gave it
+    std::vector<SourceDb> sessionSources;
+    juce::StringArray listedSources;
+    static constexpr int kMaxSources = 64;   // updateSources
+    std::atomic<bool> dbReady { false };     // a source's database is open
 
-    // Caches (protected by cacheMutex)
+    // Requests (this thread only): those not answered yet, oldest first, and
+    // every one seen in this session
+    juce::StringArray waitingRequests, seenRequests;
+
+    // When the source list was last asked for, and how long until it may be
+    // asked again for a source it did not name (this thread only)
+    static constexpr double kSourcesAskFirstMs = 5000.0;
+    static constexpr double kSourcesAskMaxMs   = 60000.0;
+    static constexpr double kReconnectWaitMs   = 5000.0;
+    double lastSourcesAskMs = 0.0;
+    double sourcesAskIntervalMs = kSourcesAskFirstMs;
+    double nextConnectMs = 0.0;              // no new connection before (after one failed)
+
+    // Caches (protected by cacheMutex), keyed by TrackRef::key()
     mutable std::mutex cacheMutex;
     std::map<std::string, DenonTrackMeta> trackCache;
-    std::map<int, juce::Image> artworkCache;
+    std::map<std::string, juce::Image> artworkCache;
     std::map<std::string, DenonWaveformData> waveformCache;
     std::map<std::string, DenonPerformanceData> perfCache;
 
