@@ -19,6 +19,7 @@
 //   5. On TrackNetworkPath change: lookup Track -> AlbumArt -> juce::Image
 //   6. A session that fails is tried again after 5, 10, 20, 40, then
 //      every 60 s, while start() still wants that device
+//   7. getStatus(): what it is doing, per source and per track, for the UI
 //
 // Requires: sqlite3 amalgamation (sqlite3.h + sqlite3.c) in the project.
 
@@ -337,6 +338,76 @@ struct StageLinQSourceDb
     double retryAtMs = 0.0;             // retryable: not tried again before (ms counter)
 };
 
+//==============================================================================
+// What the database client is doing, for the UI: a copy that
+// StageLinQDbClient::getStatus() returns (reading it waits on no I/O)
+//==============================================================================
+struct StageLinQDbStatus
+{
+    // The session: none (no unit has offered FileTransfer yet, or after
+    // stop()), opening the FileTransfer connection, reading the unit's
+    // source list (and looking for a database on its media), downloading
+    // a source's database, ready (one or more databases open), or waiting
+    // to try again after a failure (lastFailure says why)
+    enum class Session { idle, connecting, readingSources, downloading, ready, retrying };
+
+    // A source: its database not downloaded (yet), downloading, ready, no
+    // Engine library on that medium, or failed (failure says why)
+    enum class SourceState { notDownloaded, downloading, ready, noLibrary, failed };
+
+    // A requested track: still looked for, its source is not on the unit
+    // (not in the source list asked for after the request, or a medium of
+    // another unit: StageLinQDbClient::start), its source has no usable
+    // database, not in its source's database, or found
+    enum class Lookup { pending, sourceNotOnUnit, sourceHasNoDatabase, notInDatabase, found };
+
+    struct Source
+    {
+        juce::String name;                  // as the unit lists it: "USB 1", "SD", ...
+        SourceState state = SourceState::notDownloaded;
+        int percent = 0;                    // downloading
+        int trackCount = 0;                 // ready
+        juce::String failure;               // failed: why
+        int retryInSeconds = 0;             // failed, and tried again when a track needs it
+        double retryAtMs = 0.0;             // (getStatus() computes retryInSeconds from it)
+    };
+
+    struct Track
+    {
+        juce::String networkPath;           // as requestMetadata() had it
+        Lookup result = Lookup::pending;
+        bool streaming = false;
+        juce::String source;                // parts[3]; empty when streaming
+        bool waveform = false;              // found: has an overview waveform
+        bool artwork = false;               //        has artwork
+        bool cues = false;                  //        has a quick cue set
+    };
+
+    Session session = Session::idle;
+    juce::String deviceIp;                  // the unit served (empty when idle)
+    juce::String downloadingSource;         // downloading: which source
+    int downloadPercent = 0;
+    int retryInSeconds = 0;                 // retrying: the next try in
+    double retryAtMs = 0.0;                 // (getStatus() computes retryInSeconds from it)
+    juce::String lastFailure;               // why the session failed, or a connection could not be opened
+    std::vector<Source> sources;            // in the order the unit listed them
+    std::vector<Track> tracks;              // the latest requested ones, oldest first
+
+    const Track* findTrack(const juce::String& networkPath) const
+    {
+        for (auto it = tracks.rbegin(); it != tracks.rend(); ++it)
+            if (it->networkPath == networkPath) return &*it;
+        return nullptr;
+    }
+
+    const Source* findSource(const juce::String& name) const
+    {
+        for (auto& so : sources)
+            if (so.name == name) return &so;
+        return nullptr;
+    }
+};
+
 class StageLinQDbClient : public juce::Thread
 {
 public:
@@ -391,13 +462,22 @@ public:
     //    while its session holds -- AUDIT SLQ-3's first-device rule gives
     //    way.  Before 1.9.16 a failed session was not tried again: the
     //    database came only when a device offered FileTransfer anew (#26).
+    // tkn is STC's own token (the service announcement).  unitToken, when
+    // given, is the unit's own (its discovery token): the uuid a track's
+    // net:// path names its medium's unit by.  A track whose path names
+    // another unit is then not looked up in this unit's databases (see the
+    // getters); without it the uuid is not compared.
     // start() and stop() are serialised.  MainComponent calls stop() only
     // after StageLinQInput::stop() has joined the connection threads, so a
     // start() does not wait on a stop() there.
     //--------------------------------------------------------------------------
     bool start(const juce::String& ip, uint16_t fileTransferPort,
-               const uint8_t tkn[StageLinQ::kTokenLen])
+               const uint8_t tkn[StageLinQ::kTokenLen],
+               const uint8_t* unitToken = nullptr)
     {
+        const juce::String unit = unitToken != nullptr
+            ? juce::String::toHexString(unitToken, StageLinQ::kTokenLen, 0).toLowerCase()
+            : juce::String();
         std::lock_guard<std::mutex> life(lifecycleMutex);
         bool deferred = false;
         {
@@ -416,6 +496,7 @@ public:
                         deferredIp = ip;
                         deferredPort = fileTransferPort;
                         std::memcpy(deferredToken, tkn, StageLinQ::kTokenLen);
+                        deferredUnit = unit;
                         haveDeferred = true;
                     }
                     deferred = true;
@@ -440,6 +521,7 @@ public:
             targetIp = ip;
             targetPort = fileTransferPort;
             std::memcpy(targetToken, tkn, StageLinQ::kTokenLen);
+            targetUnit = unit;
             targetSerial.store(targetSerial.load() + 1);
             isRunningFlag.store(true);
         }
@@ -457,8 +539,13 @@ public:
     // requested lately are kept and asked for again when the next session
     // starts; the caches stay readable until then (beginSession clears
     // them).  An artwork check under way is cut short (queryArtwork); JUCE's
-    // decode of an image that passed it (within ImageGuard's artwork
-    // limits) is not, and is waited for.
+    // decode of an image that passed it is not, and is waited for (within
+    // ImageGuard's limits about a second here, see ImageGuard.h).  After
+    // 5 s the thread is killed.  JUCE 9.0.3 kills with TerminateThread on
+    // Windows, but with pthread_cancel on Linux and macOS, which acts only
+    // at a cancellation point and is not waited for: a killed thread may
+    // still be running when the databases are closed below, and the two
+    // then race (as the close after a kill did before 1.9.16).
     void stop()
     {
         std::lock_guard<std::mutex> life(lifecycleMutex);
@@ -472,7 +559,11 @@ public:
         closeFtSocket();                    // ends a blocking read at once
 
         if (!stopThread(5000))
-            closeDatabase();                // the thread closes it, unless it was killed
+        {
+            closeDatabase();                // the thread closes it, unless it was killed (see above)
+            phase = StageLinQDbStatus::Session::idle;
+            publishStatus();                // (run() does, unless it was killed)
+        }
 
         DBG("StageLinQ DB: Stopped");
     }
@@ -487,9 +578,11 @@ public:
     // Each looks the track up by its TrackNetworkPath in what the database
     // of its own source gave (net://<uuid>/<source>/...: USB 1, SD, ...); a
     // streaming track by its URI.  No track is answered from another
-    // source's database.  The uuid in the path (the unit that holds the
-    // medium) is not compared: a track of another unit's USB 1 is looked
-    // up in the served unit's USB 1, as before 1.9.16.
+    // source's database.  The uuid names the unit that holds the medium:
+    // when start() was given the served unit's token, a track of another
+    // unit's medium is not looked up at all; without it the uuid is not
+    // compared, and such a track is looked up in the served unit's source
+    // of the same name (USB 1 for USB 1), as before 1.9.16.
 
     // Lookup track by network path (e.g. from StateMap TrackNetworkPath)
     DenonTrackMeta getTrackByNetworkPath(const juce::String& networkPath) const
@@ -556,6 +649,31 @@ public:
     // session (another source's may still be downloading)
     bool isDatabaseReady() const { return dbReady.load(); }
 
+    // What the client is doing (StageLinQDbStatus).  Message thread, at any
+    // rate (30-60 Hz is fine): it copies a snapshot under statusMutex,
+    // which the client's thread holds only to replace that snapshot, never
+    // across socket or SQLite I/O.  The tracks are the 16 latest requested
+    // (kMaxRemembered).
+    StageLinQDbStatus getStatus() const
+    {
+        StageLinQDbStatus st;
+        {
+            std::lock_guard<std::mutex> lock(statusMutex);
+            st = status;
+        }
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        auto secondsTo = [now](double atMs)
+        {
+            return atMs > now ? (int)std::ceil((atMs - now) / 1000.0) : 0;
+        };
+        if (st.session == StageLinQDbStatus::Session::retrying)
+            st.retryInSeconds = secondsTo(st.retryAtMs);
+        for (auto& so : st.sources)
+            if (so.state == StageLinQDbStatus::SourceState::failed)
+                so.retryInSeconds = secondsTo(so.retryAtMs);
+        return st;
+    }
+
 private:
     // Threads: everything below runs on the client's thread (SLQ-DB)
     // unless its comment says otherwise.  The static helpers
@@ -566,18 +684,27 @@ private:
     // A track as its TrackNetworkPath names it (parseNetworkPath)
     struct TrackRef
     {
+        juce::String unit;                  // parts[2], the uuid without dashes, lower case; empty when streaming
         juce::String source;                // parts[3]; empty for a streaming track
         juce::String dbPath;                // Track.path, or Track.uri when streaming
         bool streaming = false;
 
         bool valid() const { return dbPath.isNotEmpty(); }
-        // The cache key: the source and the path (one medium's row never
-        // stands for another's)
+        // The cache key: the unit, the source and the path (one medium's
+        // row never stands for another's)
         std::string key() const
         {
             if (!valid()) return {};
-            return ((streaming ? juce::String("streaming") : source) + "\n" + dbPath).toStdString();
+            return ((streaming ? juce::String("streaming") : unit + "\n" + source) + "\n" + dbPath).toStdString();
         }
+    };
+
+    // A requested track's lookup result (getStatus()), and when this session
+    // first had the request
+    struct RequestedTrack
+    {
+        StageLinQDbStatus::Track track;
+        double askedMs = 0.0;
     };
 
     //==========================================================================
@@ -598,10 +725,12 @@ private:
         {
             if (!takeTarget())
             {
+                setPhase(StageLinQDbStatus::Session::idle);
                 wait(-1);                   // until start() or stop()
                 continue;
             }
             refusedDbs.clear();             // another device, or the same on another port
+            lastFailure.clear();
 
             for (int failures = 0;; ++failures)
             {
@@ -614,14 +743,27 @@ private:
 
                 const double waitMs = backoffMs(failures);
                 const double retryAt = juce::Time::getMillisecondCounterHiRes() + waitMs;
-                DBG("StageLinQ DB: Session failed -- trying again in " + juce::String((int)(waitMs / 1000.0)) + " s");
+                DBG("StageLinQ DB: Session failed (" + lastFailure + ") -- trying again in "
+                    + juce::String((int)(waitMs / 1000.0)) + " s");
+                retryAtMs = retryAt;
+                setPhase(StageLinQDbStatus::Session::retrying);
                 for (double left; !sessionShouldEnd() && !hasDeferredOffer()
                                   && (left = retryAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
-                    wait((int)std::ceil(left));
+                {
+                    // Woken once a second to take the requests made meanwhile
+                    // (getStatus() lists them as pending); no I/O
+                    wait((int)std::ceil(juce::jmin(left, 1000.0)));
+                    takeRequests();
+                    if (statusDirty)
+                        publishStatus();
+                }
+                retryAtMs = 0.0;
                 if (sessionShouldEnd() || serveDeferredOffer())
                     break;
             }
         }
+        lastFailure.clear();
+        setPhase(StageLinQDbStatus::Session::idle);
     }
 
     // The wait before the next try after a session's (or a connection's,
@@ -641,6 +783,7 @@ private:
         deviceIp = targetIp;
         ftPort = targetPort;
         std::memcpy(token, targetToken, StageLinQ::kTokenLen);
+        servedUnit = targetUnit;
         servedSerial = targetSerial.load();
         return true;
     }
@@ -656,6 +799,7 @@ private:
         targetIp = deferredIp;
         targetPort = deferredPort;
         std::memcpy(targetToken, deferredToken, StageLinQ::kTokenLen);
+        targetUnit = deferredUnit;
         targetSerial.store(targetSerial.load() + 1);
         haveDeferred = false;
         return true;
@@ -699,6 +843,18 @@ private:
             perfCache.clear();
         }
         waitingRequests = requested;
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        for (auto& [path, look] : lookups)
+        {
+            const auto source = look.track.source;
+            const bool streaming = look.track.streaming;
+            look.track = {};
+            look.track.networkPath = path;
+            look.track.source = source;
+            look.track.streaming = streaming;
+            look.askedMs = now;
+        }
+        setPhase(StageLinQDbStatus::Session::connecting);
     }
 
     // True when the session must end: stop(), or start() wants another
@@ -759,6 +915,7 @@ private:
         {
             if (!firstDone)
             {
+                takeRequests();             // listed as pending meanwhile (getStatus())
                 const DbSearch found = connectAndLoadFirst();
                 if (!otherDeviceOfferWaits()
                     && ((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
@@ -770,6 +927,8 @@ private:
                 }
                 if (found != DbSearch::found) break;
                 firstDone = true;
+                lastFailure.clear();
+                setPhase(StageLinQDbStatus::Session::ready);
                 continue;
             }
 
@@ -777,7 +936,10 @@ private:
             takeRequests();
             const Needs needs = answerFromLoaded();
             if (sessionShouldEnd()) break;
-            if (!doDeviceWork(needs))
+            const bool worked = doDeviceWork(needs);
+            if (statusDirty)
+                publishStatus();
+            if (!worked)
                 wait(100);                  // cut short by stop() and start()
         }
         // The requests still waiting are among those beginSession() asks
@@ -803,6 +965,8 @@ private:
         closeFtSocket();
         fltxReadBuf.clear();                // nothing of an earlier connection's stream
         DBG("StageLinQ DB: Connecting to FileTransfer at " + deviceIp + ":" + juce::String(ftPort));
+        if (!dbReady.load())
+            setPhase(StageLinQDbStatus::Session::connecting);
 
         // --- Connect to FileTransfer service ---
         {
@@ -811,6 +975,7 @@ private:
             if (sock == nullptr)
             {
                 DBG("StageLinQ DB: FileTransfer connect failed");
+                noteFailure("could not connect to the unit's file service");
                 return false;
             }
 
@@ -895,21 +1060,28 @@ private:
     // answered (the connection is then closed) or is empty (it stays open)
     bool askSources()
     {
+        if (!dbReady.load())
+            setPhase(StageLinQDbStatus::Session::readingSources);
         lastSourcesAskMs = juce::Time::getMillisecondCounterHiRes();
         bool answered = false;
         juce::StringArray sources = fetchSources(answered);
         if (!answered)
         {
             DBG("StageLinQ DB: No source list from the device");
+            noteFailure("no source list from the unit");
             closeFtSocket();
             return false;
         }
         if (sources.isEmpty())
         {
             DBG("StageLinQ DB: No sources found on device");
+            noteFailure("no media on the unit");
             return false;
         }
+        if (lastFailure.isNotEmpty() && dbReady.load())
+            lastFailure.clear();            // the unit answers again
         updateSources(sources);
+        statusDirty = true;
         return true;
     }
 
@@ -970,10 +1142,17 @@ private:
             auto* s = findSource(listedSources[i]);
             if (s == nullptr || s->state != SourceDb::State::notTried) continue;
             const DbSearch r = loadSource(*s);
+            if (r == DbSearch::lost || r == DbSearch::transferLost)
+                noteFailure(s->failure.isNotEmpty() ? s->failure : juce::String("connection lost"));
             if (r == DbSearch::none) continue;
             return r;
         }
         DBG("StageLinQ DB: Failed to download database");
+        juce::String why = "no Engine library on the unit's media";
+        for (auto& s : sessionSources)
+            if (s.state == SourceDb::State::failed && s.failure.isNotEmpty())
+                why = s.name + ": " + s.failure;
+        noteFailure(why);
         return DbSearch::none;
     }
 
@@ -991,11 +1170,24 @@ private:
             // A track not asked for lately: the source list may be asked
             // for again 5 s after the last time
             if (!requested.contains(r))
+            {
                 sourcesAskIntervalMs = kSourcesAskFirstMs;
+                const TrackRef ref = parseNetworkPath(r);
+                RequestedTrack look;
+                look.track.networkPath = r;
+                look.track.source = ref.source;
+                look.track.streaming = ref.streaming;
+                look.askedMs = juce::Time::getMillisecondCounterHiRes();
+                lookups[r] = look;
+                statusDirty = true;
+            }
             requested.removeString(r);
             requested.add(r);
             while (requested.size() > kMaxRemembered)
+            {
+                lookups.erase(requested[0]);
                 requested.remove(0);
+            }
             waitingRequests.addIfNotAlreadyThere(r);
         }
     }
@@ -1011,11 +1203,12 @@ private:
     // device I/O); the others stay waiting.  It stops between two requests
     // when the session must end: a session starts with up to
     // kMaxRemembered requests, and stop() waits for this thread (5 s, then
-    // it is killed).  One lookup can take over a second: an artwork at
-    // ImageGuard's limits (64 MiB of pixel data) is checked by ImageGuard
-    // and decoded by JUCE, up to 0.8 s each here.  stop() cuts the
-    // check short (queryArtwork), not the decode.  The requests not looked
-    // at stay waiting.
+    // it is killed).  One lookup can take over a second: a 4096 x 4096
+    // RGBA artwork took up to 0.78 s to check and 0.76 s to decode here,
+    // and ImageGuard's limits on deflate blocks and text chunks leave
+    // JUCE's decode an estimated 0.6 s more (ImageGuard.h).  stop() cuts
+    // the check short (queryArtwork), not the decode.  The requests not
+    // looked at stay waiting.
     Needs answerFromLoaded()
     {
         Needs needs;
@@ -1036,16 +1229,51 @@ private:
     }
 
     // One request: true when it is answered (found, or not to be found in
-    // this session); else what it waits for
+    // this session); else what it waits for.  Its lookup result is noted
+    // for getStatus() (when it is among the latest requested).
     bool resolveRequest(const juce::String& networkPath, juce::String& needSource, bool& needSources)
     {
+        using L = StageLinQDbStatus::Lookup;
+        auto it = lookups.find(networkPath);
+        RequestedTrack* look = it != lookups.end() ? &it->second : nullptr;
+        auto note = [this, look](L result)
+        {
+            if (look != nullptr && look->track.result != result)
+            {
+                look->track.result = result;
+                statusDirty = true;
+            }
+        };
         const TrackRef ref = parseNetworkPath(networkPath);
-        if (!ref.valid()) return true;
+        if (!ref.valid())
+        {
+            note(L::notInDatabase);
+            return true;
+        }
+        if (!ref.streaming && servedUnit.isNotEmpty() && ref.unit != servedUnit)
+        {
+            // A medium of another unit (its uuid is not the served unit's
+            // token): none of this unit's databases is that medium's
+            note(L::sourceNotOnUnit);
+            return true;
+        }
         const std::string key = ref.key();
+        bool cached = false;
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
-            if (trackCache.count(key) > 0) return true;
+            cached = trackCache.count(key) > 0;
         }
+        if (cached)
+        {
+            noteFound(look, key);               // takes cacheMutex itself
+            return true;
+        }
+        auto lookUp = [&](const SourceDb& src)
+        {
+            const bool found = lookUpTrack(src, ref, key);
+            if (found) noteFound(look, key);
+            return found;
+        };
 
         if (ref.streaming)
         {
@@ -1064,50 +1292,86 @@ private:
                 }
                 if (s != nullptr && s->state == SourceDb::State::ready)
                 {
-                    lookUpTrack(*s, ref, key);
+                    if (!lookUp(*s)) note(L::notInDatabase);
                     return true;
                 }
                 if (s != nullptr && s->state == SourceDb::State::failed && s->retryable)
                 {
                     if (juce::Time::getMillisecondCounterHiRes() >= s->retryAtMs)
                         needSource = name;          // tried again now (loadSource)
+                    note(L::pending);
                     return false;
                 }
                 break;
             }
-            bool anyLoaded = false;                 // else each database loaded
+            bool anyLoaded = false, found = false;  // else each database loaded
             for (auto& s : sessionSources)
             {
                 if (s.state != SourceDb::State::ready) continue;
                 anyLoaded = true;
-                if (lookUpTrack(s, ref, key)) break;
+                if ((found = lookUp(s))) break;
             }
+            if (anyLoaded && !found) note(L::notInDatabase);
             return anyLoaded;                       // none loaded yet (the first download runs): it waits
         }
 
         auto* s = findSource(ref.source);
         if (s == nullptr || (s->state == SourceDb::State::notTried && !listedSources.contains(ref.source)))
         {
-            needSources = true;                     // not on the unit's last list
+            // Not on the unit's last list: asked for again (doDeviceWork).
+            // Once a list asked for after the request still lacks it, the
+            // source is reported as not on the unit; the request still waits.
+            needSources = true;
+            note(look != nullptr && lastSourcesAskMs > look->askedMs ? L::sourceNotOnUnit : L::pending);
             return false;
         }
         switch (s->state)
         {
             case SourceDb::State::ready:
-                lookUpTrack(*s, ref, key);
+                if (!lookUp(*s)) note(L::notInDatabase);
                 return true;
             case SourceDb::State::notTried:
                 needSource = s->name;
+                note(L::pending);
                 return false;
             case SourceDb::State::failed:
                 if (!s->retryable)
+                {
+                    note(L::sourceHasNoDatabase);
                     return true;                    // its database is not usable
+                }
                 if (juce::Time::getMillisecondCounterHiRes() >= s->retryAtMs)
                     needSource = s->name;           // tried again now (loadSource)
+                note(L::pending);
                 return false;                       // waits meanwhile
             case SourceDb::State::noLibrary:
             default:
+                note(L::sourceHasNoDatabase);
                 return true;                        // its medium has no database here
+        }
+    }
+
+    // A found track's lookup result, with what the caches hold for it
+    void noteFound(RequestedTrack* look, const std::string& key)
+    {
+        if (look == nullptr) return;
+        StageLinQDbStatus::Track t = look->track;
+        t.result = StageLinQDbStatus::Lookup::found;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            t.waveform = waveformCache.count(key) > 0;
+            t.artwork = artworkCache.count(key) > 0;
+            t.cues = false;
+            auto perf = perfCache.find(key);
+            if (perf != perfCache.end())
+                for (auto& q : perf->second.quickCues)
+                    t.cues = t.cues || q.isSet();
+        }
+        const auto& o = look->track;
+        if (o.result != t.result || o.waveform != t.waveform || o.artwork != t.artwork || o.cues != t.cues)
+        {
+            look->track = t;
+            statusDirty = true;
         }
     }
 
@@ -1170,13 +1434,14 @@ private:
         if (s.state == SourceDb::State::failed)
             for (auto& p : paths)
                 unansweredStats.removeString(p);
-        auto fail = [&s](const juce::String& why, bool retryable)
+        auto fail = [this, &s](const juce::String& why, bool retryable)
         {
             s.state = SourceDb::State::failed;
             s.failure = why;
             s.retryable = retryable;
             if (retryable)
                 s.retryAtMs = juce::Time::getMillisecondCounterHiRes() + backoffMs(s.failures++);
+            statusDirty = true;
         };
         // Tried again after its back-off, a source is one not tried yet until
         // this try ends: its paths are asked afresh (above), and a stat that
@@ -1185,6 +1450,7 @@ private:
         if (s.state == SourceDb::State::failed)
         {
             s.state = SourceDb::State::notTried;
+            statusDirty = true;
         }
         bool skipped = false;
         for (auto& dbPath : paths)
@@ -1210,6 +1476,7 @@ private:
                 if (everyPath)
                     fail("the unit did not answer", true);
                 unansweredStats.add(dbPath);
+                noteFailure(fltxConnected() ? "no reply from the unit" : "connection lost");
                 return DbSearch::statUnanswered;
             }
             if (stat == Reply::refused) continue;
@@ -1225,7 +1492,10 @@ private:
 
             // Download the file
             std::vector<uint8_t> data;
+            downloadingName = s.name;
             const Reply got = downloadFile(dbPath, data);
+            downloadingName.clear();
+            settlePhase();
             if (got == Reply::lost)
             {
                 fail("download failed (" + transferFailure + ")", true);
@@ -1259,6 +1529,7 @@ private:
             s.state = SourceDb::State::ready;
             s.failure.clear();
             dbReady.store(true);
+            settlePhase();
             DBG("StageLinQ DB: Database of " + s.name + " ready (" + tempFile.getFullPathName() + ")");
             return DbSearch::found;
         }
@@ -1266,7 +1537,87 @@ private:
             fail("the unit did not answer", true);
         else
             s.state = SourceDb::State::noLibrary;
+        statusDirty = true;
         return DbSearch::none;
+    }
+
+    //==========================================================================
+    // Status (getStatus).  This thread, and stop() after it killed this
+    // thread (which on Linux and macOS may still be running then: see
+    // stop()): the members read here are this thread's.
+    //==========================================================================
+    void setPhase(StageLinQDbStatus::Session p)
+    {
+        phase = p;
+        publishStatus();
+    }
+
+    // After a download or a database opened: ready once one is, else still
+    // looking at the unit's media
+    void settlePhase()
+    {
+        setPhase(dbReady.load() ? StageLinQDbStatus::Session::ready
+                                : StageLinQDbStatus::Session::readingSources);
+    }
+
+    // Why the session (or a connection) failed, for the status line
+    void noteFailure(const juce::String& why)
+    {
+        lastFailure = why;
+        statusDirty = true;
+    }
+
+    // Replaces the snapshot getStatus() copies; statusMutex is held for the
+    // move only
+    void publishStatus()
+    {
+        using S = StageLinQDbStatus;
+        S st;
+        st.session = phase;
+        if (phase != S::Session::idle)
+            st.deviceIp = deviceIp;
+        if (phase == S::Session::downloading)
+        {
+            st.downloadingSource = downloadingName;
+            st.downloadPercent = downloadPercent;
+        }
+        if (phase == S::Session::retrying)
+            st.retryAtMs = retryAtMs;
+        st.lastFailure = lastFailure;
+        for (auto& s : sessionSources)
+        {
+            S::Source so;
+            so.name = s.name;
+            switch (s.state)
+            {
+                case SourceDb::State::ready:     so.state = S::SourceState::ready; break;
+                case SourceDb::State::noLibrary: so.state = S::SourceState::noLibrary; break;
+                case SourceDb::State::failed:    so.state = S::SourceState::failed; break;
+                case SourceDb::State::notTried:
+                default:                         so.state = S::SourceState::notDownloaded; break;
+            }
+            if (downloadingName.isNotEmpty() && s.name == downloadingName)
+            {
+                so.state = S::SourceState::downloading;
+                so.percent = downloadPercent;
+            }
+            so.trackCount = s.trackCount;
+            if (so.state == S::SourceState::failed)
+            {
+                so.failure = s.failure;
+                if (s.retryable) so.retryAtMs = s.retryAtMs;
+            }
+            st.sources.push_back(std::move(so));
+        }
+        for (auto& r : requested)
+        {
+            auto it = lookups.find(r);
+            if (it != lookups.end())
+                st.tracks.push_back(it->second.track);
+        }
+        statusDirty = false;
+        std::lock_guard<std::mutex> lock(statusMutex);
+        status = std::move(st);
     }
 
     //==========================================================================
@@ -1386,6 +1737,8 @@ private:
         if (!fltxWrite(chunkReq)) { fileData = {}; return Reply::lost; }
 
         uint32_t bytesReceived = 0;
+        downloadPercent = 0;
+        setPhase(StageLinQDbStatus::Session::downloading);
         const double deadline = juce::Time::getMillisecondCounterHiRes() + StageLinQ::kDownloadBaseMs
                                 + fileSize * StageLinQ::kDownloadMsPerByte;
         double lastChunkTime = juce::Time::getMillisecondCounterHiRes();
@@ -1409,6 +1762,14 @@ private:
                 lastAnswerMs = juce::Time::getMillisecondCounterHiRes();
                 takeRequests();
                 answerFromLoaded();
+                const int percent = (int)((uint64_t)bytesReceived * 100u / fileSize);
+                if (percent != downloadPercent)
+                {
+                    downloadPercent = percent;
+                    statusDirty = true;
+                }
+                if (statusDirty)
+                    publishStatus();
             }
             auto chunkResp = fltxReadResponse(1000);
             if (chunkResp.received && chunkResp.code == 0
@@ -1837,7 +2198,8 @@ private:
     }
 
     // Closes every source's database and deletes its copy (this thread, or
-    // stop() once the thread is gone); each handle is closed once
+    // stop() after it killed this thread, which on Linux and macOS may
+    // still be running then: see stop()); each handle is closed once
     void closeDatabase()
     {
         dbReady.store(false);
@@ -2359,7 +2721,9 @@ private:
     //
     // Format: net://uuid/source/Engine Library/Music/Artist/Track.mp3
     //   -> source "source", DB path Music/Artist/Track.mp3 (relative to
-    //      Engine Library)
+    //      Engine Library), unit the uuid without its dashes, lower case
+    //      (the discovery token of the unit that holds the medium: #23
+    //      capture, DENON26 report_0)
     //
     // Engine keeps Track.path relative to the Engine Library folder
     // (engine-dj-mcp dist/paths.js; chrisle/StageLinq Player.ts keeps
@@ -2404,6 +2768,7 @@ private:
             return ref;
         }
 
+        ref.unit = parts[2].removeCharacters("-").toLowerCase();
         ref.source = parts[3];
         juce::StringArray trackParts;
         if (parts.size() > 5 && parts[4] == "Engine Library")
@@ -2438,6 +2803,7 @@ private:
     juce::String deviceIp;
     uint16_t ftPort = 0;
     uint8_t token[StageLinQ::kTokenLen] = {};
+    juce::String servedUnit;             // its token in hex (start()'s unitToken), or empty
     uint32_t servedSerial = 0;           // the targetSerial of that session
 
     // What start() wants served (guarded by targetMutex; targetSerial is
@@ -2446,6 +2812,7 @@ private:
     juce::String targetIp;
     uint16_t targetPort = 0;
     uint8_t targetToken[StageLinQ::kTokenLen] = {};
+    juce::String targetUnit;
     std::atomic<uint32_t> targetSerial { 0 };
     // The last offer start() ignored while a session was wanted (also under
     // targetMutex): served if that session fails (run).  One of the
@@ -2453,6 +2820,7 @@ private:
     juce::String deferredIp;
     uint16_t deferredPort = 0;
     uint8_t deferredToken[StageLinQ::kTokenLen] = {};
+    juce::String deferredUnit;
     bool haveDeferred = false;
 
     std::mutex lifecycleMutex;           // serialises start() and stop()
@@ -2488,9 +2856,23 @@ private:
 
     // Requests (this thread only): those not answered yet, oldest first,
     // and the kMaxRemembered latest, oldest first (asked for again when a
-    // session starts; kept across sessions and stop())
+    // session starts; kept across sessions and stop()), with what their
+    // lookup came to (for getStatus())
     juce::StringArray waitingRequests, requested;
     static constexpr int kMaxRemembered = 16;
+    std::map<juce::String, RequestedTrack> lookups; // by network path, those in requested
+
+    // What getStatus() reports, kept by this thread (and stop() after it
+    // killed this thread, see stop()), and the snapshot it copies
+    // (statusMutex)
+    StageLinQDbStatus::Session phase = StageLinQDbStatus::Session::idle;
+    juce::String downloadingName;            // the source being downloaded
+    int downloadPercent = 0;
+    juce::String lastFailure;
+    double retryAtMs = 0.0;                  // the session's next try (retrying)
+    bool statusDirty = false;                // something changed since publishStatus()
+    mutable std::mutex statusMutex;
+    StageLinQDbStatus status;
 
     // When the source list was last asked for, and how long until it may be
     // asked again for a source it did not name (this thread only)
