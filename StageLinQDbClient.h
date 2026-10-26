@@ -17,6 +17,8 @@
 //      (or v1 fallback); another source's when a track on it is asked for
 //   4. Open each with SQLite, cache track metadata + artwork per source
 //   5. On TrackNetworkPath change: lookup Track -> AlbumArt -> juce::Image
+//   6. A session that fails is tried again after 5, 10, 20, 40, then
+//      every 60 s, while start() still wants that device
 //
 // Requires: sqlite3 amalgamation (sqlite3.h + sqlite3.c) in the project.
 
@@ -330,6 +332,9 @@ struct StageLinQSourceDb
     bool perfDataIsTable = false;       // PerformanceData is an ordinary table
     int trackCount = 0;
     juce::String failure;               // why it failed
+    bool retryable = false;             // failed for a reason a later try may not meet
+    int failures = 0;                   // failed tries in this session
+    double retryAtMs = 0.0;             // retryable: not tried again before (ms counter)
 };
 
 class StageLinQDbClient : public juce::Thread
@@ -367,22 +372,25 @@ public:
     //    addresses); within the second one port served two of STC's
     //    connections, so a reconnection on the same port is not taken for
     //    a restart.
-    //  - After a session failed (no sources, download or open failed, the
-    //    device gone), the last offer ignored while a session was wanted --
-    //    another device's, or the same device's again -- starts a new one,
-    //    also when it was ignored before the session's own device restarted
-    //    (the bullet above); without one, the next device to offer
-    //    FileTransfer does.  An ignored offer of the session's own device
-    //    (a reconnection on its port) does not replace another device's:
+    //  - A session that fails (no source list, no database on any source,
+    //    a download that failed or a connection lost before the first
+    //    database was loaded) is tried again while start() still wants
+    //    that device: after 5, 10, 20 and 40 s, then every 60 s (run).
+    //    The last offer ignored while a session was wanted -- another
+    //    device's, or the same device's again -- is served instead of the
+    //    next try, and at once: an ignored offer wakes the client's
+    //    thread, so it also ends a wait between tries.  That holds too for
+    //    an offer ignored before the session's own device restarted (the
+    //    bullet above).  An ignored offer of the session's own device (a
+    //    reconnection on its port) does not replace another device's:
     //    when the session fails, the other device is tried, not the one
     //    that just failed.  Trade-off: when the session's device itself
     //    recovers (the failure was transient) after re-offering on its
     //    port, the other unit's deferred offer is still served, not the
     //    session's device again, and that unit's database stays in use
     //    while its session holds -- AUDIT SLQ-3's first-device rule gives
-    //    way.  Before, an offer made during a session that then failed was
-    //    lost for good: a second unit was not fetched until it reconnected
-    //    (AUDIT SLQ-9).
+    //    way.  Before 1.9.16 a failed session was not tried again: the
+    //    database came only when a device offered FileTransfer anew (#26).
     // start() and stop() are serialised.  MainComponent calls stop() only
     // after StageLinQInput::stop() has joined the connection threads, so a
     // start() does not wait on a stop() there.
@@ -391,6 +399,7 @@ public:
                const uint8_t tkn[StageLinQ::kTokenLen])
     {
         std::lock_guard<std::mutex> life(lifecycleMutex);
+        bool deferred = false;
         {
             std::lock_guard<std::mutex> lock(targetMutex);
             if (isRunningFlag.load())
@@ -398,9 +407,10 @@ public:
                 if (ip != targetIp || fileTransferPort == targetPort)
                 {
                     // Ignored while this session is wanted; kept in case it
-                    // fails (run).  The latest one replaces an earlier one,
-                    // except that the session's own device does not replace
-                    // another device's (AUDIT SLQ-9).
+                    // fails, or is waiting to be tried again (run).  The
+                    // latest one replaces an earlier one, except that the
+                    // session's own device does not replace another
+                    // device's (AUDIT SLQ-9).
                     if (ip != targetIp || !haveDeferred || deferredIp == ip)
                     {
                         deferredIp = ip;
@@ -408,10 +418,20 @@ public:
                         std::memcpy(deferredToken, tkn, StageLinQ::kTokenLen);
                         haveDeferred = true;
                     }
-                    return true;
+                    deferred = true;
                 }
-                DBG("StageLinQ DB: " + ip + " is back on FileTransfer port "
-                    + juce::String(fileTransferPort) + " -- fetching its database again");
+                else
+                {
+                    DBG("StageLinQ DB: " + ip + " is back on FileTransfer port "
+                        + juce::String(fileTransferPort) + " -- fetching its database again");
+                }
+            }
+            if (deferred)
+            {
+                // A session waiting to be tried again serves it now (run);
+                // a running one goes on
+                notify();
+                return true;
             }
             // The offer served now supersedes an earlier one of its own
             // device; another device's is kept, in case this session fails.
@@ -432,8 +452,13 @@ public:
         return true;
     }
 
-    // Message thread.  Ends the session and the thread; the database and
-    // its temp file are closed, the caches kept until the next session.
+    // Message thread.  Ends the session (or the wait to try one again) and
+    // the thread; every database and temp file is closed.  The tracks
+    // requested lately are kept and asked for again when the next session
+    // starts; the caches stay readable until then (beginSession clears
+    // them).  An artwork check under way is cut short (queryArtwork); JUCE's
+    // decode of an image that passed it (within ImageGuard's artwork
+    // limits) is not, and is waited for.
     void stop()
     {
         std::lock_guard<std::mutex> life(lifecycleMutex);
@@ -452,6 +477,8 @@ public:
         DBG("StageLinQ DB: Stopped");
     }
 
+    // From start() to stop(), also while a failed session waits to be
+    // tried again (before 1.9.16 it turned false when a session failed)
     bool getIsRunning() const { return isRunningFlag.load(); }
 
     //--------------------------------------------------------------------------
@@ -556,68 +583,122 @@ private:
     //==========================================================================
     // Thread main loop
     //==========================================================================
-    // Runs from the first start() to stop(): one session for each device
+    // Runs from the first start() to stop(): the sessions of each device
     // and port start() asks for, and a wait for the next one in between.
     // A session returns when it fails, when stop() is called, or when
     // start() wants another (a restarted device); it leaves no socket,
-    // database or temp file behind.
+    // database or temp file behind.  A failed one is tried again after
+    // 5, 10, 20, 40, then every 60 s (backoffMs), unless an offer start()
+    // ignored meanwhile is served instead (start()).  stop() ends the
+    // wait at once (stopThread() notifies the thread's event), and so does
+    // an offer.  Nothing is sent to the unit during the wait.
     void run() override
     {
         while (!threadShouldExit())
         {
-            bool haveTarget = false;
-            {
-                std::lock_guard<std::mutex> lock(targetMutex);
-                if (isRunningFlag.load() && targetSerial.load() != servedSerial)
-                {
-                    deviceIp = targetIp;
-                    ftPort = targetPort;
-                    std::memcpy(token, targetToken, StageLinQ::kTokenLen);
-                    servedSerial = targetSerial.load();
-                    haveTarget = true;
-                }
-            }
-            if (!haveTarget)
+            if (!takeTarget())
             {
                 wait(-1);                   // until start() or stop()
                 continue;
             }
+            refusedDbs.clear();             // another device, or the same on another port
 
-            fltxReadBuf.clear();            // nothing of the last session's stream
-            unansweredStats.clear();
-            seenRequests.clear();
-            lastSourcesAskMs = 0.0;
-            sourcesAskIntervalMs = kSourcesAskFirstMs;
-            nextConnectMs = 0.0;
+            for (int failures = 0;; ++failures)
             {
-                std::lock_guard<std::mutex> lock(cacheMutex);   // built from the last database
-                trackCache.clear();
-                artworkCache.clear();
-                waveformCache.clear();
-                perfCache.clear();
-            }
-            runSession();
-            closeFtSocket();
-            closeDatabase();
+                beginSession();
+                runSession();
+                closeFtSocket();
+                closeDatabase();
+                if (sessionShouldEnd() || serveDeferredOffer())
+                    break;                  // stop(), another target, or an ignored offer served
 
-            std::lock_guard<std::mutex> lock(targetMutex);
-            if (targetSerial.load() == servedSerial)
-            {
-                // It failed (or stop()).  An offer that start() ignored while
-                // it ran is served now; otherwise the next start() begins
-                // anew.  stop() clears both the flag and the offer.
-                if (haveDeferred && isRunningFlag.load() && !threadShouldExit())
-                {
-                    targetIp = deferredIp;
-                    targetPort = deferredPort;
-                    std::memcpy(targetToken, deferredToken, StageLinQ::kTokenLen);
-                    targetSerial.store(targetSerial.load() + 1);
-                    haveDeferred = false;
-                }
-                else
-                    isRunningFlag.store(false);
+                const double waitMs = backoffMs(failures);
+                const double retryAt = juce::Time::getMillisecondCounterHiRes() + waitMs;
+                DBG("StageLinQ DB: Session failed -- trying again in " + juce::String((int)(waitMs / 1000.0)) + " s");
+                for (double left; !sessionShouldEnd() && !hasDeferredOffer()
+                                  && (left = retryAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
+                    wait((int)std::ceil(left));
+                if (sessionShouldEnd() || serveDeferredOffer())
+                    break;
             }
         }
+    }
+
+    // The wait before the next try after a session's (or a connection's,
+    // or a source's) consecutive failures: 5, 10, 20, 40, then 60 s
+    static double backoffMs(int failures)
+    {
+        static constexpr double steps[] = { 5000.0, 10000.0, 20000.0, 40000.0 };
+        return failures >= 0 && failures < 4 ? steps[failures] : 60000.0;
+    }
+
+    // This thread.  The device and port start() wants, when not served yet
+    bool takeTarget()
+    {
+        std::lock_guard<std::mutex> lock(targetMutex);
+        if (!isRunningFlag.load() || targetSerial.load() == servedSerial)
+            return false;
+        deviceIp = targetIp;
+        ftPort = targetPort;
+        std::memcpy(token, targetToken, StageLinQ::kTokenLen);
+        servedSerial = targetSerial.load();
+        return true;
+    }
+
+    // This thread, after a failed session: the last offer start() ignored
+    // becomes the target (true), served instead of the failed one's next
+    // try.  stop() clears both the flag and the offer.
+    bool serveDeferredOffer()
+    {
+        std::lock_guard<std::mutex> lock(targetMutex);
+        if (!haveDeferred || !isRunningFlag.load() || threadShouldExit())
+            return false;
+        targetIp = deferredIp;
+        targetPort = deferredPort;
+        std::memcpy(targetToken, deferredToken, StageLinQ::kTokenLen);
+        targetSerial.store(targetSerial.load() + 1);
+        haveDeferred = false;
+        return true;
+    }
+
+    bool hasDeferredOffer()
+    {
+        std::lock_guard<std::mutex> lock(targetMutex);
+        return haveDeferred;
+    }
+
+    // This thread.  An offer of another device waits (start() deferred it):
+    // before a first database is loaded, an unanswered stat or a lost
+    // transfer then ends the session, and run() serves that offer, instead
+    // of a new connection going on with the next path (D4 of DESIGN D41;
+    // that took up to 3.5 s a path, VERIFY-DB-3 Y04)
+    bool otherDeviceOfferWaits()
+    {
+        std::lock_guard<std::mutex> lock(targetMutex);
+        return haveDeferred && deferredIp != deviceIp;
+    }
+
+    // This thread.  A session starts afresh: nothing of the last one's
+    // stream, unanswered paths or source list; the caches cleared (built
+    // from the last database); and the tracks requested lately (the
+    // kMaxRemembered latest) asked for again, so the decks that have them
+    // loaded resolve without a reload.
+    void beginSession()
+    {
+        fltxReadBuf.clear();
+        unansweredStats.clear();
+        lastSourcesAskMs = 0.0;
+        sourcesAskIntervalMs = kSourcesAskFirstMs;
+        nextConnectMs = 0.0;
+        connectFailures = 0;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            trackCache.clear();
+            artworkCache.clear();
+            waveformCache.clear();
+            perfCache.clear();
+        }
+        waitingRequests = requested;
     }
 
     // True when the session must end: stop(), or start() wants another
@@ -645,18 +726,30 @@ private:
     //  - A streaming track is looked up by Track.uri in the database of the
     //    unit's internal storage (a source named "... (Internal)") when the
     //    unit lists one and it has a database, else in each one loaded.
+    //    While that storage's download waits to be tried again, so does
+    //    the track.
     //  - The databases stay open until the session ends.  When the
     //    FileTransfer connection closes they stay in use; a connection is
     //    opened again only when a request needs the device.
+    //  - A source whose download failed (or whose stats went unanswered,
+    //    or whose copy could not be written) is tried again when a request
+    //    waits for it, after 5, 10, 20, 40, then 60 s; a connection that
+    //    could not be opened, likewise.  The requests wait meanwhile.
     // A connection on which a request went unanswered is not used again (a
     // late reply would be taken for the next request's, VERIFY V10): when
-    // that request was a stat, the path is noted as unanswered and the next
-    // connection goes on with the paths not tried yet.  Likewise after a
-    // transfer that did not complete (its chunks could still come, and be
-    // placed in the next file): the source is noted as failed, and while no
-    // database is loaded yet a new connection goes on with the next source,
-    // when the last list names one not tried yet (at most kMaxTransfersLost
-    // times in a session).
+    // that request was a stat -- no reply in time, or the connection closed
+    // or the unit sent its disconnect before one came -- the path is noted
+    // as unanswered and the next connection goes on with the paths not
+    // tried yet (once every path of a source is noted, the source has
+    // failed, as above).  Likewise after a transfer that did not complete
+    // (its chunks could still come, and be placed in the next file): the
+    // source is noted as failed.  While no database is loaded yet, a new
+    // connection goes on with the next path or source (after a lost
+    // transfer only when the last list names a source not tried yet, at
+    // most kMaxTransfersLost times in a session), unless another device's
+    // offer waits (otherDeviceOfferWaits): the session then fails at once
+    // and run() serves that offer.  The session fails (and run() tries it
+    // again) when no first database could be loaded.  This thread.
     //==========================================================================
     void runSession()
     {
@@ -667,9 +760,10 @@ private:
             if (!firstDone)
             {
                 const DbSearch found = connectAndLoadFirst();
-                if ((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
-                    || (found == DbSearch::transferLost && untriedSourceListed()
-                        && ++transfersLost <= kMaxTransfersLost))
+                if (!otherDeviceOfferWaits()
+                    && ((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
+                        || (found == DbSearch::transferLost && untriedSourceListed()
+                            && ++transfersLost <= kMaxTransfersLost)))
                 {
                     closeFtSocket();        // a new connection goes on with the next path or source
                     continue;
@@ -686,13 +780,8 @@ private:
             if (!doDeviceWork(needs))
                 wait(100);                  // cut short by stop() and start()
         }
-
-        // Left for the next session: a request made just after a restarted
-        // device's start() is for its new database
-        std::lock_guard<std::mutex> lock(requestMutex);
-        for (auto& r : waitingRequests)
-            pendingRequests.addIfNotAlreadyThere(r);
-        waitingRequests.clear();
+        // The requests still waiting are among those beginSession() asks
+        // for again in the next session (requested)
     }
 
     // What a database search came to
@@ -700,10 +789,11 @@ private:
     {
         found,              // a database is loaded
         none,               // none there (or none usable)
-        statUnanswered,     // a stat got no reply: the path is noted, the connection is not used again
+        statUnanswered,     // a stat got no reply (or its connection closed): the path is noted,
+                            // the connection is not used again
         transferLost,       // a transfer did not complete: the source is noted as failed (its
                             // chunks could still come), the connection is not used again
-        lost                // the connection failed, or the session ends
+        lost                // the session ends (stop(), or start() wants another)
     };
 
     // Opens a FileTransfer connection, sends the service announcement and
@@ -866,10 +956,11 @@ private:
     }
 
     // Connects and loads the first listed source that has a database.  A
-    // source tried earlier in this session (on a connection that ended
-    // with a stat unanswered or a transfer lost) is not tried again here:
+    // source that failed earlier in this session (its transfer lost, or
+    // the stat of each of its paths unanswered) is not tried again here:
     // the search goes on with the next one, as before 1.9.16, where a
-    // download that failed moved on to the next source.
+    // download that failed moved on to the next source.  One whose stat
+    // went unanswered on one path is tried again on the other.
     DbSearch connectAndLoadFirst()
     {
         if (!openConnection())
@@ -886,22 +977,27 @@ private:
         return DbSearch::none;
     }
 
-    // Requests made since the last look, after the ones still waiting
+    // Requests made since the last look, after the ones still waiting;
+    // each is remembered among the kMaxRemembered latest (requested)
     void takeRequests()
     {
-        std::lock_guard<std::mutex> lock(requestMutex);
-        for (auto& r : pendingRequests)
+        juce::StringArray fresh;
         {
-            if (!seenRequests.contains(r))
-            {
-                // A track not asked for before: the source list may be
-                // asked for again 5 s after the last time
-                seenRequests.add(r);
+            std::lock_guard<std::mutex> lock(requestMutex);
+            fresh.swapWith(pendingRequests);
+        }
+        for (auto& r : fresh)
+        {
+            // A track not asked for lately: the source list may be asked
+            // for again 5 s after the last time
+            if (!requested.contains(r))
                 sourcesAskIntervalMs = kSourcesAskFirstMs;
-            }
+            requested.removeString(r);
+            requested.add(r);
+            while (requested.size() > kMaxRemembered)
+                requested.remove(0);
             waitingRequests.addIfNotAlreadyThere(r);
         }
-        pendingRequests.clear();
     }
 
     // What the requests still waiting need from the device
@@ -913,8 +1009,9 @@ private:
 
     // Answers every waiting request the loaded databases can answer (no
     // device I/O); the others stay waiting.  It stops between two requests
-    // when the session must end: stop() waits for this thread (5 s, then it
-    // is killed), and one lookup can take over a second: an artwork at
+    // when the session must end: a session starts with up to
+    // kMaxRemembered requests, and stop() waits for this thread (5 s, then
+    // it is killed).  One lookup can take over a second: an artwork at
     // ImageGuard's limits (64 MiB of pixel data) is checked by ImageGuard
     // and decoded by JUCE, up to 0.8 s each here.  stop() cuts the
     // check short (queryArtwork), not the decode.  The requests not looked
@@ -953,7 +1050,9 @@ private:
         if (ref.streaming)
         {
             // The unit's internal storage when it lists one ("... (Internal)",
-            // as chrisle's Databases.getDbPath picks it) and it has a database
+            // as chrisle's Databases.getDbPath picks it) and it has a
+            // database; while its download is to be tried again (after a
+            // failure a later try may not meet) the request waits for it
             for (auto& name : listedSources)
             {
                 if (!name.contains("(Internal)")) continue;
@@ -967,6 +1066,12 @@ private:
                 {
                     lookUpTrack(*s, ref, key);
                     return true;
+                }
+                if (s != nullptr && s->state == SourceDb::State::failed && s->retryable)
+                {
+                    if (juce::Time::getMillisecondCounterHiRes() >= s->retryAtMs)
+                        needSource = name;          // tried again now (loadSource)
+                    return false;
                 }
                 break;
             }
@@ -994,8 +1099,13 @@ private:
             case SourceDb::State::notTried:
                 needSource = s->name;
                 return false;
-            case SourceDb::State::noLibrary:
             case SourceDb::State::failed:
+                if (!s->retryable)
+                    return true;                    // its database is not usable
+                if (juce::Time::getMillisecondCounterHiRes() >= s->retryAtMs)
+                    needSource = s->name;           // tried again now (loadSource)
+                return false;                       // waits meanwhile
+            case SourceDb::State::noLibrary:
             default:
                 return true;                        // its medium has no database here
         }
@@ -1013,7 +1123,6 @@ private:
         if (askList && !(needs.sources && now - lastSourcesAskMs >= sourcesAskIntervalMs))
             return false;
         const int sourcesBefore = (int)sessionSources.size();
-        bool listed = false;                        // the list was asked for and answered
         if (!fltxConnected())
         {
             if (now < nextConnectMs) return false;
@@ -1021,18 +1130,18 @@ private:
             if (!ok)
             {
                 closeFtSocket();
-                nextConnectMs = juce::Time::getMillisecondCounterHiRes() + kReconnectWaitMs;
+                nextConnectMs = juce::Time::getMillisecondCounterHiRes() + backoffMs(connectFailures++);
                 return true;
             }
-            listed = true;
+            connectFailures = 0;
         }
         else if (askList)
         {
-            listed = askSources();
+            askSources();
         }
         if (askList)
         {
-            if (listed && (int)sessionSources.size() == sourcesBefore)   // nothing new: asked less often
+            if ((int)sessionSources.size() == sourcesBefore)   // nothing new: asked less often
                 sourcesAskIntervalMs = juce::jmin(sourcesAskIntervalMs * 2.0, kSourcesAskMaxMs);
             return true;
         }
@@ -1047,13 +1156,36 @@ private:
 
     // Looks for a source's database (v2 path first, then v1), downloads it
     // and opens it.  A path the device did not answer a stat for earlier in
-    // this session is skipped (unansweredStats).
+    // this session (no reply, or the connection closed first) is skipped
+    // (unansweredStats), unless the source is tried again after a failure.
+    // A database refused before with the
+    // same size is not downloaded again for this device (refusedDbs).
+    // A failure a later try may not meet is retried after a back-off.
     DbSearch loadSource(SourceDb& s)
     {
         const juce::String paths[] = {
             "/" + s.name + "/Engine Library/Database2/m.db",
             "/" + s.name + "/Engine Library/m.db"
         };
+        if (s.state == SourceDb::State::failed)
+            for (auto& p : paths)
+                unansweredStats.removeString(p);
+        auto fail = [&s](const juce::String& why, bool retryable)
+        {
+            s.state = SourceDb::State::failed;
+            s.failure = why;
+            s.retryable = retryable;
+            if (retryable)
+                s.retryAtMs = juce::Time::getMillisecondCounterHiRes() + backoffMs(s.failures++);
+        };
+        // Tried again after its back-off, a source is one not tried yet until
+        // this try ends: its paths are asked afresh (above), and a stat that
+        // goes unanswered moves on to the other path, then fails the source
+        // with the next, longer back-off
+        if (s.state == SourceDb::State::failed)
+        {
+            s.state = SourceDb::State::notTried;
+        }
         bool skipped = false;
         for (auto& dbPath : paths)
         {
@@ -1065,22 +1197,38 @@ private:
             const Reply stat = fetchFileStat(dbPath, fileSize);
             if (stat == Reply::lost)
             {
-                if (!fltxConnected() || sessionShouldEnd()) return DbSearch::lost;
-                DBG("StageLinQ DB: No reply to the stat of " + dbPath + " -- not asked again on this unit");
+                // No reply in time, or the connection closed (or the unit
+                // sent its disconnect) before one came: either way the path
+                // is not asked again on this unit until the source is tried
+                // again, and the source fails once each of its paths is so
+                if (sessionShouldEnd()) return DbSearch::lost;
+                DBG("StageLinQ DB: " + juce::String(fltxConnected() ? "No reply" : "Connection lost")
+                    + " at the stat of " + dbPath + " -- not asked again on this unit");
+                bool everyPath = true;
+                for (auto& p : paths)
+                    everyPath = everyPath && (p == dbPath || unansweredStats.contains(p));
+                if (everyPath)
+                    fail("the unit did not answer", true);
                 unansweredStats.add(dbPath);
                 return DbSearch::statUnanswered;
             }
             if (stat == Reply::refused) continue;
 
             DBG("StageLinQ DB: Found database " + dbPath + " (" + juce::String(fileSize) + " bytes)");
+            const auto refused = refusedDbs.find(dbPath);
+            if (refused != refusedDbs.end() && refused->second == fileSize)
+            {
+                DBG("StageLinQ DB: " + dbPath + " was refused before at this size -- not downloaded again");
+                fail("not a usable Engine database", false);
+                return DbSearch::none;
+            }
 
             // Download the file
             std::vector<uint8_t> data;
             const Reply got = downloadFile(dbPath, data);
             if (got == Reply::lost)
             {
-                s.state = SourceDb::State::failed;
-                s.failure = "download failed";
+                fail("download failed (" + transferFailure + ")", true);
                 return sessionShouldEnd() ? DbSearch::lost : DbSearch::transferLost;
             }
             if (got == Reply::refused) continue;
@@ -1095,8 +1243,7 @@ private:
             {
                 DBG("StageLinQ DB: Could not write " + tempFile.getFullPathName());
                 tempFile.deleteFile();
-                s.state = SourceDb::State::failed;
-                s.failure = "could not write a copy";
+                fail("could not write a copy", true);
                 return DbSearch::none;
             }
             DBG("StageLinQ DB: Downloaded " + juce::String((int)data.size()) + " bytes to " + tempFile.getFullPathName());
@@ -1105,17 +1252,20 @@ private:
             if (!openSourceDatabase(s, tempFile))
             {
                 DBG("StageLinQ DB: Failed to open database");
-                s.state = SourceDb::State::failed;
-                s.failure = "not a usable Engine database";
+                refusedDbs[dbPath] = fileSize;
+                fail("not a usable Engine database", false);
                 return DbSearch::none;
             }
             s.state = SourceDb::State::ready;
+            s.failure.clear();
             dbReady.store(true);
             DBG("StageLinQ DB: Database of " + s.name + " ready (" + tempFile.getFullPathName() + ")");
             return DbSearch::found;
         }
-        s.state = skipped ? SourceDb::State::failed : SourceDb::State::noLibrary;
-        if (skipped) s.failure = "the unit did not answer";
+        if (skipped)
+            fail("the unit did not answer", true);
+        else
+            s.state = SourceDb::State::noLibrary;
         return DbSearch::none;
     }
 
@@ -1194,17 +1344,23 @@ private:
     //==========================================================================
     // FileTransfer protocol: download complete file
     //==========================================================================
-    // The file's bytes in fileData (its size from the transfer-id reply)
+    // The file's bytes in fileData (its size from the transfer-id reply).
+    // When it is lost, transferFailure says why ("timed out", "connection
+    // lost", "no reply").
     Reply downloadFile(const juce::String& path, std::vector<uint8_t>& fileData)
     {
         fileData.clear();
+        transferFailure = "connection lost";
         // Request transfer ID
         auto frame = StageLinQ::buildFltxTransferId(path);
         if (!fltxWrite(frame)) return Reply::lost;
 
         auto resp = fltxWaitFor(StageLinQ::kFltxRespTransferId, StageLinQ::kFltxReplyWaitMs);
         if (!resp.received)
+        {
+            if (fltxConnected()) transferFailure = "no reply";
             return Reply::lost;
+        }
         if (resp.txFileSize == 0)
             return Reply::refused;
 
@@ -1288,6 +1444,7 @@ private:
         {
             DBG("StageLinQ DB: Incomplete download: " + juce::String(bytesReceived)
                 + "/" + juce::String(fileSize) + " -- discarding (truncated SQLite is unusable)");
+            transferFailure = fltxConnected() ? "timed out" : "connection lost";
             fileData = {};
             return Reply::lost;     // chunks of it may still come
         }
@@ -2305,13 +2462,21 @@ private:
     std::vector<uint8_t> fltxReadBuf;
 
     // Database paths whose stat the device did not answer in this session
-    // (this thread only; cleared when another device or port is served)
+    // (this thread only; cleared when a session starts)
     juce::StringArray unansweredStats;
     static constexpr int kMaxUnansweredStats = 16;
     // Connections opened again, in one session, after a transfer was lost
     // before the first database was loaded (runSession); each one goes on
     // with a source the last list named and this session had not tried
     static constexpr int kMaxTransfersLost = 16;
+
+    // Databases refused (openSourceDatabase), by path, with the size the
+    // stat gave: not downloaded again at that size until another device or
+    // port is served (this thread only)
+    std::map<juce::String, uint32_t> refusedDbs;
+
+    // Why the last download was lost (downloadFile; this thread only)
+    juce::String transferFailure;
 
     // The session's media (this thread only; closeDatabase): every source
     // listed so far, in the unit's order, with its database once loaded,
@@ -2321,18 +2486,20 @@ private:
     static constexpr int kMaxSources = 64;   // updateSources
     std::atomic<bool> dbReady { false };     // a source's database is open
 
-    // Requests (this thread only): those not answered yet, oldest first, and
-    // every one seen in this session
-    juce::StringArray waitingRequests, seenRequests;
+    // Requests (this thread only): those not answered yet, oldest first,
+    // and the kMaxRemembered latest, oldest first (asked for again when a
+    // session starts; kept across sessions and stop())
+    juce::StringArray waitingRequests, requested;
+    static constexpr int kMaxRemembered = 16;
 
     // When the source list was last asked for, and how long until it may be
     // asked again for a source it did not name (this thread only)
     static constexpr double kSourcesAskFirstMs = 5000.0;
     static constexpr double kSourcesAskMaxMs   = 60000.0;
-    static constexpr double kReconnectWaitMs   = 5000.0;
     double lastSourcesAskMs = 0.0;
     double sourcesAskIntervalMs = kSourcesAskFirstMs;
     double nextConnectMs = 0.0;              // no new connection before (after one failed)
+    int connectFailures = 0;                 // connections that failed in a row (backoffMs)
 
     // Caches (protected by cacheMutex), keyed by TrackRef::key()
     mutable std::mutex cacheMutex;
@@ -2345,6 +2512,7 @@ private:
     std::mutex requestMutex;
     juce::StringArray pendingRequests;
 
-    // A session is wanted: from start() until it fails, or stop()
+    // A session is wanted: from start() to stop() (a failed one is tried
+    // again, run)
     std::atomic<bool> isRunningFlag { false };
 };
