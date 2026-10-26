@@ -25,12 +25,14 @@
 // one moved last wins.  Loads read the whole file and reject a truncated one
 // (an older version interrupted mid-write): a .wfc or .anlz shorter than its
 // header says, which used to load as zeros, and a .art.png without the IEND
-// chunk at its end, which crashed JUCE's PNG reader.  The cache has no size
+// chunk at its end or damaged anywhere else (ImageGuard.h), which crashed
+// JUCE's PNG reader.  The cache has no size
 // bound and no expiry, and a temporary file left by a crash between a write
 // and its move stays in the directory (hidden, named after the target).
 
 #pragma once
 #include <JuceHeader.h>
+#include "ImageGuard.h"
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -122,22 +124,23 @@ public:
     }
 
     /// Load cached artwork for a track key.  The whole file is read, and one
-    /// that does not start with the PNG signature and end with the IEND
-    /// chunk saveArtwork's PNG writer puts last (a write an older version
-    /// left cut short) is rejected before it reaches the decoder: JUCE's PNG
-    /// reader crashed on such a file (AUDIT META-10).
+    /// that does not end with the IEND chunk saveArtwork's PNG writer puts
+    /// last (a write an older version left cut short), or that is damaged
+    /// anywhere else (ImageGuard::isSafePng: what libpng reads without an
+    /// error), is rejected before it reaches the decoder: JUCE's PNG reader
+    /// crashed on such a file (AUDIT META-10, #26).  So is one over
+    /// ImageGuard's artwork limits (4096 x 4096 RGBA): the message thread
+    /// loads it, and a larger image takes over a second to check and decode.
     static juce::Image loadArtwork(const std::string& trackKey)
     {
         juce::MemoryBlock file;
         if (!readWholeFile(getArtworkFile(trackKey), file)) return {};
 
-        static const uint8_t signature[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
         static const uint8_t iend[12] = { 0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
         const auto* d = static_cast<const uint8_t*>(file.getData());
         const size_t n = file.getSize();
-        if (n < sizeof(signature) + sizeof(iend)
-            || std::memcmp(d, signature, sizeof(signature)) != 0
-            || std::memcmp(d + n - sizeof(iend), iend, sizeof(iend)) != 0)
+        if (n < sizeof(iend) || std::memcmp(d + n - sizeof(iend), iend, sizeof(iend)) != 0
+            || !ImageGuard::isSafePng(d, n))
             return {};
 
         juce::MemoryInputStream in(file, false);

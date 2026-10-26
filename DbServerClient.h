@@ -52,6 +52,7 @@
 #endif
 #include "NfsAnlzFetcher.h"
 #include "WaveformCache.h"
+#include "ImageGuard.h"
 #include "AppSettings.h"
 
 //==============================================================================
@@ -1955,14 +1956,18 @@ private:
             return {};
         }
 
-        // Scan all blob arguments for valid JPEG data
+        // Scan all blob arguments for valid JPEG data.  The bytes come from
+        // the player: one that JUCE would take for a PNG is decoded only if
+        // ImageGuard finds it whole and within its artwork limits (a damaged
+        // PNG crashed JUCE's reader, #26); stop() cuts that check short
         for (int i = 0; i < (int)resp.argCount && i < 12; i++)
         {
             if (resp.blobArgs[i].getSize() > 100)  // JPEG must be at least ~100 bytes
             {
-                auto img = juce::ImageFileFormat::loadFrom(
+                auto img = ImageGuard::loadUntrustedImage(
                     resp.blobArgs[i].getData(),
-                    resp.blobArgs[i].getSize());
+                    resp.blobArgs[i].getSize(), {},
+                    [this] { return threadShouldExit(); });
 
                 if (img.isValid())
                 {

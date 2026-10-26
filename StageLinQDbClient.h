@@ -22,6 +22,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include "StageLinQInput.h"
+#include "ImageGuard.h"
 #include <atomic>
 #include <mutex>
 #include <map>
@@ -1375,17 +1376,14 @@ private:
             const void* blob = sqlite3_column_blob(stmt, 0);
             int blobSize = sqlite3_column_bytes(stmt, 0);
 
+            // AlbumArt BLOBs are standard JPEG/PNG images, from the device:
+            // a damaged PNG is refused before JUCE's reader sees it (it
+            // crashed this thread, #26; ImageGuard.h), and so is one over
+            // ImageGuard's artwork limits.  The check ends (a refusal) when
+            // stop() is called: stop() does not wait for it.
             if (blob && blobSize > 0)
-            {
-                // AlbumArt BLOBs are standard JPEG/PNG images
-                juce::MemoryInputStream stream(blob, (size_t)blobSize, false);
-                auto format = juce::ImageFileFormat::findImageFormatForStream(stream);
-                if (format)
-                {
-                    stream.setPosition(0);
-                    result = format->decodeImage(stream);
-                }
-            }
+                result = ImageGuard::loadUntrustedImage(blob, (size_t)blobSize, {},
+                                                        [this] { return threadShouldExit(); });
         }
 
         sqlite3_finalize(stmt);
