@@ -1088,6 +1088,9 @@ private:
     //  - Track (and AlbumArt, when present) must be ordinary tables: a view
     //    or a virtual table of that name would run SQL the device supplied
     //    whenever STC queries it.  Anything else refuses the database.
+    //  - PerformanceData (schema 3.x, below) is queried only when it is an
+    //    ordinary table too; a view or virtual table of that name is
+    //    ignored, not queried, and does not refuse the database.
     // The handle is closed on every failure path, and the file deleted.
     //--------------------------------------------------------------------------
     static std::string sqliteImmutableUri(const juce::File& f)
@@ -1136,6 +1139,28 @@ private:
         return ok && haveTrack;
     }
 
+    // An ordinary table of that (lower-case) name exists, by the rule above
+    static bool isPlainTable(sqlite3* handle, const char* lowerName)
+    {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(handle, "SELECT type, coalesce(sql, '') FROM sqlite_master WHERE lower(name) = ?",
+                               -1, &stmt, nullptr) != SQLITE_OK)
+            return false;
+        sqlite3_bind_text(stmt, 1, lowerName, -1, SQLITE_STATIC);
+        bool found = false, ok = true;
+        while (ok && sqlite3_step(stmt) == SQLITE_ROW)
+        {
+            const char* type = (const char*)sqlite3_column_text(stmt, 0);
+            const char* sql  = (const char*)sqlite3_column_text(stmt, 1);
+            found = true;
+            ok = type != nullptr && std::strcmp(type, "table") == 0
+                 && !juce::String(juce::CharPointer_UTF8(sql != nullptr ? sql : ""))
+                        .trimStart().startsWithIgnoreCase("CREATE VIRTUAL");
+        }
+        sqlite3_finalize(stmt);
+        return found && ok;
+    }
+
     bool openDatabase(const juce::File& dbFile)
     {
         closeDatabase();
@@ -1166,6 +1191,9 @@ private:
             return false;
         }
         dbTempFile = dbFile;
+        perfDataIsTable = isPlainTable(db, "performancedata");
+        DBG(juce::String("StageLinQ DB: PerformanceData ")
+            + (perfDataIsTable ? "is an ordinary table" : "absent, or not an ordinary table -- not queried"));
 
         // Count tracks for logging
         sqlite3_stmt* stmt = nullptr;
@@ -1188,6 +1216,7 @@ private:
             sqlite3_close(db);
             db = nullptr;
         }
+        perfDataIsTable = false;
         if (dbTempFile != juce::File())
         {
             dbTempFile.deleteFile();
@@ -1219,11 +1248,12 @@ private:
         // trackPath, which is what the getters compute; the queries use
         // the path that found the row.
         juce::String dbPath = trackPath;
-        DenonTrackMeta meta = queryTrack(dbPath);
+        juce::int64 trackId = 0;
+        DenonTrackMeta meta = queryTrack(dbPath, trackId);
         if (!meta.valid && oldFormDbPath(trackPath).isNotEmpty())
         {
             dbPath = oldFormDbPath(trackPath);
-            meta = queryTrack(dbPath);
+            meta = queryTrack(dbPath, trackId);
         }
         if (!meta.valid) return;
 
@@ -1233,10 +1263,10 @@ private:
             artImg = queryArtwork(meta.albumArtId);
 
         // Query overview waveform
-        auto wf = queryOverviewWaveform(dbPath);
+        auto wf = queryOverviewWaveform(dbPath, trackId);
 
         // Query performance data (cues, loops, beat grid)
-        auto perf = queryPerformanceData(dbPath);
+        auto perf = queryPerformanceData(dbPath, trackId);
 
         // --- Insert results into caches (lock once) ---
         {
@@ -1261,9 +1291,11 @@ private:
     //==========================================================================
     // SQLite query: Track table
     //==========================================================================
-    DenonTrackMeta queryTrack(const juce::String& trackPath)
+    // trackId: the row's Track.id, which PerformanceData is keyed by
+    DenonTrackMeta queryTrack(const juce::String& trackPath, juce::int64& trackId)
     {
         DenonTrackMeta meta;
+        trackId = 0;
         if (!db) return meta;
 
         // Streaming tracks (Beatsource/Tidal) are queried by "uri" column
@@ -1274,9 +1306,9 @@ private:
         // We download v2 first (Database2/m.db), falling back to v1.
         // Try v2 column name first, fall back to v1 on failure.
         juce::String whereCol = isStreaming ? "uri" : "path";
-        juce::String sqlV2Str = "SELECT title, artist, album, genre, key, bpm, length, albumArtId "
+        juce::String sqlV2Str = "SELECT title, artist, album, genre, key, bpm, length, albumArtId, id "
                                 "FROM Track WHERE " + whereCol + " = ? LIMIT 1";
-        juce::String sqlV1Str = "SELECT title, artist, album, genre, key, bpm, length, idAlbumArt "
+        juce::String sqlV1Str = "SELECT title, artist, album, genre, key, bpm, length, idAlbumArt, id "
                                 "FROM Track WHERE " + whereCol + " = ? LIMIT 1";
 
         sqlite3_stmt* stmt = nullptr;
@@ -1316,6 +1348,7 @@ private:
             meta.bpm        = sqlite3_column_double(stmt, 5);
             meta.length     = sqlite3_column_double(stmt, 6);
             meta.albumArtId = sqlite3_column_int(stmt, 7);
+            trackId         = sqlite3_column_int64(stmt, 8);
             meta.valid = true;
         }
 
@@ -1360,7 +1393,58 @@ private:
     }
 
     //==========================================================================
-    // SQLite query: Track.overviewWaveFormData -> DenonWaveformData
+    // A BLOB of the track: its Track column (Engine schema 2.x), or else --
+    // Track has no such column, or it is NULL or empty for this row -- the
+    // same column of PerformanceData by trackId, if PerformanceData is an
+    // ordinary table (openDatabase).  Schema 3.x (Engine DJ 4.5 and 5.x:
+    // chrisle/StageLinq 3.5.0 types/models/Track.ts, engine-dj-mcp
+    // tools/performance.js) moved overviewWaveFormData, beatData, quickCues
+    // and loops out of Track into PerformanceData.  The bytes are copied
+    // out (SQLite's pointer lives only as long as the statement).
+    // rowFound: the track has a row in the table the bytes were read from.
+    //==========================================================================
+    std::vector<uint8_t> queryTrackBlob(const char* column, const juce::String& trackPath,
+                                        juce::int64 trackId, bool& rowFound)
+    {
+        rowFound = false;
+        std::vector<uint8_t> out;
+        if (!db) return out;
+
+        auto readOne = [&](const juce::String& sql, bool byTrackId)
+        {
+            sqlite3_stmt* stmt = nullptr;
+            if (sqlite3_prepare_v2(db, sql.toRawUTF8(), -1, &stmt, nullptr) != SQLITE_OK)
+                return false;   // no such column (or table)
+            if (byTrackId)
+                sqlite3_bind_int64(stmt, 1, trackId);
+            else
+                sqlite3_bind_text(stmt, 1, trackPath.toRawUTF8(), -1, SQLITE_TRANSIENT);
+            bool row = false;
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                row = true;
+                const void* blob = sqlite3_column_blob(stmt, 0);
+                const int blobSize = sqlite3_column_bytes(stmt, 0);
+                if (blob != nullptr && blobSize > 0)
+                    out.assign(static_cast<const uint8_t*>(blob), static_cast<const uint8_t*>(blob) + blobSize);
+            }
+            sqlite3_finalize(stmt);
+            return row;
+        };
+
+        const char* col = trackPath.startsWith("streaming://") ? "uri" : "path";
+        rowFound = readOne(juce::String("SELECT ") + column + " FROM Track WHERE " + col + " = ? LIMIT 1", false);
+        if (out.empty() && perfDataIsTable && trackId > 0)
+        {
+            const bool perfRow = readOne(juce::String("SELECT ") + column
+                                         + " FROM PerformanceData WHERE trackId = ? LIMIT 1", true);
+            rowFound = rowFound || perfRow;
+        }
+        return out;
+    }
+
+    //==========================================================================
+    // SQLite query: overviewWaveFormData -> DenonWaveformData
     //
     // BLOB format (from libdjinterop, LGPL, by xsco):
     //   [uncompressed_size:i32be][zlib_data...]
@@ -1375,32 +1459,13 @@ private:
     // We reorder bytes to mid/high/low per entry to match our
     // WaveformDisplay::renderThreeBandBars() (Pioneer CDJ-3000 order).
     //==========================================================================
-    DenonWaveformData queryOverviewWaveform(const juce::String& trackPath)
+    DenonWaveformData queryOverviewWaveform(const juce::String& trackPath, juce::int64 trackId)
     {
-        DenonWaveformData result;
-        if (!db) return result;
-
-        const char* col = trackPath.startsWith("streaming://") ? "uri" : "path";
-        juce::String sqlStr = juce::String("SELECT overviewWaveFormData FROM Track WHERE ")
-                            + col + " = ? LIMIT 1";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, sqlStr.toRawUTF8(), -1, &stmt, nullptr) != SQLITE_OK) return result;
-
-        sqlite3_bind_text(stmt, 1, trackPath.toRawUTF8(), -1, SQLITE_TRANSIENT);
-
-        if (sqlite3_step(stmt) == SQLITE_ROW)
-        {
-            const void* blob = sqlite3_column_blob(stmt, 0);
-            int blobSize = sqlite3_column_bytes(stmt, 0);
-
-            if (blob && blobSize > 4)
-            {
-                result = decodeOverviewWaveform(static_cast<const uint8_t*>(blob), blobSize);
-            }
-        }
-
-        sqlite3_finalize(stmt);
-        return result;
+        bool rowFound = false;
+        const auto blob = queryTrackBlob("overviewWaveFormData", trackPath, trackId, rowFound);
+        if (blob.size() > 4)
+            return decodeOverviewWaveform(blob.data(), (int)blob.size());
+        return {};
     }
 
     //==========================================================================
@@ -1455,45 +1520,31 @@ private:
     }
 
     //==========================================================================
-    // SQLite query: performance data (quickCues, loops, beatData BLOBs)
+    // SQLite query: performance data (quickCues, loops, beatData BLOBs),
+    // each from Track or PerformanceData (queryTrackBlob).  valid: the
+    // track has a row with these columns.
     //==========================================================================
-    DenonPerformanceData queryPerformanceData(const juce::String& trackPath)
+    DenonPerformanceData queryPerformanceData(const juce::String& trackPath, juce::int64 trackId)
     {
         DenonPerformanceData result;
-        if (!db) return result;
+        bool cueRow = false, loopRow = false, beatRow = false;
 
-        const char* col = trackPath.startsWith("streaming://") ? "uri" : "path";
-        juce::String sqlStr = juce::String("SELECT quickCues, loops, beatData FROM Track WHERE ")
-                            + col + " = ? LIMIT 1";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, sqlStr.toRawUTF8(), -1, &stmt, nullptr) != SQLITE_OK) return result;
+        // Quick cues (zlib compressed)
+        const auto cueBlob = queryTrackBlob("quickCues", trackPath, trackId, cueRow);
+        if (cueBlob.size() > 4)
+            decodeQuickCues(cueBlob.data(), (int)cueBlob.size(), result);
 
-        sqlite3_bind_text(stmt, 1, trackPath.toRawUTF8(), -1, SQLITE_TRANSIENT);
+        // Loops (NOT compressed -- raw binary)
+        const auto loopBlob = queryTrackBlob("loops", trackPath, trackId, loopRow);
+        if (loopBlob.size() >= 8)
+            decodeLoops(loopBlob.data(), (int)loopBlob.size(), result);
 
-        if (sqlite3_step(stmt) == SQLITE_ROW)
-        {
-            // Quick cues (zlib compressed)
-            const void* cueBlob = sqlite3_column_blob(stmt, 0);
-            int cueBlobSize = sqlite3_column_bytes(stmt, 0);
-            if (cueBlob && cueBlobSize > 4)
-                decodeQuickCues(static_cast<const uint8_t*>(cueBlob), cueBlobSize, result);
+        // Beat data (zlib compressed)
+        const auto beatBlob = queryTrackBlob("beatData", trackPath, trackId, beatRow);
+        if (beatBlob.size() > 4)
+            decodeBeatData(beatBlob.data(), (int)beatBlob.size(), result);
 
-            // Loops (NOT compressed -- raw binary)
-            const void* loopBlob = sqlite3_column_blob(stmt, 1);
-            int loopBlobSize = sqlite3_column_bytes(stmt, 1);
-            if (loopBlob && loopBlobSize >= 8)
-                decodeLoops(static_cast<const uint8_t*>(loopBlob), loopBlobSize, result);
-
-            // Beat data (zlib compressed)
-            const void* beatBlob = sqlite3_column_blob(stmt, 2);
-            int beatBlobSize = sqlite3_column_bytes(stmt, 2);
-            if (beatBlob && beatBlobSize > 4)
-                decodeBeatData(static_cast<const uint8_t*>(beatBlob), beatBlobSize, result);
-
-            result.valid = true;
-        }
-
-        sqlite3_finalize(stmt);
+        result.valid = cueRow || loopRow || beatRow;
         return result;
     }
 
@@ -1772,6 +1823,7 @@ private:
     // SQLite handle, and the downloaded copy it reads (deleted on close)
     sqlite3* db = nullptr;
     juce::File dbTempFile;
+    bool perfDataIsTable = false;        // PerformanceData is an ordinary table (openDatabase)
     std::atomic<bool> dbReady { false };
 
     // Caches (protected by cacheMutex)
