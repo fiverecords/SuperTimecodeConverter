@@ -17,7 +17,10 @@
 // (StageLinQInput, TrackMap, engines) via const getters.
 // Artwork, overview waveform, cue and loop markers and the key come from the
 // device's Engine database (StageLinQDbClient, over the FileTransfer
-// service) when it has the track.
+// service) when it has the track.  A status line beside the layout button
+// says what the database client is doing ("Database: ..."), and a deck that
+// has a track but no waveform says why in its waveform slot; both come from
+// StageLinQDbClient::getStatus(), read once a tick (#26).
 
 #pragma once
 #include <JuceHeader.h>
@@ -86,6 +89,7 @@ private:
     bool layoutHorizontal = false;
 
     juce::TextButton btnLayout;
+    juce::Rectangle<int> dbLineBounds;      // the database status line, right of btnLayout
 
     // Colors (Denon green accent)
     const juce::Colour bgMain    { 0xFF0D0E12 };
@@ -161,11 +165,166 @@ private:
     std::array<DeckState, StageLinQ::kMaxDecks> deckState;
     double crossfaderPos = 0.0;
 
+    //--------------------------------------------------------------------------
+    // Database status texts (#26), from StageLinQDbClient::getStatus().  All
+    // on the message thread: worked out in timerCallback, drawn in paint.
+    //--------------------------------------------------------------------------
+    struct DbText
+    {
+        enum class Tone { quiet, busy, good, problem };
+        juce::StringArray forms;            // the same text, longest form first
+        Tone tone = Tone::quiet;
+    };
+
+    DbText dbLine;                          // the status line
+    std::array<DbText, StageLinQ::kMaxDecks> deckDbReason;   // empty forms: nothing to say
+
+    static juce::String plural(int n, const char* one, const char* many)
+    {
+        return juce::String(n) + " " + (n == 1 ? one : many);
+    }
+
+    // The status line: the session's state (StageLinQDbStatus::Session)
+    static DbText databaseLine(const StageLinQDbStatus& st)
+    {
+        using S = StageLinQDbStatus;
+        using T = DbText::Tone;
+        switch (st.session)
+        {
+            case S::Session::idle:
+                return { { "Database: waiting for the unit's file service", "Database: waiting for the unit",
+                           "Database: waiting" }, T::quiet };
+            case S::Session::connecting:
+                return { { "Database: connecting to the unit's file service", "Database: connecting" }, T::busy };
+            case S::Session::readingSources:
+                return { { "Database: reading the unit's media", "Database: reading media" }, T::busy };
+            case S::Session::downloading:
+            {
+                const juce::String pct = juce::String(st.downloadPercent) + " %";
+                return { { "Database: downloading " + st.downloadingSource + " (" + pct + ")",
+                           "Database: " + st.downloadingSource + " " + pct, "Database: " + pct }, T::busy };
+            }
+            case S::Session::ready:
+            {
+                juce::StringArray each;
+                int tracks = 0;
+                for (auto& so : st.sources)
+                    if (so.state == S::SourceState::ready)
+                    {
+                        each.add(so.name + " ready, " + plural(so.trackCount, "track", "tracks"));
+                        tracks += so.trackCount;
+                    }
+                if (each.isEmpty())
+                    return { { "Database: ready" }, T::good };
+                return { { "Database: " + each.joinIntoString("; "),
+                           "Database: " + plural(each.size(), "source", "sources") + " ready, "
+                               + plural(tracks, "track", "tracks"),
+                           "Database: ready" }, T::good };
+            }
+            case S::Session::retrying:
+            {
+                const juce::String why = st.lastFailure.isNotEmpty() ? st.lastFailure : juce::String("failed");
+                const juce::String retry = st.retryInSeconds > 0
+                    ? "retrying in " + juce::String(st.retryInSeconds) + " s" : juce::String("retrying");
+                return { { "Database: " + why + ", " + retry, "Database: failed, " + retry,
+                           "Database: " + retry }, T::problem };
+            }
+        }
+        return {};
+    }
+
+    // Why a deck's track has no waveform: its lookup in the status
+    // (StageLinQDbStatus::Track) and, while it waits, its source's state.
+    // Nothing when the status does not list the track (it keeps the 16
+    // latest requested) or the track has a waveform.
+    static DbText deckReason(const StageLinQDbStatus& st, const juce::String& networkPath)
+    {
+        using S = StageLinQDbStatus;
+        using T = DbText::Tone;
+        const auto* t = st.findTrack(networkPath);
+        if (t == nullptr) return {};
+        switch (t->result)
+        {
+            case S::Lookup::found:
+                if (t->waveform) return {};
+                return { { "No waveform in the database", "No waveform" }, T::problem };
+            case S::Lookup::notInDatabase:
+                if (t->streaming)
+                    return { { "Streaming track: not in a database", "Streaming: not found", "Not found" }, T::problem };
+                return { { "Not in the unit's database", "Not in database", "Not found" }, T::problem };
+            case S::Lookup::sourceNotOnUnit:
+                return { { "Not on the served unit's media", "Not on this unit" }, T::problem };
+            case S::Lookup::pending:
+            case S::Lookup::sourceHasNoDatabase:
+            default:
+                break;
+        }
+        if (t->streaming)
+            return { { "Streaming track: looking it up", "Streaming: looking up", "Looking up" }, T::busy };
+        const juce::String src = t->source;
+        if (const auto* so = st.findSource(src))
+        {
+            switch (so->state)
+            {
+                case S::SourceState::downloading:
+                {
+                    const juce::String pct = juce::String(so->percent) + " %";
+                    return { { src + ": downloading (" + pct + ")", src + ": " + pct, pct }, T::busy };
+                }
+                case S::SourceState::noLibrary:
+                    return { { src + ": no Engine library", src + ": no library", "No library" }, T::problem };
+                case S::SourceState::failed:
+                    if (so->retryInSeconds > 0)
+                        return { { src + ": download failed, retrying in " + juce::String(so->retryInSeconds) + " s",
+                                   src + ": failed, retry in " + juce::String(so->retryInSeconds) + " s",
+                                   src + ": failed" }, T::problem };
+                    return { { src + ": download failed", src + ": failed", "Failed" }, T::problem };
+                case S::SourceState::notDownloaded:
+                    return { { src + ": database not downloaded yet", src + ": not downloaded", "Waiting" }, T::busy };
+                case S::SourceState::ready:
+                default:
+                    return { { "Looking it up in the database", "Looking up" }, T::busy };
+            }
+        }
+        if (t->result == S::Lookup::sourceHasNoDatabase)
+            return { { src + ": no database", "No database" }, T::problem };
+        return { { "Waiting for the database", "Waiting" }, T::busy };
+    }
+
+    // The first form (longest first) whose width at font, measured with
+    // JUCE's glyph layout (measureStringWidth), is within width; else the
+    // last one, which drawText then shortens with an ellipsis
+    static juce::String firstThatFits(const juce::StringArray& forms, const juce::Font& font, int width)
+    {
+        for (auto& f : forms)
+            if (measureStringWidth(font, f) <= (float)width) return f;
+        return forms.isEmpty() ? juce::String() : forms[forms.size() - 1];
+    }
+
+    juce::Colour toneColour(DbText::Tone tone) const
+    {
+        switch (tone)
+        {
+            case DbText::Tone::busy:    return textMid;
+            case DbText::Tone::good:    return accentGreen;
+            case DbText::Tone::problem: return accentAmber;
+            case DbText::Tone::quiet:
+            default:                    return textDim;
+        }
+    }
+
+    static juce::Font dbLineFont() { return juce::Font(juce::FontOptions(11.0f)); }
+
     //==========================================================================
     // Timer: fetch data from StageLinQInput at 30Hz
     //==========================================================================
     void timerCallback() override
     {
+        // The database client's status: a copy, taken without waiting on
+        // its I/O (StageLinQDbClient::getStatus)
+        const auto dbStatus = dbClient.getStatus();
+        dbLine = databaseLine(dbStatus);
+
         for (int deck = 0; deck < StageLinQ::kMaxDecks; ++deck)
         {
             int dn = deck + 1;
@@ -221,6 +380,10 @@ private:
                         ds.dbKey = dbMeta.key;
                     }
                 }
+
+                // A track without a waveform: why, from the status
+                deckDbReason[(size_t)deck] = (ds.title.isNotEmpty() && netPath.isNotEmpty() && !ds.waveformLoaded)
+                    ? deckReason(dbStatus, netPath) : DbText {};
             }
 
             // Live key from StateMap (overrides DB key when available -- updates with key shift)
@@ -296,6 +459,16 @@ private:
     void paint(juce::Graphics& g) override
     {
         g.fillAll(bgMain);
+
+        // Database status line
+        if (!dbLine.forms.isEmpty() && !dbLineBounds.isEmpty())
+        {
+            const auto font = dbLineFont();
+            g.setFont(font);
+            g.setColour(toneColour(dbLine.tone));
+            g.drawText(firstThatFits(dbLine.forms, font, dbLineBounds.getWidth()), dbLineBounds,
+                       juce::Justification::centredLeft, true);
+        }
     }
 
     void resized() override
@@ -305,6 +478,8 @@ private:
         // Toolbar
         auto toolbar = area.removeFromTop(24);
         btnLayout.setBounds(toolbar.removeFromLeft(40));
+        toolbar.removeFromLeft(8);
+        dbLineBounds = toolbar;
         area.removeFromTop(4);
 
         // Crossfader bar at bottom
@@ -415,6 +590,7 @@ private:
         // Artwork + Track info row
         //----------------------------------------------------------------------
         // Reserve artwork square (same height as info+bpm rows combined)
+        const int fullLeft = inner.getX();   // the rows' left edge without it
         int artSize = 0;
         juce::Rectangle<float> artBounds;
         if (ds.artwork.isValid() && inner.getHeight() >= 40)
@@ -577,10 +753,35 @@ private:
         //----------------------------------------------------------------------
         // Waveform / Position bar
         //----------------------------------------------------------------------
+        // Its height: the waveform's, or the 8-px position bar's.  A deck
+        // with a track but no waveform says why (deckDbReason) in the slot:
+        // 12 px high, else 8 (or a slot of its own when the track has no
+        // length, or none fitted), as high as fits without taking a row
+        // below -- the fader bar, then the engine row -- from what shows
+        // today; and as wide as the deck (the rows above it, 62 px, are
+        // taller than the artwork, at most 50).
+        const auto& reason = deckDbReason[(size_t)deckIndex];
+        const bool showReason = !ds.waveformLoaded && !reason.forms.isEmpty();
+        int wfHeight = 0;
         if (ds.trackLenSec > 0 && inner.getHeight() >= 12)
+            wfHeight = ds.waveformLoaded ? juce::jmin(40, inner.getHeight() / 3) : 8;
+        if (showReason)
         {
-            int wfHeight = ds.waveformLoaded ? juce::jmin(40, inner.getHeight() / 3) : 8;
+            auto rowsBelow = [](int h) { return h >= 10 ? 10 + (h - 10 >= 12 ? 12 : 0) : 0; };
+            const int h = inner.getHeight();
+            const int shownNow = rowsBelow(h - (wfHeight > 0 ? wfHeight + 2 : 0));
+            for (int height : { 12, 8 })
+                if (h >= height && rowsBelow(juce::jmax(0, h - height - 2)) == shownNow)
+                {
+                    wfHeight = juce::jmax(wfHeight, height);
+                    break;
+                }
+        }
+        if (wfHeight > 0)
+        {
             auto wfArea = inner.removeFromTop(wfHeight);
+            if (showReason)
+                wfArea.setLeft(fullLeft);
             float ratio = juce::jlimit(0.0f, 1.0f, ds.posRatio);
 
             // Background
@@ -598,12 +799,21 @@ private:
             }
             else
             {
-                // Simple progress bar fallback
+                // Simple progress bar fallback (fainter under a reason)
                 if (ratio > 0.0f)
                 {
                     auto filled = wfArea.toFloat().withWidth(wfArea.getWidth() * ratio);
-                    g.setColour(accentGreen.withAlpha(0.6f));
+                    g.setColour(accentGreen.withAlpha(showReason ? 0.3f : 0.6f));
                     g.fillRoundedRectangle(filled, 2.0f);
+                }
+                if (showReason)
+                {
+                    const auto font = juce::Font(juce::FontOptions(wfHeight >= 12 ? 9.0f : 7.0f));
+                    const auto textArea = wfArea.reduced(3, 0);
+                    g.setFont(font);
+                    g.setColour(toneColour(reason.tone));
+                    g.drawText(firstThatFits(reason.forms, font, textArea.getWidth()), textArea,
+                               juce::Justification::centredLeft, true);
                 }
             }
 
@@ -628,9 +838,12 @@ private:
             }
 
             // Playhead cursor
-            float cursorX = wfArea.getX() + wfArea.getWidth() * ratio;
-            g.setColour(juce::Colours::white);
-            g.fillRect(cursorX - 0.5f, (float)wfArea.getY(), 1.0f, (float)wfArea.getHeight());
+            if (ds.trackLenSec > 0)
+            {
+                float cursorX = wfArea.getX() + wfArea.getWidth() * ratio;
+                g.setColour(juce::Colours::white);
+                g.fillRect(cursorX - 0.5f, (float)wfArea.getY(), 1.0f, (float)wfArea.getHeight());
+            }
 
             inner.removeFromTop(2);
         }
