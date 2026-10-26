@@ -1214,8 +1214,17 @@ private:
 
         // --- All DB queries OUTSIDE the lock (may take time) ---
 
-        // Query Track table
-        DenonTrackMeta meta = queryTrack(trackPath);
+        // Query Track table: by the path relative to Engine Library, then
+        // in STC's old form (oldFormDbPath).  The caches stay keyed by
+        // trackPath, which is what the getters compute; the queries use
+        // the path that found the row.
+        juce::String dbPath = trackPath;
+        DenonTrackMeta meta = queryTrack(dbPath);
+        if (!meta.valid && oldFormDbPath(trackPath).isNotEmpty())
+        {
+            dbPath = oldFormDbPath(trackPath);
+            meta = queryTrack(dbPath);
+        }
         if (!meta.valid) return;
 
         // Query artwork (no lock held during I/O)
@@ -1224,10 +1233,10 @@ private:
             artImg = queryArtwork(meta.albumArtId);
 
         // Query overview waveform
-        auto wf = queryOverviewWaveform(trackPath);
+        auto wf = queryOverviewWaveform(dbPath);
 
         // Query performance data (cues, loops, beat grid)
-        auto perf = queryPerformanceData(trackPath);
+        auto perf = queryPerformanceData(dbPath);
 
         // --- Insert results into caches (lock once) ---
         {
@@ -1675,11 +1684,16 @@ private:
     // Parse TrackNetworkPath to DB-compatible track path
     //
     // Format: net://uuid/source/Engine Library/Music/Artist/Track.mp3
-    //   -> DB path: Artist/Track.mp3  (relative to Music folder)
+    //   -> DB path: Music/Artist/Track.mp3  (relative to Engine Library)
     //
-    // Per chrisle/StageLinq trackPath.ts:
-    //   - Standard: strip "net://uuid/source/Engine Library/Music/"
-    //   - Non-standard: prefix with "../" (outside Engine Library)
+    // Engine keeps Track.path relative to the Engine Library folder
+    // (engine-dj-mcp dist/paths.js; chrisle/StageLinq Player.ts keeps
+    // "Music/", parts.slice(5)), so:
+    //   - Inside Engine Library ("Music/" or another folder): the path
+    //     relative to it.  The form relative to Music that STC looked up
+    //     before (chrisle's utils/trackPath.ts strips "Music/") is tried
+    //     second: oldFormDbPath().
+    //   - Outside Engine Library: prefix with "../"
     //==========================================================================
     static juce::String parseNetworkPathToDbPath(const juce::String& networkPath)
     {
@@ -1699,18 +1713,9 @@ private:
 
         if (parts.size() < 5) return {};
 
-        // Check if Engine Library/Music path
-        if (parts.size() > 6 && parts[4] == "Engine Library" && parts[5] == "Music")
+        if (parts.size() > 5 && parts[4] == "Engine Library")
         {
-            // Standard: relative to Music folder
-            juce::StringArray trackParts;
-            for (int i = 6; i < parts.size(); ++i)
-                trackParts.add(parts[i]);
-            return trackParts.joinIntoString("/");
-        }
-        else if (parts.size() > 5 && parts[4] == "Engine Library")
-        {
-            // Engine Library but not Music
+            // Inside Engine Library (Music/ or another folder): relative to it
             juce::StringArray trackParts;
             for (int i = 5; i < parts.size(); ++i)
                 trackParts.add(parts[i]);
@@ -1724,6 +1729,14 @@ private:
                 trackParts.add(parts[i]);
             return "../" + trackParts.joinIntoString("/");
         }
+    }
+
+    // The same track in the form STC looked up before 1.9.16 (relative to
+    // the Music folder: "Music/A/x.mp3" -> "A/x.mp3"), tried when the path
+    // relative to Engine Library finds no row; empty for any other path.
+    static juce::String oldFormDbPath(const juce::String& dbPath)
+    {
+        return dbPath.startsWith("Music/") && dbPath.length() > 6 ? dbPath.substring(6) : juce::String();
     }
 
     //==========================================================================
