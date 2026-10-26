@@ -141,6 +141,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 - Overview waveform preview (3-band frequency display) with cue markers (colored by DJ assignment) and minute markers
 - Quick cue positions displayed on waveform (up to 8 hot cues with colors and labels from Engine DJ)
 - Extended metadata: album, genre, key, BPM, rating
+- StageLinQ View shows a "Database: ..." status line (waiting for the unit, downloading a medium's database, ready with its track count, or the reason it failed and when it retries) and, on a deck that has a track but no waveform, the reason in the waveform's place (for example "Not in the unit's database" or "SD: downloading (40 %)")
 
 **Known limitations:**
 - No DJM-style mixer parameter mapping (Denon mixers expose basic fader data only via StateMap)
