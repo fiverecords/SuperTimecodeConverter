@@ -62,13 +62,29 @@ namespace StageLinQ
     // (AUDIT WIRE-1, WIRE-2).  Each is compared in unsigned arithmetic of the
     // field's own width before any cast, multiply or add.
     //  - A downloaded database is held in memory before it is written to a
-    //    temp file: 1 GiB is well above any Engine library seen (and above
-    //    what the 30 s download allows on a LAN), and keeps a corrupt size
-    //    from asking for 4 GiB.
+    //    temp file: 1 GiB is well above any Engine library seen, and keeps
+    //    a corrupt size from asking for 4 GiB.
+    //  - A FileTransfer message body: the device picks its chunk size
+    //    (chrisle's FileTransfer.ts sets no upper bound).  16 MiB, not
+    //    1 MiB: a chunk over 1 MiB was taken for corrupt data and the
+    //    download lost (DENON26 harness, C3).
     //  - An Engine DJ BLOB declares its uncompressed size; nothing decoded
     //    here (overview waveform, cues, beat grid) comes near 10 MiB.
     static constexpr uint32_t kMaxDbFileBytes   = 1u << 30;
+    static constexpr uint32_t kMaxFltxBodyBytes = 16u << 20;
     static constexpr int32_t  kMaxBlobBytes     = 10 * 1024 * 1024;
+
+    // How long a reply is waited for (chrisle's MESSAGE_TIMEOUT is 3 s,
+    // refs/StageLinq/types/common.ts:4), and the download limits: 30 s plus
+    // 2 ms per 1000 bytes of the file (a link of 0.5 MB/s still completes),
+    // and at most 10 s without a chunk.  chrisle's getFile() has no gap
+    // limit, only 60 s in all; the gap was 5 s, which ended a transfer the
+    // device paused for 6 s (C8), and the deadline that grows with the file
+    // would otherwise be the only end of a transfer that stopped.
+    static constexpr int    kFltxReplyWaitMs     = 3000;
+    static constexpr double kDownloadBaseMs      = 30000.0;
+    static constexpr double kDownloadMsPerByte   = 2.0 / 1000.0;
+    static constexpr double kDownloadGapMs       = 10000.0;
 
     //==========================================================================
     // Build fltx request frames (with length prefix)
@@ -522,6 +538,8 @@ private:
             }
 
             fltxReadBuf.clear();            // nothing of the last session's stream
+            unansweredStats.clear();
+            lostTransfers.clear();
             {
                 std::lock_guard<std::mutex> lock(cacheMutex);   // built from the last database
                 trackCache.clear();
@@ -561,6 +579,44 @@ private:
 
     void runSession()
     {
+        // A connection on which a request went unanswered is not used again
+        // (a late reply would be taken for the next request's, VERIFY V10):
+        // when that request was a stat, the path is noted as unanswered and
+        // a new connection goes on with the paths not tried yet.  Likewise
+        // after a transfer that did not complete (its chunks could still
+        // come, and be placed in the next file): the path is noted, and a
+        // new connection goes on with the next path or source, as before
+        // 1.9.16, where a download that failed moved on to the next one.
+        for (;;)
+        {
+            const DbSearch found = connectAndDownload();
+            if (((found == DbSearch::statUnanswered && unansweredStats.size() <= kMaxUnansweredStats)
+                 || (found == DbSearch::transferLost && lostTransfers.size() <= kMaxTransfersLost))
+                && !sessionShouldEnd())
+            {
+                closeFtSocket();
+                fltxReadBuf.clear();
+                continue;
+            }
+            if (found != DbSearch::found) return;
+            break;
+        }
+        serveRequests();
+    }
+
+    // Connects, asks for the sources and downloads and opens the first
+    // database found (as before 1.9.16); found, or why not
+    enum class DbSearch
+    {
+        found,              // a database is downloaded and open
+        none,               // none there (or none usable)
+        statUnanswered,     // a stat got no reply: the path is noted, the connection is not used again
+        transferLost,       // a transfer did not complete: the path is noted, the connection is not used again
+        lost                // the connection failed, or the session ends
+    };
+
+    DbSearch connectAndDownload()
+    {
         DBG("StageLinQ DB: Connecting to FileTransfer at " + deviceIp + ":" + juce::String(ftPort));
 
         // --- Connect to FileTransfer service ---
@@ -569,9 +625,9 @@ private:
             if (!sock->connect(deviceIp, ftPort, StageLinQ::kSocketTimeoutMs))
             {
                 DBG("StageLinQ DB: FileTransfer connect failed");
-                return;
+                return DbSearch::lost;
             }
-            if (sessionShouldEnd()) return;     // stop() or start() came during the connect
+            if (sessionShouldEnd()) return DbSearch::lost;   // stop() or start() came during the connect
 
             // Send service announcement (same as StateMap/BeatInfo)
             auto announce = StageLinQ::buildServiceAnnouncement(token, "FileTransfer", 0);
@@ -592,14 +648,14 @@ private:
         for (double left; !sessionShouldEnd()
                           && (left = requestsAt - juce::Time::getMillisecondCounterHiRes()) > 0.0;)
             wait((int)std::ceil(left));
-        if (sessionShouldEnd()) return;
+        if (sessionShouldEnd()) return DbSearch::lost;
 
         // --- Get source locations ---
         juce::StringArray sources = fetchSources();
         if (sources.isEmpty())
         {
             DBG("StageLinQ DB: No sources found on device");
-            return;
+            return DbSearch::none;
         }
 
         for (int si = 0; si < sources.size(); ++si)
@@ -608,23 +664,28 @@ private:
         }
 
         // --- Download database ---
-        juce::File dbFile = downloadDatabase(sources);
-        if (dbFile == juce::File() || !dbFile.existsAsFile())
+        juce::File dbFile;
+        const DbSearch found = downloadDatabase(sources, dbFile);
+        if (found != DbSearch::found || !dbFile.existsAsFile())
         {
             DBG("StageLinQ DB: Failed to download database");
-            return;
+            return found == DbSearch::found ? DbSearch::none : found;
         }
 
         // --- Open SQLite database ---
         if (!openDatabase(dbFile))
         {
             DBG("StageLinQ DB: Failed to open database");
-            return;
+            return DbSearch::none;
         }
 
         dbReady.store(true);
         DBG("StageLinQ DB: Database ready (" + dbFile.getFullPathName() + ")");
+        return DbSearch::found;
+    }
 
+    void serveRequests()
+    {
         // --- Process metadata requests ---
         while (!sessionShouldEnd())
         {
@@ -663,15 +724,21 @@ private:
         auto frame = StageLinQ::buildFltxSources();
         if (!fltxWrite(frame)) return {};
 
-        auto resp = fltxWaitFor(StageLinQ::kFltxRespSourceLocations, 3000);
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespSourceLocations, StageLinQ::kFltxReplyWaitMs);
         return resp.sources;
     }
 
     //==========================================================================
     // FileTransfer protocol: download database
     //==========================================================================
-    juce::File downloadDatabase(const juce::StringArray& sources)
+    // The first source's database, v2 path first, then v1.  A path the
+    // device did not answer a stat for, or whose transfer did not complete,
+    // on an earlier connection of this session is skipped (unansweredStats,
+    // lostTransfers); a request it does not answer now ends the search
+    // (statUnanswered or transferLost: the path is noted; or lost).
+    DbSearch downloadDatabase(const juce::StringArray& sources, juce::File& result)
     {
+        result = juce::File();
         for (auto& source : sources)
         {
             // Try v2 database first, then v1
@@ -682,17 +749,34 @@ private:
 
             for (auto& dbPath : paths)
             {
-                if (sessionShouldEnd()) return {};
+                if (sessionShouldEnd()) return DbSearch::lost;
+                if (unansweredStats.contains(dbPath) || lostTransfers.contains(dbPath)) continue;
 
                 // Check if file exists (stat)
-                uint32_t fileSize = fetchFileStat(dbPath);
-                if (fileSize == 0) continue;
+                uint32_t fileSize = 0;
+                const Reply stat = fetchFileStat(dbPath, fileSize);
+                if (stat == Reply::lost)
+                {
+                    if (!fltxConnected() || sessionShouldEnd()) return DbSearch::lost;
+                    DBG("StageLinQ DB: No reply to the stat of " + dbPath + " -- not asked again on this unit");
+                    unansweredStats.add(dbPath);
+                    return DbSearch::statUnanswered;
+                }
+                if (stat == Reply::refused) continue;
 
                 DBG("StageLinQ DB: Found database " + dbPath + " (" + juce::String(fileSize) + " bytes)");
 
                 // Download the file
-                auto data = downloadFile(dbPath, fileSize);
-                if (data.empty()) continue;
+                std::vector<uint8_t> data;
+                const Reply got = downloadFile(dbPath, data);
+                if (got == Reply::lost)
+                {
+                    if (sessionShouldEnd()) return DbSearch::lost;
+                    DBG("StageLinQ DB: The transfer of " + dbPath + " did not complete -- going on with the next one");
+                    lostTransfers.add(dbPath);
+                    return DbSearch::transferLost;
+                }
+                if (got == Reply::refused) continue;
 
                 // Save to a temp file of its own (it was always STC_Denon/m.db,
                 // shared by every STC instance and never deleted); deleted
@@ -704,14 +788,15 @@ private:
                 {
                     DBG("StageLinQ DB: Could not write " + tempFile.getFullPathName());
                     tempFile.deleteFile();
-                    return {};
+                    return DbSearch::none;
                 }
 
                 DBG("StageLinQ DB: Downloaded " + juce::String((int)data.size()) + " bytes to " + tempFile.getFullPathName());
-                return tempFile;
+                result = tempFile;
+                return DbSearch::found;
             }
         }
-        return {};
+        return DbSearch::none;
     }
 
     //--------------------------------------------------------------------------
@@ -743,28 +828,44 @@ private:
     //==========================================================================
     // FileTransfer protocol: get file size
     //==========================================================================
-    uint32_t fetchFileStat(const juce::String& path)
+    // A request's outcome on the FileTransfer connection
+    enum class Reply
     {
-        auto frame = StageLinQ::buildFltxStat(path);
-        if (!fltxWrite(frame)) return 0;
+        answered,   // the device answered
+        refused,    // it answered "no": a size of 0 (no such file), or over a cap
+        lost        // no reply in time, or the connection failed: no further
+                    // request is sent on this connection (its reply could
+                    // still come, and be taken for the next one's)
+    };
 
-        auto resp = fltxWaitFor(StageLinQ::kFltxRespFileStat, 2000);
-        return resp.fileSize;
+    Reply fetchFileStat(const juce::String& path, uint32_t& fileSize)
+    {
+        fileSize = 0;
+        auto frame = StageLinQ::buildFltxStat(path);
+        if (!fltxWrite(frame)) return Reply::lost;
+
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespFileStat, StageLinQ::kFltxReplyWaitMs);
+        if (!resp.received) return Reply::lost;
+        fileSize = resp.fileSize;
+        return fileSize > 0 ? Reply::answered : Reply::refused;
     }
 
     //==========================================================================
     // FileTransfer protocol: download complete file
     //==========================================================================
-    std::vector<uint8_t> downloadFile(const juce::String& path, uint32_t expectedSize)
+    // The file's bytes in fileData (its size from the transfer-id reply)
+    Reply downloadFile(const juce::String& path, std::vector<uint8_t>& fileData)
     {
-        juce::ignoreUnused(expectedSize);  // actual size comes from TransferId response
+        fileData.clear();
         // Request transfer ID
         auto frame = StageLinQ::buildFltxTransferId(path);
-        if (!fltxWrite(frame)) return {};
+        if (!fltxWrite(frame)) return Reply::lost;
 
-        auto resp = fltxWaitFor(StageLinQ::kFltxRespTransferId, 3000);
-        if (!resp.received || resp.txFileSize == 0)
-            return {};
+        auto resp = fltxWaitFor(StageLinQ::kFltxRespTransferId, StageLinQ::kFltxReplyWaitMs);
+        if (!resp.received)
+            return Reply::lost;
+        if (resp.txFileSize == 0)
+            return Reply::refused;
 
         uint32_t fileSize = resp.txFileSize;
         uint32_t txId = resp.txId;
@@ -772,24 +873,24 @@ private:
         {
             DBG("StageLinQ DB: " + path + " is " + juce::String((juce::int64)fileSize)
                 + " bytes, over the " + juce::String((juce::int64)StageLinQ::kMaxDbFileBytes) + " cap -- skipped");
-            return {};
+            return Reply::refused;
         }
         uint32_t totalChunks = (fileSize + StageLinQ::kFltxChunkSize - 1) / StageLinQ::kFltxChunkSize;
 
         DBG("StageLinQ DB: Transfer ID " + juce::String(txId) + ", size " + juce::String(fileSize)
             + ", chunks " + juce::String(totalChunks));
 
-        // Request all chunks
-        auto chunkReq = StageLinQ::buildFltxChunkRange(txId, 0, totalChunks > 0 ? totalChunks - 1 : 0);
-        if (!fltxWrite(chunkReq)) return {};
-
-        // Receive chunks into buffer (fileSize is capped above; an allocation
-        // that still fails ends this download, not the thread)
-        std::vector<uint8_t> fileData;
+        // The buffer first (fileSize is capped above; an allocation that
+        // still fails ends this download, not the thread, and nothing has
+        // been asked for yet), then all chunks
         try { fileData.assign(fileSize, 0); }
-        catch (const std::bad_alloc&) { return {}; }
+        catch (const std::bad_alloc&) { fileData = {}; return Reply::refused; }
+        auto chunkReq = StageLinQ::buildFltxChunkRange(txId, 0, totalChunks > 0 ? totalChunks - 1 : 0);
+        if (!fltxWrite(chunkReq)) { fileData = {}; return Reply::lost; }
+
         uint32_t bytesReceived = 0;
-        double deadline = juce::Time::getMillisecondCounterHiRes() + 30000.0;  // 30s timeout
+        const double deadline = juce::Time::getMillisecondCounterHiRes() + StageLinQ::kDownloadBaseMs
+                                + fileSize * StageLinQ::kDownloadMsPerByte;
         double lastChunkTime = juce::Time::getMillisecondCounterHiRes();
 
         // Anything but a chunk is skipped, as chrisle's getFile() does: the
@@ -798,7 +899,7 @@ private:
         // (AUDIT SLQ-1), and so did an end-of-message, which the unit also
         // sends after a reply (after the source list in the capture).  The
         // download ends when the file is complete, when no chunk has come for
-        // 5 s, after 30 s, or when the device disconnects.
+        // 10 s, at the deadline above, or when the device disconnects.
         while (bytesReceived < fileSize
                && juce::Time::getMillisecondCounterHiRes() < deadline
                && !sessionShouldEnd())
@@ -826,7 +927,7 @@ private:
             }
             if (chunkResp.messageId == StageLinQ::kFltxRespDisconnect || !fltxConnected())
                 break;
-            if (juce::Time::getMillisecondCounterHiRes() - lastChunkTime > 5000.0)
+            if (juce::Time::getMillisecondCounterHiRes() - lastChunkTime > StageLinQ::kDownloadGapMs)
                 break;
         }
 
@@ -837,10 +938,11 @@ private:
         {
             DBG("StageLinQ DB: Incomplete download: " + juce::String(bytesReceived)
                 + "/" + juce::String(fileSize) + " -- discarding (truncated SQLite is unusable)");
-            return {};
+            fileData = {};
+            return Reply::lost;     // chunks of it may still come
         }
 
-        return fileData;
+        return Reply::answered;
     }
 
     //==========================================================================
@@ -921,7 +1023,7 @@ private:
                     continue;
                 }
 
-                if (bodyLen > 1048576)
+                if (bodyLen > StageLinQ::kMaxFltxBodyBytes)
                 {
                     // Malformed data -- discard first byte and try to resync
                     fltxReadBuf.erase(fltxReadBuf.begin());
@@ -1817,6 +1919,15 @@ private:
     std::unique_ptr<juce::StreamingSocket> ftSocket;
     std::mutex sockMutex;
     std::vector<uint8_t> fltxReadBuf;
+
+    // Database paths whose stat the device did not answer in this session
+    // (this thread only; cleared when another device or port is served)
+    juce::StringArray unansweredStats;
+    static constexpr int kMaxUnansweredStats = 16;
+    // Database paths whose transfer did not complete in this session, each
+    // followed by a new connection (this thread only; cleared likewise)
+    juce::StringArray lostTransfers;
+    static constexpr int kMaxTransfersLost = 16;
 
     // SQLite handle, and the downloaded copy it reads (deleted on close)
     sqlite3* db = nullptr;
