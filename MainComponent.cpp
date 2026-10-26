@@ -265,9 +265,10 @@ MainComponent::MainComponent()
     {
         sharedStageLinQDb.requestMetadata(path);
     };
-    sharedStageLinQInput.onFileTransferAvailable = [this](const juce::String& ip, uint16_t port, const uint8_t* token)
+    sharedStageLinQInput.onFileTransferAvailable = [this](const juce::String& ip, uint16_t port, const uint8_t* token,
+                                                          const uint8_t* unitToken)
     {
-        sharedStageLinQDb.start(ip, port, token);
+        sharedStageLinQDb.start(ip, port, token, unitToken);
     };
     sharedProDJLinkInput.onPlayerLost = [this](const juce::String& playerIP)
     {

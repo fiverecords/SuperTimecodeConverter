@@ -1151,9 +1151,12 @@ public:
     // Callbacks for database integration (set by MainComponent to avoid
     // circular header dependency with StageLinQDbClient).
     // onMetadataRequest: called when a new TrackNetworkPath arrives.
-    // onFileTransferAvailable: called when a device's FileTransfer port is discovered.
+    // onFileTransferAvailable: called when a device's FileTransfer port is discovered,
+    //   on that device's connection thread, with STC's own token (token) and the
+    //   device's discovery token (unitToken: the unit its tracks' net:// paths name).
     std::function<void(const juce::String& networkPath)> onMetadataRequest;
-    std::function<void(const juce::String& ip, uint16_t port, const uint8_t* token)> onFileTransferAvailable;
+    std::function<void(const juce::String& ip, uint16_t port, const uint8_t* token,
+                       const uint8_t* unitToken)> onFileTransferAvailable;
 
     //==========================================================================
     // Public getters -- match ProDJLinkInput API patterns
@@ -2613,7 +2616,7 @@ private:
             // Start database client if FileTransfer is available
             if (fileTransferPort > 0 && owner.onFileTransferAvailable)
             {
-                owner.onFileTransferAvailable(deviceIp, fileTransferPort, owner.ownToken);
+                owner.onFileTransferAvailable(deviceIp, fileTransferPort, owner.ownToken, deviceToken);
             }
 
             // --- Phase 2: Connect to StateMap service ---
