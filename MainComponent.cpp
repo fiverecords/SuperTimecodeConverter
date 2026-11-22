@@ -7023,7 +7023,26 @@ void MainComponent::updateStatusLabels()
     // The TCNet output is one for all engines: the same line on every
     // engine that has TCNET OUT on (AUD11 NET-SHOW-8).
     if (lblOutputTcnetStatus.isVisible())
-        lblOutputTcnetStatus.setText(sharedTcnetOutput.getStatusText(), juce::dontSendNotification);
+    {
+        juce::String tcnetStatus = sharedTcnetOutput.getStatusText();
+        // Two engines on one layer: the highest-numbered feeds it, as in
+        // the feed in timerCallback(); the others say why their timecode
+        // is not on that layer (AUD11 MAIN-B-3).
+        if (sharedTcnetOutput.getIsRunning())
+        {
+            for (int e = (int)engines.size() - 1; e > selectedEngine; --e)
+            {
+                auto& other = *engines[(size_t)e];
+                if (other.isOutputTcnetEnabled() && other.getTcnetLayer() == eng.getTcnetLayer())
+                {
+                    tcnetStatus = "NOT SENT: LAYER " + juce::String(eng.getTcnetLayer() + 1)
+                                + " IS FED BY " + other.getName();
+                    break;
+                }
+            }
+        }
+        lblOutputTcnetStatus.setText(tcnetStatus, juce::dontSendNotification);
+    }
 
     if (eng.isOutputLtcEnabled())
     {
@@ -9189,12 +9208,30 @@ void MainComponent::timerCallback()
         // Track which layers are assigned by enabled engines
         bool layerUsed[TCNetOutput::kMaxLayers] = {};
 
+        // One engine feeds a layer: of the engines with TCNET OUT on that
+        // select it, the highest-numbered -- the one whose values reached
+        // the receivers when every such engine wrote the layer in turn.
+        // All of them writing it made the change detection below, which is
+        // per layer, see a new track on every tick for each: the title and
+        // the artwork re-sent to every receiver 60 times a second, a JPEG
+        // encoded per engine per tick (up to 13 ms of this thread), and
+        // the beat counter re-anchored each time.  Every new engine starts
+        // on Layer 1, so ticking TCNET OUT on a second engine was enough
+        // (AUD11 MAIN-B-3).  The engines that do not feed their layer say
+        // so in their TCNet status line (updateStatusLabels).
+        int layerFeeder[TCNetOutput::kMaxLayers];
+        for (auto& f : layerFeeder) f = -1;
+        for (int i = 0; i < (int)engines.size(); ++i)
+            if (engines[(size_t)i]->isOutputTcnetEnabled())
+                layerFeeder[engines[(size_t)i]->getTcnetLayer()] = i;
+
         for (int i = 0; i < (int)engines.size(); ++i)
         {
             auto& eng = *engines[(size_t)i];
             if (!eng.isOutputTcnetEnabled()) continue;
 
             int layer = eng.getTcnetLayer();  // 0-3, user-configured per engine
+            if (layerFeeder[layer] != i) continue;   // a higher-numbered engine feeds this layer
 
             auto src = eng.getActiveInput();
             int ep = eng.getEffectivePlayer();
