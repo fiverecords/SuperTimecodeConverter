@@ -9242,8 +9242,20 @@ void MainComponent::timerCallback()
             // align perfectly to the underlying audio (we have no reference)
             // but gives consoles a steady beat pulse to drive effects from.
             const bool haveNativeBeat = (src == SrcType::ProDJLink) && (beatNumber != 0);
+            // Whether getSmoothedPlayheadMs() is a deck's position on this
+            // tick, so that 0 is the start of the track and not "this
+            // source has no playhead": a DJ source that is running and
+            // following a deck -- the cases in which the engine makes its
+            // timecode from that position.  Without it a deck standing at 0
+            // went to TCNet at the engine's timecode, which carries the
+            // Track Map offset (AUD11 NET-SHOW-2).
+            const bool playheadIsPosition =
+                   (src == SrcType::ProDJLink && ep >= 1 && sharedProDJLinkInput.getIsRunning())
+                || (src == SrcType::StageLinQ && ep >= 1 && sharedStageLinQInput.getIsRunning())
+                || (src == SrcType::Winamp && eng.getWinampInput().getIsRunning()
+                                           && eng.getWinampInput().isConnected());
             uint32_t playheadForBeat = eng.getSmoothedPlayheadMs();
-            if (playheadForBeat == 0)
+            if (playheadForBeat == 0 && ! playheadIsPosition)
             {
                 // getSmoothedPlayheadMs() only returns a value for DJ sources.
                 // For Generator / MTC / Art-Net / LTC, fall back to deriving
@@ -9348,7 +9360,8 @@ void MainComponent::timerCallback()
                 beatNumber,
                 masterPlayerNum,
                 trackIdToSend,
-                eng.getSourceSpeedRatio());
+                eng.getSourceSpeedRatio(),
+                playheadIsPosition);
 
             // Feed track metadata for Resolume unicast.
             // DJ sources: real artist + title from CDJ/Denon.

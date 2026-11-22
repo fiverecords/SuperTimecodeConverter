@@ -251,12 +251,22 @@ public:
                             int offsetMs = 0, uint32_t beatNumber = 0,
                             uint8_t masterPlayerNum = 0,
                             uint32_t trackId = 0,
-                            double speedRatio = 1.0)
+                            double speedRatio = 1.0,
+                            bool playheadIsPosition = false)
     {
         if (idx < 0 || idx >= kMaxLayers) return;
         auto& L       = layers[idx];
         L.masterPlayerNum = masterPlayerNum;  // Sync Master value for Metrics
-        int64_t baseMs = (int64_t)((playheadMs > 0) ? playheadMs : tcToMs(tc, fps));
+        // The layer's position: the deck's own position (playheadMs) for a
+        // source that has one, the engine's timecode for the others.  A
+        // playheadMs of 0 used to be taken for "no playhead", so a deck
+        // standing exactly at 0 -- cued at the start of the track, or an
+        // NXS2 before its first beat -- was sent at the timecode instead,
+        // which carries the Track Map offset: 01:00:00:00 on a four-minute
+        // track, then back to 0 at PLAY.  The caller now says with
+        // playheadIsPosition that playheadMs is a position even at 0
+        // (AUD11 NET-SHOW-2).  Without it, as before: 0 means none.
+        int64_t baseMs = (int64_t)((playheadMs > 0 || playheadIsPosition) ? playheadMs : tcToMs(tc, fps));
         // Engine-side per-layer offset + venue-wide global offset.
         // Both are signed ms; the sum is clamped into the uint32 wire
         // range below so negative excursions parked at 0 instead of
