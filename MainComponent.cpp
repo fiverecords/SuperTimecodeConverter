@@ -5621,9 +5621,17 @@ void MainComponent::loadAndApplyNonAudioSettings()
                 eng.getLinkBridge().setEnabled(true);
         }
 
-        // Audio BPM detection
+        // Audio BPM detection, with the global SAMPLE RATE / BUFFER SIZE --
+        // from the settings, the selectors are not set yet.  This start is
+        // the first to open its interface, and the client that opens a
+        // shared device sets its format (AudioDeviceHub, DESIGN D23):
+        // started without them, the interface ran at the driver's default
+        // rate and buffer after every launch, for LTC and everything else
+        // on it too, under selectors that showed the chosen values (AUD11
+        // MAIN-A-5).
         if (es.audioBpmEnabled && !es.audioBpmDevice.isEmpty())
-            eng.startAudioBpm(es.audioBpmType, es.audioBpmDevice, es.audioBpmChannel);
+            eng.startAudioBpm(es.audioBpmType, es.audioBpmDevice, es.audioBpmChannel,
+                              settings.preferredSampleRate, settings.preferredBufferSize);
         eng.getAudioBpmInput().setSmoothing(es.audioBpmSmoothing);
         eng.getAudioBpmInput().setInputGain((float)es.audioBpmGain / 100.0f);
 
