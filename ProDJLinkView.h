@@ -163,6 +163,10 @@ private:
         WaveformDisplay waveform;
         WaveformDetailDisplay detailWaveform;
         juce::Rectangle<int> wfLocalBounds;  // waveform area relative to deck (set during paintDeckStatic)
+        // Timecode font size found for a strip of tcFitW x tcFitH
+        // (paintDeckTimecode, AUD11 VIEWS-EDITORS-9)
+        int   tcFitW = -1, tcFitH = -1;
+        float tcFitSize = 0.0f;
         juce::Rectangle<int> detailLocalBounds; // detail waveform area relative to deck
         uint32_t displayedDetailTrackId = 0;
         int detailRetryTicks = 0;  // countdown for supplementary data retry
@@ -2166,6 +2170,14 @@ private:
             // Draw timecode
             float tcFontSize = juce::jlimit(14.0f, 48.0f, tcH * 0.8f);
             juce::String tcStr = timecodeToString(ds.timecode);
+            // The fit starts from the size found the last time for a strip
+            // of this size: one measurement per repaint instead of one per
+            // pixel of font size shrunk, 22 to 29 in the tall narrow decks
+            // of the 4x1 layout at every repaint of a playing deck (AUD11
+            // VIEWS-EDITORS-9).  The loop still runs, so a string that came
+            // out wider is fitted as before.
+            if (ds.tcFitW == tcRow.getWidth() && ds.tcFitH == tcH)
+                tcFontSize = juce::jmin(tcFontSize, ds.tcFitSize);
             auto tcFont = juce::Font(juce::FontOptions(getMonoFontName(), tcFontSize, juce::Font::bold));
             float availW = (float)tcRow.getWidth();
             while (tcFontSize > 8.0f && measureStringWidth(tcFont, tcStr) > availW)
@@ -2173,6 +2185,9 @@ private:
                 tcFontSize -= 1.0f;
                 tcFont = juce::Font(juce::FontOptions(getMonoFontName(), tcFontSize, juce::Font::bold));
             }
+            ds.tcFitW = tcRow.getWidth();
+            ds.tcFitH = tcH;
+            ds.tcFitSize = tcFontSize;
             g.setFont(tcFont);
             g.setColour(ds.isPlaying ? tcGlow : textMid);
             g.drawText(tcStr, tcRow, juce::Justification::centred);
