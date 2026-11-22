@@ -52,12 +52,18 @@
 // JUCE also resets the track on an Alt+click (Option+click on macOS), the
 // default modifier of setDoubleClickReturnValue; the box does not copy that
 // (an Alt+click there opens the editor).
+// The mouse wheel is not the slider's (AUD11 MAIN-A-14): every one of these
+// sits in a panel that scrolls, and JUCE's default gave a wheel notch over a
+// slider to the slider -- the gain or offset under the pointer changed, was
+// applied and saved, and the panel stayed where it was.  With the wheel off
+// here the event goes on to the panel's viewport, which scrolls.
 // Message thread, as all mouse handling.
 class GainSlider : public juce::Slider
 {
 public:
     GainSlider()
     {
+        setScrollWheelEnabled(false);
         setDoubleClickReturnValue(true, 100.0);
         setTooltip("Right-click or double-click to reset");
         attachValueBoxReset();

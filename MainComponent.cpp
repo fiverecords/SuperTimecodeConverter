@@ -307,6 +307,11 @@ MainComponent::MainComponent()
     rightViewport.setViewedComponent(&rightContent, false);
     rightViewport.setScrollBarsShown(true, false);
 
+    // The mouse wheel over a panel scrolls the panel (AUD11 MAIN-A-14).  The
+    // gain and offset sliders give it up in GainSlider's constructor; the
+    // generator's VOLUME is the one panel slider of another class.
+    sldGenAudioVolume.setScrollWheelEnabled(false);
+
     // --- Input buttons ---
     for (auto* btn : { &btnMtcIn, &btnArtnetIn, &btnSysTime, &btnLtcIn, &btnProDJLinkIn, &btnStageLinQIn, &btnLANetTCIn })
     { leftContent.addAndMakeVisible(btn); btn->setClickingTogglesState(false); }
