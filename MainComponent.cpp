@@ -2575,6 +2575,15 @@ MainComponent::~MainComponent()
         eng->stopLtcInput();
     }
 
+    // The mini waveform is a member, so it is destroyed after this body,
+    // and its destructor unregisters from the audio thumbnail of the player
+    // it was last given -- a part of an engine.  With the engines gone by
+    // then, every quit read and wrote freed memory there (AUD11 MAIN-B-7).
+    // Detached while its engine is alive, as removeEngine does.  (The
+    // waveform window's view went with its window in step 6.)
+    miniWaveform.setAudioPlayer(nullptr);
+    miniWaveform.setEngine(nullptr);
+
     // 12. Now safe to destroy engine objects
     engines.clear();
 
