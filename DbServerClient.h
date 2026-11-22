@@ -85,6 +85,8 @@ struct TrackMetadata
     int waveformBytesPerEntry = 0;  // 3 = ThreeBand, 6 = ColorNxs2
     bool waveformQueried = false;   // true once waveform fetch has been attempted
     bool nfsAttempted = false;      // true once NFS ANLZ fetch has been attempted
+    bool nfsRetryAtLoad = false;    // the NFS fetch failed and its timed retries are used up: once more when the track is loaded again (AUD11 PDL-5)
+    double lastRequestMs = 0.0;     // when a caller of requestMetadata last asked for this entry (hiRes ms; AUD11 PDL-5)
     uint32_t cacheVersion = 0;      // incremented each time any field is updated
 
     // Detail waveform (high-res scrolling view, 150 entries/sec of audio)
@@ -306,6 +308,18 @@ public:
                          uint8_t trackType, uint32_t trackId, int ourPlayer,
                          const juce::String& playerModel = {})
     {
+        requestMetadataFrom(true, playerIP, slot, trackType, trackId, ourPlayer, playerModel);
+    }
+
+private:
+    /// requestMetadata, for a caller (fromCaller: the engine, the PDL View)
+    /// or for the worker asking again after a cooldown
+    /// (requeueCooldownRetries), whose request is not a load of the track
+    /// (AUD11 PDL-5, below).
+    void requestMetadataFrom(bool fromCaller, const juce::String& playerIP, uint8_t slot,
+                             uint8_t trackType, uint32_t trackId, int ourPlayer,
+                             const juce::String& playerModel)
+    {
         if (trackId == 0 || playerIP.isEmpty()) return;
         if (ourPlayer < 1 || ourPlayer > 6)
         {
@@ -324,12 +338,50 @@ public:
         // (partial cache from an early query before CDJ was fully ready)
         // are re-requested to fetch the missing waveform data.
         const CacheKey cacheKey = makeCacheKey(playerIP, slot, trackId);
+        bool fullyCached = false;
+        bool retryNfs = false;
+        uint32_t retryGeneration = 0;
         {
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             auto it = metadataCache.find(cacheKey);
-            if (it != metadataCache.end() && it->second.isFullyCached())
-                return;  // fully cached (metadata + waveform attempted)
+            if (it != metadataCache.end())
+            {
+                // A track whose NFS download failed, with its timed retries
+                // used up, gets one more round when it is loaded again
+                // (AUD11 PDL-5).  The callers ask once per load; the PDL
+                // View also asks about every 3 s while a deck has no title:
+                // only a caller's request that comes kNfsReloadGapMs after
+                // their last one for the entry counts as a new load.
+                if (fromCaller)
+                {
+                    const double now = juce::Time::getMillisecondCounterHiRes();
+                    if (it->second.nfsRetryAtLoad
+                        && now - it->second.lastRequestMs >= (double)kNfsReloadGapMs)
+                    {
+                        it->second.nfsRetryAtLoad = false;
+                        retryNfs = true;
+                        retryGeneration = slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot);
+                    }
+                    it->second.lastRequestMs = now;
+                }
+                fullyCached = it->second.isFullyCached();
+            }
         }
+        if (retryNfs)
+        {
+            NfsRetry r;
+            r.key = cacheKey;
+            r.playerIP = playerIP;
+            r.slot = slot;
+            r.trackId = trackId;
+            r.cdj3000Class = playerModel.containsIgnoreCase("3000");
+            r.mediaGeneration = retryGeneration;
+            r.attempt = 0;
+            noteNfsRetry(r);
+            requestSemaphore.signal();
+        }
+        if (fullyCached)
+            return;  // fully cached (metadata + waveform attempted)
 
         // Enqueue request (producer lock: any thread may call this)
         const juce::SpinLock::ScopedLockType producerLock(queueProducerLock);
@@ -356,6 +408,7 @@ public:
         requestSemaphore.signal();
     }
 
+public:
     //==========================================================================
     // Retrieve cached metadata (called from UI/engine thread)
     //
@@ -626,6 +679,7 @@ public:
                     || !meta.hasDetailWaveform() || !meta.hasWaveform())
                 {
                     meta.nfsAttempted = false;
+                    meta.nfsRetryAtLoad = false;    // phase 2 launches NFS there itself
                     meta.waveformQueried = false;   // so requestMetadata does not take it as complete
                 }
                 auto it = metadataCache.find(newKey);
@@ -740,6 +794,11 @@ private:
         failedAtMs.clear();
         cooldownRetries.clear();
         nfsLostPlayers.clear();
+        nfsRetries.clear();
+        {
+            const juce::ScopedLock sl(nfsRetryNotesLock);
+            nfsRetryNotes.clear();
+        }
         nfsAnlzFetcher.clearAll();
     }
 
@@ -782,6 +841,12 @@ private:
     static constexpr int kReconnectCooldownMs = 5000;   // per player IP, after a failed attempt or fresh session (AUDIT META-8)
     static constexpr int kCooldownRetries     = 3;      // asks again after the cooldown, per request (AUDIT META-8)
     static constexpr int kMaxCooldownRetryRequests = 16;  // remembered requests at most; the oldest is dropped
+    // NFS download that failed (AUD11 PDL-5): tried again this many times
+    // per load of the track, this long after the 1st, 2nd and 3rd failure.
+    static constexpr int kNfsRetries = 3;
+    static constexpr int kNfsRetryDelayMs[kNfsRetries] = { 5000, 15000, 30000 };
+    static constexpr int kNfsReloadGapMs   = 20000;       // see requestMetadata
+    static constexpr int kMaxNfsRetryTracks = 16;         // remembered tracks at most; the oldest is dropped
     // Idle connection lifetime.  Set to 30 s to mirror the way Beat Link's
     // ConnectionManager keeps a Client open between successive queries to the
     // same player (see ConnectionManager.invokeWithClientSession in the
@@ -1712,8 +1777,8 @@ private:
             --r.retriesLeft;
             DBG("DbServerClient: asking " + r.req.playerIP + " again for trackId="
                 + juce::String(r.req.trackId) + " after its cooldown");
-            requestMetadata(r.req.playerIP, r.req.slot, r.req.trackType, r.req.trackId,
-                            r.req.ourPlayer, r.req.playerModel);
+            requestMetadataFrom(false, r.req.playerIP, r.req.slot, r.req.trackType, r.req.trackId,
+                                r.req.ourPlayer, r.req.playerModel);
             ++i;
         }
     }
@@ -2961,6 +3026,8 @@ private:
         merged.songStructure         = std::move(old.songStructure);
         merged.cueList               = std::move(old.cueList);
         merged.nfsAttempted          = old.nfsAttempted;
+        merged.nfsRetryAtLoad        = old.nfsRetryAtLoad;
+        merged.lastRequestMs         = old.lastRequestMs;
         merged.cacheVersion          = old.cacheVersion + 1;
         old = std::move(merged);
     }
@@ -3050,6 +3117,9 @@ private:
                     cooldownRetries.erase(std::remove_if(cooldownRetries.begin(), cooldownRetries.end(),
                                                          [&ip](const CooldownRetry& r) { return r.req.playerIP == ip; }),
                                           cooldownRetries.end());
+                    nfsRetries.erase(std::remove_if(nfsRetries.begin(), nfsRetries.end(),
+                                                    [&ip](const NfsRetry& r) { return r.playerIP == ip; }),
+                                     nfsRetries.end());
                     nfsLostPlayers.addIfNotAlreadyThere(ip);
                 }
             }
@@ -3080,6 +3150,7 @@ private:
             if (threadShouldExit()) break;
 
             requeueCooldownRetries();
+            runNfsRetries();
 
             // Process all queued requests
             while (true)
@@ -3597,6 +3668,115 @@ private:
     std::atomic<bool> nfsBusy { false };   // set by the worker at launch, cleared by the NFS thread when done
     juce::StringArray nfsLostPlayers;      // worker thread only: lost players the fetcher still has to forget
 
+    // NFS downloads to try again (AUD11 PDL-5).  A download that failed for
+    // a reason another try may cure (NfsAnlzFetcher::AnlzResult::retry: no
+    // reply or a refusal from the player, export.pdb or an analysis file
+    // not readable -- not a track export.pdb does not list, not a cancel)
+    // is launched again by the worker kNfsRetries times, kNfsRetryDelayMs
+    // after each failure, with the same parameters; nothing is asked of the
+    // dbserver again.  When those are used up the entry is marked
+    // nfsRetryAtLoad, and the next load of the track (requestMetadata)
+    // starts one more such round.  Before, the entry stayed "attempted" and
+    // the track had no beat grid, cues, phrases or waveforms for the rest
+    // of the session.  A retry is dropped when its entry is gone or
+    // complete, when the slot's media changed, when the player is lost and
+    // at stop().
+    //   nfsRetryNotes: handed to the worker by the NFS thread (a failure)
+    //                  and by requestMetadata (a new load), under
+    //                  nfsRetryNotesLock, held only to append or swap;
+    //   nfsRetries:    the worker's list, worker thread only.
+    struct NfsRetry
+    {
+        CacheKey key;
+        juce::String playerIP;
+        uint8_t slot = 0;
+        uint32_t trackId = 0;
+        bool cdj3000Class = true;
+        uint32_t mediaGeneration = 0;   // the slot's at the failure (slotMediaGeneration)
+        int attempt = 0;                // downloads already made in this round
+        double dueMs = 0.0;             // worker: launch at this time (hiRes ms)
+    };
+    juce::CriticalSection nfsRetryNotesLock;
+    std::vector<NfsRetry> nfsRetryNotes;
+    std::vector<NfsRetry> nfsRetries;
+
+    /// Any thread.  Hand a download to try again to the worker.
+    void noteNfsRetry(const NfsRetry& r)
+    {
+        const juce::ScopedLock sl(nfsRetryNotesLock);
+        nfsRetryNotes.push_back(r);
+    }
+
+    /// Worker thread, each pass of run() (at least every 500 ms).  Take the
+    /// notes: a track with retries left waits its delay in nfsRetries, one
+    /// without is marked nfsRetryAtLoad.  Then launch one retry that is
+    /// due, only when no download is running, so the worker never waits
+    /// here; launchNfsAsync returns at once then.  A retry runs alone on
+    /// the NFS thread like any download, so a request that needs NFS
+    /// meanwhile waits for it as it waits for any other (at most the three
+    /// transmissions of two calls, 3.5 s, towards a player that is silent).
+    void runNfsRetries()
+    {
+        std::vector<NfsRetry> notes;
+        {
+            const juce::ScopedLock sl(nfsRetryNotesLock);
+            notes.swap(nfsRetryNotes);
+        }
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        for (auto& n : notes)
+        {
+            nfsRetries.erase(std::remove_if(nfsRetries.begin(), nfsRetries.end(),
+                                            [&n](const NfsRetry& r) { return r.key == n.key; }),
+                             nfsRetries.end());
+            if (n.attempt > kNfsRetries)
+            {
+                const juce::SpinLock::ScopedLockType lock(cacheLock);
+                auto it = metadataCache.find(n.key);
+                if (it != metadataCache.end()
+                    && slotMediaGenerationLocked(n.key.ip, n.key.slot) == n.mediaGeneration)
+                    it->second.nfsRetryAtLoad = true;
+                continue;
+            }
+            n.dueMs = now + (n.attempt > 0 ? (double)kNfsRetryDelayMs[n.attempt - 1] : 0.0);
+            if ((int)nfsRetries.size() >= kMaxNfsRetryTracks)
+                nfsRetries.erase(nfsRetries.begin());   // drop the oldest
+            nfsRetries.push_back(std::move(n));
+        }
+
+        if (nfsRetries.empty() || !nfsIdle())
+            return;
+        for (size_t i = 0; i < nfsRetries.size(); )
+        {
+            if (nfsRetries[i].dueMs > now)
+            {
+                ++i;
+                continue;
+            }
+            const NfsRetry r = nfsRetries[i];
+            nfsRetries.erase(nfsRetries.begin() + (std::ptrdiff_t)i);
+            bool wanted = false;
+            {
+                // Still the entry the download failed for, and still short
+                // of something NFS brings.  nfsAttempted false means phase 2
+                // will launch NFS for it itself (movePlayer).
+                const juce::SpinLock::ScopedLockType lock(cacheLock);
+                auto it = metadataCache.find(r.key);
+                wanted = it != metadataCache.end()
+                      && it->second.nfsAttempted
+                      && slotMediaGenerationLocked(r.key.ip, r.key.slot) == r.mediaGeneration
+                      && (!it->second.hasBeatGrid() || !it->second.hasCueList()
+                          || !it->second.hasSongStructure()
+                          || !it->second.hasDetailWaveform()
+                          || !it->second.hasWaveform());
+            }
+            if (!wanted)
+                continue;
+            DBG("DbServerClient: NFS RETRY " + juce::String(r.attempt) + " trackId=" + juce::String(r.trackId));
+            launchNfsAsync(r.key, r.playerIP, r.slot, r.trackId, r.cdj3000Class, r.attempt);
+            return;
+        }
+    }
+
     // dbserver port-discovery listener (TCP 12523).
     //
     // CDJs that interpret a peer as running a Pioneer-style dbserver attempt
@@ -3702,9 +3882,12 @@ private:
     /// cdj3000Class is the request's CDJ-3000 test (its player model
     /// contains "3000"), for the .wfc rule of savePreviewIfMissing; both
     /// callers pass it.  Left out it is true, the rule from before the fit
-    /// test: any valid .wfc is kept, never replaced.
+    /// test: any valid .wfc is kept, never replaced.  attempt counts the
+    /// downloads already made for this load of the track: 0 from the
+    /// request path, 1..kNfsRetries from runNfsRetries (AUD11 PDL-5).
     void launchNfsAsync(const CacheKey& cacheKey, const juce::String& playerIP,
-                        uint8_t slot, uint32_t trackId, bool cdj3000Class = true)
+                        uint8_t slot, uint32_t trackId, bool cdj3000Class = true,
+                        int attempt = 0)
     {
         // Wait for the previous download in short slices rather than in
         // join(), so that stop() never waits on this thread behind a long
@@ -3726,7 +3909,7 @@ private:
             mediaGeneration = slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot);
         }
         nfsBusy.store(true, std::memory_order_release);
-        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, cancelToken, mediaGeneration, cdj3000Class]()
+        nfsThread = std::thread([this, cacheKey, playerIP, slot, trackId, cancelToken, mediaGeneration, cdj3000Class, attempt]()
         {
             // The ANLZ path comes from the media's export.pdb (AUDIT META-1).
             DBG("DbServerClient: NFS async (PDB lookup) -- trackId=" + juce::String(trackId));
@@ -3771,6 +3954,32 @@ private:
                 {
                     saveAnlzToDisk(cacheKey, diskKey);
                     savePreviewIfMissing(cacheKey, diskKey, cdj3000Class);
+                }
+            }
+
+            // The download failed, or brought one file and lost the other,
+            // in a way another try may cure: hand it to the worker
+            // (runNfsRetries, AUD11 PDL-5).  Not when stopping, and not when
+            // the entry is gone or the slot's media changed since the launch.
+            if (anlz.retry && isRunningFlag.load(std::memory_order_relaxed))
+            {
+                bool sameEntry = false;
+                {
+                    const juce::SpinLock::ScopedLockType lock(cacheLock);
+                    sameEntry = metadataCache.find(cacheKey) != metadataCache.end()
+                             && slotMediaGenerationLocked(cacheKey.ip, cacheKey.slot) == mediaGeneration;
+                }
+                if (sameEntry)
+                {
+                    NfsRetry r;
+                    r.key = cacheKey;
+                    r.playerIP = playerIP;
+                    r.slot = slot;
+                    r.trackId = trackId;
+                    r.cdj3000Class = cdj3000Class;
+                    r.mediaGeneration = mediaGeneration;
+                    r.attempt = attempt + 1;
+                    noteNfsRetry(r);
                 }
             }
             nfsBusy.store(false, std::memory_order_release);   // last use of nfsAnlzFetcher

@@ -89,6 +89,14 @@ public:
     struct AnlzResult
     {
         bool ok = false;
+        // fetchByTrackId only (AUD11 PDL-5): the fetch did not bring all it
+        // went for and another try may -- export.pdb or an analysis file
+        // could not be read, or a call got no usable reply.  False when
+        // export.pdb was read and does not list the track (final for that
+        // medium), when the slot has no NFS volume, and when the fetch was
+        // cancelled.  ok and retry can both be set: one of the two files
+        // came, the other went unanswered.
+        bool retry = false;
         std::vector<BeatEntry>   beatGrid;
         std::vector<CueEntry>    cueList;        // memory points, hot cues and loops, by position
         bool cueTagsFound = false;               // the file had a PCO2 or PCOB tag (possibly empty)
@@ -125,6 +133,7 @@ public:
     {
         AnlzResult result;
         fetchGeneration = token;
+        fetchUnanswered = false;
         if (playerIP.isEmpty() || trackId == 0) return result;
 
         juce::String mountPath = slotToMountPath(slot);
@@ -134,10 +143,14 @@ public:
             + " on " + playerIP + " slot=" + juce::String(slot));
 
         // Step 1: Download export.pdb to find the ANLZ path
-        juce::String anlzPath = findAnlzPathFromPdb(playerIP, mountPath, trackId);
+        bool indexRead = false;
+        juce::String anlzPath = findAnlzPathFromPdb(playerIP, mountPath, trackId, &indexRead);
         if (anlzPath.isEmpty())
         {
             DBG("NfsAnlzFetcher: could not find ANLZ path for track " + juce::String(trackId));
+            // Worth another try only if export.pdb itself could not be read
+            // (AUD11 PDL-5).
+            result.retry = !indexRead && !isCancelled();
             return result;
         }
 
@@ -155,11 +168,19 @@ public:
             // may have come from the old media before the .EXT went stale,
             // and the same path on another export is not the same analysis
             // (AUDIT META-4).
-            const juce::String freshPath = findAnlzPathFromPdb(playerIP, mountPath, trackId);
+            const juce::String freshPath = findAnlzPathFromPdb(playerIP, mountPath, trackId, &indexRead);
             if (freshPath.isEmpty())
-                return {};
+            {
+                AnlzResult none;
+                none.retry = !indexRead && !isCancelled();
+                return none;
+            }
             result = fetchAnalysisFiles(playerIP, mountPath, freshPath, nullptr);
         }
+        // Neither file came, or one of this fetch's calls went unanswered
+        // (the other file may then be missing): worth another try (AUD11
+        // PDL-5).
+        result.retry = !isCancelled() && (!result.ok || fetchUnanswered);
         return result;
     }
 
@@ -509,7 +530,7 @@ private:
             if (isCancelled())
                 return {};
             if (sock.write(host, port, msg.getData(), (int)msg.getSize()) < 0)
-                return {};
+                return rpcUnanswered();
 
             const double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
             for (;;)
@@ -518,13 +539,13 @@ private:
                 if (waitMs <= 0) break;
                 if (isCancelled()) return {};
                 const int ready = sock.waitUntilReady(true, juce::jmin(waitMs, kCancelPollMs));
-                if (ready < 0) return {};
+                if (ready < 0) return rpcUnanswered();
                 if (ready == 0) continue;   // re-check the deadline and the cancel flag
 
                 juce::String senderIP;
                 int senderPort = 0;
                 const int bytesRead = sock.read(recvBuf, (int)sizeof(recvBuf), false, senderIP, senderPort);
-                if (bytesRead < 0) return {};
+                if (bytesRead < 0) return rpcUnanswered();
                 if (senderIP != host) continue;   // not the player we called
 
                 const auto reply = parseRpcReply(recvBuf, bytesRead, xid);
@@ -533,7 +554,7 @@ private:
                 {
                     DBG("NfsAnlzFetcher: RPC call rejected (prog=" + juce::String(program)
                         + " proc=" + juce::String(procedure) + ")");
-                    return {};
+                    return rpcUnanswered();
                 }
                 return juce::MemoryBlock(recvBuf + reply.bodyOffset, (size_t)(bytesRead - reply.bodyOffset));
             }
@@ -542,6 +563,16 @@ private:
 
         DBG("NfsAnlzFetcher: RPC call timed out (prog=" + juce::String(program)
             + " proc=" + juce::String(procedure) + ")");
+        return rpcUnanswered();
+    }
+
+    /// rpcCall gives up for a reason other than a cancel: no reply in three
+    /// transmissions, a rejected call, or a socket error.  Noted for the
+    /// running fetch (AnlzResult::retry, AUD11 PDL-5); the empty block is
+    /// rpcCall's failure value.
+    juce::MemoryBlock rpcUnanswered()
+    {
+        fetchUnanswered = true;
         return {};
     }
 
@@ -1039,9 +1070,14 @@ private:
     // Track row has fixed fields + ofs_strings[21] array of u2 offsets.
     // analyze_path = ofs_strings[14] -> device_sql_string.
 
+    /// @p indexRead (optional) is set when the answer comes from the slot's
+    /// export.pdb -- then an empty path means the export does not list the
+    /// track -- and left alone when export.pdb could not be downloaded
+    /// (AUD11 PDL-5).
     juce::String findAnlzPathFromPdb(const juce::String& playerIP,
                                      const juce::String& mountPath,
-                                     uint32_t targetTrackId)
+                                     uint32_t targetTrackId,
+                                     bool* indexRead = nullptr)
     {
         // Check this slot's index first
         const SlotKey key { playerIP, mountPath };
@@ -1053,7 +1089,11 @@ private:
             {
                 auto t = idx->second.find(targetTrackId);
                 if (t != idx->second.end())
+                {
+                    if (indexRead != nullptr)
+                        *indexRead = true;
                     return t->second;
+                }
             }
             epoch = slotEpochLocked(playerIP, mountPath);
         }
@@ -1069,6 +1109,8 @@ private:
         DBG("NfsAnlzFetcher: downloaded export.pdb -- " + juce::String((int)pdb.getSize()) + " bytes");
 
         // Index all tracks of this export; it replaces the slot's old index
+        if (indexRead != nullptr)
+            *indexRead = true;
         auto index = parsePdbTrackPaths(pdb);
         juce::String path;
         auto t = index.find(targetTrackId);
@@ -1658,6 +1700,7 @@ private:
     // moves.
     std::atomic<uint32_t> cancelGeneration { 0 };
     uint32_t fetchGeneration = 0;   // the running fetch's token; NFS thread only
+    bool fetchUnanswered = false;   // a call of the running fetch went unanswered (rpcUnanswered); NFS thread only
     bool isCancelled() const noexcept
     {
         return cancelGeneration.load(std::memory_order_relaxed) != fetchGeneration;
