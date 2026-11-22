@@ -38,9 +38,19 @@
 //    exactly the bytes the image needs (Adam7 passes included), with
 //    every row's filter byte 0..4 and the Adler-32 matching, in no more
 //    deflate blocks than below.
-// A refused image is simply no artwork.  Anything else image-like (JPEG,
-// GIF, WebP) goes to JUCE as before, neither checked nor bounded here:
-// loadUntrustedImage().
+// A refused image is simply no artwork.
+//
+// The other formats JUCE would decode (AUD11 SLQ-2, FUZZ-6):
+//  - a JPEG must state, in its frame header, a size within the same
+//    limits (isBoundedJpeg); JUCE allocates and decodes whatever size the
+//    header states, and a 2.7 KB file stating 30000 x 30000 took 7 s and
+//    4.3 GB.  That bounds what a JPEG costs; it does not make JUCE's JPEG
+//    reader safe on a damaged file (BACKLOG, "Images");
+//  - GIF and WebP are refused: no artwork source sends them (Engine and
+//    rekordbox artwork is PNG and JPEG), and JUCE's GIF reader takes the
+//    LZW code size from the file and writes past its table -- a 35-byte
+//    GIF crashed STC (Windows and Linux; macOS decodes with CoreImage).
+// loadUntrustedImage() applies all of this.
 //
 // What one PNG may cost is bounded too (Limits; libpng accepts more), for
 // JUCE's decode cannot be cut short:
@@ -765,10 +775,76 @@ namespace ImageGuard
     }
 
     //==========================================================================
+    // True when the bytes begin as a JPEG whose frame header (SOFn) states a
+    // picture JUCE's reader decodes -- baseline, extended or progressive
+    // Huffman, 8 bits a sample, 1 to 4 components -- of a size within the
+    // limits (AUD11 SLQ-2, FUZZ-6).  JUCE's reader (IJG libjpeg) allocates
+    // the image and its own buffers from that header before it reads a
+    // pixel.  Nothing after the frame header is looked at.
+    //
+    // The markers before it are walked as libjpeg walks them (jdmarker.c):
+    // bytes that are not FF are passed over, then any run of FF, and FF 00
+    // is not a marker; RSTn and TEM carry nothing, every other marker its
+    // length.  Where libjpeg would read a segment differently from "skip
+    // its length" it has reported an error by then, and JUCE decodes
+    // nothing after an error in the header; so the first frame header
+    // found here is the one an image would be allocated from.  On macOS
+    // JUCE decodes with CoreImage, whose parser this does not mirror.
+    //==========================================================================
+    inline bool isBoundedJpeg(const void* data, size_t size, const Limits& limits = {})
+    {
+        const auto* d = static_cast<const uint8_t*>(data);
+        if (d == nullptr || size < 4 || size > limits.maxFileBytes
+            || d[0] != 0xFF || d[1] != 0xD8 || d[2] != 0xFF)                  // SOI, then a marker
+            return false;
+
+        size_t pos = 2;
+        for (;;)
+        {
+            while (pos < size && d[pos] != 0xFF) ++pos;
+            while (pos < size && d[pos] == 0xFF) ++pos;
+            if (pos >= size) return false;                                    // no frame header at all
+            const uint8_t marker = d[pos++];
+            if (marker == 0x00 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+                continue;                                                     // FF 00; TEM, RSTn
+
+            if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2)           // SOF0, SOF1, SOF2
+            {
+                if (size - pos < 8) return false;
+                const uint32_t len        = (uint32_t(d[pos]) << 8) | d[pos + 1];
+                const uint32_t precision  = d[pos + 2];
+                const uint32_t height     = (uint32_t(d[pos + 3]) << 8) | d[pos + 4];
+                const uint32_t width      = (uint32_t(d[pos + 5]) << 8) | d[pos + 6];
+                const uint32_t components = d[pos + 7];
+                if (precision != 8 || components < 1 || components > 4 || len != 8 + 3 * components)
+                    return false;
+                if (width == 0 || height == 0 || width > limits.maxSide || height > limits.maxSide)
+                    return false;
+                const uint64_t pixels = uint64_t(width) * height;
+                return pixels <= limits.maxPixels && pixels * 3 <= limits.maxBytes;   // decoded as RGB
+            }
+
+            // The other frame types (lossless, hierarchical, arithmetic) and
+            // JPG: JUCE's reader does not decode them.  A second SOI, the
+            // end of the image or a scan before any frame header: no picture.
+            if ((marker >= 0xC3 && marker <= 0xCF && marker != 0xC4 && marker != 0xCC)
+                || marker == 0xD8 || marker == 0xD9 || marker == 0xDA)
+                return false;
+
+            if (size - pos < 2) return false;
+            const size_t len = (size_t(d[pos]) << 8) | d[pos + 1];
+            if (len < 2 || len > size - pos) return false;
+            pos += len;
+        }
+    }
+
+    //==========================================================================
     // Decodes image bytes that came from a device, the network or a device's
-    // database, as juce::ImageFileFormat::loadFrom does (the first of JUCE's
-    // formats that understands them), except that a PNG must pass
-    // isSafePng() first (with these limits; cancelled can end that check).
+    // database, with the first of JUCE's formats that understands them, as
+    // juce::ImageFileFormat::loadFrom does -- but only a PNG that passes
+    // isSafePng() (with these limits; cancelled can end that check) or a
+    // JPEG that passes isBoundedJpeg().  Whatever else JUCE would decode
+    // (GIF, WebP) is refused: see the top of the file (AUD11 SLQ-2, FUZZ-6).
     // Returns an invalid Image for anything refused.
     //==========================================================================
     inline juce::Image loadUntrustedImage(const void* data, size_t size, const Limits& limits = {},
@@ -778,9 +854,20 @@ namespace ImageGuard
         juce::MemoryInputStream stream(data, size, false);
         auto* format = juce::ImageFileFormat::findImageFormatForStream(stream);
         if (format == nullptr) return {};
-        if ((dynamic_cast<juce::PNGImageFormat*>(format) != nullptr || looksLikePng(data, size))
-            && ! isSafePng(data, size, limits, cancelled))
+        if (dynamic_cast<juce::PNGImageFormat*>(format) != nullptr || looksLikePng(data, size))
+        {
+            if (! isSafePng(data, size, limits, cancelled))
+                return {};
+        }
+        else if (dynamic_cast<juce::JPEGImageFormat*>(format) != nullptr)
+        {
+            if (! isBoundedJpeg(data, size, limits))
+                return {};
+        }
+        else
+        {
             return {};
+        }
         stream.setPosition(0);
         return format->decodeImage(stream);
     }
