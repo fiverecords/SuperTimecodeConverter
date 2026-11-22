@@ -1923,7 +1923,7 @@ public:
                     // ran away from the deck for as long as it stayed cued
                     // (36.7 s on LinkInfo2), and at PLAY the outputs started
                     // that far ahead until the next beat pulled them back:
-                    // +3.1 to +6.0 s for 160-200 ms on the four starts of
+                    // +1.6 to +6.0 s for 160-200 ms on the four starts of
                     // capture S13, with the cues of the first beat lost or
                     // fired early.  The PLL ran its position on too and
                     // reported a seek every second or so, and TCNet carried
@@ -2095,10 +2095,24 @@ public:
                             // the step for a seek, and a cue of that beat
                             // fired a second time when the deck moved on
                             // (capture S13, a hold of 130 ms; AUD11
-                            // VX-REF-1).  The anchor stays where the deck
-                            // stopped and is shown; only its time moves, so
-                            // the first advance after the hold starts from
-                            // there without the leap described above.
+                            // VX-REF-1).  The anchor stays where the
+                            // interpolation had got to and is shown; only its
+                            // time moves, so the first advance after the hold
+                            // starts from there without the leap described
+                            // above.  That place is not exactly where the
+                            // deck stopped: the status that first reads 0
+                            // has moved the anchor over the whole interval
+                            // before it at the old speed, so it can be up to
+                            // one status interval (about 200 ms) past the
+                            // stop, and the deck's restart is seen up to one
+                            // interval late.  After the hold the value can
+                            // therefore run up to about 200 ms ahead of the
+                            // deck until the next beat takes it back, and
+                            // when that step is over 100 ms a cue in the
+                            // stretch just after that beat fires early and
+                            // then again (a simulated deck stopped right
+                            // after a status and released right before one;
+                            // the S13 hold does not show it).
                             if (! hasAbs && pdlMoving && pdlSnapMs > (double)rawPlayheadMs)
                             {
                                 currentTimecode = ProDJLink::playheadToTimecode(
