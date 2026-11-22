@@ -9746,8 +9746,23 @@ void MainComponent::timerCallback()
 
         // Clear layers not assigned to any engine
         for (int i = 0; i < TCNetOutput::kMaxLayers; ++i)
+        {
             if (!layerUsed[i])
+            {
                 sharedTcnetOutput.clearLayer(i);
+                // clearLayer() drops the layer's artwork, waveform and beat
+                // grid, so what the feed remembers having sent goes too.
+                // The keys stayed, and a layer used again with the track
+                // still loaded -- an engine moved to another layer and
+                // back, or its TCNET OUT switched off and on while another
+                // engine kept the output up -- got its title back and
+                // nothing else until the next track (AUD11 MAIN-B-5).
+                tcnetArtworkKey[i] = {};
+                tcnetArtworkPending[i] = false;
+                tcnetWaveformKey[i] = {};
+                tcnetWaveformVersion[i] = 0;
+            }
+        }
     }
 
     // Update UI for selected engine
