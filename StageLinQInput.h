@@ -1101,14 +1101,23 @@ public:
 
     int getInterfaceCount() const { return availableInterfaces.size(); }
 
-    juce::String getBindInfo() const { return bindIp; }
+    /// The address of the interface chosen at start().  When none was up
+    /// then (AUD11 SLQ-6): empty until one is listed, then the address of
+    /// the interface start() was asked for, as the discovery thread finds
+    /// it -- what MainComponent works out as the address wanted, so that
+    /// touching the input or interface selector later does not restart
+    /// an input that is running.  Message thread.
+    juce::String getBindInfo() const
+    {
+        if (bindIp.isNotEmpty()) return bindIp;
+        std::lock_guard<std::mutex> lock(lateBindMutex);
+        return lateBindIp;
+    }
     int getSelectedInterface() const { return selectedInterface; }
 
     /// What an engine's status line says after "LISTENING | " or
-    /// "WAITING | ": the address of the interface chosen at start(), or
-    /// ALL when none was up then (AUD11 SLQ-6; getBindInfo() stays the bare
-    /// address, which MainComponent compares with the interface list).
-    /// Message thread, as getBindInfo().
+    /// "WAITING | ": getBindInfo(), or ALL while there is no address to
+    /// show because no interface is up (AUD11 SLQ-6).  Message thread.
     /// While the discovery port could not be bound it says that instead,
     /// in the words the Art-Net input uses: no unit can be found until the
     /// program holding UDP 51337 lets go of it (AUD11 SLQ-4).
@@ -1116,7 +1125,8 @@ public:
     {
         if (discoveryPortTaken.load(std::memory_order_relaxed))
             return "FAILED TO BIND PORT " + juce::String(StageLinQ::kDiscoveryPort);
-        return bindIp.isEmpty() ? juce::String("ALL") : bindIp;
+        const juce::String ip = getBindInfo();
+        return ip.isEmpty() ? juce::String("ALL") : ip;
     }
 
     //==========================================================================
@@ -1137,17 +1147,23 @@ public:
         // network appears.  start() returned false here and nothing ever
         // called it again: every StageLinQ engine read NOT CONNECTED until
         // the operator selected the input once more (AUD11 SLQ-6).
+        {
+            std::lock_guard<std::mutex> lock(lateBindMutex);
+            lateBindIp.clear();
+        }
         if (availableInterfaces.isEmpty())
         {
             DBG("StageLinQ: No network interfaces available yet -- listening on all");
             bindIp = juce::String();
             selectedInterface = 0;
+            lateBindIndex.store(juce::jmax(0, interfaceIndex), std::memory_order_relaxed);
         }
         else
         {
             int idx = juce::jlimit(0, availableInterfaces.size() - 1, interfaceIndex);
             bindIp = availableInterfaces[idx].ip;
             selectedInterface = idx;
+            lateBindIndex.store(-1, std::memory_order_relaxed);
         }
 
         // Reset all decks and the mixer
@@ -1800,6 +1816,18 @@ private:
         );
 
         auto interfaces = ::getNetworkInterfaces();
+
+        // start() found no interface: the address getBindInfo() gives is
+        // that of the interface it was asked for, in the list as it is now
+        // (AUD11 SLQ-6)
+        const int lateIndex = lateBindIndex.load(std::memory_order_relaxed);
+        if (lateIndex >= 0 && !interfaces.isEmpty())
+        {
+            const juce::String ip = interfaces[juce::jlimit(0, interfaces.size() - 1, lateIndex)].ip;
+            std::lock_guard<std::mutex> lock(lateBindMutex);
+            if (lateBindIp != ip) lateBindIp = ip;
+        }
+
         for (auto& iface : interfaces)
         {
             // Skip link-local 169.254.x.x -- chrisle/StageLinq skips these too.
@@ -3445,6 +3473,13 @@ private:
     juce::String bindIp;
     int selectedInterface = 0;
     juce::Array<NetworkInterface> availableInterfaces;
+
+    // start() with no interface up (AUD11 SLQ-6): the index it was asked
+    // for (-1 otherwise), and the address the discovery thread found for
+    // it since (getBindInfo)
+    std::atomic<int> lateBindIndex { -1 };
+    mutable std::mutex lateBindMutex;
+    juce::String lateBindIp;            // guarded by lateBindMutex
 
     // Discovery socket
     std::unique_ptr<juce::DatagramSocket> discoverySocket;
