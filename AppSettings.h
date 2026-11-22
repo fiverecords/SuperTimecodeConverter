@@ -34,7 +34,11 @@
 //    a message naming both is left for the UI, instead of the file being
 //    silently replaced by defaults on the next save -- which is how a
 //    whole show configuration used to vanish.
-//  * Writes are atomic (temporary file + rename, via replaceWithText).
+//  * Writes are atomic and checked (writeRotating): the text goes to a
+//    temporary file beside the target, which is renamed over the target
+//    only once every byte is known to be in it.  A write that fails -- a
+//    full volume, a file another program holds -- leaves the file and its
+//    .bak as they were and returns false (AUD11 NET-SHOW-1).
 //
 // Saves can be suspended until STC restarts (writesSuspended), for a
 // configuration restore: the configuration the running engines still hold
@@ -92,7 +96,7 @@ struct SafeJsonFile
         return writeRotating(file, text);
     }
 
-    /// Rotate the previous file to .bak, then write atomically.  When the
+    /// Write the new text, then rotate the previous file to .bak.  When the
     /// file already holds exactly `text`, do neither: the write would change
     /// nothing, and the rotation would replace the previous version in .bak
     /// with a second copy of the current one.  Saves of an unchanged state
@@ -100,21 +104,132 @@ struct SafeJsonFile
     /// files too, changed or not), so without this a file written wrongly
     /// once -- an empty map, defaults after a quarantine -- reached .bak on
     /// the next save and the last good version was gone (AUDIT SET-1).  The
-    /// comparison reads the file back as text: replaceWithText writes the
-    /// JSON writer's CR LF line ends unchanged, so a file STC wrote compares
-    /// equal to the text it was written from; a file that differs in any way
-    /// is rotated and written as before.
+    /// comparison reads the file back as text: the JSON writer's CR LF line
+    /// ends are written unchanged, so a file STC wrote compares equal to the
+    /// text it was written from; a file that differs in any way is rotated
+    /// and written.
+    ///
+    /// A save that fails at any point leaves a good file and a good .bak
+    /// (AUD11 NET-SHOW-1).  Before, the copy to .bak came first and deleted
+    /// .bak to make it, and the new text was renamed into place whether or
+    /// not it had been written in full: one save on a full volume left
+    /// settings.json empty and trackmap.json cut short, and the next save
+    /// rotated those over the .bak files -- the whole Track Map gone, with
+    /// nothing on screen.  Now, in this order, each step complete or not
+    /// done at all:
+    ///  1. the new text into a temporary file, checked (writeAllTo).  If
+    ///     that fails nothing has changed and the result is false;
+    ///  2. the current file copied to a second temporary file, checked --
+    ///     and only a current file that is a whole JSON value (scan): a
+    ///     file cut short never becomes .bak;
+    ///  3. the new text renamed over the file.  If that fails (on Windows,
+    ///     a file another program holds open) nothing has changed and the
+    ///     result is false;
+    ///  4. the copy renamed over .bak.  If step 2 or this one fails the
+    ///     save still stands: .bak keeps the version before the previous
+    ///     one, whole.
+    /// A process killed between two steps leaves the same: the file is the
+    /// previous text or the new one, .bak the version before one of those
+    /// (and a temporary file, hidden, that nothing reads).
+    /// Returns whether the file now holds `text`.
     /// Called directly only by a restore, which must also write when an
     /// earlier restore in this session has suspended saves.
     static bool writeRotating(const juce::File& file, const juce::String& text)
     {
-        if (file.existsAsFile())
+        const bool exists = file.existsAsFile();
+        juce::String current;
+        if (exists)
         {
-            if (file.loadFileAsString() == text)
+            current = file.loadFileAsString();
+            if (current == text)
                 return true;
-            file.copyFileTo(backupFor(file));
         }
-        return file.replaceWithText(text);
+
+        juce::TemporaryFile incoming(file, juce::TemporaryFile::useHiddenFile);
+        if (! writeAllTo(incoming.getFile(), text))
+            return false;
+
+        const juce::File bak = backupFor(file);
+        juce::TemporaryFile outgoing(bak, juce::TemporaryFile::useHiddenFile);
+        const bool rotate = exists && scan(current).complete
+                            && file.copyFileTo(outgoing.getFile())
+                            && outgoing.getFile().getSize() == file.getSize();
+
+        if (! incoming.overwriteTargetFileWithTemporary())
+            return false;
+
+        if (rotate)
+            outgoing.getFile().replaceFileIn(bak);   // one attempt: a .bak in use keeps its content
+        return true;
+    }
+
+    /// Write `text` to `dest` (a temporary file that does not exist yet) and
+    /// say whether all of it is there.  The stream buffers: a write the
+    /// volume refuses can go unreported until the stream closes, where the
+    /// result is lost -- so the size of the closed file is compared with
+    /// the number of bytes the stream took.  UTF-8, no byte order mark, line
+    /// ends as they are in JSON text (CR LF): File::replaceWithText's
+    /// defaults, and its bytes.  Not flushed to the device: that would hold
+    /// the message thread on every save.
+    static bool writeAllTo(const juce::File& dest, const juce::String& text)
+    {
+        juce::int64 taken = 0;
+        {
+            juce::FileOutputStream out(dest);
+            if (! out.openedOk() || ! out.writeText(text, false, false, "\r\n"))
+                return false;
+            taken = out.getPosition();
+        }
+        return dest.getSize() == taken;
+    }
+
+    /// What scan() finds in JSON text without parsing it.
+    struct JsonShape
+    {
+        int  depth    = 0;       // deepest nesting of objects and arrays in the root value
+        bool complete = false;   // the root value closes, and only whitespace follows it
+    };
+
+    /// One pass over JSON text, counting brackets outside strings the way
+    /// juce::JSON's parser reads them (a string opens with " or ', a
+    /// backslash takes the next character with it): for text that parser
+    /// accepts, the root value ends exactly where this says.  A file cut
+    /// short at any point is not `complete`.  Calling thread; about a
+    /// millisecond per megabyte.
+    static JsonShape scan(const juce::String& text)
+    {
+        JsonShape shape;
+        const char* p = juce::CharPointer_UTF8(text.toRawUTF8()).findEndOfWhitespace().getAddress();
+
+        int depth = 0;
+        char quote = 0;
+        for (; *p != 0; ++p)
+        {
+            const char c = *p;
+            if (quote != 0)
+            {
+                if (c == '\\')       { if (p[1] != 0) ++p; }
+                else if (c == quote)  quote = 0;
+            }
+            else if (c == '{' || c == '[')
+            {
+                shape.depth = juce::jmax(shape.depth, ++depth);
+            }
+            else if (depth == 0)
+            {
+                break;   // the text does not open with an object or an array
+            }
+            else if (c == '"' || c == '\'')
+            {
+                quote = c;
+            }
+            else if ((c == '}' || c == ']') && --depth == 0)
+            {
+                shape.complete = juce::CharPointer_UTF8(p + 1).findEndOfWhitespace().isEmpty();
+                break;
+            }
+        }
+        return shape;
     }
 
     static juce::File backupFor(const juce::File& file)
