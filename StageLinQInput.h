@@ -1076,8 +1076,13 @@ public:
     /// ALL when none was up then (AUD11 SLQ-6; getBindInfo() stays the bare
     /// address, which MainComponent compares with the interface list).
     /// Message thread, as getBindInfo().
+    /// While the discovery port could not be bound it says that instead,
+    /// in the words the Art-Net input uses: no unit can be found until the
+    /// program holding UDP 51337 lets go of it (AUD11 SLQ-4).
     juce::String getListenInfo() const
     {
+        if (discoveryPortTaken.load(std::memory_order_relaxed))
+            return "FAILED TO BIND PORT " + juce::String(StageLinQ::kDiscoveryPort);
         return bindIp.isEmpty() ? juce::String("ALL") : bindIp;
     }
 
@@ -1126,6 +1131,7 @@ public:
         // Generate fresh token each start
         StageLinQ::generateToken(ownToken);
 
+        discoveryPortTaken.store(false, std::memory_order_relaxed);   // until this run's bind says otherwise
         isRunningFlag.store(true, std::memory_order_release);
         startThread(juce::Thread::Priority::normal);
 
@@ -1652,30 +1658,23 @@ private:
         DBG("StageLinQ: Thread started");
 
         // Create discovery listen socket (port 51337)
-        // JUCE bindToPort() sets SO_REUSEADDR internally, allowing
-        // SoundSwitch/Resolume to share the port.
-        // DatagramSocket(true) additionally enables SO_BROADCAST for
-        // sending our announcement frames.
-        {
-            std::lock_guard<std::mutex> lock(socketMutex);
-            discoverySocket = std::make_unique<juce::DatagramSocket>(true);
-            if (!discoverySocket->bindToPort(StageLinQ::kDiscoveryPort))
-            {
-                DBG("StageLinQ: Failed to bind UDP port " + juce::String(StageLinQ::kDiscoveryPort)
-                    + " -- another application may be using it. Retrying without SO_BROADCAST...");
-                discoverySocket = std::make_unique<juce::DatagramSocket>(false);
-                if (!discoverySocket->bindToPort(StageLinQ::kDiscoveryPort))
-                {
-                    DBG("StageLinQ: Still failed to bind. Will send discovery but cannot receive.");
-                }
-            }
-        }
+        bool discoveryBound = openDiscoverySocket();
+        double lastBindAttempt = juce::Time::getMillisecondCounterHiRes();
 
         double lastAnnounceTime = 0.0;
 
         while (!threadShouldExit() && isRunningFlag.load(std::memory_order_relaxed))
         {
             double now = juce::Time::getMillisecondCounterHiRes();
+
+            // --- The port was taken: try again every few seconds, so the
+            // input recovers by itself once the other program has let go of
+            // it (AUD11 SLQ-4).  Until then the status says so.
+            if (!discoveryBound && (now - lastBindAttempt) > kDiscoveryBindRetryMs)
+            {
+                discoveryBound = openDiscoverySocket();
+                lastBindAttempt = now;
+            }
 
             // --- Send our discovery announcement periodically ---
             if ((now - lastAnnounceTime) > StageLinQ::kDiscoveryInterval * 1000.0)
@@ -1711,6 +1710,42 @@ private:
         }
 
         DBG("StageLinQ: Thread stopped");
+    }
+
+    //==========================================================================
+    // Discovery: open the listen socket on UDP 51337, every address.
+    // DatagramSocket(true) enables SO_BROADCAST, and JUCE sets SO_REUSEADDR
+    // on every datagram socket: on Windows and Linux that lets another
+    // StageLinQ program (SoundSwitch, Resolume, Engine DJ) hold the same
+    // port.  macOS shares a wildcard address and port only when both
+    // sockets set SO_REUSEPORT (the project's notes: ArtnetInput.h,
+    // NetworkUtils.h), which is what setEnablePortReuse() sets there and
+    // nowhere else; discovery frames are broadcasts, which every socket on
+    // the port receives -- as for Pro DJ Link's keepalive socket.  The
+    // comment here said SO_REUSEADDR was enough everywhere (AUD11 SLQ-4).
+    //
+    // A bind that fails -- a program on the port that does not share it --
+    // used to be retried once without SO_BROADCAST, which cannot succeed,
+    // and then left a DBG line: the input was running, the status read
+    // WAITING | <address> and no unit was ever found.  The result is now
+    // kept for the status line (getListenInfo) and run() tries again.
+    // Returns true when the socket is bound.
+    //==========================================================================
+    static constexpr double kDiscoveryBindRetryMs = 3000.0;
+
+    bool openDiscoverySocket()
+    {
+        std::lock_guard<std::mutex> lock(socketMutex);
+        discoverySocket = std::make_unique<juce::DatagramSocket>(true);
+        discoverySocket->setEnablePortReuse(true);
+        const bool bound = discoverySocket->bindToPort(StageLinQ::kDiscoveryPort);
+        if (!bound)
+        {
+            DBG("StageLinQ: Failed to bind UDP port " + juce::String(StageLinQ::kDiscoveryPort)
+                + " -- another application is using it. Sending discovery, cannot receive.");
+        }
+        discoveryPortTaken.store(!bound, std::memory_order_relaxed);
+        return bound;
     }
 
     //==========================================================================
@@ -3328,6 +3363,7 @@ private:
     // Discovery socket
     std::unique_ptr<juce::DatagramSocket> discoverySocket;
     std::mutex socketMutex;
+    std::atomic<bool> discoveryPortTaken { false };   // the last bind of UDP 51337 failed (AUD11 SLQ-4)
 
     // Discovered devices
     std::map<std::string, StageLinQDeviceInfo> discoveredDevices;
