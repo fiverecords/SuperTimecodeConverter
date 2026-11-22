@@ -167,7 +167,10 @@ public:
             // download both files again, even under the same path: the .DAT
             // may have come from the old media before the .EXT went stale,
             // and the same path on another export is not the same analysis
-            // (AUDIT META-4).
+            // (AUDIT META-4).  indexRead starts again: it was set by the old
+            // index, and says here whether the new export.pdb was read
+            // (AUD11 PDL-5).
+            indexRead = false;
             const juce::String freshPath = findAnlzPathFromPdb(playerIP, mountPath, trackId, &indexRead);
             if (freshPath.isEmpty())
             {
