@@ -892,6 +892,7 @@ private:
     // left of the blob, in unsigned arithmetic, before it is used (AUDIT WIRE-4).
     static constexpr uint32_t kMaxFieldBlobBytes   = 2 * 1024 * 1024; // one 0x14 field (artwork JPEG, one ANLZ tag)
     static constexpr uint32_t kMaxFieldStringChars = 0x10000;         // one 0x26 field
+    static constexpr uint32_t kMaxDurationSeconds  = 24 * 60 * 60;    // menu item 0x000B
     static constexpr uint32_t kMaxBeats            = 100000;          // PQTZ: 11 h at 150 BPM
     static constexpr uint32_t kMaxDetailEntries    = 5000000;         // PWV5/PWV7 at 150/s: 9.2 h (the blob cap binds first)
     static constexpr uint16_t kMaxPhrases          = 1000;            // PSSI
@@ -1988,7 +1989,12 @@ private:
                     meta.album = item.strArgs[3];
                     break;
                 case 0x000B:  // Duration
-                    meta.durationSeconds = (int)item.numArgs[1];
+                    // Seconds, a 32-bit field.  More than 24 h is not a
+                    // track's length: it is left unknown (0), as for a
+                    // player that gives none, and seconds * 1000 in the
+                    // callers cannot wrap (AUD11 VIEWS-EDITORS-5).
+                    meta.durationSeconds = item.numArgs[1] <= kMaxDurationSeconds
+                                         ? (int)item.numArgs[1] : 0;
                     break;
                 case 0x000D:  // Tempo
                     meta.bpmTimes100 = (int)item.numArgs[1];

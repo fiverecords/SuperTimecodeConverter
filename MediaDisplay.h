@@ -81,8 +81,10 @@ public:
 
     bool hasWaveformData() const { return hasColorData; }
 
-    /// Set track duration for minute markers.
-    void setDurationMs(uint32_t ms) { durationMs = ms; }
+    /// Set track duration for minute markers.  A value over 24 h is not a
+    /// track's: it is held at 24 h, so the markers are 1439 at most (AUD11
+    /// VIEWS-EDITORS-5; see the marker loop in the cache rebuild).
+    void setDurationMs(uint32_t ms) { durationMs = juce::jmin(ms, kMaxDurationMs); }
 
     /// Set beat grid for beat ruler lines on the preview.
     void setBeatGrid(const std::vector<TrackMetadata::BeatEntry>& grid)
@@ -259,7 +261,10 @@ private:
         {
             uint32_t minuteMs = 60000;
             float botY = inset + drawH;
-            for (uint32_t ms = minuteMs; ms < durationMs; ms += minuteMs)
+            // Counted in 64 bits: a uint32_t counter wrapped for a duration
+            // within a minute of 2^32 ms and, for the top 31 values, never
+            // reached it -- paint() did not return (AUD11 VIEWS-EDITORS-5).
+            for (uint64_t ms = minuteMs; ms < durationMs; ms += minuteMs)
             {
                 float ratio = (float)ms / (float)durationMs;
                 float xp = inset + ratio * drawW;
@@ -522,6 +527,7 @@ private:
     bool hasColorData = false;
     float playPosition = 0.0f;   // 0.0 = start, 1.0 = end
     uint32_t durationMs = 0;     // track duration for minute markers
+    static constexpr uint32_t kMaxDurationMs = 24u * 60u * 60u * 1000u;   // setDurationMs
     std::vector<TrackMetadata::RekordboxCue> previewCues;  // colored cue markers
     std::vector<TrackMetadata::BeatEntry> previewBeatGrid; // beat grid for downbeat lines
 
