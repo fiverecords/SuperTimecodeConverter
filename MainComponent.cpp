@@ -816,27 +816,42 @@ MainComponent::MainComponent()
         // Callbacks use member pointers directly (no dangling reference)
         // Locked: the field shows the engine's value again rather than the
         // one typed and not applied.
-        auto applyStartTC = [this] {
+        //
+        // A focus loss applies the text only if it is not what the field
+        // shows for the engine's value (AUD11 MAIN-A-7).  The engine keeps
+        // Start and Stop TC in milliseconds and the field shows them as
+        // timecode at the engine's rate, a whole frame: applied again on
+        // every focus loss, a click into the field and out with nothing
+        // typed moved a value that is not on a frame of the current rate --
+        // one set at another rate -- to the frame shown.  Return applies
+        // what is shown, edited or not.
+        auto applyStartTC = [this](bool onlyIfEdited) {
             auto& eng = currentEngine();
+            if (onlyIfEdited
+                && txtGenStartTC.getText() == msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()))
+                return;
             if (isShowLockedRestore([&] { txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false); }))
                 return;
             eng.setGeneratorStartMs(parseTimecodeToMs(txtGenStartTC.getText(), eng.getCurrentFps()));
             txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false);
             saveSettings();
         };
-        txtGenStartTC.onReturnKey = applyStartTC;
-        txtGenStartTC.onFocusLost = applyStartTC;
+        txtGenStartTC.onReturnKey = [applyStartTC] { applyStartTC(false); };
+        txtGenStartTC.onFocusLost = [applyStartTC] { applyStartTC(true); };
 
-        auto applyStopTC = [this] {
+        auto applyStopTC = [this](bool onlyIfEdited) {
             auto& eng = currentEngine();
+            if (onlyIfEdited
+                && txtGenStopTC.getText() == msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()))
+                return;
             if (isShowLockedRestore([&] { txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false); }))
                 return;
             eng.setGeneratorStopMs(parseTimecodeToMs(txtGenStopTC.getText(), eng.getCurrentFps()));
             txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
             saveSettings();
         };
-        txtGenStopTC.onReturnKey = applyStopTC;
-        txtGenStopTC.onFocusLost = applyStopTC;
+        txtGenStopTC.onReturnKey = [applyStopTC] { applyStopTC(false); };
+        txtGenStopTC.onFocusLost = [applyStopTC] { applyStopTC(true); };
 
         // Preset selector
         leftContent.addAndMakeVisible(lblGenPreset);
@@ -10576,6 +10591,20 @@ void MainComponent::timerCallback()
             lastDisplayedFps = curFps;
             updateFpsButtonStates();
             pushFpsToGenPresetEditor();
+            // The generator's START TC / STOP TC fields at the new rate
+            // (AUD11 MAIN-A-7, GENERATOR-6).  The engine keeps both in
+            // milliseconds through a rate change, so their timecode
+            // changes: 01:00:00:00 set at 25 fps is 00:59:56:09 at 23.976,
+            // where an address lasts 0.1 % longer (DESIGN D20), and a
+            // non-zero frame number changes between any two rates.  The
+            // fields kept the old text, so the panel said 01:00:00:00 while
+            // PLAY started at 00:59:56:09.  They show what the engine
+            // holds; GO, or picking the preset again, sets the preset's
+            // Start TC at the new rate.  (A click on an FPS button takes
+            // the keyboard focus first, so a value being typed has been
+            // applied by then.)
+            txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), curFps), false);
+            txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), curFps), false);
         }
         if (curOutFps != lastDisplayedOutFps)
         {
