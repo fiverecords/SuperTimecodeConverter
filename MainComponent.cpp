@@ -3017,20 +3017,30 @@ void MainComponent::syncUIFromEngine()
         bool bpmUsesSharedAudio = eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC;
         juce::String inType  = bpmUsesSharedAudio ? es.audioBpmType   : es.audioInputType;
         juce::String inDev   = bpmUsesSharedAudio ? es.audioBpmDevice : es.audioInputDevice;
+        // A configured device that is not in the list leaves its selector
+        // empty; once the scan is in, the empty selector names it, dimmed,
+        // so that the status line of a component that opened nothing for
+        // want of it (audioDeviceToStart) can be read (AUD11 MAIN-A-2).
+        auto showConfigured = [this](juce::ComboBox& cmb, int idx, const juce::String& device)
+        {
+            cmb.setSelectedId(idx >= 0 ? idx + 1 : 0, juce::dontSendNotification);
+            cmb.setTextWhenNothingSelected(idx < 0 && device.isNotEmpty() && audioDevicesApplied
+                                               ? device + " (not listed)" : juce::String());
+        };
         int audioInIdx = findFilteredIndex(filteredInputIndices, scannedAudioInputs, inType, inDev);
-        cmbAudioInputDevice.setSelectedId(audioInIdx >= 0 ? audioInIdx + 1 : 0, juce::dontSendNotification);
+        showConfigured(cmbAudioInputDevice, audioInIdx, inDev);
 
         int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                              es.audioOutputType, es.audioOutputDevice);
-        cmbAudioOutputDevice.setSelectedId(audioOutIdx >= 0 ? audioOutIdx + 1 : 0, juce::dontSendNotification);
+        showConfigured(cmbAudioOutputDevice, audioOutIdx, es.audioOutputDevice);
 
         int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                             es.thruOutputType, es.thruOutputDevice);
-        cmbThruOutputDevice.setSelectedId(thruOutIdx >= 0 ? thruOutIdx + 1 : 0, juce::dontSendNotification);
+        showConfigured(cmbThruOutputDevice, thruOutIdx, es.thruOutputDevice);
 
         int genAudioIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                              es.generatorAudioType, es.generatorAudioDevice);
-        cmbGenAudioDevice.setSelectedId(genAudioIdx >= 0 ? genAudioIdx + 1 : 0, juce::dontSendNotification);
+        showConfigured(cmbGenAudioDevice, genAudioIdx, es.generatorAudioDevice);
 
         btnGenAudioOut.setToggleState(eng.isGeneratorAudioRunning() || es.generatorAudioEnabled,
                                        juce::dontSendNotification);
@@ -3171,19 +3181,64 @@ void MainComponent::startCurrentLANetTCInput()
     eng.startLANetTCInput(sel);
 }
 
+//==============================================================================
+// The device an audio start opens when its selector shows none -- one rule
+// for LTC in, LTC OUT, Audio Thru, generator audio and Audio BPM (AUD11
+// MAIN-A-2, MAIN-B-8, MAIN-A-V4, VX-APP-1):
+//  - a device is configured (`savedDevice`, with `savedType` when the
+//    settings have one): that device if the scan lists it, and the selector
+//    is put on it unless the AUDIO DRIVER filter hides it.  If the scan
+//    does not list it, nothing: the caller starts with an empty name, the
+//    engine opens nothing and says so in its status line, and the saved
+//    name is kept -- as MTC does with a missing MIDI device (AUDIT UI-6).
+//  - nothing is configured (a first setup): the first device of the
+//    selector, as before.
+// Every such start used to open the first device of the selector: the
+// computer's own output when the configured interface was not connected,
+// and at every launch for Audio Thru, whose selector is set only after the
+// LTC input has started it.  Message thread.
+//==============================================================================
+static AudioDeviceEntry audioDeviceToStart(juce::ComboBox& cmb, const juce::Array<int>& filteredIndices,
+                                           const juce::Array<AudioDeviceEntry>& entries,
+                                           const juce::String& savedType, const juce::String& savedDevice)
+{
+    auto isConfigured = [&savedType, &savedDevice](const AudioDeviceEntry& e)
+    {
+        return e.deviceName == savedDevice && (savedType.isEmpty() || e.typeName == savedType);
+    };
+    for (int f = 0; f < filteredIndices.size(); ++f)
+    {
+        const int realIdx = filteredIndices[f];
+        if (realIdx < 0 || realIdx >= entries.size())
+            continue;
+        if (savedDevice.isEmpty() || isConfigured(entries.getReference(realIdx)))
+        {
+            cmb.setSelectedId(f + 1, juce::dontSendNotification);
+            return entries[realIdx];
+        }
+    }
+    if (savedDevice.isNotEmpty())
+        for (const auto& e : entries)   // listed by the scan, hidden by the AUDIO DRIVER filter
+            if (isConfigured(e))
+                return e;
+    return {};
+}
+
 void MainComponent::startCurrentLtcInput()
 {
     auto& eng = currentEngine();
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     auto entry = getSelectedAudioInput();
-    if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
-    { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
+    if (entry.deviceName.isEmpty())   // nothing shown: the configured device, if listed (audioDeviceToStart)
+        entry = audioDeviceToStart(cmbAudioInputDevice, filteredInputIndices, scannedAudioInputs,
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].audioInputType   : juce::String(),
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].audioInputDevice : juce::String());
 
     // The channel selectors are empty until a start has filled them -- at
     // launch, always.  The saved channels are used then, as the outputs use
     // theirs (getChannelFromComboOrSettings): this start used to fall to
     // Ch 1, and Ch 2 for the Audio Thru tap, at every launch, and the save
     // it queues wrote those over the configured channels (AUD11 MAIN-A-V1).
-    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     int ltcCh = cmbAudioInputChannel.getSelectedId() - 1;
     if (ltcCh < 0 && hasSettings) ltcCh = settings.engines[(size_t) selectedEngine].audioInputChannel;
     if (ltcCh < 0) ltcCh = 0;
@@ -4174,14 +4229,17 @@ void MainComponent::startCurrentThruOutput()
     auto& eng = currentEngine();
     if (!eng.isPrimary()) return;
 
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     auto entry = getSelectedThruOutput();
-    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
-    { cmbThruOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedThruOutput(); }
+    if (entry.deviceName.isEmpty())   // nothing shown: the configured device, if listed (audioDeviceToStart)
+        entry = audioDeviceToStart(cmbThruOutputDevice, filteredOutputIndices, scannedAudioOutputs,
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].thruOutputType   : juce::String(),
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].thruOutputDevice : juce::String());
 
     // Settings fallback for empty-combo case (first launch before populate*).
     int settingsCh   = 1;
     bool settingsStereo = true;
-    if (selectedEngine < (int) settings.engines.size())
+    if (hasSettings)
     {
         const auto& es = settings.engines[(size_t) selectedEngine];
         settingsCh     = es.thruOutputChannel;
@@ -4263,9 +4321,12 @@ void MainComponent::startCurrentLtcOutput()
     auto& eng = currentEngine();
     eng.stopLtcOutput();
 
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     auto entry = getSelectedAudioOutput();
-    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
-    { cmbAudioOutputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioOutput(); }
+    if (entry.deviceName.isEmpty())   // nothing shown: the configured device, if listed (audioDeviceToStart)
+        entry = audioDeviceToStart(cmbAudioOutputDevice, filteredOutputIndices, scannedAudioOutputs,
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].audioOutputType   : juce::String(),
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].audioOutputDevice : juce::String());
 
     // Combo may be empty on first launch (before populateAudioOutputChannels);
     // fall back to the persisted settings in that window so the user's saved
@@ -4273,7 +4334,7 @@ void MainComponent::startCurrentLtcOutput()
     // getChannelFromComboOrSettings comment.
     int settingsCh   = 0;
     bool settingsStereo = true;
-    if (selectedEngine < (int) settings.engines.size())
+    if (hasSettings)
     {
         const auto& es = settings.engines[(size_t) selectedEngine];
         settingsCh     = es.audioOutputChannel;
@@ -4304,17 +4365,17 @@ void MainComponent::startCurrentGenAudio()
     auto& eng = currentEngine();
     eng.stopGeneratorAudio();
 
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     auto entry = getSelectedGenAudioOutput();
-    if (entry.deviceName.isEmpty() && !filteredOutputIndices.isEmpty())
-    {
-        cmbGenAudioDevice.setSelectedId(1, juce::dontSendNotification);
-        entry = getSelectedGenAudioOutput();
-    }
+    if (entry.deviceName.isEmpty())   // nothing shown: the configured device, if listed (audioDeviceToStart)
+        entry = audioDeviceToStart(cmbGenAudioDevice, filteredOutputIndices, scannedAudioOutputs,
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].generatorAudioType   : juce::String(),
+                                   hasSettings ? settings.engines[(size_t) selectedEngine].generatorAudioDevice : juce::String());
 
     // Settings fallback for empty-combo case (first launch before populate*).
     int settingsCh   = 0;
     bool settingsStereo = true;
-    if (selectedEngine < (int) settings.engines.size())
+    if (hasSettings)
     {
         const auto& es = settings.engines[(size_t) selectedEngine];
         settingsCh     = es.generatorAudioChannel;
@@ -4450,6 +4511,15 @@ bool MainComponent::stopAudioScanThread()
 void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inputs,
                                          const juce::Array<AudioDeviceEntry>& outputs)
 {
+    // The device selectors are emptied before the lists their items index
+    // are replaced: they are set again below from the settings, by device
+    // type and name (applyAudioSettings for what it starts, syncUIFromEngine
+    // for all four).  Refilled with a selection, each would have gone back
+    // to its old position in the new list, and with the configured
+    // interface gone Refresh Devices opened the device that had taken its
+    // place (AUD11 MAIN-A-V4).
+    for (auto* cmb : { &cmbAudioInputDevice, &cmbAudioOutputDevice, &cmbThruOutputDevice, &cmbGenAudioDevice })
+        cmb->setSelectedId(0, juce::dontSendNotification);
     scannedAudioInputs  = inputs;
     scannedAudioOutputs = outputs;
     populateAudioCombos();
@@ -4536,9 +4606,38 @@ void MainComponent::populateTypeFilterCombos()
         cmbAudioOutputTypeFilter.setSelectedId(1, juce::dontSendNotification);
 }
 
+//==============================================================================
+// The item of an audio device selector for `shown`, the device it showed at
+// item `shownId` before it was refilled: the same item if that is still the
+// device, otherwise the device's item in the new list, or 0 when it is not
+// in it.  The selectors used to be put back on the same position, which
+// after an AUDIO DRIVER filter change is another device -- one a start then
+// opened and a save made the configured device (AUD11 MAIN-A-V4).
+//==============================================================================
+static int audioDeviceItemId(const juce::Array<int>& filteredIndices, const juce::Array<AudioDeviceEntry>& entries,
+                             const AudioDeviceEntry& shown, int shownId)
+{
+    if (shown.deviceName.isEmpty())
+        return 0;
+    auto isShown = [&filteredIndices, &entries, &shown](int id)
+    {
+        const int realIdx = (id > 0 && id <= filteredIndices.size()) ? filteredIndices[id - 1] : -1;
+        return realIdx >= 0 && realIdx < entries.size()
+            && entries.getReference(realIdx).deviceName == shown.deviceName
+            && entries.getReference(realIdx).typeName == shown.typeName;
+    };
+    if (isShown(shownId))
+        return shownId;
+    for (int id = 1; id <= filteredIndices.size(); ++id)
+        if (isShown(id))
+            return id;
+    return 0;
+}
+
 void MainComponent::populateFilteredInputDeviceCombo()
 {
     int savedId = cmbAudioInputDevice.getSelectedId();
+    const auto shownInput = getSelectedAudioInput();   // looked up before the list is rebuilt
     auto filter = getInputTypeFilter();
     filteredInputIndices.clear();
     cmbAudioInputDevice.clear(juce::dontSendNotification);
@@ -4555,7 +4654,8 @@ void MainComponent::populateFilteredInputDeviceCombo()
                                          filteredInputIndices.size());
         }
     }
-    if (savedId > 0 && savedId <= cmbAudioInputDevice.getNumItems())
+    savedId = audioDeviceItemId(filteredInputIndices, scannedAudioInputs, shownInput, savedId);
+    if (savedId > 0)
         cmbAudioInputDevice.setSelectedId(savedId, juce::dontSendNotification);
 }
 
@@ -4564,6 +4664,8 @@ void MainComponent::populateFilteredOutputDeviceCombos()
     int savedOutId = cmbAudioOutputDevice.getSelectedId();
     int savedThruId = cmbThruOutputDevice.getSelectedId();
     int savedGenAudioId = cmbGenAudioDevice.getSelectedId();
+    // Looked up before the list is rebuilt (audioDeviceItemId).
+    const auto shownOut = getSelectedAudioOutput(), shownThru = getSelectedThruOutput(), shownGenAudio = getSelectedGenAudioOutput();
     auto filter = getOutputTypeFilter();
     filteredOutputIndices.clear();
     cmbAudioOutputDevice.clear(juce::dontSendNotification);
@@ -4584,11 +4686,14 @@ void MainComponent::populateFilteredOutputDeviceCombos()
             cmbGenAudioDevice.addItem(scannedAudioOutputs[i].displayName + marker, id);
         }
     }
-    if (savedOutId > 0 && savedOutId <= cmbAudioOutputDevice.getNumItems())
+    savedOutId      = audioDeviceItemId(filteredOutputIndices, scannedAudioOutputs, shownOut, savedOutId);
+    savedThruId     = audioDeviceItemId(filteredOutputIndices, scannedAudioOutputs, shownThru, savedThruId);
+    savedGenAudioId = audioDeviceItemId(filteredOutputIndices, scannedAudioOutputs, shownGenAudio, savedGenAudioId);
+    if (savedOutId > 0)
         cmbAudioOutputDevice.setSelectedId(savedOutId, juce::dontSendNotification);
-    if (savedThruId > 0 && savedThruId <= cmbThruOutputDevice.getNumItems())
+    if (savedThruId > 0)
         cmbThruOutputDevice.setSelectedId(savedThruId, juce::dontSendNotification);
-    if (savedGenAudioId > 0 && savedGenAudioId <= cmbGenAudioDevice.getNumItems())
+    if (savedGenAudioId > 0)
         cmbGenAudioDevice.setSelectedId(savedGenAudioId, juce::dontSendNotification);
 }
 
@@ -5647,8 +5752,13 @@ void MainComponent::applyAudioSettings()
 
             if (i == selectedEngine)
             {
-                // For selected engine, use combo box path
-                if (audioInIdx >= 0) cmbAudioInputDevice.setSelectedId(audioInIdx + 1, juce::dontSendNotification);
+                // For selected engine, use combo box path.  A configured
+                // device that is not listed empties the selector -- it used
+                // to keep whatever it showed, which after a rescan was the
+                // device now at the old position (AUD11 MAIN-A-V4) -- and
+                // the start then opens nothing (audioDeviceToStart).  The
+                // three outputs below likewise.
+                cmbAudioInputDevice.setSelectedId(audioInIdx >= 0 ? audioInIdx + 1 : 0, juce::dontSendNotification);
                 startCurrentLtcInput();
             }
             else if (!es.audioInputDevice.isEmpty())
@@ -5668,7 +5778,7 @@ void MainComponent::applyAudioSettings()
             {
                 int audioOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                                      es.audioOutputType, es.audioOutputDevice);
-                if (audioOutIdx >= 0) cmbAudioOutputDevice.setSelectedId(audioOutIdx + 1, juce::dontSendNotification);
+                cmbAudioOutputDevice.setSelectedId(audioOutIdx >= 0 ? audioOutIdx + 1 : 0, juce::dontSendNotification);
                 startCurrentLtcOutput();
             }
             else if (!es.audioOutputDevice.isEmpty())
@@ -5688,7 +5798,7 @@ void MainComponent::applyAudioSettings()
                 {
                     int thruOutIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                                         es.thruOutputType, es.thruOutputDevice);
-                    if (thruOutIdx >= 0) cmbThruOutputDevice.setSelectedId(thruOutIdx + 1, juce::dontSendNotification);
+                    cmbThruOutputDevice.setSelectedId(thruOutIdx >= 0 ? thruOutIdx + 1 : 0, juce::dontSendNotification);
                     startCurrentThruOutput();
                 }
                 else if (!es.thruOutputDevice.isEmpty())
@@ -5711,7 +5821,7 @@ void MainComponent::applyAudioSettings()
             {
                 int genIdx = findFilteredIndex(filteredOutputIndices, scannedAudioOutputs,
                                                 es.generatorAudioType, es.generatorAudioDevice);
-                if (genIdx >= 0) cmbGenAudioDevice.setSelectedId(genIdx + 1, juce::dontSendNotification);
+                cmbGenAudioDevice.setSelectedId(genIdx >= 0 ? genIdx + 1 : 0, juce::dontSendNotification);
                 btnGenAudioOut.setToggleState(true, juce::dontSendNotification);
 
                 // Open with channel from settings -- combo isn't populated yet.
@@ -6330,9 +6440,12 @@ void MainComponent::restartAudioBpm()
     else
     {
         // Non-LTC — read from shared AUDIO SETTINGS combos
+        const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
         auto entry = getSelectedAudioInput();
-        if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
-        { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
+        if (entry.deviceName.isEmpty())   // nothing shown: the configured device, if listed (audioDeviceToStart)
+            entry = audioDeviceToStart(cmbAudioInputDevice, filteredInputIndices, scannedAudioInputs,
+                                       hasSettings ? settings.engines[(size_t) selectedEngine].audioBpmType   : juce::String(),
+                                       hasSettings ? settings.engines[(size_t) selectedEngine].audioBpmDevice : juce::String());
         if (entry.deviceName.isEmpty())
         {
             eng.stopAudioBpm();
