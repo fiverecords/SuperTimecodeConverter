@@ -3333,6 +3333,28 @@ public:
     void setGeneratorPresetName(const juce::String& name) { genPresetName = name.trim(); }
     juce::String getGeneratorPresetName() const           { return genPresetName; }
 
+    /// The range of the generator's times -- position, Start and Stop TC,
+    /// the A/B points -- in ms from midnight: 0 to 30 days (AUD11
+    /// GENERATOR-11).  They are milliseconds that do not wrap at 24 h (a
+    /// run across midnight counts on while the timecode wraps), so a day
+    /// is not the limit; but they had none at all, and the position is
+    /// turned into a timecode and into the cue cursor's uint32 at every
+    /// tick: an OSC /stc/N/gen/jog carrying +inf or 3e30 left the generator
+    /// at a position no timecode has -- hours -15, frames -2147483648 on
+    /// the display and for every output, LTC OUT with no decodable frame --
+    /// until STOP, and a NaN threw it to 00:00:00:00 while it played.  The
+    /// position still counts on by itself past this (49 days of unbroken
+    /// play would be needed to reach the cursor's own limit).
+    static constexpr double kGenMaxPositionMs = 30.0 * 86400000.0;
+
+    /// A Start TC, Stop TC or A/B point as the engine keeps it: within the
+    /// range above; a value that is not a number counts as 0, which is
+    /// "none" for Stop TC and the A/B points.
+    static double generatorMsInRange(double ms)
+    {
+        return std::isfinite(ms) ? juce::jlimit(0.0, kGenMaxPositionMs, ms) : 0.0;
+    }
+
     /// Set start timecode in ms from midnight.
     ///
     /// With the timecode loop (#24) Start TC is where each pass begins and
@@ -3362,7 +3384,7 @@ public:
     {
         const double prevStartMs = genStartMs;
         const bool wasHeld = generatorPlayerLoopHeld();
-        genStartMs = juce::jmax(0.0, ms);
+        genStartMs = generatorMsInRange(ms);
         if (genState == GeneratorState::Stopped && activeInput == InputSource::SystemTime)
         {
             const double fromMs = genCurrentMs;
@@ -3401,7 +3423,7 @@ public:
         double endMs = 0.0;
         bool gapless = false;
         const bool wasGapless = loopTimecodeEnd(endMs, gapless) && gapless;
-        genStopMs = juce::jmax(0.0, ms);
+        genStopMs = generatorMsInRange(ms);
         syncGeneratorPlayerLooping();
         if (genState != GeneratorState::Stopped && ! wasGapless && loopTimecodeEnd(endMs, gapless) && gapless)
             seekGeneratorAudioIntoLoop(endMs, true, true);
@@ -3640,10 +3662,10 @@ public:
     /// Set the loop In point.  Caller passes the absolute TC ms (same
     /// coordinate system as genCurrentMs).  No effect until
     /// setGeneratorLoopEnabled(true) is also called.
-    void setGeneratorLoopInMs(double ms)  { genLoopInMs  = juce::jmax(0.0, ms); }
+    void setGeneratorLoopInMs(double ms)  { genLoopInMs  = generatorMsInRange(ms); }
 
     /// Set the loop Out point.  Must be > loop In for the loop to be active.
-    void setGeneratorLoopOutMs(double ms) { genLoopOutMs = juce::jmax(0.0, ms); }
+    void setGeneratorLoopOutMs(double ms) { genLoopOutMs = generatorMsInRange(ms); }
 
     /// Enable / disable A/B loop.  When enabling and the loaded preset has
     /// no in/out set yet, the loop has no effect until points are placed.
@@ -3760,7 +3782,11 @@ public:
     ///                       with consumer media players)
     ///
     /// The caller is responsible for any clamping (e.g. against Stop TC or
-    /// the audio file's length); this method only enforces newMs >= 0.
+    /// the audio file's length); this method only enforces newMs >= 0, and
+    /// ignores a value that is not a position at all: not a number, or
+    /// more than kGenMaxPositionMs from 0 either way (AUD11 GENERATOR-11;
+    /// an OSC jog adds any float to the position).  The generator then
+    /// stays where it is, playing or not.
     /// The audio goes where the timecode puts it
     /// (seekGeneratorAudioToTimecode): timecode - Start TC, folded into the
     /// file while the player loops it, and on the timecode loop's gapless
@@ -3787,6 +3813,8 @@ public:
     /// nothing to announce.  Message thread.
     void setGeneratorPosition(double newMs)
     {
+        if (! std::isfinite(newMs) || std::abs(newMs) > kGenMaxPositionMs)
+            return;
         const double fromMs = genCurrentMs;
         genCurrentMs    = juce::jmax(0.0, newMs);
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();

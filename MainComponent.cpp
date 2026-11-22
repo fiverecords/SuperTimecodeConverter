@@ -8008,8 +8008,12 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
     }
     else if (cmd == "/stc/gen/jog")
     {
+        // Seconds, a float: any bit pattern arrives here.  One that is not
+        // a number is no jog (AUD11 GENERATOR-11); a number that leaves no
+        // position the generator can have is refused by the engine
+        // (TimecodeEngine::setGeneratorPosition).
         float deltaSec = msg.getFloat(0, 0.0f);
-        if (deltaSec != 0.0f)
+        if (deltaSec != 0.0f && std::isfinite(deltaSec))
         {
             double newMs = eng.getGeneratorCurrentMs() + (double)deltaSec * 1000.0;
             eng.setGeneratorPosition(newMs);
@@ -8051,25 +8055,32 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
     }
     else if (cmd == "/stc/gen/start")
     {
-        auto tc = msg.getString(0);
-        if (tc.isNotEmpty())
+        // A timecode as text.  Text that is none is ignored (AUD11
+        // GENERATOR-11): the parser reads what it cannot parse as 0, so
+        // "banana" moved Start TC to 00:00:00:00 -- and, as stoptime below,
+        // removed the Stop TC -- and the panel's field showed the word.
+        // The field shows what the engine took, at its rate, as after GO
+        // (showGenPresetInPanel): a field out of range is limited by the
+        // parser, and the raw text ("99:99:99:99") stayed in the field.
+        auto tc = msg.getString(0).trim();
+        if (tc.isNotEmpty() && tc.containsOnly("0123456789:;.") && tc.containsAnyOf("0123456789"))
         {
             double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
             eng.setGeneratorStartMs(ms);
             if (targetEngine == selectedEngine)
-                txtGenStartTC.setText(tc, false);
+                txtGenStartTC.setText(msToTimecodeString(eng.getGeneratorStartMs(), eng.getCurrentFps()), false);
             saveSettings();
         }
     }
     else if (cmd == "/stc/gen/stoptime")
     {
-        auto tc = msg.getString(0);
-        if (tc.isNotEmpty())
+        auto tc = msg.getString(0).trim();   // as /gen/start above
+        if (tc.isNotEmpty() && tc.containsOnly("0123456789:;.") && tc.containsAnyOf("0123456789"))
         {
             double ms = parseTimecodeToMs(tc, eng.getCurrentFps());
             eng.setGeneratorStopMs(ms);
             if (targetEngine == selectedEngine)
-                txtGenStopTC.setText(tc, false);
+                txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
             saveSettings();
         }
     }
