@@ -208,6 +208,28 @@ public:
     void start()
     {
         if (isThreadRunning()) return;
+
+        // Forget what was learnt from the players before the stop, unless
+        // this start follows it at once (AUD11 PDL-4).  Every stop of the
+        // Pro DJ Link input is followed by a stop of this client, and while
+        // the input is stopped nobody sees a stick swapped or a player
+        // replaced: ProDJLinkInput::stop() reports no player lost, and
+        // after start() the first status of a slot only notes its media.
+        // rekordbox IDs are per export, so an entry kept from before -- the
+        // last engine left Pro DJ Link for an act, the DJs changed over --
+        // answered the next DJ's track 5 with the previous DJ's title, grid
+        // and cues ("fully cached", nothing queued), and the fetcher
+        // resolved the ID in the old stick's export.pdb.  A restart within
+        // kRestartKeepMs is MainComponent stopping and starting the input
+        // in one go (bridge identity or interface changed): no medium can
+        // have changed in that time, and everything is kept, so the engines
+        // that were not restarted with it, and what is shown and sent from
+        // the cache, lose nothing.  A client that was never stopped has
+        // nothing from before.
+        if (stoppedAtMs >= 0.0
+            && juce::Time::getMillisecondCounterHiRes() - stoppedAtMs > (double)kRestartKeepMs)
+            forgetAllPlayers();
+
         DBG("DbServerClient: starting background thread...");
         isRunningFlag.store(true, std::memory_order_relaxed);
         dbPortInboundCount.store(0, std::memory_order_relaxed);
@@ -271,23 +293,12 @@ public:
         for (auto& conn : connections)
             conn.close();
 
-        // Clear any pending invalidation requests
-        {
-            const juce::ScopedLock sl(pendingInvalidateLock);
-            pendingInvalidateIPs.clear();
-        }
-
-        // Forget what was learnt from the players (AUD11 PDL-4).  Every
-        // stop of the Pro DJ Link input is followed by this one (the last
-        // engine left Pro DJ Link, the interface or the bridge identity
-        // changed), and while the input is stopped nobody sees a stick
-        // swapped or a player replaced: ProDJLinkInput::stop() reports no
-        // player lost, and after start() the first status of a slot only
-        // notes its media.  rekordbox IDs are per export, so an entry kept
-        // across the stop answered the next DJ's track 5 with the previous
-        // DJ's title, grid and cues ("fully cached", nothing queued), and
-        // the fetcher resolved the ID in the old stick's export.pdb.
-        forgetAllPlayers();
+        // The pending invalidations are kept (they were cleared here): the
+        // worker of the next start drops the cooldowns and the NFS state of
+        // a player lost just before this stop, which otherwise survived an
+        // immediate restart; start() clears them with everything else when
+        // it forgets the players (AUD11 PDL-4).
+        stoppedAtMs = juce::Time::getMillisecondCounterHiRes();
     }
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
@@ -759,16 +770,14 @@ private:
         }
     }
 
-    /// stop(), with the worker and the NFS thread joined (AUD11 PDL-4):
+    /// start(), with no worker and no NFS thread running (AUD11 PDL-4):
     /// drop everything that came from the players or names their tracks --
     /// the metadata and artwork caches, the requests still queued or waiting
-    /// for a cooldown, the dbserver ports, the cooldowns, and the NFS
-    /// fetcher's ports, mount handles and export.pdb indexes.  The next
-    /// start asks for the loaded tracks again, as a first start does; the
+    /// for a cooldown or an NFS retry, the dbserver ports, the cooldowns,
+    /// and the NFS fetcher's ports, mount handles and export.pdb indexes.
+    /// The loaded tracks are then asked for again, as at a first start; the
     /// disk cache (.anlz / .wfc, keyed by artist|title|duration) is not
-    /// touched and fills their analysis in phase 1.  An entry made after
-    /// this by a caller that still holds an old track ID is fetched from
-    /// the player as it is then, not taken from before the stop.
+    /// touched and fills their analysis in phase 1.
     void forgetAllPlayers()
     {
         {
@@ -780,9 +789,9 @@ private:
             artworkCache.clear();
         }
         {
-            // The worker is the only consumer and it has ended: taking the
-            // read position to the write position under the producers' lock
-            // empties the queue.
+            // The worker is the only consumer and it is not running: taking
+            // the read position to the write position under the producers'
+            // lock empties the queue.
             const juce::SpinLock::ScopedLockType producerLock(queueProducerLock);
             reqReadPos.store(reqWritePos.load(std::memory_order_relaxed), std::memory_order_release);
         }
@@ -790,7 +799,7 @@ private:
             const juce::ScopedLock sl(knownDbPortsLock);
             knownDbPorts.clear();
         }
-        // Worker-thread state; the worker has ended.
+        // Worker-thread state; the worker is not running.
         failedAtMs.clear();
         cooldownRetries.clear();
         nfsLostPlayers.clear();
@@ -798,6 +807,10 @@ private:
         {
             const juce::ScopedLock sl(nfsRetryNotesLock);
             nfsRetryNotes.clear();
+        }
+        {
+            const juce::ScopedLock sl(pendingInvalidateLock);
+            pendingInvalidateIPs.clear();
         }
         nfsAnlzFetcher.clearAll();
     }
@@ -834,6 +847,7 @@ private:
     static constexpr int kPortDiscoveryPort = 12523;
     static constexpr int kConnectTimeoutMs  = 3000;
     static constexpr int kStopTimeoutMs     = kConnectTimeoutMs + 2000;   // see stop()
+    static constexpr int kRestartKeepMs     = 3000;   // a start this soon after a stop keeps the players' data (start(), AUD11 PDL-4)
     static constexpr int kReadTimeoutMs     = 1000;  // CDJ responds in <10ms; 3000 was wasteful
     static constexpr int kMaxCacheEntries   = 256;
     static constexpr int kMaxArtCacheEntries = 64;
@@ -3619,6 +3633,7 @@ private:
     // Member data
     //==========================================================================
     std::atomic<bool> isRunningFlag { false };
+    double stoppedAtMs = -1.0;  // when stop() last returned (hiRes ms), negative before the first; the callers of start() and stop() only
 
     // Request queue (MPSC: any thread produces via queueLock, DB thread consumes)
     juce::SpinLock queueProducerLock;  // serialises requestMetadata callers (and enqueueInternal)
@@ -3704,7 +3719,8 @@ private:
     // the track had no beat grid, cues, phrases or waveforms for the rest
     // of the session.  A retry is dropped when its entry is gone or
     // complete, when the slot's media changed, when the player is lost and
-    // at stop().
+    // when start() forgets the players; it survives a stop that a start
+    // follows at once.
     //   nfsRetryNotes: handed to the worker by the NFS thread (a failure)
     //                  and by requestMetadata (a new load), under
     //                  nfsRetryNotesLock, held only to append or swap;
@@ -4014,9 +4030,14 @@ private:
 
             // The download failed, or brought one file and lost the other,
             // in a way another try may cure: hand it to the worker
-            // (runNfsRetries, AUD11 PDL-5).  Not when stopping, and not when
-            // the entry is gone or the slot's media changed since the launch.
-            if (anlz.retry && isRunningFlag.load(std::memory_order_relaxed))
+            // (runNfsRetries, AUD11 PDL-5).  Not when the entry is gone or
+            // the slot's media changed since the launch.  A download that
+            // stop() ended is handed over as well, uncounted: if the client
+            // is started again at once the entry is still there, marked as
+            // attempted, and the download is made again (it was lost for the
+            // session); otherwise start() drops the note with the entry.
+            const bool stopping = !isRunningFlag.load(std::memory_order_relaxed);
+            if (anlz.retry || stopping)
             {
                 bool sameEntry = false;
                 {
@@ -4033,7 +4054,7 @@ private:
                     r.trackId = trackId;
                     r.cdj3000Class = cdj3000Class;
                     r.mediaGeneration = mediaGeneration;
-                    r.attempt = attempt + 1;
+                    r.attempt = stopping ? attempt : attempt + 1;
                     noteNfsRetry(r);
                 }
             }

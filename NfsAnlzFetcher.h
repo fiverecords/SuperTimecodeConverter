@@ -317,13 +317,13 @@ public:
     }
 
     /// Forget everything learnt from every player: the RPC ports as well as
-    /// the mount handles and export.pdb indexes.  For DbServerClient::stop()
-    /// (AUD11 PDL-4): while the input is stopped nobody watches the players,
-    /// so a stick may be swapped or a player replaced unseen, and what was
-    /// learnt before is not known to hold at the next start.  Call it with
-    /// no fetch running (stop() has joined the NFS thread by then): the
-    /// ports have no all-players counter, so a fetch in flight could still
-    /// store the ports it was looking up.
+    /// the mount handles and export.pdb indexes.  For DbServerClient::start()
+    /// after the input was stopped for a while (AUD11 PDL-4): meanwhile
+    /// nobody watched the players, so a stick may have been swapped or a
+    /// player replaced unseen, and what was learnt before is not known to
+    /// hold.  Call it with no fetch running (none is before the worker
+    /// starts): the ports have no all-players counter, so a fetch in flight
+    /// could still store the ports it was looking up.
     void clearAll()
     {
         const std::lock_guard<std::mutex> lock(cacheMutex);
@@ -1092,8 +1092,9 @@ private:
                 // the whole export.pdb again, for every such track -- 19,000
                 // READs for a 24 MB library -- while the worker waited.  The
                 // index is the medium's as long as it is kept: a media
-                // change, a stale handle, a lost player and stop() drop it
-                // (clearPdbCache, forgetSlot, removePlayer, clearAll).
+                // change, a stale handle, a lost player and a start after
+                // the input was stopped for a while drop it (clearPdbCache,
+                // forgetSlot, removePlayer, clearAll).
                 if (indexRead != nullptr)
                     *indexRead = true;
                 auto t = idx->second.find(targetTrackId);
