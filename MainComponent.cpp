@@ -2604,6 +2604,23 @@ void MainComponent::removeEngine(int index)
         trackMapEditorScope = -1;
     }
 
+    // So does a cue point editor open on an override entry, and it outlives
+    // the Track Map editor it was opened from: that window's close button
+    // leaves it open.  With its engine removed, its TrackMapEntry& pointed
+    // into the freed override set and the next Add, Capture, Delete, Apply
+    // or repaint used freed memory; with an engine before it removed,
+    // cuePointEditorScope named another engine or none, so an edit was not
+    // saved at once and did not reach the engine it was made for (AUD11
+    // VIEWS-EDITORS-V1).  Closed here whether or not the Track Map editor
+    // is open; one on an entry of the global map (scope -1) stays.
+    if (cuePointWindow != nullptr && cuePointEditorScope >= 0)
+    {
+        cuePointWindow.reset();
+        cuePointTrackKey.clear();
+        cuePointEditedArtist.clear();
+        cuePointEditedTitle.clear();
+    }
+
     // Remember if the deleted engine was the primary and had thru enabled,
     // so we can restart AudioThru on the new primary after reindexing.
     bool deletedWasPrimary = engines[(size_t)index]->isPrimary();

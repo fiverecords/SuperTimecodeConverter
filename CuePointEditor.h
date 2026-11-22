@@ -19,7 +19,11 @@
 // entry's contents.  MainComponent closes this editor in the Track Map
 // editor's onChange, which runs synchronously on the message thread right
 // after each Track Map mutation, before anything touches the reference;
-// a restore must close it before AppSettings::load().
+// a restore must close it before AppSettings::load().  An entry of an
+// engine's override set lives inside that TimecodeEngine: it dies with the
+// engine, whether or not the Track Map editor is still open, so
+// MainComponent::removeEngine closes this editor first (AUD11
+// VIEWS-EDITORS-V1).
 //
 // Key feature: "Capture" button reads the current playhead from the
 // active engine and creates a cue at that position.  This is the
