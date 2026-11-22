@@ -186,15 +186,36 @@ public:
         bool valid = false;
     };
 
+    // What a .anlz may hold, for saveAnlz and loadAnlz alike (AUD11 PDL-10).
+    // loadAnlz had limits of its own (200 cues, 500 phrases, 2,000,000
+    // detail entries) below what the parsers of DbServerClient and
+    // NfsAnlzFetcher let through and saveAnlz wrote: the file of a track
+    // longer than 3 h 42 min (2,000,000 detail entries at 150 per second)
+    // was written in every session and never loaded, so the track went to
+    // NFS again each time.  The limits are now the parsers': both cap the
+    // detail at 5,000,000 entries, the NFS beat grid at 200,000 beats; a
+    // PSSI count is 16 bits; the dbserver gives at most two cue lists of
+    // 200.  saveAnlz writes nothing beyond them, nor a file readWholeFile
+    // would refuse for its size.
+    static constexpr uint32_t kMaxAnlzBeats         = 200000;
+    static constexpr uint32_t kMaxAnlzCues          = 400;
+    static constexpr uint32_t kMaxAnlzPhrases       = 65535;
+    static constexpr uint32_t kMaxAnlzDetailEntries = 5000000;
+
     static bool saveAnlz(const std::string& trackKey, const CachedAnlz& a)
     {
         if (!a.valid) return false;
+        if (a.beatGrid.size() > kMaxAnlzBeats || a.cueList.size() > kMaxAnlzCues
+            || a.songStructure.size() > kMaxAnlzPhrases)
+            return false;   // loadAnlz would refuse the file
 
         // The detail counts are written only when the bytes behind them are,
         // so the file never claims more than it holds.
         const size_t detailSize = (a.detailEntryCount > 0 && a.detailBytesPerEntry > 0)
             ? (size_t)a.detailEntryCount * (size_t)a.detailBytesPerEntry : 0;
         const bool hasDetail = detailSize > 0 && a.detailData.size() >= detailSize;
+        if (hasDetail && ((uint32_t)a.detailEntryCount > kMaxAnlzDetailEntries || a.detailBytesPerEntry > 3))
+            return false;   // loadAnlz would refuse the file
 
         juce::MemoryOutputStream fos;
 
@@ -251,6 +272,9 @@ public:
         if (hasDetail)
             fos.write(a.detailData.data(), detailSize);
 
+        if ((juce::int64)fos.getDataSize() > kMaxFileBytes)
+            return false;   // readWholeFile would refuse the file
+
         return writeAtomically(getAnlzFile(trackKey), fos);
     }
 
@@ -274,9 +298,9 @@ public:
         uint32_t detailBPE  = fis.u32();
         if (!fis.ok) return result;
 
-        // Sanity
-        if (numBeats > 200000 || numCues > 200 || numPhrases > 500) return result;
-        if (detailBPE > 3 || detailEC > 2000000) return result;
+        // Sanity: the limits saveAnlz writes within (AUD11 PDL-10)
+        if (numBeats > kMaxAnlzBeats || numCues > kMaxAnlzCues || numPhrases > kMaxAnlzPhrases) return result;
+        if (detailBPE > 3 || detailEC > kMaxAnlzDetailEntries) return result;
 
         // The fixed-size parts must all be in the file before anything is
         // allocated (8 bytes per beat, at least 17 per cue, 11 per phrase,
@@ -388,9 +412,9 @@ private:
         return getCacheDir().getChildFile(hash + ".anlz");
     }
 
-    /// Largest cache file a load will read (the largest .anlz saveAnlz can
-    /// write within loadAnlz's limits is about 7.7 MB; an artwork PNG larger
-    /// than this is not loaded).
+    /// Largest cache file a load will read (saveAnlz writes no .anlz larger
+    /// than this: at kMaxAnlzDetailEntries of 3 bytes the detail alone is
+    /// 15 MB; an artwork PNG larger than this is not loaded).
     static constexpr juce::int64 kMaxFileBytes = 16 * 1024 * 1024;
 
     /// Serialises the creation of the cache directory and the moves of
