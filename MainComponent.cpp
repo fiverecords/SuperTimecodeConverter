@@ -5515,7 +5515,9 @@ void MainComponent::loadAndApplyNonAudioSettings()
         return;
     }
 
-    // Ensure we have enough engines
+    // Ensure we have enough engines -- at most kMaxEngines: load() takes no
+    // more blocks than that from the file (AUD11 MAIN-A-13).
+    static_assert(AppSettings::kMaxStoredEngines == kMaxEngines, "AppSettings::load must stop at kMaxEngines");
     while (engines.size() < settings.engines.size())
     {
         engines.push_back(std::make_unique<TimecodeEngine>((int)engines.size()));

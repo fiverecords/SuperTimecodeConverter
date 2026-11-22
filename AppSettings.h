@@ -750,7 +750,7 @@ struct TrackMapEntry
 
         artist         = getString("artist");
         title          = getString("title");
-        durationSec    = juce::jmax(0, getInt("durationSec", 0));
+        durationSec    = juce::jlimit(0, 359999, getInt("durationSec", 0));   // up to 99:59:59 (AUD11 FUZZ-12)
         notes          = getString("notes");
         sortOrder      = juce::jmax(0, getInt("sortOrder", 0));
 
@@ -1975,6 +1975,18 @@ struct EngineSettings
         return juce::var(obj);
     }
 
+    /// Ranges for the numbers of settings.json that were read without one
+    /// (AUD11 FUZZ-12): a hand-edited or damaged file could hand any value
+    /// to the code that uses them.  Each range holds every value STC itself
+    /// writes, so a file from an earlier version loads as it did.
+    /// A network interface index: -1 (none, or all) upwards; one past the
+    /// list selects nothing, as before.
+    static int loadNicIndex(int index) { return juce::jlimit(-1, 255, index); }
+    /// A generator position in ms.  Anything negative or past two days is
+    /// not a timecode at any rate and loads as 0, the "none" of all four
+    /// fields (a negative one already became 0 in the engine).
+    static double loadGeneratorMs(double ms) { return (ms >= 0.0 && ms <= 172800000.0) ? ms : 0.0; }
+
     void fromVar(const juce::var& v)
     {
         auto* obj = v.getDynamicObject();
@@ -2000,27 +2012,30 @@ struct EngineSettings
         engineName           = getString("engineName");
         inputSource          = getString("inputSource", "SystemTime");
         midiInputDevice      = getString("midiInputDevice");
-        artnetInputInterface = getInt("artnetInputInterface", 0);
-        hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
-        hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
-        laNetTCInputInterface    = getInt("laNetTCInputInterface", 0);
+        artnetInputInterface = loadNicIndex(getInt("artnetInputInterface", 0));
+        hippotizerInputInterface = loadNicIndex(getInt("hippotizerInputInterface", 0));
+        hippotizerTcChannel      = juce::jlimit(0, 1, getInt("hippotizerTcChannel", 0));
+        laNetTCInputInterface    = loadNicIndex(getInt("laNetTCInputInterface", 0));
         generatorClockMode       = getBool("generatorClockMode", true);
         generatorPresetName      = getString("generatorPresetName", "");
         // Saved as double -- at 24, 30 and the 1001 rates a frame is not a
         // whole number of milliseconds -- and read back as one.  Read as an
         // int, 01:00:00:01 at 30 fps came back as 01:00:00:00 (AUDIT SET-6).
-        generatorStartMs         = getDouble("generatorStartMs", 0.0);
-        generatorStopMs          = getDouble("generatorStopMs", 0.0);
-        generatorLoopInMs        = (double) obj->getProperty("generatorLoopInMs");
-        generatorLoopOutMs       = (double) obj->getProperty("generatorLoopOutMs");
+        generatorStartMs         = loadGeneratorMs(getDouble("generatorStartMs", 0.0));
+        generatorStopMs          = loadGeneratorMs(getDouble("generatorStopMs", 0.0));
+        generatorLoopInMs        = loadGeneratorMs((double) obj->getProperty("generatorLoopInMs"));
+        generatorLoopOutMs       = loadGeneratorMs((double) obj->getProperty("generatorLoopOutMs"));
         generatorLoopEnabled     = getBool("generatorLoopEnabled", false);
         generatorAudioDevice     = getString("generatorAudioDevice");
         generatorAudioType       = getString("generatorAudioType");
-        generatorAudioChannel    = getInt("generatorAudioChannel", 0);
+        // -1 is what a selector with no selection was saved as (kept).
+        generatorAudioChannel    = juce::jlimit(-1, 127, getInt("generatorAudioChannel", 0));
         generatorAudioStereo     = getBool("generatorAudioStereo", true);
         generatorAudioEnabled    = getBool("generatorAudioEnabled", false);
-        generatorAudioVolume     = (float) getDouble("generatorAudioVolume", 1.0);
-        generatorAudioFileChannelMode = getInt("generatorAudioFileChannelMode", 0);
+        // The slider's range.  The double is limited before the cast: one
+        // out of a float's range must not be cast.
+        generatorAudioVolume     = (float) juce::jlimit(0.0, 1.5, getDouble("generatorAudioVolume", 1.0));
+        generatorAudioFileChannelMode = juce::jlimit(0, 2, getInt("generatorAudioFileChannelMode", 0));
         // proDJLinkPlayer ids: 1-6 = players, 7 = XF-A, 8 = XF-B, 9 = MASTER, 10 = ON AIR
         proDJLinkPlayer      = juce::jlimit(1, 10, getInt("proDJLinkPlayer", 1));
         trackMapEnabled      = getBool("trackMapEnabled", getBool("tcnetTrackMapEnabled", false));
@@ -2049,7 +2064,7 @@ struct EngineSettings
         artnetMixerForward   = getBool("artnetMixerForward", false);
         artnetMixerUniverse  = juce::jlimit(0, 32767, getInt("artnetMixerUniverse", 0));
         artnetTriggerUniverse = juce::jlimit(0, 32767, getInt("artnetTriggerUniverse", 1));
-        artnetDmxInterface   = getInt("artnetDmxInterface", -1);  // -1 = All Interfaces
+        artnetDmxInterface   = loadNicIndex(getInt("artnetDmxInterface", -1));  // -1 = All Interfaces
         linkEnabled          = getBool("linkEnabled", getBool("tcnetLinkEnabled", false));
         audioInputDevice     = getString("audioInputDevice");
         audioInputType       = getString("audioInputType");
@@ -2067,8 +2082,8 @@ struct EngineSettings
         hippoOutEnabled      = getBool("hippoOutEnabled", false);
         hippotizerDestIp     = getString("hippotizerDestIp", "255.255.255.255");
         midiOutputDevice     = getString("midiOutputDevice");
-        artnetOutputInterface = getInt("artnetOutputInterface", 0);
-        laNetTCOutputInterface = getInt("laNetTCOutputInterface", 0);
+        artnetOutputInterface = loadNicIndex(getInt("artnetOutputInterface", 0));
+        laNetTCOutputInterface = loadNicIndex(getInt("laNetTCOutputInterface", 0));
         audioOutputDevice    = getString("audioOutputDevice");
         audioOutputType      = getString("audioOutputType");
         audioOutputChannel   = juce::jlimit(0, 127, getInt("audioOutputChannel", 0));
@@ -2217,6 +2232,17 @@ struct AppSettings
     GeneratorPresetMap generatorPresets;
 
     //==================================================================
+    /// The most engine blocks load() takes from settings.json: kMaxEngines
+    /// (TimecodeEngine.h, which includes this file and so cannot be named
+    /// here; MainComponent.cpp checks the two are equal).
+    static constexpr int kMaxStoredEngines = 8;
+
+    /// SAMPLE RATE and BUFFER SIZE as stored: 0 is "Default", and so is a
+    /// value no device could take (AUD11 FUZZ-12; EngineSettings has the
+    /// other ranges).
+    static double loadSampleRate(double rate) { return (rate > 0.0 && rate <= 768000.0) ? rate : 0.0; }
+    static int    loadBufferSize(int size)    { return (size > 0 && size <= 65536) ? size : 0; }
+
     static juce::File getSettingsFile()
     {
         auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -2310,22 +2336,22 @@ struct AppSettings
         {
             audioInputTypeFilter  = getString("audioInputTypeFilter");
             audioOutputTypeFilter = getString("audioOutputTypeFilter");
-            preferredSampleRate   = getDouble("preferredSampleRate", 0.0);
-            preferredBufferSize   = getInt("preferredBufferSize", 0);
+            preferredSampleRate   = loadSampleRate(getDouble("preferredSampleRate", 0.0));
+            preferredBufferSize   = loadBufferSize(getInt("preferredBufferSize", 0));
             selectedEngine        = getInt("selectedEngine", 0);
             {
                 auto v = obj->getProperty("showModeLocked");
                 showModeLocked = v.isVoid() ? false : (bool)v;
             }
-            proDJLinkInterface    = getInt("proDJLinkInterface", 0);
+            proDJLinkInterface    = EngineSettings::loadNicIndex(getInt("proDJLinkInterface", 0));
             prodjlinkBridgeIdentity = juce::jlimit(0, 3, getInt("prodjlinkBridgeIdentity", 0));
             prodjlink95bMode        = juce::jlimit(0, 2, getInt("prodjlink95bMode", 0));
-            stageLinQInterface    = getInt("stageLinQInterface", 0);
-            tcnetInterface        = getInt("tcnetInterface", -1);
+            stageLinQInterface    = EngineSettings::loadNicIndex(getInt("stageLinQInterface", 0));
+            tcnetInterface        = EngineSettings::loadNicIndex(getInt("tcnetInterface", -1));
             tcnetGlobalOffsetMs   = juce::jlimit(-2000, 2000, getInt("tcnetGlobalOffsetMs", 0));
             oscInputEnabled       = getInt("oscInputEnabled", 0) != 0;
             oscInputPort          = juce::jlimit(1, 65535, getInt("oscInputPort", 9800));
-            oscInputInterface     = getInt("oscInputInterface", 0);
+            oscInputInterface     = EngineSettings::loadNicIndex(getInt("oscInputInterface", 0));
 
             mainWindowBounds = getString("mainWindowBounds");
             pdlViewBounds   = getString("pdlViewBounds");
@@ -2346,6 +2372,23 @@ struct AppSettings
             {
                 for (auto& item : *engArray)
                 {
+                    // No more engines than the "+" button allows.  Every
+                    // block used to load, and MainComponent makes an engine
+                    // for each: 40 blocks in a hand-edited, merged or
+                    // foreign file gave 40 engines ticking at 60 Hz, with a
+                    // tab bar running off the window and no way to reach or
+                    // remove the ones beyond it (AUD11 FUZZ-12, MAIN-A-13,
+                    // NET-SHOW-14).  Said at start-up; the file itself
+                    // changes only at the next save, and that save keeps it
+                    // as .bak.
+                    if ((int) engines.size() >= kMaxStoredEngines)
+                    {
+                        SafeJsonFile::lastLoadProblem() += "settings.json holds " + juce::String(engArray->size())
+                            + " engines; STC runs " + juce::String(kMaxStoredEngines)
+                            + " at most and loaded the first " + juce::String(kMaxStoredEngines)
+                            + ". The next save writes only those: copy the file first to keep the others.\n";
+                        break;
+                    }
                     EngineSettings es;
                     es.fromVar(item);
                     engines.push_back(es);
@@ -2382,23 +2425,23 @@ private:
 
         audioInputTypeFilter  = getString("audioInputTypeFilter");
         audioOutputTypeFilter = getString("audioOutputTypeFilter");
-        preferredSampleRate   = getDouble("preferredSampleRate", 0.0);
-        preferredBufferSize   = getInt("preferredBufferSize", 0);
+        preferredSampleRate   = loadSampleRate(getDouble("preferredSampleRate", 0.0));
+        preferredBufferSize   = loadBufferSize(getInt("preferredBufferSize", 0));
         selectedEngine        = 0;
 
         EngineSettings es;
         es.inputSource          = getString("inputSource", "SystemTime");
         es.midiInputDevice      = getString("midiInputDevice");
-        es.artnetInputInterface = getInt("artnetInputInterface", 0);
-        es.hippotizerInputInterface = getInt("hippotizerInputInterface", 0);
-        es.hippotizerTcChannel      = getInt("hippotizerTcChannel", 0);
-        es.laNetTCInputInterface = getInt("laNetTCInputInterface", 0);
+        es.artnetInputInterface = EngineSettings::loadNicIndex(getInt("artnetInputInterface", 0));   // ranges as EngineSettings::fromVar (AUD11 FUZZ-12)
+        es.hippotizerInputInterface = EngineSettings::loadNicIndex(getInt("hippotizerInputInterface", 0));
+        es.hippotizerTcChannel      = juce::jlimit(0, 1, getInt("hippotizerTcChannel", 0));
+        es.laNetTCInputInterface = EngineSettings::loadNicIndex(getInt("laNetTCInputInterface", 0));
         es.generatorClockMode   = getBool("generatorClockMode", true);
         es.generatorPresetName  = getString("generatorPresetName", "");
-        es.generatorStartMs     = getDouble("generatorStartMs", 0.0);   // doubles, as EngineSettings::fromVar
-        es.generatorStopMs      = getDouble("generatorStopMs", 0.0);
-        es.generatorLoopInMs    = (double) obj->getProperty("generatorLoopInMs");
-        es.generatorLoopOutMs   = (double) obj->getProperty("generatorLoopOutMs");
+        es.generatorStartMs     = EngineSettings::loadGeneratorMs(getDouble("generatorStartMs", 0.0));   // doubles, as EngineSettings::fromVar
+        es.generatorStopMs      = EngineSettings::loadGeneratorMs(getDouble("generatorStopMs", 0.0));
+        es.generatorLoopInMs    = EngineSettings::loadGeneratorMs((double) obj->getProperty("generatorLoopInMs"));
+        es.generatorLoopOutMs   = EngineSettings::loadGeneratorMs((double) obj->getProperty("generatorLoopOutMs"));
         es.generatorLoopEnabled = getBool("generatorLoopEnabled", false);
         es.audioInputDevice     = getString("audioInputDevice");
         es.audioInputType       = getString("audioInputType");
@@ -2410,8 +2453,8 @@ private:
         es.ltcOutEnabled        = getBool("ltcOutEnabled", false);
         es.thruOutEnabled       = getBool("thruOutEnabled", false);
         es.midiOutputDevice     = getString("midiOutputDevice");
-        es.artnetOutputInterface = getInt("artnetOutputInterface", 0);
-        es.laNetTCOutputInterface = getInt("laNetTCOutputInterface", 0);
+        es.artnetOutputInterface = EngineSettings::loadNicIndex(getInt("artnetOutputInterface", 0));
+        es.laNetTCOutputInterface = EngineSettings::loadNicIndex(getInt("laNetTCOutputInterface", 0));
         es.audioOutputDevice    = getString("audioOutputDevice");
         es.audioOutputType      = getString("audioOutputType");
         es.audioOutputChannel   = juce::jlimit(0, 127, getInt("audioOutputChannel", 0));
