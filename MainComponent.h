@@ -463,7 +463,7 @@ private:
     juce::TextButton btnGenPresetEdit { "EDIT" };
     // The audio file each engine was last given with a preset (#24): the
     // preset's path, or none for a preset without one, as GO, a browse with
-    // the audio stopped, < > and OSC /stc/N/gen/preset apply it
+    // the generator not running, < > and OSC /stc/N/gen/preset apply it
     // (applyGenPresetToEngine) -- the file it loads, is still loading, or
     // found missing on disk; after a restart, whose settings keep the
     // preset's name and load no file, the file of that preset (and an A/B
@@ -474,10 +474,11 @@ private:
     // entry, and an engine without one was given none.  Message thread.
     std::map<const TimecodeEngine*, juce::File> genPresetFileGiven;
     // Engines whose genPresetFileGiven came from the settings, which load no
-    // file (#24): until GO, or a browse with the audio stopped, applies a
-    // preset to the engine, its audio status reads NOT LOADED for that
-    // preset's file, which may well be on disk, instead of FILE NOT FOUND
-    // (updateStatusLabels).  removeEngine drops the entry.  Message thread.
+    // file (#24): until GO, or a browse with the generator not running,
+    // applies a preset to the engine, its audio status reads NOT LOADED for
+    // that preset's file, which may well be on disk, instead of FILE NOT
+    // FOUND (updateStatusLabels).  removeEngine drops the entry.  Message
+    // thread.
     std::set<const TimecodeEngine*> genPresetFileNotLoaded;
 
     // Generator audio playback (per-engine output device for preset audio files)
