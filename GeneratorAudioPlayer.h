@@ -225,11 +225,13 @@ public:
     {
         // Set by the load before the job starts.
         juce::File file;
-        juce::File loadedFile;                      // the file the player holds, if any
+        juce::File loadedFile;                      // the file the player holds, if any,
+        juce::int64 loadedSize = 0, loadedModTime = 0;   // with its size and time when it was loaded
         std::shared_ptr<juce::AudioFormatManager> formats;
 
         // The answer, for the load to read once `done` is signalled.
         bool found = false;
+        juce::int64 size = 0, modTime = 0;          // bytes; ms since the epoch
         bool sameAsLoaded = false;                  // nothing to load: the readers are not opened
         std::unique_ptr<juce::AudioFormatReader> reader, waveformReader;
 
@@ -239,7 +241,19 @@ public:
         void run()
         {
             found = file.existsAsFile();
-            sameAsLoaded = found && file == loadedFile;
+            if (found && ! abandoned.load(std::memory_order_acquire))
+            {
+                // The same file is the same path with the same size and
+                // modification time (AUD11 GENERATOR-7).  By the path
+                // alone, a file replaced on disk under its name -- the
+                // track exported again from the DAW during a rehearsal --
+                // was never loaded again: GO played the old length (and on
+                // POSIX the old data), under the old waveform, until
+                // another preset's file had been loaded in between.
+                size    = file.getSize();
+                modTime = file.getLastModificationTime().toMilliseconds();
+                sameAsLoaded = file == loadedFile && size == loadedSize && modTime == loadedModTime;
+            }
             if (found && ! sameAsLoaded && ! abandoned.load(std::memory_order_acquire))
             {
                 reader.reset(formats->createReaderFor(file));
@@ -294,7 +308,11 @@ public:
         {
             const juce::ScopedLock sl(transportLock);
             if (currentReaderSource != nullptr)
-                job->loadedFile = currentFile;
+            {
+                job->loadedFile    = currentFile;
+                job->loadedSize    = currentFileSize;
+                job->loadedModTime = currentFileModTime;
+            }
         }
         if (! askDisk(job))
             return false;   // the player is being destroyed: nothing was touched
@@ -307,7 +325,8 @@ public:
             return failLoad("FILE NOT FOUND: " + file.getFileName(), waveform);
         }
 
-        // Skip reload if same file is already loaded.
+        // Skip reload if same file is already loaded -- the same path,
+        // size and modification time (DiskJob, AUD11 GENERATOR-7).
         if (job->sameAsLoaded)
             return true;
 
@@ -348,9 +367,14 @@ public:
         if (! isUsable(*newReader))
             return failLoad("EMPTY OR CORRUPT FILE", waveform);
 
-        // The thumbnail's own reader, opened by the job with this one.
+        // The thumbnail's own reader, opened by the job with this one.  The
+        // thumbnail cache goes by the path with the file's size and time
+        // too, or it would bring back the waveform of the file that was
+        // there before (AUD11 GENERATOR-7).
         waveform.reader  = std::move(job->waveformReader);
-        waveform.hash    = file.hashCode64();
+        waveform.hash    = (juce::int64) ((juce::uint64) file.hashCode64()
+                                          ^ ((juce::uint64) job->modTime * 31u)
+                                          ^ ((juce::uint64) job->size * 0x9E3779B97F4A7C15ull));
         waveform.changed = true;
 
         // AudioFormatReaderSource takes ownership of the reader.
@@ -377,6 +401,8 @@ public:
                 oldSource            = std::move(currentReaderSource);
                 currentReaderSource  = std::move(newSource);
                 currentFile          = file;
+                currentFileSize      = job->size;
+                currentFileModTime   = job->modTime;
                 trackArtist          = tagArtist;
                 trackTitle           = tagTitle;
                 sourceFileSampleRate = readerSR;
@@ -423,6 +449,8 @@ public:
             const juce::ScopedLock sl(transportLock);
             oldSource            = std::move(currentReaderSource);
             currentFile          = juce::File();
+            currentFileSize      = 0;
+            currentFileModTime   = 0;
             trackArtist.clear();
             trackTitle.clear();
             sourceFileSampleRate = 0.0;
@@ -1140,6 +1168,7 @@ private:
     std::unique_ptr<juce::AudioFormatReaderSource> currentReaderSource;
     juce::AudioTransportSource                     transport;
     juce::File   currentFile;
+    juce::int64  currentFileSize = 0, currentFileModTime = 0;   // as the load found them (AUD11 GENERATOR-7); under transportLock
     juce::String trackArtist, trackTitle;   // under transportLock
     double       sourceFileSampleRate = 0.0;
     double       fileLengthSeconds    = 0.0;
