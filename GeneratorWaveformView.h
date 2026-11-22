@@ -248,7 +248,16 @@ private:
         const double totalLen = thumb.getTotalLength();   // seconds
         if (totalLen <= 0.0)
         {
-            paintEmpty(g, fullArea, "loading\u2026");      // loading…
+            // AUD11 GENERATOR-4: the ellipsis is written as its UTF-8 bytes
+            // and read as UTF-8.  It used to be a universal character name
+            // in a narrow literal, which is not ASCII, and
+            // juce::String(const char*) takes ASCII only: it asserts in a
+            // Debug build and draws "loading" followed by two or three wrong
+            // characters.  That went unseen while the waveform was given its
+            // file before the player had loaded it; the waveform now follows
+            // the load, so this text is on screen from the moment a file is
+            // loaded until its waveform has a length.
+            paintEmpty(g, fullArea, juce::String(juce::CharPointer_UTF8("loading\xe2\x80\xa6")));   // loading…
             return;
         }
 
