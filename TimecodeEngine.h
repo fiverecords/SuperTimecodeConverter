@@ -3002,7 +3002,15 @@ public:
     //==========================================================================
     juce::String getInputStatusText() const { return inputStatusText; }
     juce::String getMtcOutStatusText() const { return mtcOutStatusText; }
-    juce::String getArtnetOutStatusText() const { return artnetOutStatusText; }
+    /// "TX: <address>:6454" from start; "SEND FAILING: ..." while the OS
+    /// refuses the output's sends (ArtnetOutput::isSendFailing, AUD11
+    /// STATIC-1).  The row shows PAUSED instead while the output is paused.
+    juce::String getArtnetOutStatusText() const
+    {
+        if (artnetOutput.getIsRunning() && artnetOutput.isSendFailing())
+            return "SEND FAILING: " + artnetOutput.getBroadcastIp() + ":6454";
+        return artnetOutStatusText;
+    }
     /// "48k/512": the sample rate and buffer size the driver actually
     /// settled on, which is what the operator needs to see when a driver
     /// ignores the requested values (ASIO interfaces set theirs in their own
@@ -3040,7 +3048,13 @@ public:
     }
     juce::String getThruOutStatusText() const { return thruOutStatusText; }
     juce::String getHippoOutStatusText() const { return hippoOutStatusText; }
-    juce::String getLANetTCOutStatusText() const { return laNetTCOutStatusText; }
+    /// As getArtnetOutStatusText() (AUD11 STATIC-1).
+    juce::String getLANetTCOutStatusText() const
+    {
+        if (laNetTCOutput.getIsRunning() && laNetTCOutput.isSendFailing())
+            return "SEND FAILING: " + laNetTCOutput.getBroadcastIp() + ":8201";
+        return laNetTCOutStatusText;
+    }
 
     /// Only the currently displayed engine needs to build status text strings.
     /// Call with true for the selected engine, false for background engines.

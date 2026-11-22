@@ -100,6 +100,7 @@ public:
         isRunningFlag.store(true, std::memory_order_relaxed);
         paused.store(false, std::memory_order_relaxed);
         sendErrors.store(0, std::memory_order_relaxed);
+        lastSendErrorMs.store(0.0, std::memory_order_relaxed);
         artnetSeeded = false;
         resyncRequested.store(false, std::memory_order_relaxed);
         updateTimerRate();
@@ -123,6 +124,17 @@ public:
     juce::String getBroadcastIp() const { return broadcastIp; }
     int getSelectedInterface() const { return selectedInterface; }
     uint32_t getSendErrors() const { return sendErrors.load(std::memory_order_relaxed); }
+
+    /// True while the OS has refused a send within the last second -- no
+    /// route to the destination, the interface's address gone.  For the
+    /// output's status line, which said "TX" whatever became of the sends
+    /// (AUD11 STATIC-1).  It tells only what the OS reports: a send it
+    /// accepts and then drops is not seen.  Any thread.
+    bool isSendFailing() const
+    {
+        const double at = lastSendErrorMs.load(std::memory_order_relaxed);
+        return at > 0.0 && (juce::Time::getMillisecondCounterHiRes() - at) < 1000.0;
+    }
 
     //==============================================================================
     void setTimecode(const Timecode& tc)
@@ -258,7 +270,10 @@ public:
             written = socket->write(broadcastIp, destPort, packet, 18 + numChannels);
         }
         if (written < 0)
+        {
             sendErrors.fetch_add(1, std::memory_order_relaxed);
+            lastSendErrorMs.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+        }
     }
 
 private:
@@ -401,7 +416,10 @@ private:
             written = socket->write(broadcastIp, destPort, packet, sizeof(packet));
         }
         if (written < 0)
+        {
             sendErrors.fetch_add(1, std::memory_order_relaxed);
+            lastSendErrorMs.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_relaxed);
+        }
     }
 
     void updateTimerRate()
@@ -449,6 +467,7 @@ private:
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };
     std::atomic<uint32_t> sendErrors { 0 };
+    std::atomic<double> lastSendErrorMs { 0.0 };   // hi-res ms of the last refused send, 0 = none (isSendFailing)
     // ArtTimeCode (timer thread) and ArtDmx (message thread) share the
     // socket.  juce::DatagramSocket::write keeps the resolved destination in
     // the socket and stores it, unlocked, on its first send: the two never
