@@ -285,6 +285,7 @@ public:
         running = true; seq = 0; uptimeSeconds = 0; tickCount = 0;
         sendErrors = 0; lastSendErrorMs = 0.0; lastSlaveRefusedMs = 0.0;
         for (auto& s : slaves) s.active = false;
+        for (int i = 0; i < kMaxSlaves; ++i) forgetBeatGridRequests(i);
 
         sendOptIn();
         sendStatus();
@@ -761,6 +762,7 @@ private:
                 s.nodeId = nid;
                 s.lastSeenMs = now;
                 s.active = true;
+                forgetBeatGridRequests((int) (&s - slaves));   // the slot's previous receiver's
                 // Send initial data burst to new slave
                 sendInitialDataToSlave(s);
                 return;
@@ -795,6 +797,21 @@ private:
         return first;
     }
 
+    /// The index in slaves[] of the slave replyPortFor() answers on, by the
+    /// same rule; -1 when no slave has that IP.
+    int slaveSlotFor(const juce::String& srcIp, int srcPort) const
+    {
+        int first = -1;
+        for (int i = 0; i < kMaxSlaves; ++i)
+        {
+            const auto& s = slaves[i];
+            if (!s.active || s.ip != srcIp) continue;
+            if ((int) s.listenerPort == srcPort) return i;
+            if (first < 0) first = i;
+        }
+        return first;
+    }
+
     void sendInitialDataToSlave(const SlaveNode& slave)
     {
         if (!unicastSocket) return;
@@ -812,14 +829,41 @@ private:
     // ============================================================
     // Request handler -- listen on our NodeListenerPort
     // ============================================================
+    //
+    // Bounded per timer callback (AUD11 NET-SHOW-7).  The loop below read
+    // until the socket was empty and answered every request at once, on
+    // the message thread: a Beat Grid request, 26 bytes, is answered with
+    // 49 packets (117 KB) for the 2 h default grid, so 200 queued requests
+    // held one callback for 40-90 ms -- Time packets, cue points and the
+    // window waiting -- and a sender that kept asking held it for as long
+    // as it sent.  Now:
+    //   - at most kMaxRequestsPerTick datagrams are read per callback; the
+    //     rest stay in the socket's buffer for the next ones;
+    //   - at most kMaxBeatGridsPerTick Beat Grid replies go out per
+    //     callback, and one receiver gets the grid of one layer at most
+    //     once per kBeatGridMinIntervalMs.  A request over either limit is
+    //     not dropped: it is noted per receiver and layer (so a repeated
+    //     one is noted once) and answered by a later callback, with the
+    //     grid as it is then.
+    // A request within the limits is answered at once, as before, and the
+    // packets of a reply are what they were: only when a reply goes out
+    // changes.  Every layer 1-8 is still served, active or not (see
+    // sendBeatGridUnicast: MagicQ wants the grid, never an Error).
+    static constexpr int    kMaxRequestsPerTick    = 64;
+    static constexpr int    kMaxBeatGridsPerTick   = 2;
+    static constexpr double kBeatGridMinIntervalMs = 500.0;
+
     void pollRequests()
     {
         if (!listenerSocket) return;
         uint8_t buf[512];
         juce::String srcIp;
         int srcPort = 0;
-        while (listenerSocket->waitUntilReady(true, 0) == 1)
+        beatGridsThisTick = 0;
+        int handled = 0;
+        while (handled < kMaxRequestsPerTick && listenerSocket->waitUntilReady(true, 0) == 1)
         {
+            ++handled;
             int n = listenerSocket->read(buf, sizeof(buf), false, srcIp, srcPort);
             if (n < 24) continue;
             if (buf[4] != 'T' || buf[5] != 'C' || buf[6] != 'N') continue;
@@ -841,6 +885,71 @@ private:
                 handleApplication(srcIp, srcPort, buf, n);
             }
         }
+        sendPendingBeatGrids();
+    }
+
+    /// A Beat Grid request from the slave in slot `slot` for a layer:
+    /// answered now when this callback and this receiver's layer are
+    /// within their limits, noted for a later callback otherwise (see
+    /// pollRequests).
+    void requestBeatGrid(int slot, int layerIdx)
+    {
+        if (slot < 0 || slot >= kMaxSlaves || layerIdx < 0 || layerIdx >= kPacketLayers) return;
+        if (! trySendBeatGrid(slot, layerIdx) && ! beatGridPending[slot][layerIdx])
+        {
+            beatGridPending[slot][layerIdx] = true;
+            ++beatGridsPending;
+        }
+    }
+
+    bool trySendBeatGrid(int slot, int layerIdx)
+    {
+        if (beatGridsThisTick >= kMaxBeatGridsPerTick) return false;
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double last = beatGridSentMs[slot][layerIdx];
+        if (last > 0.0 && (now - last) < kBeatGridMinIntervalMs) return false;
+        beatGridSentMs[slot][layerIdx] = now;
+        ++beatGridsThisTick;
+        sendBeatGridUnicast(slaves[slot].ip, slaves[slot].listenerPort, layerIdx);
+        return true;
+    }
+
+    /// The noted Beat Grid requests that can go out in this callback.  The
+    /// scan starts one place further on each time, so no receiver or layer
+    /// waits behind another that keeps asking.
+    void sendPendingBeatGrids()
+    {
+        if (beatGridsPending <= 0) return;
+        constexpr int kPlaces = kMaxSlaves * kPacketLayers;
+        beatGridScanStart = (beatGridScanStart + 1) % kPlaces;
+        for (int k = 0; k < kPlaces && beatGridsPending > 0; ++k)
+        {
+            const int place = (beatGridScanStart + k) % kPlaces;
+            const int slot = place / kPacketLayers, layerIdx = place % kPacketLayers;
+            if (! beatGridPending[slot][layerIdx]) continue;
+            if (! slaves[slot].active)   // the receiver expired meanwhile
+            {
+                beatGridPending[slot][layerIdx] = false;
+                --beatGridsPending;
+                continue;
+            }
+            if (beatGridsThisTick >= kMaxBeatGridsPerTick) break;
+            if (trySendBeatGrid(slot, layerIdx))
+            {
+                beatGridPending[slot][layerIdx] = false;
+                --beatGridsPending;
+            }
+        }
+    }
+
+    void forgetBeatGridRequests(int slot)
+    {
+        if (slot < 0 || slot >= kMaxSlaves) return;
+        for (int l = 0; l < kPacketLayers; ++l)
+        {
+            if (beatGridPending[slot][l]) { beatGridPending[slot][l] = false; --beatGridsPending; }
+            beatGridSentMs[slot][l] = 0.0;
+        }
     }
 
     void handleRequest(const juce::String& srcIp, int srcPort, uint8_t dataType, uint8_t layerId)
@@ -857,8 +966,8 @@ private:
             sendMetricsUnicast(srcIp, dstPort, layerIdx);
         else if (dataType == 128)  // Artwork (low-res JPEG)
             sendArtworkUnicast(srcIp, dstPort, layerIdx);
-        else if (dataType == 8)   // Beat Grid
-            sendBeatGridUnicast(srcIp, dstPort, layerIdx);
+        else if (dataType == 8)   // Beat Grid: bounded, see pollRequests
+            requestBeatGrid(slaveSlotFor(srcIp, srcPort), layerIdx);
         else if (dataType == 16)  // Small Waveform
             sendSmallWaveformUnicast(srcIp, dstPort, layerIdx);
         else
@@ -909,7 +1018,9 @@ private:
         // counter doesn't stall at the end of the grid. For the 2-hour default
         // (kDefaultDurationMs) at 120 BPM = 14401 entries = 115208 bytes = 49
         // packets.  All of them go out here, back to back, inside one timer
-        // callback on the message thread (AUDIT NET-11, deferred).
+        // callback on the message thread (AUDIT NET-11, deferred); how many
+        // such replies one callback sends is bounded in pollRequests
+        // (AUD11 NET-SHOW-7).
         constexpr int kEntrySize = 8;
         constexpr int kMaxEntriesPerPacket = 300;  // 2400 bytes / 8
         constexpr int kClusterSize = kMaxEntriesPerPacket * kEntrySize;  // 2400
@@ -1471,6 +1582,14 @@ private:
     LayerData layers[kPacketLayers] = {};
     LayerData emptyLayer;
     SlaveNode slaves[kMaxSlaves] = {};
+    // Beat Grid requests, per slave slot and layer (AUD11 NET-SHOW-7, see
+    // pollRequests): noted and not answered yet, and when the last reply
+    // went out (hi-res ms, 0 = never).
+    bool   beatGridPending[kMaxSlaves][kPacketLayers] = {};
+    double beatGridSentMs[kMaxSlaves][kPacketLayers]  = {};
+    int    beatGridsPending  = 0;   // how many beatGridPending are set
+    int    beatGridsThisTick = 0;   // replies sent by the current pollRequests()
+    int    beatGridScanStart = 0;
     // Fixed: two STCs on one network (a main and a backup) send the same
     // NodeID and NodeName, and each takes the other's OptIn for its own
     // (pollDiscovery).  Left as is: what receivers do with two nodes of one
