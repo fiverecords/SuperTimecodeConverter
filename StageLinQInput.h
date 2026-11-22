@@ -2829,18 +2829,35 @@ private:
                     lastRefTime = now;
                 }
 
+                // A BeatInfo message is stamped with the time it is read at
+                // (handleBeatInfo), and that pair of position and time is
+                // what the engine counts on from.  Each pass waited 1 ms on
+                // the main socket, 5 ms on StateMap, 5 ms on BeatInfo and
+                // then slept 5 ms, so a message that arrived outside its
+                // own 5 ms was read up to 13 ms late (5 ms on average), a
+                // delay that changed from message to message (AUD11 SLQ-8).
+                // With a BeatInfo connection the pass now waits on that
+                // socket only -- the others are looked at without waiting,
+                // every 5 ms at most -- and a message is read as it comes.
+                // Without one the pass is as it was: something must wait.
+                bool waitOnBeatInfo = false;
+                {
+                    std::lock_guard<std::mutex> lock(sockMutex);
+                    waitOnBeatInfo = beatSocket && beatSocket->isConnected();
+                }
+
                 // Drain main socket (Reference/Timestamp messages from device)
                 {
                     std::lock_guard<std::mutex> lock(sockMutex);
                     if (mainSocket && mainSocket->isConnected())
-                        drainMainSocket();
+                        drainMainSocket(waitOnBeatInfo ? 0 : 1);
                 }
 
                 // Read StateMap data
                 {
                     std::lock_guard<std::mutex> lock(sockMutex);
                     if (stateSocket && stateSocket->isConnected())
-                        readStateMapData(stateSocket.get());
+                        readStateMapData(stateSocket.get(), waitOnBeatInfo ? 0 : 5);
                 }
 
                 // Read BeatInfo data
@@ -2891,11 +2908,21 @@ private:
                     }
                 }
 
-                juce::Thread::sleep(5);
+                if (!waitOnBeatInfo)
+                    juce::Thread::sleep(5);
             }
 
             // --- Clean shutdown: send BeatInfo stop before closing sockets ---
             // Without this the device only learns we left via TCP RST.
+            // Only when the loop ended by itself (the device went quiet, a
+            // socket died).  When this thread is told to stop, closeSocket()
+            // follows at once, and it always had the sockets closed before
+            // this point was reached: the loop slept 5 ms with the lock free
+            // before it looked at threadShouldExit().  So on stop() and
+            // after a unit's EXIT no stop frame was ever sent.  Without that
+            // sleep (AUD11 SLQ-8) this thread could get here first and send
+            // one; what STC sends stays as it was (DESIGN D2).
+            if (!threadShouldExit())
             {
                 std::lock_guard<std::mutex> lock(sockMutex);
                 if (beatSocket && beatSocket->isConnected())
@@ -3081,10 +3108,10 @@ private:
         // goroutine that reads mainSocket continuously.  Without draining,
         // the TCP receive window fills and the device stops sending.
         //----------------------------------------------------------------------
-        void drainMainSocket()
+        void drainMainSocket(int waitMs = 1)
         {
             if (!mainSocket || !mainSocket->isConnected()) return;
-            const int ready = mainSocket->waitUntilReady(true, 1);
+            const int ready = mainSocket->waitUntilReady(true, waitMs);
             if (ready == 0) return;
 
             uint8_t tmp[4096];
@@ -3150,11 +3177,11 @@ private:
         // A failed read, or the device's close (ready, nothing to read),
         // closes the socket so that the dead-socket test in run() sees it
         // (AUDIT SLQ-5).
-        bool tcpReadAvailable(juce::StreamingSocket* sock, std::vector<uint8_t>& buf)
+        bool tcpReadAvailable(juce::StreamingSocket* sock, std::vector<uint8_t>& buf, int waitMs = 5)
         {
             if (!sock || !sock->isConnected()) return false;
 
-            const int ready = sock->waitUntilReady(true, 5);
+            const int ready = sock->waitUntilReady(true, waitMs);
             if (ready == 0)
                 return true;  // no data, but no error
 
@@ -3217,9 +3244,9 @@ private:
         //----------------------------------------------------------------------
         // Read and parse StateMap data (non-blocking)
         //----------------------------------------------------------------------
-        void readStateMapData(juce::StreamingSocket* sock)
+        void readStateMapData(juce::StreamingSocket* sock, int waitMs = 5)
         {
-            if (!tcpReadAvailable(sock, stateReadBuf)) return;
+            if (!tcpReadAvailable(sock, stateReadBuf, waitMs)) return;
 
             // Parse complete smaa blocks from the buffer
             while (stateReadBuf.size() >= 4)
