@@ -7,6 +7,8 @@
 #include "AudioDeviceHub.h"
 #include <atomic>
 #include <cstring>
+#include <system_error>
+#include <thread>
 
 //==============================================================================
 // GeneratorAudioPlayer -- Plays a single audio file, transport-controlled,
@@ -32,11 +34,13 @@
 //    requestLoad only queues the request, and the waveform thumbnail is
 //    handed its reader, already open, by the LoaderThread (postWaveform).
 //  - LoaderThread ("STC Generator Loader"): loadFile / unloadFile /
-//    setLooping, as requestLoad schedules them, and every access to the
-//    file a load needs: whether it exists, opening it and reading its
-//    header, for the transport and for the thumbnail.  setLooping also
-//    runs on the message thread, inside setLoopingWhilePlaying, only while
-//    no load is pending.
+//    setLooping, as requestLoad schedules them.  What a load needs of the
+//    disk -- whether the file exists, opening it and reading its header,
+//    for the transport and for the thumbnail -- runs on a short-lived
+//    thread per load that the LoaderThread waits for (DiskJob), so that a
+//    player destroyed while a disk does not answer can leave it behind.
+//    setLooping also runs on the message thread, inside
+//    setLoopingWhilePlaying, only while no load is pending.
 //  - Audio thread: audioDeviceIOCallbackWithContext, called by the hub's
 //    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
 //    adds or removes us or the device restarts (message thread, or the
@@ -75,6 +79,9 @@ public:
         // explicitly afterwards; JUCE_DEBUG asserts on duplicate format
         // registration (jassertfalse in AudioFormatManager::registerFormat).
         formatManager.registerBasicFormats();
+        // The same formats for the loads' disk jobs, which can outlive the
+        // player (DiskJob, AUD11 GENERATOR-9) and so share their own.
+        diskFormats->registerBasicFormats();
     }
 
     ~GeneratorAudioPlayer() override
@@ -99,6 +106,12 @@ public:
         // member destruction begins.
         // The loader thread is stopped first because its tick can call back
         // into transport / reader objects that closeDevice will tear down.
+        // It is waited for, however long, and never killed (AUD11
+        // GENERATOR-9): a load still asking the disk about its file is
+        // abandoned at once (DiskJob), one already swapping the transport's
+        // source finishes the swap first -- at worst the read in flight on
+        // the read-ahead thread, which reads no more now that shuttingDown
+        // is set (ReaderSource).
         loaderThread.stop();
         closeDevice();
         unloadFile();
@@ -170,8 +183,11 @@ public:
             }
             AudioDeviceHub::get().release(this);   // blocks until any in-flight callback returns
         }
+        // Waited for, not killed after two seconds (AUD11 GENERATOR-9): the
+        // setSource(nullptr) above has already waited for the read it had
+        // in flight, so it has nothing left to do.
         if (backgroundThread.isThreadRunning())
-            backgroundThread.stopThread(2000);
+            backgroundThread.stopThread(-1);
     }
 
     bool         isDeviceOpen()        const { return deviceOpen.load(std::memory_order_relaxed); }
@@ -193,6 +209,50 @@ public:
         bool changed = false;
         std::unique_ptr<juce::AudioFormatReader> reader;
         juce::int64 hash = 0;   // the thumbnail cache's key for the file
+    };
+
+    /// What a load asks of the disk: whether the file is there, a reader on
+    /// it for the transport and a second one for the waveform thumbnail.
+    /// These are the calls that wait for as long as a disk takes to answer
+    /// (a USB disk spinning up, a share that has gone away), and they touch
+    /// nothing of the player: they run on a thread of their own, which the
+    /// job and its results belong to as much as to the load that waits for
+    /// it (askDisk).  A player destroyed meanwhile abandons the job, and
+    /// the thread ends by itself whenever the disk lets it (AUD11
+    /// GENERATOR-9: the LoaderThread used to make these calls, and was
+    /// killed by force when it had not come back after three seconds).
+    struct DiskJob
+    {
+        // Set by the load before the job starts.
+        juce::File file;
+        juce::File loadedFile;                      // the file the player holds, if any
+        std::shared_ptr<juce::AudioFormatManager> formats;
+
+        // The answer, for the load to read once `done` is signalled.
+        bool found = false;
+        bool sameAsLoaded = false;                  // nothing to load: the readers are not opened
+        std::unique_ptr<juce::AudioFormatReader> reader, waveformReader;
+
+        juce::WaitableEvent done { true };          // manual reset
+        std::atomic<bool>   abandoned { false };    // nobody waits any more: stop at the next step
+
+        void run()
+        {
+            found = file.existsAsFile();
+            sameAsLoaded = found && file == loadedFile;
+            if (found && ! sameAsLoaded && ! abandoned.load(std::memory_order_acquire))
+            {
+                reader.reset(formats->createReaderFor(file));
+                // The waveform thumbnail reads the file on its own thread,
+                // so it needs a reader of its own -- only for a file the
+                // player takes (AUD11 FUZZ-14).  The message thread used to
+                // open it in requestLoad, before the load had started
+                // (AUD11 GENERATOR-4).
+                if (reader != nullptr && isUsable(*reader) && ! abandoned.load(std::memory_order_acquire))
+                    waveformReader.reset(formats->createReaderFor(file));
+            }
+            done.signal();
+        }
     };
 
     /// Load an audio file synchronously.  Replaces any previously loaded
@@ -217,30 +277,41 @@ public:
         setLoadError({});
         requestedFileMissing.store(false, std::memory_order_release);
 
-        // This is where the disk is asked whether the file is there (AUD11
-        // GENERATOR-4): requestLoad and its callers no longer do, so a path
-        // that is not on disk gets here.  The message names the file, as the
-        // panel's status line did when it was the one to find it missing.
-        if (file == juce::File() || ! file.existsAsFile())
+        if (file == juce::File())
         {
-            if (file != juce::File())
-            {
-                requestedFileMissing.store(true, std::memory_order_release);
-                return failLoad("FILE NOT FOUND: " + file.getFileName(), waveform);
-            }
             unloadFile();
             waveform.changed = true;
             return false;
         }
 
-        // Skip reload if same file is already loaded.
+        // This is where the disk is asked whether the file is there (AUD11
+        // GENERATOR-4): requestLoad and its callers no longer do, so a path
+        // that is not on disk gets here.  Asked on a thread of its own
+        // (DiskJob), together with the opening of the file.
+        auto job = std::make_shared<DiskJob>();
+        job->file    = file;
+        job->formats = diskFormats;
         {
             const juce::ScopedLock sl(transportLock);
-            if (currentFile == file && currentReaderSource != nullptr)
-                return true;
+            if (currentReaderSource != nullptr)
+                job->loadedFile = currentFile;
+        }
+        if (! askDisk(job))
+            return false;   // the player is being destroyed: nothing was touched
+
+        // The message names the file, as the panel's status line did when
+        // it was the one to find it missing.
+        if (! job->found)
+        {
+            requestedFileMissing.store(true, std::memory_order_release);
+            return failLoad("FILE NOT FOUND: " + file.getFileName(), waveform);
         }
 
-        std::unique_ptr<juce::AudioFormatReader> newReader(formatManager.createReaderFor(file));
+        // Skip reload if same file is already loaded.
+        if (job->sameAsLoaded)
+            return true;
+
+        std::unique_ptr<juce::AudioFormatReader> newReader(std::move(job->reader));
         if (newReader == nullptr)
         {
             // Most likely cause: the file's format is not registered with
@@ -274,21 +345,17 @@ public:
         // What the reader says of the file is checked before the reader is
         // used (AUD11 FUZZ-14): a header that states an absurd sample size
         // or channel count gets no further than this.
-        if (readerSR <= 0.0 || totalSamples <= 0 || ! hasSaneFrame(*newReader))
+        if (! isUsable(*newReader))
             return failLoad("EMPTY OR CORRUPT FILE", waveform);
 
-        // The waveform thumbnail reads the file on its own thread, so it
-        // needs a reader of its own.  Opened here, on the LoaderThread,
-        // with the file known to be one the player takes: the message
-        // thread used to open it in requestLoad, before the load had
-        // started (AUD11 GENERATOR-4).
-        waveform.reader.reset(formatManager.createReaderFor(file));
+        // The thumbnail's own reader, opened by the job with this one.
+        waveform.reader  = std::move(job->waveformReader);
         waveform.hash    = file.hashCode64();
         waveform.changed = true;
 
         // AudioFormatReaderSource takes ownership of the reader.
         std::unique_ptr<juce::AudioFormatReaderSource> newSource(
-            new juce::AudioFormatReaderSource(newReader.release(), true));
+            new ReaderSource(newReader.release(), shuttingDown));
         newSource->setLooping(loopFlag.load(std::memory_order_relaxed));
 
         // Detach, swap and re-attach as one step under sourceLock, so the
@@ -722,11 +789,20 @@ private:
             stop();
         }
 
+        // Waits for the thread, however long, and never kills it (AUD11
+        // GENERATOR-9).  stopThread(3000) killed it by force when a load
+        // had not come back in three seconds -- waiting on a disk that had
+        // stopped answering, the moment an operator gives up and quits --
+        // and the process then aborted (Linux, run) or went on with the
+        // thread terminated while it held sourceLock (Windows, by reading).
+        // The wait is short: the disk calls of a load run on a thread that
+        // can be left behind (DiskJob), and run() starts nothing new once
+        // it is told to exit.
         void stop()
         {
             signalThreadShouldExit();
             notify();
-            stopThread(3000);
+            stopThread(-1);
         }
 
         // Message thread (requestLoad).  pendingLoad is set under stateLock,
@@ -754,6 +830,10 @@ private:
 
                 for (;;)
                 {
+                    // The player is being destroyed: a request still queued
+                    // is not started (AUD11 GENERATOR-9).
+                    if (threadShouldExit()) return;
+
                     juce::File file;
                     bool       loop = false;
                     {
@@ -771,6 +851,11 @@ private:
                     // request; posted below, after the audio is settled.
                     WaveformChange waveform;
                     owner.loadFile(file, waveform);   // an empty file unloads
+
+                    // Told to exit meanwhile -- the load may have been
+                    // abandoned (askDisk): nothing to settle, nobody to
+                    // tell.
+                    if (threadShouldExit()) return;
 
                     // Single chokepoint for "load completed (or unloaded)".
                     // Doing it here, AFTER loadFile / unloadFile returns,
@@ -1045,6 +1130,7 @@ private:
 
     //==========================================================================
     juce::AudioFormatManager  formatManager;
+    std::shared_ptr<juce::AudioFormatManager> diskFormats { std::make_shared<juce::AudioFormatManager>() };   // the loads' readers (DiskJob)
     juce::AudioThumbnailCache thumbnailCache { 32 };  // cache the last 32 files' peaks so navigating presets back-and-forth does not re-decode each time
     juce::AudioThumbnail      thumbnail      { 512, formatManager, thumbnailCache };
     juce::TimeSliceThread     backgroundThread { "STC Generator Audio Reader" };
@@ -1126,6 +1212,70 @@ private:
     {
         return reader.numChannels   >= 1 && reader.numChannels   <= 256
             && reader.bitsPerSample >= 8 && reader.bitsPerSample <= 64;
+    }
+
+    // A reader the player takes: it has samples, at a rate, in frames that
+    // can be read.  Anything else is EMPTY OR CORRUPT FILE.
+    static bool isUsable(const juce::AudioFormatReader& reader)
+    {
+        return reader.sampleRate > 0.0 && reader.lengthInSamples > 0 && hasSaneFrame(reader);
+    }
+
+    // The reader source the transport plays: JUCE's, which stops asking
+    // the disk once the player is being destroyed (AUD11 GENERATOR-9).  The
+    // read-ahead thread reads through it, and a load's setSource waits
+    // until that thread has filled a quarter of a second -- so does the
+    // destructor, which waits for the load.  With the reads given up, that
+    // wait ends with the one read in flight; the silence returned instead
+    // goes to a transport that is about to be taken down.
+    struct ReaderSource : public juce::AudioFormatReaderSource
+    {
+        ReaderSource(juce::AudioFormatReader* reader, const std::atomic<bool>& playerIsGoing)
+            : juce::AudioFormatReaderSource(reader, true), playerGoing(playerIsGoing) {}
+
+        void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override
+        {
+            if (playerGoing.load(std::memory_order_acquire))
+            {
+                info.clearActiveBufferRegion();
+                return;
+            }
+            juce::AudioFormatReaderSource::getNextAudioBlock(info);
+        }
+
+        const std::atomic<bool>& playerGoing;   // the player's shuttingDown
+    };
+
+    // LoaderThread (loadFile): run `job` on a thread of its own and wait
+    // for its answer.  False when the player is being destroyed: the job is
+    // abandoned (it and the thread it runs on end by themselves; they hold
+    // nothing of the player) and the load is not to go on -- nor is it
+    // after an answer that arrives while the player is going, since the
+    // swap that follows could wait for the disk again (AUD11 GENERATOR-9).
+    // If no thread can be started, the job runs here, as it did before.
+    // A detached std::thread, as StageLinQDbClient's connect has: with
+    // juce::Thread::launch a job that is over at once (a file that is not
+    // there) can delete its Thread object while the launching thread is
+    // still inside startThread, holding that object's lock.
+    bool askDisk(const std::shared_ptr<DiskJob>& job)
+    {
+        try
+        {
+            std::thread([job] { job->run(); }).detach();
+        }
+        catch (const std::system_error&)
+        {
+            job->run();
+        }
+        while (! job->done.wait(20))
+        {
+            if (loaderThread.threadShouldExit())
+            {
+                job->abandoned.store(true, std::memory_order_release);
+                return false;
+            }
+        }
+        return ! loaderThread.threadShouldExit();
     }
 
     // LoaderThread (loadFile): a load that ends with no file -- the message,
