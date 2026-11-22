@@ -593,6 +593,7 @@ private:
     uint32_t displayedArtworkId = 0;             // Pro DJ Link: displayed artwork ID
     juce::String displayedPdlMedia;              // Pro DJ Link: "ip/slot" those IDs belong to (AUDIT META-5)
     uint32_t displayedSlqTrackVersion = 0;       // StageLinQ: track version on display
+    int displayedSlqDeck = 0;                    // StageLinQ: the deck that version counts on (AUD11 MAIN-B-4)
     uint32_t slqPanelClearedFor = 0;             // StageLinQ: track version the panel was cleared for (not in the DB)
 
     /// The player holding the media of Pro DJ Link player `player`'s track,

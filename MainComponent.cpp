@@ -10329,6 +10329,23 @@ void MainComponent::timerCallback()
             }
             displayedWaveformTrackId = 0;
             displayedArtworkId = 0;
+            // The track version counts the loads of one deck, so two decks
+            // on their first track both read 1 and the version alone did
+            // not tell them apart: with another engine selected, or the
+            // engine following ON AIR or the crossfader to the other deck,
+            // the title, BPM and cursor were the new deck's and the
+            // artwork, waveform, cue markers and duration stayed the old
+            // one's, and the new deck's track got no cue auto-populate
+            // (AUD11 MAIN-B-4).  The deck is part of the key: another deck
+            // on screen starts from an empty panel, whatever its version.
+            if (slqDeck != displayedSlqDeck)
+            {
+                displayedSlqDeck = slqDeck;
+                displayedSlqTrackVersion = 0;
+                slqPanelClearedFor = 0;
+                artworkDisplay.clearImage();
+                waveformDisplay.clearWaveform();
+            }
             {
                 auto netPath = sharedStageLinQInput.getTrackNetworkPath(slqDeck);
                 uint32_t slqTrackVer = sharedStageLinQInput.getTrackVersion(slqDeck);
