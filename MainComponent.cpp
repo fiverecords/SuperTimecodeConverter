@@ -4479,7 +4479,13 @@ void MainComponent::updateCurrentOutputStates()
     if (eng.isOutputLANetTCEnabled() && !eng.getLANetTCOutput().getIsRunning()) startCurrentLANetTCOutput();
     else if (!eng.isOutputLANetTCEnabled() && eng.getLANetTCOutput().getIsRunning()) eng.stopLANetTCOutput();
 
-    if (eng.isOutputLtcEnabled() && !eng.getLtcOutput().getIsRunning() && !scannedAudioOutputs.isEmpty()) startCurrentLtcOutput();
+    // LTC OUT is not started while the first device scan runs: its result
+    // starts it (applyAudioSettings).  After that it is started whatever
+    // the scan found.  The condition used to be a list that is not empty,
+    // so on a machine with no audio output at all LTC OUT ON did nothing:
+    // a lit toggle over an empty status line.  The start opens nothing
+    // there, and the line reads NO AUDIO DEVICE AVAILABLE (AUD11 APPRUN-2).
+    if (eng.isOutputLtcEnabled() && !eng.getLtcOutput().getIsRunning() && audioDevicesApplied) startCurrentLtcOutput();
     else if (!eng.isOutputLtcEnabled() && eng.getLtcOutput().getIsRunning()) eng.stopLtcOutput();
 
     if (eng.isPrimary())
