@@ -1089,7 +1089,9 @@ private:
     //--------------------------------------------------------------------------
     // Form actions
     //--------------------------------------------------------------------------
-    void onFormSave()
+    /// `replaceConfirmed`: the operator has answered "Replace" to the
+    /// question below, asked by an earlier call for this same form.
+    void onFormSave(bool replaceConfirmed = false)
     {
         // Validate title (required for key; artist is optional)
         juce::String formArtist = edFormArtist.getText().trim();
@@ -1118,16 +1120,19 @@ private:
         std::vector<CuePoint> preservedCuePoints;
         int preservedDurationSec = editingDurationSec;
         int preservedSortOrder = 0;
+        std::string editedKey;        // key of the entry the form edits; empty for a new one
+        bool removeEdited = false;    // its artist/title changed: it goes once the save goes ahead
         if (const auto* oldEntry = findEditedEntry())
         {
             preservedCuePoints   = oldEntry->cuePoints;
             preservedDurationSec = oldEntry->durationSec;
             preservedSortOrder   = oldEntry->sortOrder;
+            editedKey            = oldEntry->key();
 
-            // If the artist/title changed, remove the old entry (the copies
-            // above are taken; oldEntry is not used after this).
-            if (TrackMapEntry::makeKey(formArtist, formTitle, oldEntry->durationSec) != oldEntry->key())
-                trackMap.remove(editingArtist, editingTitle, editingDurationSec);
+            // If the artist/title changed, the old entry is removed -- below,
+            // after the question about an entry in the way, so that a
+            // "Cancel" there leaves the map as it was.
+            removeEdited = (TrackMapEntry::makeKey(formArtist, formTitle, oldEntry->durationSec) != editedKey);
         }
 
         TrackMapEntry entry;
@@ -1199,6 +1204,46 @@ private:
         }
 
         auto savedKey = entry.key();
+
+        // Another entry already has the key this one is saved under: Add,
+        // typing a track that is in the map (the key ignores case and outer
+        // spaces, and a manual entry has no duration, so a second manual Add
+        // of the same track always lands on the first), or an entry saved
+        // under another entry's artist and title.  addOrUpdate() assigns the
+        // whole entry, so that entry's cue points, triggers, notes and
+        // playlist position were gone, the file saved, and nothing said
+        // (AUD11 VIEWS-EDITORS-4).  Ask first; nothing has been changed yet.
+        // "Open Existing" is the first button, the one a second Return
+        // answers (Return in a field is what saves the form): it loses
+        // nothing that is in the map.
+        if (!replaceConfirmed && savedKey != editedKey)
+        {
+            if (const auto* inTheWay = trackMap.find(entry.artist, entry.title, entry.durationSec))
+            {
+                auto options = juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle("Track Already in Track Map")
+                    .withMessage("\"" + (inTheWay->artist.isNotEmpty() ? inTheWay->artist + " - " : juce::String())
+                                 + inTheWay->title + "\" "
+                                 + (isOverrideScope() ? "already has an override on this engine"
+                                                      : "is already in the Track Map")
+                                 + ".\n\nReplace it? Its cue points, triggers and notes will be lost.")
+                    .withButton("Open Existing")
+                    .withButton("Replace")
+                    .withButton("Cancel");
+
+                deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
+                    [this, savedKey](int result)
+                    {
+                        if (result == 1)       openFormForKey(savedKey);
+                        else if (result == 2)  onFormSave(true);
+                    });
+                return;
+            }
+        }
+
+        if (removeEdited)
+            trackMap.remove(editingArtist, editingTitle, editingDurationSec);
         trackMap.addOrUpdate(entry);
 
         // Auto-populate cue points from rekordbox for new entries.
@@ -2092,7 +2137,8 @@ private:
 
     // Async delete confirmation (must stay alive until callback fires).
     // Also holds the editor's other questions (Learn of a track mapped under
-    // another length): one box at a time, closed with the editor.
+    // another length, Save onto another entry's key): one box at a time,
+    // closed with the editor.
     juce::ScopedMessageBox deleteConfirmBox;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TrackMapEditor)
