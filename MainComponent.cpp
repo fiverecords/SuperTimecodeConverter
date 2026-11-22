@@ -1866,10 +1866,14 @@ MainComponent::MainComponent()
         if (isShowLockedSlider(sldLtcInputGain, (showsBpmGain ? eng.getAudioBpmInput().getInputGain()
                                                                : eng.getLtcInput().getInputGain()) * 100.0f))
             return;
+        // One or the other: with LTC as the input, Audio BPM has its own
+        // BPM INPUT GAIN slider, and this one used to overwrite its gain as
+        // well -- until the next start, the saved value being that
+        // slider's (AUD11 MAIN-A-10).
         float gain = (float)sldLtcInputGain.getValue() / 100.0f;
         if (eng.getActiveInput() == SrcType::LTC)
             eng.getLtcInput().setInputGain(gain);
-        if (eng.isAudioBpmRunning())
+        else if (eng.isAudioBpmRunning())
             eng.getAudioBpmInput().setInputGain(gain);
         saveSettings();
     };
