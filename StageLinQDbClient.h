@@ -1879,32 +1879,60 @@ private:
 
         while (!sessionShouldEnd())
         {
-            // Try to parse a complete message
-            while (fltxReadBuf.size() >= 4)
+            // Try to parse a complete message.  The bytes done with are
+            // counted in `used` and taken off the front of the buffer once,
+            // below.  Each empty frame and each byte of a stream out of
+            // frame used to be erased from the front on its own, in a loop
+            // that never looked at sessionShouldEnd(): 512 KiB of such
+            // bytes -- what drainFltx() may read before parsing -- kept
+            // this thread busy for 3 s, and stop() waiting (AUD11 SLQ-13).
+            size_t used = 0;
+            bool complete = false;
+            while (fltxReadBuf.size() - used >= 4)
             {
-                uint32_t bodyLen = StageLinQ::readU32BE(fltxReadBuf.data());
+                const uint8_t* at = fltxReadBuf.data() + used;
+                const size_t avail = fltxReadBuf.size() - used;
+                uint32_t bodyLen = StageLinQ::readU32BE(at);
 
                 if (bodyLen == 0)
                 {
                     // Service announcement or empty frame -- skip the 4-byte header
-                    fltxReadBuf.erase(fltxReadBuf.begin(), fltxReadBuf.begin() + 4);
+                    used += 4;
                     continue;
                 }
 
                 if (bodyLen > StageLinQ::kMaxFltxBodyBytes)
                 {
-                    // Malformed data -- discard first byte and try to resync
-                    fltxReadBuf.erase(fltxReadBuf.begin());
+                    // Out of frame.  A message is its 4-byte length and then
+                    // "fltx": go on at the next one in the buffer, or, with
+                    // none, keep only the 7 bytes a length and the start of
+                    // the magic may be split across.
+                    size_t skip = avail > 7 ? avail - 7 : 1;
+                    for (size_t i = 5; i + 4 <= avail; ++i)
+                    {
+                        if (std::memcmp(at + i, StageLinQ::kFltxMagic, 4) == 0)
+                        {
+                            skip = i - 4;
+                            break;
+                        }
+                    }
+                    used += skip;
                     continue;
                 }
 
-                if (fltxReadBuf.size() < bodyLen + 4)
+                if (avail < (size_t)bodyLen + 4)
                     break;   // incomplete, read more
 
-                resp = parseFltxBody(fltxReadBuf.data() + 4, bodyLen);
+                resp = parseFltxBody(at + 4, bodyLen);
                 resp.received = true;
-                fltxReadBuf.erase(fltxReadBuf.begin(), fltxReadBuf.begin() + 4 + bodyLen);
+                used += (size_t)bodyLen + 4;
+                complete = true;
+                break;
+            }
+            fltxReadBuf.erase(fltxReadBuf.begin(), fltxReadBuf.begin() + (std::ptrdiff_t)used);
 
+            if (complete)
+            {
                 // Device sent FileTransfer disconnect -- close socket to
                 // prevent stale reads.  chrisle changelog: "Handle Shutdown
                 // msg (0x9) from FileTransfer svc".
