@@ -1846,6 +1846,22 @@ public:
                                    : isOnAirMode() ? ": NO PLAYER ON AIR"
                                                    : ": NO PLAYER ON SIDE");
                         }
+                        // No deck to follow, but the BPM forward and the
+                        // mixer forward are not the followed deck's: the
+                        // tempo master's BPM and every channel of the DJM.
+                        // They sat only below this break, so in XF-A/B with
+                        // no channel on the side, MASTER before a master is
+                        // seen and ON AIR before a deck is on air, the
+                        // faders and the BPM stood still at the receivers
+                        // (AUD11 ENGINE-CORE-4).
+                        if (sharedProDJLink->isReceiving())
+                            forwardMasterBpmWithoutDeck(sharedProDJLink->getMasterBPM());
+                        if (sharedProDJLink->hasMixerFaderData()
+                            && mixerMapPtr != nullptr
+                            && (oscMixerForwardEnabled || midiMixerForwardEnabled || artnetMixerForwardEnabled))
+                        {
+                            forwardMixerParams();
+                        }
                         break;
                     }
 
@@ -2467,6 +2483,16 @@ public:
                                 inputStatusText = juce::String(autoModeLabel()) + ": NO DECK ON AIR";
                             else
                                 inputStatusText = "INVALID DECK";
+                        }
+                        // As in the Pro DJ Link branch: the master tempo and
+                        // the mixer are forwarded without a deck to follow
+                        // (AUD11 ENGINE-CORE-4) -- on a PRIME 4+, which never
+                        // sends the crossfader sides, XF-A/B has none ever.
+                        if (sharedStageLinQ->isReceiving())
+                        {
+                            forwardMasterBpmWithoutDeck(sharedStageLinQ->getMasterBPM());
+                            if (oscMixerForwardEnabled || midiMixerForwardEnabled || artnetMixerForwardEnabled)
+                                forwardStageLinQMixer();
                         }
                         break;
                     }
@@ -4873,6 +4899,26 @@ public:
     juce::String getOscFwdBpmCmd() const  { return oscFwdBpmCmd; }
 
     // Send BPM via OSC: if command template is set, send as string; otherwise as float
+    /// The BPM forward of a DJ source's tick that has no deck to follow
+    /// (AUD11 ENGINE-CORE-4): MIDI clock, Ableton Link and OSC BPM get the
+    /// tempo master's BPM, which is what the tick forwards first when it has
+    /// a deck, with the same conditions and the same dedup.  There is no
+    /// track then, so the multiplier is a session override or none.
+    void forwardMasterBpmWithoutDeck(double masterBpm)
+    {
+        if (masterBpm <= 0.0) return;
+        masterBpm = applyBpmMultiplier(masterBpm, getEffectiveBpmMultiplier());
+        if (midiClockEnabled && triggerOutput.isMidiClockRunning()
+            && std::abs((float)masterBpm - lastSentClockBpm) > 0.05f)
+        {
+            triggerOutput.updateMidiClockBpm(masterBpm);
+            lastSentClockBpm = (float)masterBpm;
+        }
+        if (linkBridge.isEnabled())
+            linkBridge.setTempo(masterBpm);
+        sendBpmOsc(masterBpm);
+    }
+
     void sendBpmOsc(double bpm)
     {
         if (!oscForwardEnabled || !triggerOutput.isOscConnected() || bpm <= 0.0) return;
