@@ -343,6 +343,51 @@ public:
             auto selected = table.getSelectedRows();
             if (selected.isEmpty()) return;
 
+            // Delete erased every selected cue at once (multi-selection is
+            // on) and saved, with no question and no way back, a few pixels
+            // from Add and Capture.  More than one cue, or a cue that carries
+            // a trigger, is now confirmed first, as the Track Map editor
+            // confirms its Delete; one plain cue -- a Capture in the wrong
+            // place -- still goes at once (AUD11 VIEWS-EDITORS-11).  On
+            // "Delete" the box calls this handler again with deleteConfirmed.
+            if (!deleteConfirmed)
+            {
+                int count = 0;
+                bool anyTrigger = false;
+                juce::String what;
+                for (int i = 0; i < selected.size(); ++i)
+                {
+                    const int idx = selected[i];
+                    if (idx < 0 || idx >= (int)trackEntry.cuePoints.size()) continue;
+                    const auto& cp = trackEntry.cuePoints[(size_t)idx];
+                    if (count++ == 0)
+                        what = "\"" + cp.name + "\" (" + CuePoint::formatPositionMs(cp.positionMs) + ")";
+                    anyTrigger = anyTrigger || cp.hasAnyTrigger();
+                }
+                if (count > 1 || anyTrigger)
+                {
+                    auto options = juce::MessageBoxOptions()
+                        .withIconType(juce::MessageBoxIconType::QuestionIcon)
+                        .withTitle(count > 1 ? "Delete Cue Points" : "Delete Cue Point")
+                        .withMessage(count > 1 ? "Delete " + juce::String(count) + " cue points?"
+                                               : "Delete cue point " + what + "?")
+                        .withButton("Delete")
+                        .withButton("Cancel");
+
+                    deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
+                        [this](int result)
+                        {
+                            if (result == 1)
+                            {
+                                deleteConfirmed = true;
+                                btnDelete.onClick();
+                                deleteConfirmed = false;
+                            }
+                        });
+                    return;
+                }
+            }
+
             // Collect indices and erase in reverse order to avoid index shifting
             std::vector<int> indices;
             for (int i = 0; i < selected.size(); ++i)
@@ -689,6 +734,12 @@ private:
     bool editCursorForCapture = false;     // ...and the playhead has not moved since: where Capture goes too
     bool trackIsLive = true;       // false when playing track != editing track
     uint32_t lastPlayheadMs = 0;   // for detecting playhead movement (jog/scrub/play)
+
+    // Delete's question (see btnDelete.onClick): the box lives and closes
+    // with the editor; deleteConfirmed is set only while its "Delete" runs
+    // the handler again.
+    juce::ScopedMessageBox deleteConfirmBox;
+    bool deleteConfirmed = false;
 
     // Table
     juce::TableListBox table { "CuePoints", this };
