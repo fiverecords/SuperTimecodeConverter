@@ -127,6 +127,9 @@ public:
         // from a value that stands still (AUD11 TC-IO-4).
         const double nowMs = juce::Time::getMillisecondCounterHiRes();
         const juce::SpinLock::ScopedLockType lock(tcLock);
+        if (tc.frames != pendingTimecode.frames || tc.seconds != pendingTimecode.seconds
+            || tc.minutes != pendingTimecode.minutes || tc.hours != pendingTimecode.hours)
+            pendingMovedMs = nowMs;
         pendingTimecode = tc;
         pendingSetMs = nowMs;
     }
@@ -276,11 +279,12 @@ private:
             if (qfIdx == 0)
             {
                 Timecode pending;
-                double pendingAtMs = 0.0;
+                double pendingAtMs = 0.0, pendingMovedAtMs = 0.0;
                 {
                     const juce::SpinLock::ScopedLockType lock(tcLock);
                     pending = pendingTimecode;
                     pendingAtMs = pendingSetMs;
+                    pendingMovedAtMs = pendingMovedMs;
                 }
 
                 if (!mtcSeeded)
@@ -315,7 +319,13 @@ private:
                     // snapped without one before.
                     const Timecode next = incrementFrame(incrementFrame(cycleTimecode, fps), fps);
                     const double age = now - pendingAtMs;
-                    if (age <= kPublicationStaleMs)
+                    // Carried forward only when the value was moving when
+                    // the publication stopped: a source parked on a frame
+                    // that still counts as present (an Art-Net sender
+                    // repeating one) is tracked as it always was.
+                    const bool wasMoving = pendingMovedAtMs > 0.0
+                                        && (pendingAtMs - pendingMovedAtMs) <= kPublicationMovingMs;
+                    if (age <= kPublicationStaleMs || ! wasMoving)
                     {
                         cycleTimecode = heldPastGrace ? pending
                                                       : trackPublishedValue(next, pending, 2, fps);
@@ -406,6 +416,7 @@ private:
     juce::SpinLock tcLock;
     Timecode pendingTimecode;   // Written by UI thread, read under tcLock
     double   pendingSetMs = 0.0;   // when setTimecode() stored it (hi-res ms), under tcLock; 0 = never
+    double   pendingMovedMs = 0.0; // when setTimecode() last stored a different value, under tcLock; 0 = never
 
     // The engine publishes on every 60 Hz tick while the timer runs.  A
     // publication older than two ticks is not arriving: the engine's thread
@@ -417,6 +428,7 @@ private:
     // TC-IO-4).
     static constexpr double kPublicationStaleMs = 2.0 * 1000.0 / 60.0;
     static constexpr double kPublicationGraceMs = 1000.0;
+    static constexpr double kPublicationMovingMs = 250.0;   // the value last changed within this of its last publication: it was moving
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
 
     // The cycle state -- cycleTimecode, mtcSeeded, heldPastGrace, currentQFIndex -- belongs
