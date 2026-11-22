@@ -4403,6 +4403,9 @@ private:
         // Velocity below this = stopped
         static constexpr double kDeadZone = 0.005;  // 0.5% speed
 
+        // The longest gap between two ticks the clock advances over (tick)
+        static constexpr double kMaxTickGapMs = 5000.0;
+
         void reset()
         {
             positionMs     = 0.0;
@@ -4482,8 +4485,19 @@ private:
             // This eliminates micro-oscillation from timer jitter (especially macOS).
             bool trulyStopped = !playing && std::abs(driveVelocity) <= kDeadZone;
 
+            // The clock runs over the real time since the last tick, also
+            // when that tick came late.  It used to stand still over a gap of
+            // 200 ms or more, so after a held message thread it was behind
+            // the deck by the whole hold, and a hold over half a second read
+            // as a seek at the next packet: the cues the deck had played
+            // across were passed without firing instead of firing late, and
+            // the outputs, which run on by themselves through a hold, were
+            // forced to resync (AUD11 ENGINE-CORE-7; AUDIT D8 for the
+            // holds).  Beyond kMaxTickGapMs it still stands still -- the
+            // machine slept, or the hold is too long to fire its cues late --
+            // and the next packet then decides by the 500 ms test as before.
             if (!trulyStopped && std::abs(driveVelocity) > kDeadZone
-                && elapsed > 0.0 && elapsed < 200.0)
+                && elapsed > 0.0 && elapsed < kMaxTickGapMs)
                 positionMs += elapsed * driveVelocity;
 
             // Pitch for LTC encoder
