@@ -88,12 +88,72 @@ struct SafeJsonFile
     /// Every save of a settings, Track Map, preset or mixer map file: the
     /// rotation and write of writeRotating(), unless saves are suspended
     /// after a restore, in which case nothing is written and the result is
-    /// false.  Message thread, or the Track Map's background save thread.
+    /// false.  A write that fails is noted for the UI (takeSaveProblems).
+    /// Message thread, or the Track Map's background save thread.
     static bool save(const juce::File& file, const juce::String& text)
     {
         if (writesSuspended().load())
             return false;
-        return writeRotating(file, text);
+        const bool written = writeRotating(file, text);
+        noteSaveResult(file, written);
+        return written;
+    }
+
+    /// Saves that did not reach the disk, for the UI to show.  No caller
+    /// looks at save()'s result (the settings, preset and mixer map saves
+    /// return nothing), so a save that failed -- a full volume, or on
+    /// Windows a file another program holds open -- was silent: the change
+    /// was gone after the restart and nothing had said so (AUD11 PLAT-4).
+    /// A file is handed to the UI when its save starts to fail and not again
+    /// until one has worked: a volume that stays full gives one message, not
+    /// one per save.  Guarded by `lock` (saves come from the message thread
+    /// and from the Track Map's background thread); `pending` lets the
+    /// 60 Hz tick ask without taking it.
+    struct SaveProblems
+    {
+        std::mutex lock;
+        juce::StringArray failing;       // files whose last save failed
+        juce::StringArray unreported;    // those of them the UI has not taken yet
+        std::atomic<bool> pending { false };
+    };
+
+    static SaveProblems& saveProblems()
+    {
+        static SaveProblems problems;
+        return problems;
+    }
+
+    static void noteSaveResult(const juce::File& file, bool written)
+    {
+        auto& problems = saveProblems();
+        const juce::String path = file.getFullPathName();
+        const std::lock_guard<std::mutex> hold(problems.lock);
+        if (written)
+        {
+            problems.failing.removeString(path);
+            problems.unreported.removeString(path);
+        }
+        else if (! problems.failing.contains(path))
+        {
+            problems.failing.add(path);
+            problems.unreported.add(path);
+            problems.pending.store(true);
+        }
+    }
+
+    /// The files whose save has started to fail since the last call; empty,
+    /// at the cost of one atomic read, when there is none.  Message thread
+    /// (MainComponent's tick).
+    static juce::StringArray takeSaveProblems()
+    {
+        auto& problems = saveProblems();
+        juce::StringArray files;
+        if (problems.pending.load() && problems.pending.exchange(false))
+        {
+            const std::lock_guard<std::mutex> hold(problems.lock);
+            files.swapWith(problems.unreported);
+        }
+        return files;
     }
 
     /// Write the new text, then rotate the previous file to .bak.  When the

@@ -10487,6 +10487,27 @@ void MainComponent::timerCallback()
             flushSettings();
     }
 
+    // A save that did not reach the disk -- this one, an editor's, the Track
+    // Map's background one -- is said here, once per file until a save of it
+    // has worked (SafeJsonFile::takeSaveProblems; one atomic read when there
+    // is nothing to say).  It used to be silent: on a full volume, or on
+    // Windows with the file open in another program, the change was gone at
+    // the next start (AUD11 PLAT-4).  Nothing is retried from here: every
+    // later save writes again (the next change, the exit save), and on
+    // Windows a retry of a file that is still held costs the message thread
+    // half a second.
+    {
+        const juce::StringArray notSaved = SafeJsonFile::takeSaveProblems();
+        if (! notSaved.isEmpty())
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                "Configuration not saved",
+                notSaved.joinIntoString("\n")
+                + "\ncould not be written: the disk may be full or write-protected, or the file "
+                  "may be in use by another program. The previous file has been kept.\n\n"
+                  "Your changes are still in STC, which tries again each time it saves; "
+                  "this message returns only after a save has worked.");
+    }
+
     // --- Update checker ---
     if (updateCheckDelay > 0)
     {
