@@ -420,8 +420,23 @@ private:
             ds.jogTouch  = stageLinQ.isScratchWheelTouched(dn);
             ds.syncMode  = stageLinQ.getSyncMode(dn);
 
-            // Timecode from playhead
-            FrameRate fps = FrameRate::FPS_30;  // default -- StageLinQ has no fps detection
+            // Timecode from playhead, at the frame rate of the first engine
+            // that follows this deck -- the rate that engine converts the
+            // playhead with and sends (TimecodeEngine, StageLinQ branch).
+            // It was always 30 fps, so with an engine on 24, 25 or 29.97
+            // the frames here and in the MAP line counted 0-29 and did not
+            // match what STC puts out (AUD11 SLQ-15).  30 fps when no engine
+            // follows the deck: StageLinQ itself carries no frame rate.
+            FrameRate fps = FrameRate::FPS_30;
+            for (auto& eng : engines)
+            {
+                if (eng->getActiveInput() == TimecodeEngine::InputSource::StageLinQ
+                    && eng->getEffectivePlayer() == dn)
+                {
+                    fps = eng->getEffectiveOutputFps();
+                    break;
+                }
+            }
             ds.timecode = StageLinQ::playheadToTimecode(ds.playheadMs, fps);
             ds.fpsStr = frameRateToString(fps);
 
