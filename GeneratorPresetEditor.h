@@ -1216,8 +1216,17 @@ private:
                 .getChildFile("generator_presets.json"),
             "*.json");
 
+        // As the Track Map and Mixer Map exports (AUD11 VIEWS-EDITORS-12,
+        // NET-SHOW-V1).  warnAboutOverwriting: the platform's file chooser
+        // asks before an existing export is replaced (off on Windows
+        // without the flag).  And the result of the write is shown either
+        // way: File::replaceWithText reports a file as written whatever the
+        // write did, its result was ignored on top of that, and nothing
+        // said whether a file had been written -- a presets file exported
+        // to a full or write-protected volume was found out at import time.
         fileChooser->launchAsync(
-            juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                | juce::FileBrowserComponent::warnAboutOverwriting,
             [this](const juce::FileChooser& fc)
             {
                 auto file = fc.getResult();
@@ -1229,7 +1238,14 @@ private:
                 for (auto& p : rows)
                     arr.add(p.toVar());
                 root->setProperty("presets", arr);
-                file.replaceWithText(juce::JSON::toString(juce::var(root)));
+                const bool written = SafeJsonFile::writeChecked(file, juce::JSON::toString(juce::var(root)));
+                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                    .withIconType(written ? juce::MessageBoxIconType::InfoIcon : juce::MessageBoxIconType::WarningIcon)
+                    .withTitle(written ? "Export Complete" : "Export Failed")
+                    .withMessage(written ? juce::String(arr.size()) + " preset(s) exported to " + file.getFileName() + "."
+                                         : "The presets were not exported. " + SafeJsonFile::couldNotWriteText(file))
+                    .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
+                    nullptr);
             });
     }
 
@@ -1247,7 +1263,11 @@ private:
                 auto file = fc.getResult();
                 if (file == juce::File() || !file.existsAsFile()) return;
 
-                auto parsed = juce::JSON::parse(file.loadFileAsString());
+                // SafeJsonFile::parse, as the Track Map and Mixer Map
+                // imports: a file with anything after its JSON object, or
+                // nested deeper than any presets file, is refused rather
+                // than read in part (AUD11 FUZZ-11, FUZZ-2).
+                auto parsed = SafeJsonFile::parse(file.loadFileAsString());
                 auto* obj = parsed.getDynamicObject();
                 if (!obj || !obj->hasProperty("presets"))
                 {
