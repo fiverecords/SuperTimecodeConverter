@@ -163,6 +163,29 @@ struct SafeJsonFile
         return true;
     }
 
+    /// Write `text` to `file` through a temporary file beside it, renamed
+    /// over `file` only when the whole text is in it; otherwise `file` is
+    /// left as it was -- or is not created -- and the result is false.  For
+    /// the files the operator names: a Track Map, Mixer Map or configuration
+    /// backup written to a volume without room (a USB stick) used to be
+    /// reported as written, or not reported at all, and was a fragment that
+    /// did not parse -- found out at restore time (AUD11 NET-SHOW-V1).
+    /// File::replaceWithText, which this replaces there, renames its
+    /// temporary file whatever the write did and returns true.  The bytes
+    /// are the same.  Calling thread; no rotation.
+    static bool writeChecked(const juce::File& file, const juce::String& text)
+    {
+        juce::TemporaryFile incoming(file, juce::TemporaryFile::useHiddenFile);
+        return writeAllTo(incoming.getFile(), text) && incoming.overwriteTargetFileWithTemporary();
+    }
+
+    /// What to tell the operator when writeChecked() or a save returns false.
+    static juce::String couldNotWriteText(const juce::File& file)
+    {
+        return file.getFullPathName() + " could not be written: the disk may be full or "
+               "write-protected, or the file may be in use by another program.";
+    }
+
     /// Write `text` to `dest` (a temporary file that does not exist yet) and
     /// say whether all of it is there.  The stream buffers: a write the
     /// volume refuses can go unreported until the stream closes, where the
@@ -1146,7 +1169,7 @@ public:
         root->setProperty("tracks", arr);
 
         juce::var jsonVar(root);
-        return file.replaceWithText(juce::JSON::toString(jsonVar));
+        return SafeJsonFile::writeChecked(file, juce::JSON::toString(jsonVar));   // false: nothing written (AUD11 NET-SHOW-V1)
     }
 
     //------------------------------------------------------------------

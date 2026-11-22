@@ -4197,15 +4197,31 @@ void MainComponent::exportConfig()
             .getChildFile("stc_backup.json"),
         "*.json");
 
+    // warnAboutOverwriting: the platform's file chooser asks before an older
+    // backup is replaced (off on Windows without the flag, AUD11
+    // VIEWS-EDITORS-12).  The write is checked and its result shown: it was
+    // ignored, so a backup to a full or write-protected volume left a
+    // fragment or nothing, and the operator found out at the restore
+    // (AUD11 MAIN-A-12, NET-SHOW-V1).
     configFileChooser->launchAsync(
-        juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+        juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+            | juce::FileBrowserComponent::warnAboutOverwriting,
         [this](const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
             if (file == juce::File()) return;
 
             auto bundle = settings.buildExportBundle();
-            file.replaceWithText(juce::JSON::toString(bundle));
+            if (SafeJsonFile::writeChecked(file, juce::JSON::toString(bundle)))
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::MessageBoxIconType::InfoIcon,
+                    "Backup Complete",
+                    "Configuration saved to " + file.getFullPathName() + ".");
+            else
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::MessageBoxIconType::WarningIcon,
+                    "Backup Failed",
+                    "No backup was written. " + SafeJsonFile::couldNotWriteText(file));
         });
 }
 

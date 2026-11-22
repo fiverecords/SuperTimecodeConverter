@@ -108,8 +108,14 @@ public:
             fileChooser = std::make_unique<juce::FileChooser>(
                 "Export Mixer Map", juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
                     .getChildFile(mixerMap.getMode() == MixerMapMode::Denon ? "slq_mixermap.json" : "mixermap.json"), "*.json");
+            // warnAboutOverwriting: the platform's file chooser asks before
+            // an existing export is replaced (off on Windows without the
+            // flag).  The result of the write is shown either way: it was
+            // ignored, and nothing said whether a file had been written
+            // (AUD11 VIEWS-EDITORS-12, NET-SHOW-V1).
             fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
-                                   | juce::FileBrowserComponent::canSelectFiles,
+                                   | juce::FileBrowserComponent::canSelectFiles
+                                   | juce::FileBrowserComponent::warnAboutOverwriting,
                 [this](const juce::FileChooser& fc)
                 {
                     auto file = fc.getResult();
@@ -120,7 +126,14 @@ public:
                     for (auto& e : mixerMap.getEntries())
                         arr.add(e.toVar());
                     root->setProperty("params", arr);
-                    file.replaceWithText(juce::JSON::toString(juce::var(root)));
+                    const bool written = SafeJsonFile::writeChecked(file, juce::JSON::toString(juce::var(root)));
+                    juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                        .withIconType(written ? juce::MessageBoxIconType::InfoIcon : juce::MessageBoxIconType::WarningIcon)
+                        .withTitle(written ? "Export Complete" : "Export Failed")
+                        .withMessage(written ? "Mixer Map exported to " + file.getFileName() + "."
+                                             : "The Mixer Map was not exported. " + SafeJsonFile::couldNotWriteText(file))
+                        .withButton("OK"),
+                        nullptr);
                 });
         };
 
@@ -138,11 +151,29 @@ public:
                 {
                     auto file = fc.getResult();
                     if (file == juce::File() || !file.existsAsFile()) return;
+                    // An import that changes nothing says why: a file that
+                    // is not a Mixer Map, or one exported for the other mixer
+                    // family (none of its parameters is in this map), used to
+                    // close the file chooser and nothing else
+                    // (AUD11 VIEWS-EDITORS-12).
+                    auto refused = [](const juce::String& why)
+                    {
+                        juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                            .withIconType(juce::MessageBoxIconType::WarningIcon)
+                            .withTitle("Import Failed")
+                            .withMessage(why + " Nothing was imported.")
+                            .withButton("OK"),
+                            nullptr);
+                    };
                     auto parsed = juce::JSON::parse(file.loadFileAsString());
                     auto* obj = parsed.getDynamicObject();
-                    if (!obj) return;
-                    auto* arr = obj->getProperty("params").getArray();
-                    if (!arr) return;
+                    auto* arr = obj != nullptr ? obj->getProperty("params").getArray() : nullptr;
+                    if (!arr)
+                    {
+                        refused(file.getFileName() + " is not a Mixer Map file.");
+                        return;
+                    }
+                    int matched = 0;
                     for (auto& item : *arr)
                     {
                         MixerMapEntry saved;
@@ -156,9 +187,16 @@ public:
                                 e.midiNote   = saved.midiNote;
                                 e.artnetCh   = saved.artnetCh;
                                 e.enabled    = saved.enabled;
+                                ++matched;
                                 break;
                             }
                         }
+                    }
+                    if (matched == 0)
+                    {
+                        refused(file.getFileName() + " holds no parameter of this mixer"
+                                " (a Mixer Map exported for the other mixer family?).");
+                        return;
                     }
                     table.updateContent();
                     table.repaint();

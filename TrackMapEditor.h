@@ -1534,7 +1534,7 @@ private:
                 if (playlists.isEmpty())
                 {
                     // No playlists found — import entire collection
-                    importRekordboxEntries(TrackMap::parseRekordboxXml(file));
+                    importRekordboxEntries(TrackMap::parseRekordboxXml(file), file);
                 }
                 else
                 {
@@ -1547,10 +1547,18 @@ private:
                 // STC JSON format
                 auto parsed = juce::JSON::parse(file.loadFileAsString());
                 auto* obj = parsed.getDynamicObject();
-                if (!obj) return;
+                if (!obj)
+                {
+                    importRefused(file.getFileName() + " is not a Track Map file (it does not read as JSON).");
+                    return;
+                }
 
                 auto* arr = obj->getProperty("tracks").getArray();
-                if (!arr || arr->isEmpty()) return;
+                if (!arr || arr->isEmpty())
+                {
+                    importRefused(file.getFileName() + " holds no tracks.");
+                    return;
+                }
 
                 std::vector<TrackMapEntry> entries;
                 for (auto& item : *arr)
@@ -1561,7 +1569,11 @@ private:
                         entries.push_back(std::move(e));
                 }
 
-                if (entries.empty()) return;
+                if (entries.empty())
+                {
+                    importRefused("None of the entries in " + file.getFileName() + " has a title.");
+                    return;
+                }
                 std::sort(entries.begin(), entries.end(),
                     [](const TrackMapEntry& a, const TrackMapEntry& b) {
                         int cmp = a.artist.compareIgnoreCase(b.artist);
@@ -1572,10 +1584,28 @@ private:
         });
     }
 
-    void importRekordboxEntries(std::vector<TrackMapEntry> entries)
+    void importRekordboxEntries(std::vector<TrackMapEntry> entries, const juce::File& file)
     {
-        if (entries.empty()) return;
+        if (entries.empty())
+        {
+            importRefused("No tracks were found in " + file.getFileName()
+                          + ". STC reads the collection that rekordbox exports as XML.");
+            return;
+        }
         showImportPreview(std::move(entries), false);
+    }
+
+    /// An import that ends with nothing to show says so: a file that is not
+    /// a Track Map, or holds no usable entry, used to close the file chooser
+    /// and nothing else (AUD11 VIEWS-EDITORS-12).
+    static void importRefused(const juce::String& why)
+    {
+        juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon)
+            .withTitle("Import Failed")
+            .withMessage(why + " Nothing was imported.")
+            .withButton("OK"),
+            nullptr);
     }
 
     void showPlaylistPicker(const juce::File& xmlFile, const juce::StringArray& playlists)
@@ -1950,8 +1980,13 @@ private:
             TrackMap::getTrackMapFile().getParentDirectory().getChildFile("trackmap_export.json"),
             "*.json");
 
+        // warnAboutOverwriting: the platform's file chooser asks before an
+        // existing export is replaced.  Without the flag JUCE switches that
+        // question off on Windows, and an older export was replaced without
+        // a word (AUD11 VIEWS-EDITORS-12).
         fileChooser->launchAsync(juce::FileBrowserComponent::saveMode
-                                | juce::FileBrowserComponent::canSelectFiles,
+                                | juce::FileBrowserComponent::canSelectFiles
+                                | juce::FileBrowserComponent::warnAboutOverwriting,
             [this](const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
@@ -1963,6 +1998,17 @@ private:
                     .withIconType(juce::MessageBoxIconType::InfoIcon)
                     .withTitle("Export Complete")
                     .withMessage(juce::String(trackMap.size()) + " track(s) exported.")
+                    .withButton("OK"),
+                    nullptr);
+            }
+            else
+            {
+                // Said nothing before: the operator took the missing
+                // "Export Complete" for a written file.
+                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                    .withIconType(juce::MessageBoxIconType::WarningIcon)
+                    .withTitle("Export Failed")
+                    .withMessage("The Track Map was not exported. " + SafeJsonFile::couldNotWriteText(file))
                     .withButton("OK"),
                     nullptr);
             }
