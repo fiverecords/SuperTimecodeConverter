@@ -40,7 +40,8 @@
 //  - Audio thread: audioDeviceIOCallbackWithContext, called by the hub's
 //    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
 //    adds or removes us or the device restarts (message thread, or the
-//    driver's thread for a restart it starts itself).
+//    driver's thread for a restart it starts itself).  A restart is told
+//    to the owner on the message thread (onDeviceRestarted).
 //  - sourceLock serialises everything that builds, replaces, prepares,
 //    repositions or starts the transport's source chain (setSource,
 //    prepareToPlay, releaseResources, setPosition, start) between those
@@ -671,6 +672,18 @@ public:
     /// for the wiring.
     std::function<void()> onLoadCompleted;
 
+    /// Optional callback invoked on the message thread after the device
+    /// this player is open on has been started again under it (AUD11
+    /// GENERATOR-8): the hub reopening it for the global SAMPLE RATE /
+    /// BUFFER SIZE, for another component joining it, or after the
+    /// interface was lost and came back, or the driver restarting it
+    /// itself.  The transport keeps its position across the restart while
+    /// the owner's timecode has run on, so the owner brings the audio back
+    /// to it (TimecodeEngine::resyncGeneratorAudioAfterRestart).  Not for the
+    /// player's own openDevice, whose caller does that itself.  Set once,
+    /// as onLoadCompleted, with the same care for the engine's lifetime.
+    std::function<void()> onDeviceRestarted;
+
 private:
     //==========================================================================
     // LoaderThread -- dedicated I/O thread for asynchronous loadFile.
@@ -1009,8 +1022,17 @@ private:
         // sourceLock: setSource reads the prepared rate and block size and
         // prepares the new chain with them, so it must not run halfway
         // through this on the LoaderThread.
-        const juce::ScopedLock sl(sourceLock);
-        transport.prepareToPlay(currentBufferSize, currentSampleRate);
+        {
+            const juce::ScopedLock sl(sourceLock);
+            transport.prepareToPlay(currentBufferSize, currentSampleRate);
+        }
+
+        // A start while we are open is a restart under us (AUD11
+        // GENERATOR-8); the announcement our own openDevice gets from the
+        // hub comes before deviceOpen is set.  Posted, as this can be the
+        // driver's thread; a copy goes to callAsync, as for onLoadCompleted.
+        if (deviceOpen.load(std::memory_order_relaxed) && onDeviceRestarted)
+            juce::MessageManager::callAsync(std::function<void()>(onDeviceRestarted));
     }
 
     void audioDeviceStopped() override

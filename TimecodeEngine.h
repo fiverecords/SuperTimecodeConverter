@@ -104,6 +104,22 @@ public:
                 if (self->genState == GeneratorState::Stopped) return;
                 self->seekGeneratorAudioToTimecode();
             };
+
+        // The audio device restarted under the player (AUD11 GENERATOR-8):
+        // the hub reopening it for the global SAMPLE RATE / BUFFER SIZE or
+        // for another component joining it, an interface that was lost
+        // coming back, a driver reset.  The audio resumes where it stopped
+        // and the timecode has run on meanwhile: DESIGN D18 then dragged
+        // the timecode back when the two were under a second apart, and
+        // left the audio late for the rest of the file when they were
+        // not.  The audio is brought to the timecode instead, as when the
+        // operator reopens the output (resyncGeneratorAudioAfterRestart).
+        generatorAudioPlayer.onDeviceRestarted =
+            [weak = juce::WeakReference<TimecodeEngine>(this)]()
+            {
+                if (auto* self = weak.get())
+                    self->resyncGeneratorAudioAfterRestart();
+            };
     }
 
     ~TimecodeEngine()
@@ -3838,7 +3854,9 @@ public:
     /// The generator's audio output was (re)opened (startGeneratorAudio:
     /// MainComponent::startCurrentGenAudio, for the AUDIO PLAYBACK DEVICE or
     /// AUDIO CHANNEL changed, or the output turned on), which attaches the
-    /// loaded file at its top: bring the audio to where the timecode puts
+    /// loaded file at its top -- or its device was restarted under it
+    /// (resyncGeneratorAudioAfterRestart, AUD11 GENERATOR-8), which leaves
+    /// the audio where it stopped: bring the audio to where the timecode puts
     /// it, as a seek of the generator does (seekGeneratorAudioToTimecode,
     /// which on the timecode loop's gapless path folds a timecode before
     /// Start TC into the loop, #24), and start it while the generator
@@ -3854,6 +3872,29 @@ public:
         seekGeneratorAudioToTimecode();
         if (genState == GeneratorState::Playing)
             generatorAudioPlayer.play();
+    }
+
+    /// The audio device was restarted under the player (the player's
+    /// onDeviceRestarted, AUD11 GENERATOR-8): bring the audio to the
+    /// timecode, as resyncGeneratorAudioToTimecode does -- to where the
+    /// timecode is now.  A restart made by the hub runs on the message
+    /// thread, so no tick has run while the device reopened: the timecode
+    /// is where the last tick left it, and the next tick adds the time
+    /// since in one step (updateGenerator).  That step is taken here
+    /// first, exactly as the tick takes it; a seek to the timecode of the
+    /// last tick would leave the audio behind by the time the reopen
+    /// took.  Message thread.
+    void resyncGeneratorAudioAfterRestart()
+    {
+        if (activeInput == InputSource::SystemTime && ! genClockMode && genState == GeneratorState::Playing)
+        {
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            const double delta = now - genLastTickTime;
+            genLastTickTime = now;
+            if (delta > 0.0)
+                genCurrentMs += delta;
+        }
+        resyncGeneratorAudioToTimecode();
     }
 
     bool isGeneratorAudioRunning() const { return generatorAudioPlayer.isDeviceOpen(); }
