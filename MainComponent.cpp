@@ -372,14 +372,23 @@ MainComponent::MainComponent()
             {
                 startCurrentGenAudio();
             }
-            // Re-push the selected preset's cues into the engine.
+            // Re-push the cues of the engine's preset into the engine.
             // setInputSource cleared armedCues + rawGeneratorCues to keep
             // sources from leaking into each other; without this restore
             // the user would have to re-select their preset in the combo
             // for cues to fire after switching back from another input.
-            if (cmbGenPreset.isVisible() && cmbGenPreset.getSelectedId() > 0)
+            // By the preset the engine names (AUD11 MAIN-A-4): this used
+            // to go by the preset selector, and only while it was visible
+            // -- which it is not at this point, the generator's controls
+            // being hidden until updateDeviceSelectorVisibility below -- so
+            // it never ran, and PLAY after the round trip ran the preset
+            // with none of its cue triggers.  Not for a preset the settings
+            // only named at start-up (genPresetFileNotLoaded): that one has
+            // neither its file nor its cues until GO, with or without a
+            // round trip.
+            if (genPresetFileNotLoaded.count(&eng) == 0)
             {
-                if (auto* preset = settings.generatorPresets.find(selectedGenPresetName()))
+                if (auto* preset = settings.generatorPresets.find(eng.getGeneratorPresetName()))
                     eng.setGeneratorCuePoints(preset->cuePoints);
             }
             updateInputButtonStates(); updateDeviceSelectorVisibility(); resized();
