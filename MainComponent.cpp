@@ -3195,6 +3195,47 @@ void MainComponent::startCurrentLANetTCInput()
 }
 
 //==============================================================================
+// Starts that end on the channel the device really gave (AUD11 TC-IO-8).
+// LtcInput, LtcOutput and AudioThru open a channel the device does not have
+// as Ch 1 (and the stereo pair of a one-channel device as Ch 1), while the
+// engine builds its status line from the channel that was asked for: "TX:
+// <device> Ch 7" over LTC that plays on output 1.  When the component
+// reports another channel than the one requested, it is started once more
+// on that channel, so that the status line, the channel selector
+// (populate*Channels) and the next save say what was opened.  A second
+// open in that case only.  Message thread.
+//==============================================================================
+static bool startLtcInputAsOpened(TimecodeEngine& eng, const juce::String& typeName, const juce::String& devName,
+                                  int ltcChannel, int thruChannel, double sampleRate, int bufferSize)
+{
+    if (! eng.startLtcInput(typeName, devName, ltcChannel, thruChannel, sampleRate, bufferSize))
+        return false;
+    const int opened = eng.getLtcInput().getSelectedChannel();
+    return opened == ltcChannel
+        || eng.startLtcInput(typeName, devName, opened, thruChannel, sampleRate, bufferSize);
+}
+
+static bool startLtcOutputAsOpened(TimecodeEngine& eng, const juce::String& typeName, const juce::String& devName,
+                                   int channel, double sampleRate, int bufferSize)
+{
+    if (! eng.startLtcOutput(typeName, devName, channel, sampleRate, bufferSize))
+        return false;
+    const int opened = eng.getLtcOutput().getSelectedChannel();
+    return opened == channel
+        || eng.startLtcOutput(typeName, devName, opened, sampleRate, bufferSize);
+}
+
+static bool startThruOutputAsOpened(TimecodeEngine& eng, const juce::String& typeName, const juce::String& devName,
+                                    int channel, double sampleRate, int bufferSize)
+{
+    if (! eng.startThruOutput(typeName, devName, channel, sampleRate, bufferSize))
+        return false;   // also when the engine has no Audio Thru (not the primary engine)
+    const int opened = eng.getAudioThru()->getSelectedChannel();
+    return opened == channel
+        || eng.startThruOutput(typeName, devName, opened, sampleRate, bufferSize);
+}
+
+//==============================================================================
 // The device an audio start opens when its selector shows none -- one rule
 // for LTC in, LTC OUT, Audio Thru, generator audio and Audio BPM (AUD11
 // MAIN-A-2, MAIN-B-8, MAIN-A-V4, VX-APP-1):
@@ -3264,8 +3305,8 @@ void MainComponent::startCurrentLtcInput()
         if (thruCh < 0) thruCh = 1;
     }
 
-    if (eng.startLtcInput(entry.typeName, entry.deviceName, ltcCh, thruCh,
-                           getPreferredSampleRate(), getPreferredBufferSize()))
+    if (startLtcInputAsOpened(eng, entry.typeName, entry.deviceName, ltcCh, thruCh,
+                              getPreferredSampleRate(), getPreferredBufferSize()))
     {
         eng.getLtcInput().setInputGain((float)sldLtcInputGain.getValue() / 100.0f);
         eng.getLtcInput().setPassthruGain((float)sldThruInputGain.getValue() / 100.0f);
@@ -4259,8 +4300,8 @@ void MainComponent::startCurrentThruOutput()
         settingsStereo = es.thruOutputStereo;
     }
     int outCh = getChannelFromComboOrSettings(cmbThruOutputChannel, settingsCh, settingsStereo);
-    eng.startThruOutput(entry.typeName, entry.deviceName, outCh,
-                         getPreferredSampleRate(), getPreferredBufferSize());
+    startThruOutputAsOpened(eng, entry.typeName, entry.deviceName, outCh,
+                            getPreferredSampleRate(), getPreferredBufferSize());
 
     if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
     {
@@ -4355,8 +4396,8 @@ void MainComponent::startCurrentLtcOutput()
     }
     int channel = getChannelFromComboOrSettings(cmbAudioOutputChannel, settingsCh, settingsStereo);
 
-    if (eng.startLtcOutput(entry.typeName, entry.deviceName, channel,
-                            getPreferredSampleRate(), getPreferredBufferSize()))
+    if (startLtcOutputAsOpened(eng, entry.typeName, entry.deviceName, channel,
+                               getPreferredSampleRate(), getPreferredBufferSize()))
     {
         eng.getLtcOutput().setOutputGain((float)sldLtcOutputGain.getValue() / 100.0f);
         populateAudioOutputChannels();
@@ -5786,9 +5827,9 @@ void MainComponent::applyAudioSettings()
             {
                 // For non-selected engines, start directly
                 int thruCh = (eng.isPrimary() && eng.isOutputThruEnabled()) ? es.thruInputChannel : -1;
-                eng.startLtcInput(es.audioInputType, es.audioInputDevice,
-                                   es.audioInputChannel, thruCh,
-                                   getPreferredSampleRate(), getPreferredBufferSize());
+                startLtcInputAsOpened(eng, es.audioInputType, es.audioInputDevice,
+                                      es.audioInputChannel, thruCh,
+                                      getPreferredSampleRate(), getPreferredBufferSize());
             }
         }
 
@@ -5805,8 +5846,8 @@ void MainComponent::applyAudioSettings()
             else if (!es.audioOutputDevice.isEmpty())
             {
                 int ch = es.audioOutputStereo ? -1 : es.audioOutputChannel;
-                eng.startLtcOutput(es.audioOutputType, es.audioOutputDevice, ch,
-                                    getPreferredSampleRate(), getPreferredBufferSize());
+                startLtcOutputAsOpened(eng, es.audioOutputType, es.audioOutputDevice, ch,
+                                       getPreferredSampleRate(), getPreferredBufferSize());
             }
         }
 
@@ -5825,8 +5866,8 @@ void MainComponent::applyAudioSettings()
                 else if (!es.thruOutputDevice.isEmpty())
                 {
                     int ch = es.thruOutputStereo ? -1 : es.thruOutputChannel;
-                    eng.startThruOutput(es.thruOutputType, es.thruOutputDevice, ch,
-                                         getPreferredSampleRate(), getPreferredBufferSize());
+                    startThruOutputAsOpened(eng, es.thruOutputType, es.thruOutputDevice, ch,
+                                            getPreferredSampleRate(), getPreferredBufferSize());
                 }
             }
         }
