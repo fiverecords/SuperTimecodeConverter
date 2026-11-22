@@ -368,6 +368,10 @@ struct ProDJLinkPlayerState
     // From status packets
     std::atomic<uint32_t> trackId      { 0 };    // rekordbox database ID
     std::atomic<uint32_t> playState    { 0 };    // ProDJLink::kPlay* enum
+    std::atomic<uint8_t>  playState3   { 0xff }; // P3 (status offset 157, 0x9d): 00 no track
+                                                    // loaded, 01 paused or reverse, 09 / 0d playing
+                                                    // forward (jog mode vinyl / CDJ), 0b slipping
+                                                    // (dysentery vcdj.adoc); ff until a status says
     std::atomic<uint32_t> beatCount    { 0 };    // beat counter
     // When a beat packet last advanced beatCount (beat-derived position),
     // getMillisecondCounterHiRes; 0 before the first.  beatCountBeforeBeat:
@@ -422,6 +426,34 @@ struct ProDJLinkPlayerState
     // one at a time, a position could be paired with the next packet's
     // timestamp (AUDIT PDL-8).
     std::atomic<uint32_t> positionSeq    { 0 };
+
+    /// The scan a player makes of a track it has just loaded (AUD11 PDL-1).
+    /// On the July 2026 captures a CDJ-2000nexus (firmware 1.44) that loads
+    /// a track with hot cues reports P1 = 03 (playing) for about 2 s while
+    /// its beat count visits the places around the hot cues (capture S06:
+    /// 136-141 and 192-197; S15a twice), then goes back to loading and
+    /// stops cued.  The deck does not play: it sends no beat packet, the F
+    /// play bit is clear and P3 reads 00, "no track is loaded".  Read as
+    /// playing from P1 alone, the Track Map cues placed there -- where the
+    /// imported rekordbox hot cues are -- fired at the load, seconds before
+    /// the DJ pressed PLAY, and ON AIR follow could take the deck for a
+    /// playing one.  All three must agree: P1 = 03 with the play bit clear
+    /// is also a platter held during play, and there P3 is 01 (capture
+    /// S13); a playing deck has P3 09 or 0d.  Over the 18 dysentery
+    /// captures (all CDJ-2000nexus) the test matches the three scans and
+    /// nothing else: no status between two beat packets, none in CUE PLAY
+    /// or with the platter touched.  Loop (04) and emergency loop (12) are
+    /// in no capture and are left as they were.  Only a player whose
+    /// position STC derives from the beat count: nothing is known of a
+    /// player that sends 0x0b here (no capture has one), and for it
+    /// nothing changes.
+    bool reportsLoadScan() const
+    {
+        return playState.load(std::memory_order_relaxed) == ProDJLink::kPlayPlaying
+            && ! isPlaying.load(std::memory_order_relaxed)
+            && playState3.load(std::memory_order_relaxed) == 0
+            && ! hasAbsolutePosition.load(std::memory_order_relaxed);
+    }
 
     /// Network thread: publish a position and the time it was received.
     void publishPosition(uint32_t ms, double ts)
@@ -487,6 +519,7 @@ struct ProDJLinkPlayerState
         beatInBar.store(1, std::memory_order_relaxed);
         trackId.store(0, std::memory_order_relaxed);
         playState.store(0, std::memory_order_relaxed);
+        playState3.store(0xff, std::memory_order_relaxed);
         beatCount.store(0, std::memory_order_relaxed);
         beatAdvancedMs = 0.0;
         beatCountBeforeBeat = 0;
@@ -926,11 +959,13 @@ public:
     /// capture has it, so this is unverified on hardware (AUDIT PDL-10).
     /// Cue scratch (0x08) and search (0x09) move the playhead by hand or in
     /// jumps, at no rate to interpolate at: not counted (unverified on
-    /// hardware; no capture has either).
+    /// hardware; no capture has either).  Nor is the scan after a load,
+    /// which reports "playing" (reportsLoadScan, AUD11 PDL-1).
     bool isPositionMoving(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        if (players[idx].reportsLoadScan()) return false;
         uint32_t ps = players[idx].playState.load(std::memory_order_relaxed);
         return ps == ProDJLink::kPlayPlaying
             || ps == ProDJLink::kPlayLooping
@@ -957,11 +992,15 @@ public:
         }
     }
 
-    /// Get the play state string for display
+    /// Get the play state string for display.  The scan after a load reads
+    /// as loading, which is what the player reports before and after it
+    /// (reportsLoadScan, AUD11 PDL-1).
     juce::String getPlayStateString(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return "?";
+        if (players[idx].reportsLoadScan())
+            return ProDJLink::playStateToString(ProDJLink::kPlayLoading);
         return ProDJLink::playStateToString(
             players[idx].playState.load(std::memory_order_relaxed));
     }
@@ -1438,11 +1477,14 @@ public:
     /// True if player is actively playing (for PLL advance, and the ON AIR
     /// rule's "playing").  An emergency loop counts as playing: by Pioneer's
     /// manuals the player loops what it has so the audio does not stop
-    /// (unverified on hardware; see isPositionMoving, AUDIT PDL-10).
+    /// (unverified on hardware; see isPositionMoving, AUDIT PDL-10).  The
+    /// scan after a load reports "playing" and is not (reportsLoadScan,
+    /// AUD11 PDL-1).
     bool isPlayerPlaying(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        if (players[idx].reportsLoadScan()) return false;
         uint32_t ps = players[idx].playState.load(std::memory_order_relaxed);
         return (ps == ProDJLink::kPlayPlaying || ps == ProDJLink::kPlayLooping
                 || ps == ProDJLink::kPlayEmergency);
@@ -3216,7 +3258,10 @@ private:
             p.hasBeatDerivedPosition.store(false, std::memory_order_relaxed);
         }
 
-        // Play state
+        // Play state.  P3 first: it and the F play bit below tell the scan
+        // after a load from play (reportsLoadScan, AUD11 PDL-1).
+        if (len > 157)
+            p.playState3.store(data[157], std::memory_order_relaxed);
         if (len > 123)
         {
             uint32_t ps = ProDJLink::readU32BE(data + 120);
