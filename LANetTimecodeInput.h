@@ -160,6 +160,7 @@ public:
     {
         Timecode tc;
         double   arrivalMs = 0.0;   // 0 = nothing received yet
+        int      repeats = 0;       // packets in a row that repeated the value before them (0-2)
     };
 
     /// Any thread.  A sequence lock: the writer (the receive thread, once
@@ -177,18 +178,81 @@ public:
             }
             f.tc        = unpackTimecode(packedTimecode.load(std::memory_order_relaxed));
             f.arrivalMs = lastPacketTime.load(std::memory_order_relaxed);
+            f.repeats   = frameRepeats.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if (frameSeq.load(std::memory_order_relaxed) == before)
                 return f;
         }
     }
 
+    /// What the engine publishes from this input: the live value, its phase
+    /// inside the frame, and whether the source counts as present -- all
+    /// from one snapshot and one clock reading, as LtcInput::getLiveTimecode
+    /// (AUDIT LTC-10; the principle of DESIGN D29).
+    struct LiveTimecode
+    {
+        Timecode tc;
+        double   phaseMs = 0.0;
+        bool     phaseValid = false;   // false until a packet has arrived
+        bool     receiving = false;
+    };
+
+    /// `atMs` is the hi-res ms counter, `fps` the engine's rate.  Any thread.
+    ///
+    /// The sender emits a packet at its frame boundary, so the packet's
+    /// arrival is the start of the frame it carries.  While packets keep
+    /// coming the engine reads the value less than a frame later and it is
+    /// the packet's own.  When they stop for a while inside the freewheel
+    /// window -- a switch reconverging, a Wi-Fi gap -- the source still
+    /// counts as present, and the value is aged by the whole frames elapsed
+    /// since the arrival with the phase what remains: one measurement
+    /// expressed two ways, as LtcInput and MtcInput do.  Before, the value
+    /// stood still for the whole window with a phase that kept turning, and
+    /// the outputs followed a reference that did not move: LTC OUT ran
+    /// ahead and snapped back every four frames, MTC OUT stepped backwards,
+    /// Art-Net and LA-Net OUT repeated one frame until the packets came back (AUD11
+    /// TC-IO-3).
+    ///
+    /// A sender parked on a frame -- kHeldRepeats packets running that
+    /// repeat the value before them -- is not aged: its packets say it is
+    /// not moving.  The price of the aging is LtcInput's (AUDIT LTC-10): a
+    /// sender that really stops is counted on through the window, and the
+    /// value steps back to the last packet's when the window closes.
+    ///
+    /// While not receiving the value is the last packet's, as before.  The
+    /// phase is the remainder in every case, which is what the engine
+    /// published before.
+    LiveTimecode getLiveTimecode(double atMs, FrameRate fps) const
+    {
+        LiveTimecode live;
+        const ReceivedFrame f = getLastFrame();
+        live.tc = f.tc;
+        if (f.arrivalMs <= 0.0)
+            return live;
+
+        // A packet stored after the caller read the clock: it has just arrived.
+        const double elapsed = juce::jmax(0.0, atMs - f.arrivalMs);
+        live.receiving = elapsed < timeoutMs.load(std::memory_order_relaxed);   // isReceiving() on this snapshot
+
+        const double rate = frameRateToDouble(fps);
+        if (rate <= 0.0)
+            return live;
+        const double frameMs = 1000.0 / rate;
+        const double frames = elapsed / frameMs;
+        const double fl = std::floor(frames);
+        live.phaseMs = (frames - fl) * frameMs;
+        live.phaseValid = true;
+        if (live.receiving && fl >= 1.0 && f.repeats < kHeldRepeats)
+            live.tc = offsetTimecode(f.tc, (int) fl, fps);
+        return live;
+    }
+
     /// Freewheel (AUDIT D10): how long after the last frame/packet the source still
-    /// counts as present.  The senders count on their own through it, so a
-    /// short dropout -- a USB stall, a display wake -- never reaches the
-    /// wire; the price is that a real stop takes this long to reach the
-    /// outputs.  The operator sets it (engine setting), default
-    /// kSourceTimeoutMs.
+    /// counts as present.  The engine counts the value on through it
+    /// (getLiveTimecode), so a short dropout -- a USB stall, a display wake
+    /// -- never reaches the wire; the price is that a real stop takes this
+    /// long to reach the outputs.  The operator sets it (engine setting),
+    /// default kSourceTimeoutMs.
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }
     double getTimeoutMs() const  { return timeoutMs.load(std::memory_order_relaxed); }
 
@@ -335,12 +399,22 @@ private:
         // they are being stored, and a reader that saw it odd or changed
         // reads again (getLastFrame, AUDIT LTC-8).  Only this thread writes,
         // so it never waits.
+        //
+        // A value that repeats the packet before it is counted, up to
+        // kHeldRepeats: a sender parked on a frame, which getLiveTimecode
+        // must not count on (AUD11 TC-IO-3).  The first packet ever
+        // repeats nothing.
+        const uint64_t packed = packTimecode(hours, minutes, seconds, frames);
+        const bool repeated = lastPacketTime.load(std::memory_order_relaxed) != 0.0
+                           && packed == packedTimecode.load(std::memory_order_relaxed);
+        valueRepeats = repeated ? juce::jmin(valueRepeats + 1, kHeldRepeats) : 0;
+
         const uint32_t seq = frameSeq.load(std::memory_order_relaxed);
         frameSeq.store(seq + 1u, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_release);
         lastPacketTime.store(arrivalMs, std::memory_order_relaxed);
-        packedTimecode.store(packTimecode(hours, minutes, seconds, frames),
-                             std::memory_order_relaxed);
+        packedTimecode.store(packed, std::memory_order_relaxed);
+        frameRepeats.store(valueRepeats, std::memory_order_relaxed);
         frameSeq.store(seq + 2u, std::memory_order_release);
     }
 
@@ -358,9 +432,15 @@ private:
 
     std::atomic<uint64_t> packedTimecode { 0 };
     std::atomic<FrameRate> detectedFps { FrameRate::FPS_25 };
-    // Sequence lock over packedTimecode and lastPacketTime: odd while the
-    // receive thread is storing a frame (getLastFrame).
+    // Sequence lock over packedTimecode, lastPacketTime and frameRepeats:
+    // odd while the receive thread is storing a frame (getLastFrame).
     std::atomic<uint32_t> frameSeq { 0 };
+    std::atomic<int> frameRepeats { 0 };         // ReceivedFrame::repeats
+    int valueRepeats = 0;                        // receive thread only
+    // Packets in a row repeating the value before them from which the
+    // sender counts as parked on a frame, and the value is not aged
+    // (getLiveTimecode); LtcInput's figure.
+    static constexpr int kHeldRepeats = 2;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LANetTimecodeInput)
 };

@@ -1755,12 +1755,24 @@ public:
                     // Value and arrival as one record (AUDIT LTC-8): with two
                     // getters a packet stored in between paired a new value
                     // with the previous arrival.
-                    const auto frame = artnetInput.getLastFrame();
-                    currentTimecode = frame.tc;
                     // ArtTimeCode goes out once per frame at the sender's frame
                     // boundary, so the packet's arrival is this frame's start.
-                    setFramePhaseFromArrival(frame.arrivalMs, currentFps);
-                    bool rx = artnetInput.isReceiving();
+                    // The live value is the packet's, aged by the whole
+                    // frames since it arrived while the source counts as
+                    // present, with the phase the remainder and the receive
+                    // verdict from the same snapshot and clock reading -- as
+                    // for LTC below.  With packets arriving that is the
+                    // packet's value; in a dropout inside the FREEWHEEL
+                    // window it counts on, where it stood still and the
+                    // outputs stepped back or repeated (AUD11 TC-IO-3).
+                    const auto live = artnetInput.getLiveTimecode(juce::Time::getMillisecondCounterHiRes(), currentFps);
+                    currentTimecode = live.tc;
+                    if (live.phaseValid)
+                    {
+                        framePhaseMs = live.phaseMs;
+                        framePhaseValid = true;
+                    }
+                    bool rx = live.receiving;
                     if (rx)
                     {
                         // Rate code 0 is 24 and 23.976 alike: a 23.976 the
@@ -1779,11 +1791,17 @@ public:
             case InputSource::LANetTC:
                 if (laNetTCInput.getIsRunning())
                 {
-                    // Value and arrival as one record (AUDIT LTC-8), as for Art-Net.
-                    const auto frame = laNetTCInput.getLastFrame();
-                    currentTimecode = frame.tc;
-                    setFramePhaseFromArrival(frame.arrivalMs, currentFps);
-                    bool rx = laNetTCInput.isReceiving();
+                    // Value and arrival as one record (AUDIT LTC-8), aged
+                    // through a dropout inside the FREEWHEEL window (AUD11
+                    // TC-IO-3), as for Art-Net.
+                    const auto live = laNetTCInput.getLiveTimecode(juce::Time::getMillisecondCounterHiRes(), currentFps);
+                    currentTimecode = live.tc;
+                    if (live.phaseValid)
+                    {
+                        framePhaseMs = live.phaseMs;
+                        framePhaseValid = true;
+                    }
+                    bool rx = live.receiving;
                     if (rx)
                     {
                         // LA-Net carries 24, 25 or 30: 23.976 and 29.97 the
