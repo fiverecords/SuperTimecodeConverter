@@ -345,7 +345,7 @@ private:
     DbServerClient sharedDbClient;        // shared across all engines (Phase 2)
     TCNetOutput    sharedTcnetOutput;     // shared TCNet timecode broadcast
     juce::String   tcnetArtworkKey[TCNetOutput::kMaxLayers];  // track key per layer for artwork change detection
-    bool           tcnetArtworkPending[TCNetOutput::kMaxLayers] = {};  // Pro DJ Link artwork not cached yet: looked up each tick
+    bool           tcnetArtworkPending[TCNetOutput::kMaxLayers] = {};  // Pro DJ Link artwork / StageLinQ track entry not cached yet: looked up each tick
     juce::String   tcnetWaveformKey[TCNetOutput::kMaxLayers]; // track key per layer for waveform/beatgrid change detection
     uint32_t       tcnetWaveformVersion[TCNetOutput::kMaxLayers] = {};  // DbServerClient entry version last fed (Pro DJ Link)
 

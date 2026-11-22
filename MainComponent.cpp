@@ -9465,6 +9465,7 @@ void MainComponent::timerCallback()
                 if (newTrack || tcnetArtworkPending[layer])
                 {
                     juce::Image artImg;
+                    bool slqEntryAwaited = false;   // StageLinQ: the track's database entry is not cached yet
 
                     // 1. Try live source (already in memory from metadata fetch)
                     if (src == SrcType::ProDJLink && info.artworkId != 0)
@@ -9474,11 +9475,25 @@ void MainComponent::timerCallback()
                         const auto media = getPdlMediaSource(ep);
                         artImg = sharedDbClient.getCachedArtwork(media.ip, media.slot, info.artworkId);
                     }
-                    else if (newTrack && src == SrcType::StageLinQ)
+                    else if (src == SrcType::StageLinQ)
                     {
+                        // The database client answers a track's query on
+                        // its own thread, after the track is on the deck --
+                        // and after the database has been downloaded, for
+                        // the tracks loaded when STC connects.  Asked once,
+                        // on the tick the title changed, the cache was not
+                        // filled yet and the layer kept the STC logo for
+                        // the whole track, while the panel, which keeps
+                        // looking, showed the cover.  So this keeps looking
+                        // too, as the waveform below does, until the
+                        // track's entry is cached: its artwork, if it has
+                        // one, is cached with it (AUD11 MAIN-B-V1).
                         auto netPath = sharedStageLinQInput.getTrackNetworkPath(ep);
-                        if (netPath.isNotEmpty() && sharedStageLinQDb.isDatabaseReady())
+                        if (netPath.isNotEmpty() && sharedStageLinQDb.isDatabaseReady()
+                            && sharedStageLinQDb.getTrackByNetworkPath(netPath).valid)
                             artImg = sharedStageLinQDb.getArtworkForTrack(netPath);
+                        else
+                            slqEntryAwaited = true;
                     }
 
                     // DbServerClient caches the metadata, which the track
@@ -9487,8 +9502,9 @@ void MainComponent::timerCallback()
                     // lookup in memory) and its image replaces what steps 2
                     // and 3 sent, as the waveform is fed when it arrives
                     // (AUDIT META-16).  Steps 2 and 3 run once per track.
-                    tcnetArtworkPending[layer] = src == SrcType::ProDJLink && info.artworkId != 0
-                                              && ! artImg.isValid();
+                    tcnetArtworkPending[layer] = (src == SrcType::ProDJLink && info.artworkId != 0
+                                                  && ! artImg.isValid())
+                                              || slqEntryAwaited;
                     if (newTrack || artImg.isValid())
                     {
                         tcnetArtworkKey[layer] = artKey;
