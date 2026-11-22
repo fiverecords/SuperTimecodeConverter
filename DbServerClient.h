@@ -897,6 +897,7 @@ private:
     static constexpr uint32_t kMaxDetailEntries    = 5000000;         // PWV5/PWV7 at 150/s: 9.2 h (the blob cap binds first)
     static constexpr uint16_t kMaxPhrases          = 1000;            // PSSI
     static constexpr uint16_t kMaxCuesPerList      = 200;             // PCOB/PCO2
+    static constexpr size_t   kMaxCuesPerReply     = 2 * (size_t)kMaxCuesPerList;  // one reply: two lists' worth (AUD11 PDL-9)
     static constexpr uint32_t kMaxPcp2EntryBytes   = 4096;            // one PCP2 entry, comment included
     static constexpr uint32_t kMaxCueCommentBytes  = 512;             // PCP2 comment (UTF-16BE)
 
@@ -2907,7 +2908,17 @@ private:
 
                 result.push_back(cue);
                 entryOff += entryLen;
+                if (result.size() >= kMaxCuesPerReply) break;
             }
+
+            // The scan goes on after the entries this list took, and stops
+            // at kMaxCuesPerReply cues (AUD11 PDL-9).  It went on at the
+            // next byte, so list headers 20 bytes apart could each walk the
+            // same run of 200 entries: a 256 KB reply gave 2.5 million cues
+            // and 260 MB.  A list's entries always lie after its header, so
+            // no later header can reach back over them.
+            if (result.size() >= kMaxCuesPerReply) break;
+            if (entryOff > i + 1) i = entryOff - 1;
         }
 
         // Sort by position
@@ -2987,7 +2998,13 @@ private:
 
                 result.push_back(cue);
                 entryOff += kPcptSize;
+                if (result.size() >= kMaxCuesPerReply) break;
             }
+
+            // As in parseCueListExtended: on after this list's entries, and
+            // no more than kMaxCuesPerReply cues (AUD11 PDL-9).
+            if (result.size() >= kMaxCuesPerReply) break;
+            if (entryOff > i + 1) i = entryOff - 1;
         }
 
         std::sort(result.begin(), result.end(),
