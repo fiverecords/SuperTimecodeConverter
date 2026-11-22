@@ -331,7 +331,15 @@ private:
         // Validate ranges -- discard malformed packets
         // (lastPacketTime is updated AFTER validation so isReceiving()
         //  only returns true when we actually accepted valid data)
-        if (hours > 23 || minutes > 59 || seconds > 59 || frames > 29)
+        // Frames against the rate the packet itself names (24, 25, 29.97,
+        // 30), as MtcInput does for a Full Frame.  The test was "above 29"
+        // for every rate, so frame 24..29 with Type 0 or 25..29 with Type
+        // 1 -- a frame that does not exist at that rate -- went to the
+        // engine and on to the outputs as it was (AUD11 FUZZ-10).  The two
+        // frame numbers drop-frame leaves out are not tested: no capture
+        // shows how senders number the frames under Type 2 (DESIGN D2).
+        static constexpr int kFramesPerRateCode[4] = { 24, 25, 30, 30 };
+        if (hours > 23 || minutes > 59 || seconds > 59 || frames >= kFramesPerRateCode[rateCode])
             return;
 
         const double arrivalMs = juce::Time::getMillisecondCounterHiRes();
