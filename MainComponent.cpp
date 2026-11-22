@@ -5703,17 +5703,23 @@ void MainComponent::loadAndApplyNonAudioSettings()
         if (es.midiClockEnabled)
             eng.setMidiClockEnabled(true);
 
-        // OSC BPM forward
-        if (es.oscBpmForward)
-            eng.setOscForward(true, es.oscBpmAddr, es.oscBpmCmd);
+        // OSC BPM forward and mixer fader forward: the engine gets the
+        // stored address, command, MIDI channels and universe whether the
+        // feature is on or off.  They were applied only when it was on, so
+        // with it off the engine kept its defaults, the next save wrote
+        // those over the stored ones (flushSettings saves from the engine),
+        // and the operator's address, command template, channels and
+        // universe were gone when the feature was switched on in a later
+        // session (AUD11 MAIN-A-8).  An address that was stored empty with
+        // the feature off loads as the default one, as it did.
+        eng.setOscForward(es.oscBpmForward,
+                          (es.oscBpmForward || es.oscBpmAddr.isNotEmpty()) ? es.oscBpmAddr : eng.getOscFwdBpmAddr(),
+                          es.oscBpmCmd);
 
-        // Mixer fader forward
         if (es.oscMixerForward)
             eng.setOscMixerForward(true);
-        if (es.midiMixerForward)
-            eng.setMidiMixerForward(true, es.midiMixerCCChannel, es.midiMixerNoteChannel);
-        if (es.artnetMixerForward)
-            eng.setArtnetMixerForward(true, es.artnetMixerUniverse);
+        eng.setMidiMixerForward(es.midiMixerForward, es.midiMixerCCChannel, es.midiMixerNoteChannel);
+        eng.setArtnetMixerForward(es.artnetMixerForward, es.artnetMixerUniverse);
         eng.setArtnetTriggerUniverse(es.artnetTriggerUniverse);
         eng.setArtnetTriggerEnabled(es.artnetTriggerEnabled);
 
