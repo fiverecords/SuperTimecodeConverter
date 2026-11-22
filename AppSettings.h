@@ -1870,7 +1870,15 @@ struct EngineSettings
         thruOutputType       = getString("thruOutputType");
         thruOutputChannel    = juce::jlimit(0, 127, getInt("thruOutputChannel", 1));
         thruOutputStereo     = getBool("thruOutputStereo", true);
-        thruInputChannel     = juce::jlimit(0, 127, getInt("thruInputChannel", 1));
+        // A negative value is what 1.9.16-beta1 and earlier saved for a
+        // selector with no selection -- in every session whose input was not
+        // LTC (AUD11 MAIN-A-1).  It loads as the default, Ch 2, which is
+        // what those versions then started with on the engine on screen.
+        // Clamped to Ch 1 it is the LTC channel's default, and a tap on the
+        // LTC channel is dropped: now that the saved channel is used
+        // (AUD11 MAIN-A-V1), Audio Thru would not start.
+        thruInputChannel     = getInt("thruInputChannel", 1);
+        thruInputChannel     = thruInputChannel < 0 ? 1 : juce::jmin(127, thruInputChannel);
 
         auto clampGain = [](int val) { return (val < 0 || val > 200) ? 100 : val; };
         ltcInputGain   = clampGain(getInt("ltcInputGain", 100));
@@ -2205,7 +2213,9 @@ private:
         es.thruOutputType       = getString("thruOutputType");
         es.thruOutputChannel    = juce::jlimit(0, 127, getInt("thruOutputChannel", 1));
         es.thruOutputStereo     = getBool("thruOutputStereo", true);
-        es.thruInputChannel     = juce::jlimit(0, 127, getInt("thruInputChannel", 1));
+        // A negative value loads as the default, as in EngineSettings::fromVar.
+        es.thruInputChannel     = getInt("thruInputChannel", 1);
+        es.thruInputChannel     = es.thruInputChannel < 0 ? 1 : juce::jmin(127, es.thruInputChannel);
 
         auto clampGain = [](int v) { return (v < 0 || v > 200) ? 100 : v; };
         es.ltcInputGain   = clampGain(getInt("ltcInputGain", 100));
