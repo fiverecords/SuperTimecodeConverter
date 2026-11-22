@@ -259,8 +259,8 @@ public:
         if (nfsThread.joinable())
             nfsThread.join();
 
-        // Tear down the dbserver-port listener.  Closing the socket unblocks
-        // waitForNextConnection() inside dbPortListenerLoop so it can exit.
+        // Tear down the dbserver-port listener.  Closing the socket ends the
+        // wait inside dbPortListenerLoop so it can exit.
         if (dbPortListenSock)
             dbPortListenSock->close();
         if (dbPortListenerThread.joinable())
@@ -3831,6 +3831,21 @@ private:
         if (!dbPortListenSock) return;
         while (isRunningFlag.load(std::memory_order_relaxed))
         {
+            // Wait for a connection in slices and call accept() only when
+            // one is pending (AUD11 APPRUN-3), as HippotizerInput's
+            // listeners do.  The thread used to sit in accept() when stop()
+            // closed the socket; outside Windows JUCE's close() then wakes
+            // the accept by connecting to the port itself, and
+            // waitForNextConnection() drops the descriptor accept()
+            // returned without closing it: one socket left open per stop,
+            // about two stops in three.  Now the thread is waiting in
+            // waitUntilReady() at a stop: it wakes, finds the socket no
+            // longer a listener and leaves without an accept().  stop() is
+            // unchanged; should closing the socket not wake the wait, it
+            // lasts one slice at most.
+            const int ready = dbPortListenSock->waitUntilReady(true, 100);
+            if (ready < 0) break;       // socket closed or failed
+            if (ready == 0) continue;   // nothing pending: look at the flag again
             auto* client = dbPortListenSock->waitForNextConnection();
             if (!client) break;  // shutdown signalled or socket closed
             std::unique_ptr<juce::StreamingSocket> conn(client);
