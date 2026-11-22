@@ -5349,9 +5349,28 @@ private:
     /// 120 BPM no TrackMap cue fired at all on that path.  The first beat
     /// after a play from a pause late in a beat can still exceed the PLL's
     /// 500 ms; the Pro DJ Link caller does not pass that one-beat step as a
-    /// seek (AUDIT ENG-2).  A backward step is still a seek.
+    /// seek (AUDIT ENG-2).  A backward step is still a seek, unless it is
+    /// kCueMovedBackMs or less and the source reports none: the playhead is
+    /// interpolated between packets, and a packet a few ms behind the last
+    /// interpolated value -- late on the network, or after a speed estimate
+    /// a little high -- steps it back without the deck having moved back
+    /// (11 to 21 times in 57 s of play on the PRIME 4+ capture of issue #23,
+    /// 10 ms at worst; 9 to 13 ms on the CDJ-2000NXS beat fallback).  Taken
+    /// for a seek, such a step un-fired the cues between the two positions
+    /// and they fired a second time, 17 to 33 ms after the first (AUD11
+    /// ENGINE-CORE-3).  The cursor now waits where it was until the playhead
+    /// is past it again; nothing is re-armed.  It does not follow the step,
+    /// so steps that add up to more than kCueMovedBackMs behind it are a
+    /// seek.  The bound is the one a paused deck has (dispatchTrackCues);
+    /// with an absolute position the interpolation runs at most
+    /// kInterpolationCapMs of wall time ahead of a packet.  A real jump back
+    /// that short -- a loop roll under 100 ms -- re-fires nothing either.
     void tickCuePoints(uint32_t playheadMs, bool sourceSeeked)
     {
+        if (! sourceSeeked && playheadMs < lastCueCheckMs
+            && lastCueCheckMs - playheadMs <= kCueMovedBackMs)
+            return;
+
         const bool seekDetected = sourceSeeked || (playheadMs < lastCueCheckMs);
 
         // After this call every cue up to this playhead is fired or passed,
