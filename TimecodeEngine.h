@@ -1070,6 +1070,12 @@ public:
         dbRequestIp.clear();
         lastSeenTrackVersion = 0;
         cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
+        // The Track Map multiplier belongs to the track whose offset this
+        // clears, as in setInputSource and switchResolvedPlayer.  It stayed,
+        // so after the operator picked a player with no track loaded the
+        // previous deck's x2 went on scaling the BPM forward (AUD11
+        // ENGINE-CORE-5).  A track on the new player sets its own again.
+        cachedBpmMultiplier = 0;
         cachedTrackArtist.clear();
         cachedTrackTitle.clear();
         cachedTrackDurationSec = 0;
@@ -1247,16 +1253,21 @@ public:
     }
 
     /// Enable or disable TrackMap offset application.
-    /// Triggers fire independently of this setting.
+    /// Triggers fire independently of this setting, and the track's BPM
+    /// multiplier applies independently of it too.
     void setTrackMapEnabled(bool enabled)
     {
         trackMapEnabled = enabled;
         if (!enabled)
         {
-            // Reset offset state only -- keep cachedTrackId for trigger use
+            // Reset offset state only -- keep cachedTrackId for trigger use.
+            // The BPM multiplier stays: lookupTrackInMap sets it for every
+            // track whatever this switch says, and a double click saves it
+            // with the switch off.  Clearing it here took it from the track
+            // on the deck only, and the next track had it again (AUD11
+            // ENGINE-CORE-5).
             trackMapped = false;
             cachedOffH = cachedOffM = cachedOffS = cachedOffF = 0;
-            cachedBpmMultiplier = 0;
             lastSentClockBpm = -1.0f;
             lastSentOscBpm   = -1.0f;
         }
