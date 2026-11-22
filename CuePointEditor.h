@@ -259,6 +259,7 @@ public:
             // Update position display in status
             editCursorMs = ms;
             editCursorActive = true;
+            editCursorForCapture = true;
         };
 
         // --- Table ---
@@ -297,8 +298,9 @@ public:
         {
             uint32_t ms = 0;
 
-            // Use edit cursor if set (clicked on waveform), else live playhead
-            if (editCursorActive && editCursorMs > 0)
+            // Use edit cursor if set (clicked on waveform) and the playhead
+            // has not moved since, else live playhead
+            if (editCursorActive && editCursorForCapture && editCursorMs > 0)
             {
                 ms = editCursorMs;
             }
@@ -486,14 +488,16 @@ public:
             }
             waveformStrip.setPlayheadMs(ms);
 
-            // Any playhead movement (play, jog, scrub) clears the edit cursor
-            // so Capture uses the live position instead of the stale click point.
-            if (editCursorActive && ms != lastPlayheadMs)
-            {
-                editCursorActive = false;
-                editCursorMs = 0;
-                waveformStrip.clearEditCursor();
-            }
+            // Any playhead movement (play, jog, scrub) since the click hands
+            // Capture back to the live position instead of the stale click
+            // point.  The click point itself stays -- shown on the strip, and
+            // used by Add -- until Capture, a new click or a click outside
+            // the strip.  It used to be discarded here, which is one timer
+            // period after the click while the edited track plays: the cyan
+            // cursor vanished and Add put the cue at 00:00.000 (AUD11
+            // VIEWS-EDITORS-6).
+            if (editCursorForCapture && ms != lastPlayheadMs)
+                editCursorForCapture = false;
             lastPlayheadMs = ms;
         }
     }
@@ -681,7 +685,8 @@ private:
     CueWaveformStrip waveformStrip;
     uint32_t trackDurationMs = 0;
     uint32_t editCursorMs = 0;
-    bool editCursorActive = false;
+    bool editCursorActive = false;         // a click point is placed: where Add goes
+    bool editCursorForCapture = false;     // ...and the playhead has not moved since: where Capture goes too
     bool trackIsLive = true;       // false when playing track != editing track
     uint32_t lastPlayheadMs = 0;   // for detecting playhead movement (jog/scrub/play)
 
