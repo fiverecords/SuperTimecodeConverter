@@ -216,10 +216,18 @@ private:
                     }
                 if (each.isEmpty())
                     return { { "Database: ready" }, T::good };
-                return { { "Database: " + each.joinIntoString("; "),
-                           "Database: " + plural(each.size(), "source", "sources") + " ready, "
-                               + plural(tracks, "track", "tracks"),
-                           "Database: ready" }, T::good };
+                const juce::String all = "Database: " + each.joinIntoString("; ");
+                const juce::String sum = "Database: " + plural(each.size(), "source", "sources") + " ready, "
+                                       + plural(tracks, "track", "tracks");
+                // A database is open, but the unit could not be reached
+                // for another one since (the client clears lastFailure when
+                // the unit answers again): say so where there is room.  The
+                // line read "ready" and a deck "database not downloaded
+                // yet" while STC could not connect at all (AUD11 SLQ-12).
+                if (st.lastFailure.isNotEmpty())
+                    return { { all + "; " + st.lastFailure, sum + "; " + st.lastFailure,
+                               "Database: ready; " + st.lastFailure, all, sum, "Database: ready" }, T::good };
+                return { { all, sum, "Database: ready" }, T::good };
             }
             case S::Session::retrying:
             {
@@ -274,11 +282,20 @@ private:
                 case S::SourceState::noLibrary:
                     return { { src + ": no Engine library", src + ": no library", "No library" }, T::problem };
                 case S::SourceState::failed:
+                {
+                    // The client's own reason (Source::failure: "not a usable
+                    // Engine database", "could not write a copy", "the unit
+                    // did not answer", "download failed (timed out)").  This
+                    // said "download failed" for all of them, which sent
+                    // the operator to the network for a database problem
+                    // or a full temp folder (AUD11 SLQ-12).
+                    const juce::String why = so->failure.isNotEmpty() ? so->failure : juce::String("download failed");
                     if (so->retryInSeconds > 0)
-                        return { { src + ": download failed, retrying in " + juce::String(so->retryInSeconds) + " s",
+                        return { { src + ": " + why + ", retrying in " + juce::String(so->retryInSeconds) + " s",
                                    src + ": failed, retry in " + juce::String(so->retryInSeconds) + " s",
                                    src + ": failed" }, T::problem };
-                    return { { src + ": download failed", src + ": failed", "Failed" }, T::problem };
+                    return { { src + ": " + why, src + ": failed", "Failed" }, T::problem };
+                }
                 case S::SourceState::notDownloaded:
                     return { { src + ": database not downloaded yet", src + ": not downloaded", "Waiting" }, T::busy };
                 case S::SourceState::ready:
