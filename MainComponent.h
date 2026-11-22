@@ -370,6 +370,7 @@ private:
 
     void addEngine();
     void removeEngine(int index);
+    void confirmRemoveEngine(int index);   // the tab menu's Delete: asks first (AUD11 APPRUN-4)
     void selectEngine(int index);
     void renameEngine(int index);
 
@@ -734,6 +735,7 @@ private:
 
     std::unique_ptr<juce::FileChooser> configFileChooser;
     juce::ScopedMessageBox importConfirmBox;
+    juce::ScopedMessageBox removeEngineConfirmBox;   // "Delete Engine" (confirmRemoveEngine)
     std::unique_ptr<ProDJLinkViewWindow> proDJLinkViewWindow;
     std::unique_ptr<StageLinQViewWindow> stageLinQViewWindow;
 

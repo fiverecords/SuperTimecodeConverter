@@ -2917,8 +2917,42 @@ void MainComponent::showTabContextMenu(int index)
     menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, index](int result) {
         if (safeThis == nullptr) return;
         if (result == 1) safeThis->renameEngine(index);
-        else if (result == 2) safeThis->removeEngine(index);
+        else if (result == 2) safeThis->confirmRemoveEngine(index);
     });
+}
+
+//==============================================================================
+// The tab menu's Delete (AUD11 APPRUN-4).  It sits directly under Rename and
+// called removeEngine at once: the engine's outputs stopped, its tab went
+// and its settings were erased by the next save, with no question and no
+// way back, whether or not the engine was the one sending timecode --
+// while deleting one Track Map entry asks first.  It asks now, as that one
+// does.  The engine is looked up again by identity when the answer comes,
+// because the list of engines can have changed while the box was up; and
+// nothing is removed if Show Lock is on by then.  (Under Show Lock the menu
+// does not open, so the question is never asked there.)
+//==============================================================================
+void MainComponent::confirmRemoveEngine(int index)
+{
+    if (engines.size() <= 1 || index < 0 || index >= (int)engines.size())
+        return;
+
+    auto* engine = engines[(size_t)index].get();
+    auto options = juce::MessageBoxOptions()
+        .withIconType(juce::MessageBoxIconType::QuestionIcon)
+        .withTitle("Delete Engine")
+        .withMessage("Delete \"" + engine->getName() + "\"?\n\n"
+                     "Its settings are removed and everything it sends stops.")
+        .withButton(juce::MessageBoxButtonOptions("Delete", 1).withPreferredAction())
+        .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
+
+    removeEngineConfirmBox = juce::AlertWindow::showScopedAsync(options,
+        [this, engine](int result)
+        {
+            if (result != 1 || settings.showModeLocked) return;
+            for (int i = 0; i < (int)engines.size(); ++i)
+                if (engines[(size_t)i].get() == engine) { removeEngine(i); return; }
+        });
 }
 
 //==============================================================================
