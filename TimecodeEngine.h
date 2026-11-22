@@ -1159,7 +1159,7 @@ public:
 
         if (sharedStageLinQ != nullptr && sharedStageLinQ->getIsRunning())
         {
-            inputStatusText = "LISTENING | " + sharedStageLinQ->getBindInfo();
+            inputStatusText = "LISTENING | " + sharedStageLinQ->getListenInfo();
             return true;
         }
         inputStatusText = "WAITING FOR STAGELINQ...";
@@ -2809,11 +2809,11 @@ public:
                                     inputStatusText += " | NO MAP";
                             }
 
-                            inputStatusText += " | " + sharedStageLinQ->getBindInfo();
+                            inputStatusText += " | " + sharedStageLinQ->getListenInfo();
                         }
                         else
                         {
-                            inputStatusText = "WAITING | " + sharedStageLinQ->getBindInfo();
+                            inputStatusText = "WAITING | " + sharedStageLinQ->getListenInfo();
                         }
                     }
 

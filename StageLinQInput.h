@@ -1071,6 +1071,16 @@ public:
     juce::String getBindInfo() const { return bindIp; }
     int getSelectedInterface() const { return selectedInterface; }
 
+    /// What an engine's status line says after "LISTENING | " or
+    /// "WAITING | ": the address of the interface chosen at start(), or
+    /// ALL when none was up then (AUD11 SLQ-6; getBindInfo() stays the bare
+    /// address, which MainComponent compares with the interface list).
+    /// Message thread, as getBindInfo().
+    juce::String getListenInfo() const
+    {
+        return bindIp.isEmpty() ? juce::String("ALL") : bindIp;
+    }
+
     //==========================================================================
     // Start / Stop
     //==========================================================================
@@ -1080,16 +1090,27 @@ public:
             return true;
 
         refreshNetworkInterfaces();
+
+        // No interface up yet (the show PC started before its switch, or
+        // before DHCP answered) is not a reason to refuse: the interface
+        // chosen here only names the status line.  The discovery socket
+        // listens on every address and the announcements list the
+        // interfaces again each second, so a unit is found as soon as a
+        // network appears.  start() returned false here and nothing ever
+        // called it again: every StageLinQ engine read NOT CONNECTED until
+        // the operator selected the input once more (AUD11 SLQ-6).
         if (availableInterfaces.isEmpty())
         {
-            DBG("StageLinQ: No network interfaces available");
-            return false;
+            DBG("StageLinQ: No network interfaces available yet -- listening on all");
+            bindIp = juce::String();
+            selectedInterface = 0;
         }
-
-        int idx = juce::jlimit(0, availableInterfaces.size() - 1, interfaceIndex);
-        const auto& iface = availableInterfaces[idx];
-        bindIp = iface.ip;
-        selectedInterface = idx;
+        else
+        {
+            int idx = juce::jlimit(0, availableInterfaces.size() - 1, interfaceIndex);
+            bindIp = availableInterfaces[idx].ip;
+            selectedInterface = idx;
+        }
 
         // Reset all decks and the mixer
         for (auto& d : decks) d.reset();
