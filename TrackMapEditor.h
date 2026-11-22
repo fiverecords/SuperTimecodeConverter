@@ -359,8 +359,7 @@ public:
     //--------------------------------------------------------------------------
     void refresh()
     {
-        rebuildRows();
-        table.updateContent();
+        rebuildRowsKeepingSelection();
         table.repaint();
         updateStatusText();
     }
@@ -441,8 +440,7 @@ public:
     {
         activeSortColumn = newSortColumnId;
         sortForwards = isForwards;
-        rebuildRows();
-        table.updateContent();
+        rebuildRowsKeepingSelection(true);   // the operator's own sort: the view follows the selected track
         table.repaint();
     }
 
@@ -569,6 +567,11 @@ public:
     {
         (void)lastRowSelected;
         // Don't auto-open form on single click -- double-click opens it
+
+        // Remember the selected entry by its key (see selectedKey).
+        if (restoringSelection) return;
+        const int row = table.getSelectedRow();
+        selectedKey = (row >= 0 && row < (int)rows.size()) ? rows[(size_t)row]->key() : std::string();
     }
 
 private:
@@ -591,6 +594,15 @@ private:
     bool sortForwards     = true;
     uint64_t rowsGeneration = 0;               // generation at which rows were built
     std::string activeTrackKey;  // artist|title key of currently playing track (no duration)
+
+    // The selected entry, by key and not by row, for the same reason as the
+    // form below: the table only keeps a row number, and after a sort, a
+    // refresh() from outside or a save that number names another track.  The
+    // highlight moved to it, and Delete asked about -- and removed -- that
+    // one (AUD11 VIEWS-EDITORS-13).  Kept by selectedRowsChanged, put back
+    // by rebuildRowsKeepingSelection.  Empty = no row selected.
+    std::string selectedKey;
+    bool restoringSelection = false;   // rows are being rebuilt: selectedRowsChanged must not take the row number's new track
 
     // The entry the form edits, by identity -- artist, title and duration,
     // the map's key -- not by row: rows are rebuilt by every refresh(), sort
@@ -731,6 +743,37 @@ private:
         rowsGeneration = trackMap.getGeneration();
     }
 
+    /// rebuildRows() and table.updateContent(), with the selection put back
+    /// on the entry that had it, wherever its row is now; nothing is selected
+    /// when that entry has gone (see selectedKey).  The view is scrolled to
+    /// the row only when asked: a refresh that comes from outside must not
+    /// move the list under the operator.
+    void rebuildRowsKeepingSelection(bool scrollToSelection = false)
+    {
+        const std::string key = selectedKey;
+        restoringSelection = true;
+        rebuildRows();
+        table.updateContent();
+        int row = -1;
+        if (!key.empty())
+        {
+            for (int i = 0; i < (int)rows.size(); ++i)
+            {
+                if (rows[(size_t)i]->key() == key)
+                {
+                    row = i;
+                    break;
+                }
+            }
+        }
+        if (row >= 0)
+            table.selectRow(row, !scrollToSelection);
+        else
+            table.deselectAllRows();
+        restoringSelection = false;
+        selectedKey = (row >= 0) ? key : std::string();
+    }
+
     /// The entry the form was opened on, looked up by key now; null when
     /// the form adds a new entry or the entry has gone from the map.
     TrackMapEntry* findEditedEntry()
@@ -750,8 +793,7 @@ private:
 
     void notifyChanged()
     {
-        rebuildRows();
-        table.updateContent();
+        rebuildRowsKeepingSelection();
         table.repaint();
         updateStatusText();
         if (onChange) onChange();
@@ -958,8 +1000,7 @@ private:
                 if (safeThis == nullptr || result <= 0 || result > (int)candidates.size()) return;
                 TrackMapEntry copy = *candidates[(size_t)result - 1];
                 safeThis->trackMap.addOrUpdate(copy);
-                safeThis->rebuildRows();
-                safeThis->table.updateContent();
+                safeThis->rebuildRowsKeepingSelection();
                 safeThis->lblStatus.setText("Override added from global: " + copy.title, juce::dontSendNotification);
                 if (safeThis->onChange) safeThis->onChange();
             });
@@ -1474,8 +1515,7 @@ private:
     /// Select the row of the entry saved under `key` and open its form.
     void openFormForKey(const std::string& key)
     {
-        rebuildRows();
-        table.updateContent();
+        rebuildRowsKeepingSelection();
         for (int i = 0; i < (int)rows.size(); ++i)
         {
             if (rows[(size_t)i]->key() == key)
@@ -1762,8 +1802,7 @@ private:
                     // sortOrderChanged depending on prior state, so we also
                     // rebuild explicitly to guarantee the display updates.
                     safeThis->table.getHeader().setSortColumnId(ColPlaylistPos, true);
-                    safeThis->rebuildRows();
-                    safeThis->table.updateContent();
+                    safeThis->rebuildRowsKeepingSelection();
                     safeThis->repaint();
                     // Persist through the owner (the map may be the global
                     // file or an engine's settings block) and refresh the
