@@ -292,6 +292,7 @@ private:
                     const juce::String why = so->failure.isNotEmpty() ? so->failure : juce::String("download failed");
                     if (so->retryInSeconds > 0)
                         return { { src + ": " + why + ", retrying in " + juce::String(so->retryInSeconds) + " s",
+                                   src + ": " + why,     // the reason before the countdown, where both do not fit
                                    src + ": failed, retry in " + juce::String(so->retryInSeconds) + " s",
                                    src + ": failed" }, T::problem };
                     return { { src + ": " + why, src + ": failed", "Failed" }, T::problem };
