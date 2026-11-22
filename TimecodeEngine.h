@@ -1908,8 +1908,58 @@ public:
                     // beat fallback it is what the position was derived from
                     // (the grid lookup and the cue dispatch below).
                     const uint32_t pdlBeatCount = sharedProDJLink->getBeatCount(ep);
-                    pll.tick(pdlPos.playheadMs, pdlPos.packetTs, cdjSpeed,
-                             sharedProDJLink->isPositionMoving(ep));
+                    const bool pdlMoving = sharedProDJLink->isPositionMoving(ep);
+                    bool hasAbs = sharedProDJLink->playerHasAbsolutePosition(ep);
+
+                    // Beat fallback (no 0x0b): the speed field counts only
+                    // while the deck moves (AUD11 PDL-3, ENGINE-CORE-6).
+                    // Pitch2 is not "0 while stopped" there: on the
+                    // CDJ-2000nexus captures a deck stopped on a cue point
+                    // (P1 = 06) carries the pitch fader's value in 1300 of
+                    // 1308 statuses, and an empty deck mostly does too.
+                    // Everything below took it for motion: each 5 Hz status
+                    // of the standing deck moved the interpolation anchor by
+                    // 200 ms x the fader, without bound, so the value shown
+                    // ran away from the deck for as long as it stayed cued
+                    // (36.7 s on LinkInfo2), and at PLAY the outputs started
+                    // that far ahead until the next beat pulled them back:
+                    // +3.1 to +6.0 s for 160-200 ms on the four starts of
+                    // capture S13, with the cues of the first beat lost or
+                    // fired early.  The PLL ran its position on too and
+                    // reported a seek every second or so, and TCNet carried
+                    // the fader as the speed of a stopped layer.  The speed
+                    // is now read as 0 unless the deck runs: it moves
+                    // (isPositionMoving) or its play flag is set.  That is
+                    // the case AUDIT ENG-2 already handles: the anchor sits
+                    // on the beat-derived position and the first advance
+                    // after PLAY starts from there.  With the flag set the
+                    // speed is left alone whatever P1 says, so nothing
+                    // changes in a state where the source-active test below
+                    // lets such a player's outputs run (it asks that flag of
+                    // every model but the CDJ-3000).
+                    // One exception keeps what the interpolation below was
+                    // given a pause case for: a PAUSED deck (P1 = 05) keeps
+                    // its speed for kPdlBrakeHoldMs after it last ran or
+                    // its speed last fell, so a brake that ramps the speed
+                    // down is followed to its end; a paused deck whose speed
+                    // stays where it was (the CDJ-mode pause described at the
+                    // source-active test below) stops after that time
+                    // instead of running on for the whole pause.  A player
+                    // with 0x0b is not touched: its position does not come
+                    // from here.
+                    if (! hasAbs)
+                    {
+                        const double speedNowMs = juce::Time::getMillisecondCounterHiRes();
+                        const bool pdlRuns = pdlMoving || sharedProDJLink->isPlayingFlagSet(ep);
+                        if (pdlRuns || cdjSpeed < pdlFallbackSpeed)
+                            pdlBrakeSeenAt = speedNowMs;
+                        pdlFallbackSpeed = cdjSpeed;
+                        if (! pdlRuns
+                            && ! (sharedProDJLink->isPaused(ep)
+                                  && speedNowMs - pdlBrakeSeenAt <= kPdlBrakeHoldMs))
+                            cdjSpeed = 0.0;
+                    }
+                    pll.tick(pdlPos.playheadMs, pdlPos.packetTs, cdjSpeed, pdlMoving);
 
                     // This engine's own beat grid for its player (AUDIT ENG-4).
                     refreshBeatGridFromDb();
@@ -1922,7 +1972,6 @@ public:
                     // Smooth timecode display using interpolation between CDJ packets.
                     uint32_t rawPlayheadMs = pdlPos.playheadMs;
                     double now = juce::Time::getMillisecondCounterHiRes();
-                    bool hasAbs = sharedProDJLink->playerHasAbsolutePosition(ep);
 
                     // Beat grid precision for NXS2: replace the rough position
                     // (beatCount x 60000/BPM) with the exact ms from the rekordbox
@@ -4680,6 +4729,13 @@ private:
     double pdlSnapMs = 0.0;           // playhead ms at last CDJ packet (interpolation anchor)
     double pdlSnapTime = 0.0;         // hi-res timestamp of last CDJ packet
     double pdlSnapSpeed = 1.0;        // actualSpeed at last CDJ packet
+    // Beat fallback (no 0x0b): the speed field at the last tick, and when the
+    // deck last ran or that field last fell -- a paused deck keeps its
+    // speed for kPdlBrakeHoldMs after that (tick, AUD11 PDL-3).  The time is
+    // two status intervals and a half: one lost status does not end a brake.
+    double pdlFallbackSpeed = 0.0;
+    double pdlBrakeSeenAt   = 0.0;
+    static constexpr double kPdlBrakeHoldMs = 500.0;
 
     // This engine's player's rekordbox beat grid (DbServerClient's cache,
     // refreshBeatGridFromDb; setBeatGrid).  On the NXS2 beat fallback (no

@@ -1017,6 +1017,18 @@ public:
             == ProDJLink::kPlayEmergency;
     }
 
+    /// True if the player reports PAUSED (playState 0x05): stopped by the
+    /// play/pause button, not on a cue point (that is 0x06).  The engine
+    /// asks it on the beat fallback, where a paused deck may still be
+    /// braking (AUD11 PDL-3).
+    bool isPaused(int playerNum) const
+    {
+        int idx = playerNum - 1;
+        if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return false;
+        return players[idx].playState.load(std::memory_order_relaxed)
+            == ProDJLink::kPlayPaused;
+    }
+
     /// True if player has reached end of track (CDJ reports playState 0x11).
     /// In this state, actualSpeed freezes at the last playing value and
     /// never ramps to zero -- unlike pause where actualSpeed decelerates.
