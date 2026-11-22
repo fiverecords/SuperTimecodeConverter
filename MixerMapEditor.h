@@ -206,6 +206,26 @@ public:
         };
     }
 
+    /// A cell of the table (EditableCell, a juce::Label) can hold the
+    /// keyboard focus when the editor is destroyed: one click on a cell
+    /// gives it the focus, and a close request that is not a mouse click --
+    /// the window manager's (Alt+F4 on this window), or STC quitting --
+    /// leaves it there.  JUCE 9's ~TableListBox has already destroyed its own
+    /// ListBoxModel base when ~ListBox takes the header down; each header
+    /// column's accessibility handler then asks whether it is a parent of
+    /// the focused cell, through the row's handler, which calls getNumRows()
+    /// on that dead base: "pure virtual method called", and STC aborted with
+    /// every engine and output (AUD11 APPRUN-1).  So the focus is given away
+    /// here, while the table is still whole.  A cell being edited commits its
+    /// text as it does when the operator clicks elsewhere.  This is the only
+    /// table in STC with components in its cells; another one would need
+    /// the same.
+    ~MixerMapEditor() override
+    {
+        if (hasKeyboardFocus(true))
+            juce::Component::unfocusAllComponents();
+    }
+
     /// Called whenever a parameter mapping is changed
     std::function<void()> onChange;
 
