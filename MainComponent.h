@@ -791,6 +791,11 @@ private:
     juce::HyperlinkButton btnGitHub { "github.com/fiverecords/SuperTimecodeConverter",
                                        juce::URL("https://github.com/fiverecords/SuperTimecodeConverter") };
 
+    // --- Power request (AUD11 PLAT-3; see keepSystemAwake) ---
+    void keepSystemAwake(bool keep);
+    bool systemKeptAwake = false;           // the request as last made
+    int  powerCheckCountdown = 0;           // ticks until timerCallback looks again (once a second)
+
     // --- Update checker ---
     UpdateChecker updateChecker;
     juce::HyperlinkButton btnUpdateAvailable { "", juce::URL() };

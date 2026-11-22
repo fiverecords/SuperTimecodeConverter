@@ -2582,6 +2582,38 @@ MainComponent::~MainComponent()
     // devices and drop their managers while JUCE is still alive, so the
     // hub's static instance destroys nothing at process exit.
     AudioDeviceHub::shutdown();
+
+    // 14. Nothing runs any more: give up the power request (AUD11 PLAT-3).
+    keepSystemAwake(false);
+}
+
+//==============================================================================
+// AUD11 PLAT-3: STC told the operating system nothing about being in use.
+// Windows decides idle sleep from keyboard and mouse input and from the
+// power requests of the running programs, not from network or MIDI traffic,
+// so a show PC on its default power plan that nobody touched went to sleep
+// at the idle timeout with timecode running, and every output stopped.
+//
+// While an engine is in use (timerCallback decides, once a second) the
+// message thread holds ES_SYSTEM_REQUIRED: the system stays up, the display
+// may still switch off.  ES_CONTINUOUS alone gives the request up; that is
+// done when no engine is in use any more and at exit, so STC left open and
+// idle does not keep an office PC awake.  SetThreadExecutionState belongs
+// to the calling thread: both calls come from the message thread, which
+// lives for the whole run.  It does not stop a closed lid, the power button
+// or a critical battery level.
+//
+// Windows only.  macOS has the same rule and needs its own call (an IOKit
+// power assertion); not done.  Linux has no one interface for it.
+//==============================================================================
+void MainComponent::keepSystemAwake(bool keep)
+{
+    if (keep == systemKeptAwake)
+        return;
+    systemKeptAwake = keep;
+   #if JUCE_WINDOWS
+    SetThreadExecutionState(keep ? (ES_CONTINUOUS | ES_SYSTEM_REQUIRED) : ES_CONTINUOUS);
+   #endif
 }
 
 //==============================================================================
@@ -9433,6 +9465,26 @@ void MainComponent::timerCallback()
                 txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
             saveSettings();
         }
+    }
+
+    // AUD11 PLAT-3: the power request follows the engines, looked at once a
+    // second.  An engine is in use when it listens to an input from outside
+    // (anything but the internal generator / system clock), when its
+    // generator is playing, or when one of its timecode outputs is switched
+    // on.  The engine STC starts with -- system clock, no output -- is not.
+    if (--powerCheckCountdown <= 0)
+    {
+        powerCheckCountdown = 60;
+        bool inUse = false;
+        for (auto& e : engines)
+            inUse = inUse
+                 || (e->getActiveInput() != SrcType::SystemTime && e->isInputStarted())
+                 || (e->getActiveInput() == SrcType::SystemTime && ! e->getGeneratorClockMode()
+                       && e->getGeneratorState() == TimecodeEngine::GeneratorState::Playing)
+                 || e->isOutputMtcEnabled() || e->isOutputArtnetEnabled() || e->isOutputLANetTCEnabled()
+                 || e->isOutputLtcEnabled() || e->isOutputThruEnabled()
+                 || e->isOutputTcnetEnabled() || e->isOutputHippoEnabled();
+        keepSystemAwake(inUse);
     }
 
     // Feed TCNet output layers from engines.
