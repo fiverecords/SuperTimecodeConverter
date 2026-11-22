@@ -122,6 +122,13 @@ namespace StageLinQ
     // per deck: the largest in the #23 PRIME 4+ captures are 322 and 144.
     static constexpr uint32_t kMaxServiceBlock = 65536;
 
+    // Devices tracked from discovery, and connection threads alive, at any
+    // one time.  A rig is a handful of units, each announcing from its own
+    // address; without a limit, discovery frames from 300 source addresses
+    // (free to forge) made 300 entries and 304 threads, each with its
+    // sockets, and stop() waited for them all (AUD11 SLQ-11).
+    static constexpr int kMaxDevices = 16;
+
     // Maximum supported decks per device (Prime 4 has 4)
     static constexpr int kMaxDecksPerDevice = 4;
 
@@ -1935,7 +1942,16 @@ private:
         double now = juce::Time::getMillisecondCounterHiRes();
 
         std::lock_guard<std::mutex> lock(devicesMutex);
-        auto& dev = discoveredDevices[senderIp.toStdString()];
+
+        // A new address when kMaxDevices are tracked already is not taken
+        // in (AUD11 SLQ-11).  The ones tracked stay, and an entry is given
+        // up 5 s after its device stopped announcing (manageConnections).
+        const std::string key = senderIp.toStdString();
+        if (discoveredDevices.find(key) == discoveredDevices.end()
+            && discoveredDevices.size() >= (size_t)StageLinQ::kMaxDevices)
+            return;
+
+        auto& dev = discoveredDevices[key];
         bool isNew = dev.ip.isEmpty();
 
         dev.ip = senderIp;
@@ -1964,6 +1980,20 @@ private:
         // connThreadsMutex and waited for threads whose markDisconnected()
         // needs devicesMutex: a lock-order cycle (AUDIT SLQ-6).
         std::vector<StageLinQDeviceInfo> toLaunch;
+
+        // The connection threads still alive: those of the devices
+        // connected or connecting, and any that was told to stop (an EXIT,
+        // a re-announce) and has not finished -- a connect in progress
+        // takes up to 2 s.  No more than kMaxDevices in all (AUD11 SLQ-11);
+        // only this thread launches them, so the count can only fall
+        // between here and the launch below.
+        size_t threadsAlive = 0;
+        {
+            std::lock_guard<std::mutex> cLock(connThreadsMutex);
+            for (const auto& ct : connectionThreads)
+                if (ct->isThreadRunning()) ++threadsAlive;
+        }
+
         {
             std::lock_guard<std::mutex> lock(devicesMutex);
 
@@ -2001,6 +2031,9 @@ private:
                 if (dev.lastConnectAttempt > 0.0
                     && (now - dev.lastConnectAttempt) < StageLinQ::kReconnectDelay * 1000.0)
                     continue;
+
+                // Not while kMaxDevices threads are alive: on a later pass
+                if (threadsAlive + toLaunch.size() >= (size_t)StageLinQ::kMaxDevices) continue;
 
                 // Connect in a background thread to avoid blocking discovery
                 dev.connected = true;  // Mark as connecting to prevent re-entry
