@@ -2648,6 +2648,20 @@ void MainComponent::removeEngine(int index)
     for (int i = 0; i < (int)engines.size(); i++)
         engines[(size_t)i]->reindex(i);
 
+    // The shared TCNet output runs while some engine has TCNET OUT on.
+    // The output toggles apply that rule; removing the last such engine
+    // did not, so STC stayed on the network as a TCNet node with no layer
+    // until another output was toggled or STC was restarted (AUD11
+    // MAIN-A-11).
+    if (sharedTcnetOutput.getIsRunning())
+    {
+        bool anyTcnet = false;
+        for (auto& e : engines)
+            if (e->isOutputTcnetEnabled()) { anyTcnet = true; break; }
+        if (!anyTcnet)
+            sharedTcnetOutput.stop();
+    }
+
     // Keep settings.engines in sync with engines vector
     if (index < (int)settings.engines.size())
         settings.engines.erase(settings.engines.begin() + index);
