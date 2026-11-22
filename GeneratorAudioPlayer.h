@@ -270,7 +270,10 @@ public:
                 tagTitle = base;
         }
 
-        if (readerSR <= 0.0 || totalSamples <= 0)
+        // What the reader says of the file is checked before the reader is
+        // used (AUD11 FUZZ-14): a header that states an absurd sample size
+        // or channel count gets no further than this.
+        if (readerSR <= 0.0 || totalSamples <= 0 || ! hasSaneFrame(*newReader))
             return failLoad("EMPTY OR CORRUPT FILE", waveform);
 
         // The waveform thumbnail reads the file on its own thread, so it
@@ -1079,6 +1082,28 @@ private:
     {
         const juce::ScopedLock sl(transportLock);
         loadError = message;
+    }
+
+    // LoaderThread (loadFile): does the reader state a frame that can be
+    // read (AUD11 FUZZ-14)?  JUCE's WAV and AIFF readers convert through a
+    // block of 5,760 bytes and take from the file as many whole frames as
+    // fit in it at a time.  A frame larger than the block is none at a
+    // time, and their read loop never ends: a 40-byte AIFF whose COMM chunk
+    // states a sample size of tens of thousands of bits, or a WAV stating
+    // 3000 channels, loaded as a valid file and left the read-ahead thread
+    // and the thumbnail's thread spinning, after which the next preset
+    // change or the quit never came back.  JUCE's readers accept such a
+    // header, so the bounds are set here: 8 to 64 bits a sample and 1 to
+    // 256 channels, a frame of at most 2,048 bytes.  Files an audio program
+    // writes are far inside them (the transport plays the first two
+    // channels of a file with more, as before).  Under 8 bits there is
+    // nothing to lose -- JUCE's AIFF reader gives silence for such a file --
+    // and a damaged FLAC header stating 1 bit a sample sent JUCE's FLAC
+    // reader round the same way.
+    static bool hasSaneFrame(const juce::AudioFormatReader& reader)
+    {
+        return reader.numChannels   >= 1 && reader.numChannels   <= 256
+            && reader.bitsPerSample >= 8 && reader.bitsPerSample <= 64;
     }
 
     // LoaderThread (loadFile): a load that ends with no file -- the message,
