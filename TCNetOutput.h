@@ -798,7 +798,9 @@ private:
     }
 
     /// The index in slaves[] of the slave replyPortFor() answers on, by the
-    /// same rule; -1 when no slave has that IP.
+    /// same rule; -1 when no slave has that IP.  A slave that announced
+    /// listener port 0 is passed over as "the first with that IP", as it is
+    /// there (its port leaves `first` at 0): the reply goes to the next one.
     int slaveSlotFor(const juce::String& srcIp, int srcPort) const
     {
         int first = -1;
@@ -807,7 +809,7 @@ private:
             const auto& s = slaves[i];
             if (!s.active || s.ip != srcIp) continue;
             if ((int) s.listenerPort == srcPort) return i;
-            if (first < 0) first = i;
+            if (first < 0 && s.listenerPort != 0) first = i;
         }
         return first;
     }
