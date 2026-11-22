@@ -3178,12 +3178,23 @@ void MainComponent::startCurrentLtcInput()
     if (entry.deviceName.isEmpty() && !filteredInputIndices.isEmpty())
     { cmbAudioInputDevice.setSelectedId(1, juce::dontSendNotification); entry = getSelectedAudioInput(); }
 
+    // The channel selectors are empty until a start has filled them -- at
+    // launch, always.  The saved channels are used then, as the outputs use
+    // theirs (getChannelFromComboOrSettings): this start used to fall to
+    // Ch 1, and Ch 2 for the Audio Thru tap, at every launch, and the save
+    // it queues wrote those over the configured channels (AUD11 MAIN-A-V1).
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
     int ltcCh = cmbAudioInputChannel.getSelectedId() - 1;
+    if (ltcCh < 0 && hasSettings) ltcCh = settings.engines[(size_t) selectedEngine].audioInputChannel;
     if (ltcCh < 0) ltcCh = 0;
 
     int thruCh = -1;
     if (eng.isPrimary() && eng.isOutputThruEnabled())
-    { thruCh = cmbThruInputChannel.getSelectedId() - 1; if (thruCh < 0) thruCh = 1; }
+    {
+        thruCh = cmbThruInputChannel.getSelectedId() - 1;
+        if (thruCh < 0 && hasSettings) thruCh = settings.engines[(size_t) selectedEngine].thruInputChannel;
+        if (thruCh < 0) thruCh = 1;
+    }
 
     if (eng.startLtcInput(entry.typeName, entry.deviceName, ltcCh, thruCh,
                            getPreferredSampleRate(), getPreferredBufferSize()))
