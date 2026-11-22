@@ -3585,6 +3585,7 @@ private:
                     const juce::SpinLock::ScopedLockType lock(cacheLock);
                     auto it = metadataCache.find(cacheKey);
                     if (it != metadataCache.end()
+                        && nfsRouteApplies(req)
                         && !it->second.nfsAttempted
                         && (!it->second.hasBeatGrid() || !it->second.hasCueList()
                             || !it->second.hasSongStructure()
@@ -3881,6 +3882,21 @@ private:
         }
     }
 
+    /// The NFS route finds a track's analysis by its ID in the medium's
+    /// export.pdb, which lists rekordbox tracks only (AUD11 PDL-6).  For a
+    /// track of another type (2: a file rekordbox has not analysed, 5: a
+    /// CD) the status packet's ID is one the player assigned -- or the CD
+    /// track number -- and may equal a rekordbox ID of the same medium:
+    /// the lookup then gave that other track's beat grid, cues and
+    /// waveforms.  So the route runs for trackType 1 only.  Both callers
+    /// of requestMetadata still pass 1 for every load (the player's track
+    /// type is not handed to them yet), so this takes effect once they
+    /// pass the type they see.
+    static bool nfsRouteApplies(const MetadataRequest& req)
+    {
+        return req.trackType == 1;
+    }
+
     /// Run the NFS route only (used when there is no dbserver connection).
     /// Ensures a cache entry exists and launches the NFS download.
     void processNfsFallback(const MetadataRequest& req, const CacheKey& cacheKey)
@@ -3893,6 +3909,7 @@ private:
             const juce::SpinLock::ScopedLockType lock(cacheLock);
             auto it = metadataCache.find(cacheKey);
             if (it != metadataCache.end()
+                && nfsRouteApplies(req)
                 && !it->second.nfsAttempted
                 && (!it->second.hasBeatGrid() || !it->second.hasCueList()
                     || !it->second.hasSongStructure()
