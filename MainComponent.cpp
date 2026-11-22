@@ -6665,7 +6665,14 @@ void MainComponent::updateStatusLabels()
 {
     auto& eng = currentEngine();
 
-    lblInputStatus.setText(eng.getInputStatusText(), juce::dontSendNotification);
+    // An audio interface that delivers no audio any more (unplugged, taken
+    // by another program, not reopened) says so in place of the line of
+    // whatever runs on it -- here LTC IN, below LTC OUT and Audio Thru
+    // (AUD11 TC-IO-2; AudioDeviceHub's "A lost device").
+    if (eng.getActiveInput() == SrcType::LTC && eng.getLtcInput().isDeviceLost())
+        lblInputStatus.setText("DEVICE LOST: " + eng.getLtcInput().getCurrentDeviceName(), juce::dontSendNotification);
+    else
+        lblInputStatus.setText(eng.getInputStatusText(), juce::dontSendNotification);
     lblInputStatus.setColour(juce::Label::textColourId,
                              eng.isSourceActive() ? getInputColour(eng.getActiveInput()) : textDim);
 
@@ -6712,7 +6719,9 @@ void MainComponent::updateStatusLabels()
 
     if (eng.isOutputLtcEnabled())
     {
-        if (eng.getLtcOutput().getIsRunning())
+        if (eng.getLtcOutput().isDeviceLost())   // before PAUSED: AUD11 TC-IO-2
+            lblOutputLtcStatus.setText("DEVICE LOST: " + eng.getLtcOutput().getCurrentDeviceName(), juce::dontSendNotification);
+        else if (eng.getLtcOutput().getIsRunning())
             lblOutputLtcStatus.setText(eng.getLtcOutput().isPaused() ? "PAUSED" : eng.getLtcOutStatusText(), juce::dontSendNotification);
         else
             lblOutputLtcStatus.setText(eng.getLtcOutStatusText(), juce::dontSendNotification);
@@ -6720,7 +6729,9 @@ void MainComponent::updateStatusLabels()
 
     if (eng.isPrimary() && eng.isOutputThruEnabled())
     {
-        juce::String thruStatus = eng.getThruOutStatusText();
+        juce::String thruStatus = (eng.getAudioThru() && eng.getAudioThru()->isDeviceLost())
+                                    ? "DEVICE LOST: " + eng.getAudioThru()->getCurrentDeviceName()
+                                    : eng.getThruOutStatusText();
         if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning() && eng.getLtcInput().getIsRunning())
         {
             uint32_t under = eng.getLtcInput().getPassthruUnderruns();

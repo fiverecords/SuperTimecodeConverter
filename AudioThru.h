@@ -88,6 +88,12 @@ public:
     }
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
+    /// Running, but the interface delivers no audio: unplugged, taken by
+    /// another program, stalled, or not reopened (AudioDeviceHub's "A lost
+    /// device", AUD11 TC-IO-2).  The running flag and everything else stay
+    /// as they are -- the hub starts this again when the device is back;
+    /// this is for the status line.  Message thread.
+    bool isDeviceLost() const { return getIsRunning() && AudioDeviceHub::get().isDeviceLost(this); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
     juce::String getCurrentTypeName() const { return currentTypeName; }
     int getSelectedChannel() const { return selectedChannel.load(std::memory_order_relaxed); }
