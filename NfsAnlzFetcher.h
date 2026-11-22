@@ -295,6 +295,23 @@ public:
         ++allSlotsEpoch;
     }
 
+    /// Forget everything learnt from every player: the RPC ports as well as
+    /// the mount handles and export.pdb indexes.  For DbServerClient::stop()
+    /// (AUD11 PDL-4): while the input is stopped nobody watches the players,
+    /// so a stick may be swapped or a player replaced unseen, and what was
+    /// learnt before is not known to hold at the next start.  Call it with
+    /// no fetch running (stop() has joined the NFS thread by then): the
+    /// ports have no all-players counter, so a fetch in flight could still
+    /// store the ports it was looking up.
+    void clearAll()
+    {
+        const std::lock_guard<std::mutex> lock(cacheMutex);
+        portCache.clear();
+        mountCache.clear();
+        pdbAnlzCache.clear();
+        ++allSlotsEpoch;
+    }
+
 private:
     //==========================================================================
     // Constants

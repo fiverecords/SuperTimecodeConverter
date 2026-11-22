@@ -274,6 +274,18 @@ public:
             const juce::ScopedLock sl(pendingInvalidateLock);
             pendingInvalidateIPs.clear();
         }
+
+        // Forget what was learnt from the players (AUD11 PDL-4).  Every
+        // stop of the Pro DJ Link input is followed by this one (the last
+        // engine left Pro DJ Link, the interface or the bridge identity
+        // changed), and while the input is stopped nobody sees a stick
+        // swapped or a player replaced: ProDJLinkInput::stop() reports no
+        // player lost, and after start() the first status of a slot only
+        // notes its media.  rekordbox IDs are per export, so an entry kept
+        // across the stop answered the next DJ's track 5 with the previous
+        // DJ's title, grid and cues ("fully cached", nothing queued), and
+        // the fetcher resolved the ID in the old stick's export.pdb.
+        forgetAllPlayers();
     }
 
     bool getIsRunning() const { return isRunningFlag.load(std::memory_order_relaxed); }
@@ -691,6 +703,44 @@ private:
             const juce::ScopedLock sl(knownDbPortsLock);
             knownDbPorts.erase(playerIP.toStdString());
         }
+    }
+
+    /// stop(), with the worker and the NFS thread joined (AUD11 PDL-4):
+    /// drop everything that came from the players or names their tracks --
+    /// the metadata and artwork caches, the requests still queued or waiting
+    /// for a cooldown, the dbserver ports, the cooldowns, and the NFS
+    /// fetcher's ports, mount handles and export.pdb indexes.  The next
+    /// start asks for the loaded tracks again, as a first start does; the
+    /// disk cache (.anlz / .wfc, keyed by artist|title|duration) is not
+    /// touched and fills their analysis in phase 1.  An entry made after
+    /// this by a caller that still holds an old track ID is fetched from
+    /// the player as it is then, not taken from before the stop.
+    void forgetAllPlayers()
+    {
+        {
+            const juce::SpinLock::ScopedLockType lock(cacheLock);
+            metadataCache.clear();
+        }
+        {
+            const juce::SpinLock::ScopedLockType lock(artCacheLock);
+            artworkCache.clear();
+        }
+        {
+            // The worker is the only consumer and it has ended: taking the
+            // read position to the write position under the producers' lock
+            // empties the queue.
+            const juce::SpinLock::ScopedLockType producerLock(queueProducerLock);
+            reqReadPos.store(reqWritePos.load(std::memory_order_relaxed), std::memory_order_release);
+        }
+        {
+            const juce::ScopedLock sl(knownDbPortsLock);
+            knownDbPorts.clear();
+        }
+        // Worker-thread state; the worker has ended.
+        failedAtMs.clear();
+        cooldownRetries.clear();
+        nfsLostPlayers.clear();
+        nfsAnlzFetcher.clearAll();
     }
 
     /// Internal enqueue (called from background thread for phase 2 re-enqueue).
