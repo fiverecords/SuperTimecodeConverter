@@ -611,7 +611,7 @@ private:
     juce::Label        lblOscFwdBpmCmd;
     juce::ToggleButton btnOscMixerFwd   { "OSC MIXER FWD" };
     juce::ToggleButton btnMidiMixerFwd  { "MIDI MIXER FWD" };
-    juce::ToggleButton btnArtnetMixerFwd { "ARTNET MIXER FWD" };
+    juce::ToggleButton btnArtnetMixerFwd { "ART-NET MIXER FWD" };   // Art-Net spelled as on the other labels (AUD11 DOCS-7)
     juce::ComboBox     cmbArtMixNet, cmbArtMixSub, cmbArtMixUni;
     juce::Label        lblArtMixAddr;
     juce::ComboBox     cmbMidiMixCCCh;
@@ -733,7 +733,7 @@ private:
     juce::ToggleButton btnTriggerOsc { "OSC Trigger" };
     juce::TextEditor edOscIp;
     juce::TextEditor edOscPort;
-    juce::ToggleButton btnArtnetTrigger { "ARTNET Trigger" };
+    juce::ToggleButton btnArtnetTrigger { "ART-NET Trigger" };
     juce::ComboBox cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni;
     juce::Label    lblArtTrigAddr;
     juce::ComboBox cmbArtnetDmxInterface;     juce::Label lblArtnetDmxInterface;

@@ -208,8 +208,15 @@ struct SafeJsonFile
     /// (and a temporary file, hidden, that nothing reads).
     /// Returns whether the file now holds `text`.
     /// Called directly only by a restore, which must also write when an
-    /// earlier restore in this session has suspended saves.
-    static bool writeRotating(const juce::File& file, const juce::String& text)
+    /// earlier restore in this session has suspended saves.  A restore
+    /// passes `previousMustBeKept`: it replaces a whole file with another
+    /// one, so the file it replaces has to reach .bak first (steps 2 and 4
+    /// before step 3), and where that fails the file is not replaced and
+    /// the result is false.  (A file that was missing, or was not a whole
+    /// JSON value, has nothing to keep.)  The restore's message can then
+    /// say that the previous version of each restored file is its .bak
+    /// (AUD11 DOCS-7).
+    static bool writeRotating(const juce::File& file, const juce::String& text, bool previousMustBeKept = false)
     {
         const bool exists = file.existsAsFile();
         juce::String current;
@@ -226,9 +233,14 @@ struct SafeJsonFile
 
         const juce::File bak = backupFor(file);
         juce::TemporaryFile outgoing(bak, juce::TemporaryFile::useHiddenFile);
-        const bool rotate = exists && scan(current).complete
+        const bool worthKeeping = exists && scan(current).complete;
+        const bool rotate = worthKeeping
                             && file.copyFileTo(outgoing.getFile())
                             && outgoing.getFile().getSize() == file.getSize();
+
+        if (previousMustBeKept && worthKeeping)
+            return rotate && outgoing.getFile().replaceFileIn(bak)
+                          && incoming.overwriteTargetFileWithTemporary();
 
         if (! incoming.overwriteTargetFileWithTemporary())
             return false;
@@ -1495,7 +1507,7 @@ private:
         const std::lock_guard<std::mutex> hold(order.lock);
         if (seq <= order.written) return false;   // a newer snapshot is already on disk
         order.written = seq;
-        return restore ? SafeJsonFile::writeRotating(file, text) : SafeJsonFile::save(file, text);
+        return restore ? SafeJsonFile::writeRotating(file, text, true) : SafeJsonFile::save(file, text);
     }
 };
 
@@ -2545,7 +2557,8 @@ public:
     // Bundles five files -- settings.json, trackmap.json, mixermap.json,
     // slq_mixermap.json and generator_presets.json -- into a single JSON
     // file.  Import writes back each one the bundle carries (the current
-    // file kept as .bak); it reloads nothing and suspends nothing itself.
+    // file kept as .bak) and says which were written and which were not;
+    // it reloads nothing and suspends nothing itself.
     // Its caller is to suspend every save until restart
     // (suspendSavesUntilRestart) together with the message that says so.
     // MainComponent then reloads AppSettings (and with it the Track Map and
@@ -2571,34 +2584,52 @@ public:
         return juce::var(root);
     }
 
-    bool applyImportBundle(const juce::var& bundle)
+    /// Returns whether any file was restored -- the caller's cue to suspend
+    /// saves and reload.  `restored` and `notRestored`, when given, receive
+    /// the names of the files written and of those the bundle carries that
+    /// were not: a write that failed (the file is then as it was), or a
+    /// section that is not a JSON object, which is not written over a good
+    /// file.  Before, the result of every write was dropped and any bundle
+    /// returned true: on a full or write-protected settings folder, or with
+    /// a file held open by another program on Windows, the operator was
+    /// told "Configuration restored", saves were suspended, and the restart
+    /// brought the old or a half-restored configuration (AUD11 DOCS-7).
+    bool applyImportBundle(const juce::var& bundle,
+                           juce::StringArray* restored = nullptr, juce::StringArray* notRestored = nullptr)
     {
         auto* obj = bundle.getDynamicObject();
         if (!obj) return false;
 
         auto dir = getSettingsFile().getParentDirectory();
-        auto settingsVar = obj->getProperty("settings");
-        auto trackmapVar = obj->getProperty("trackmap");
-        auto mixermapVar = obj->getProperty("mixermap");
-        auto slqMixermapVar = obj->getProperty("slq_mixermap");   // absent from bundles before 1.9.14
-        auto presetsVar  = obj->getProperty("generator_presets");
+        juce::StringArray written, missed;
 
         // Write each section back to its file (only if present in bundle),
-        // keeping the current files as .bak -- a restore replaces the show.
-        // Written past a suspension left by an earlier restore in this
-        // session; the Track Map in order with its own saves.
-        if (!settingsVar.isVoid())
-            SafeJsonFile::writeRotating(getSettingsFile(), juce::JSON::toString(settingsVar));
-        if (!trackmapVar.isVoid())
-            TrackMap::writeRestoredFile(juce::JSON::toString(trackmapVar));
-        if (!mixermapVar.isVoid())
-            SafeJsonFile::writeRotating(dir.getChildFile("mixermap.json"), juce::JSON::toString(mixermapVar));
-        if (!slqMixermapVar.isVoid())
-            SafeJsonFile::writeRotating(dir.getChildFile("slq_mixermap.json"), juce::JSON::toString(slqMixermapVar));
-        if (!presetsVar.isVoid())
-            SafeJsonFile::writeRotating(dir.getChildFile("generator_presets.json"), juce::JSON::toString(presetsVar));
+        // keeping the current files as .bak -- a restore replaces the show,
+        // and a file whose current version cannot be kept is not replaced
+        // (writeRotating, previousMustBeKept).  Written past a suspension
+        // left by an earlier restore in this session; the Track Map in
+        // order with its own saves.
+        auto restore = [&](const char* section, const char* fileName)
+        {
+            const juce::var content = obj->getProperty(section);
+            if (content.isVoid())
+                return;   // not in this bundle (slq_mixermap: none before 1.9.14)
+            const juce::String name(fileName);
+            const bool ok = content.getDynamicObject() != nullptr
+                            && (name == "trackmap.json"
+                                    ? TrackMap::writeRestoredFile(juce::JSON::toString(content))
+                                    : SafeJsonFile::writeRotating(dir.getChildFile(name), juce::JSON::toString(content), true));
+            (ok ? written : missed).add(name);
+        };
+        restore("settings",          "settings.json");
+        restore("trackmap",          "trackmap.json");
+        restore("mixermap",          "mixermap.json");
+        restore("slq_mixermap",      "slq_mixermap.json");
+        restore("generator_presets", "generator_presets.json");
 
-        return true;
+        if (restored != nullptr)    *restored = written;
+        if (notRestored != nullptr) *notRestored = missed;
+        return ! written.isEmpty();
     }
 
     /// After a configuration restore: no settings, Track Map, preset or

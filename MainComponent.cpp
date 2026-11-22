@@ -1298,7 +1298,7 @@ MainComponent::MainComponent()
             // Unlock: confirm dialog to prevent accidental unlock
             auto options = juce::MessageBoxOptions()
                 .withIconType(juce::MessageBoxIconType::WarningIcon)
-                .withTitle("Unlock Show Mode?")
+                .withTitle("Unlock Show Lock?")
                 .withMessage("Show Lock is active. Unlocking allows changes to "
                              "input sources, devices, frame rates, and engine "
                              "configuration.\n\nUnlock now?")
@@ -4191,8 +4191,10 @@ void MainComponent::exportConfig()
     sharedMixerMap.save();
     sharedSlqMixerMap.save();
 
+    // The dialogs carry the buttons' words, Backup and Restore; they said
+    // Export and Import Configuration (AUD11 DOCS-7).
     configFileChooser = std::make_unique<juce::FileChooser>(
-        "Export STC Configuration",
+        "Backup STC Configuration",
         juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
             .getChildFile("stc_backup.json"),
         "*.json");
@@ -4225,10 +4227,16 @@ void MainComponent::exportConfig()
         });
 }
 
+/// Why a file of a backup was not restored, for the two dialogs that name
+/// such files.
+static const char* const kNotRestoredWhy =
+    "the file could not be written (the disk may be full or write-protected, or the file "
+    "in use by another program), or the backup holds no valid data for it.";
+
 void MainComponent::importConfig()
 {
     configFileChooser = std::make_unique<juce::FileChooser>(
-        "Import STC Configuration",
+        "Restore STC Configuration",
         juce::File::getSpecialLocation(juce::File::userDesktopDirectory),
         "*.json");
 
@@ -4248,18 +4256,18 @@ void MainComponent::importConfig()
             {
                 juce::AlertWindow::showMessageBoxAsync(
                     juce::MessageBoxIconType::WarningIcon,
-                    "Import Failed",
-                    "This file is not a valid STC backup.");
+                    "Restore Failed",
+                    "This file is not a valid STC backup. Nothing was changed.");
                 return;
             }
 
             auto options = juce::MessageBoxOptions()
                 .withIconType(juce::MessageBoxIconType::QuestionIcon)
-                .withTitle("Import Configuration")
+                .withTitle("Restore Configuration")
                 .withMessage("This will replace ALL current settings, track maps, generator presets "
                              "and mixer maps. The application will need to restart to apply changes.\n\n"
                              "Continue?")
-                .withButton("Import")
+                .withButton("Restore")
                 .withButton("Cancel");
 
             importConfirmBox = juce::AlertWindow::showScopedAsync(options,
@@ -4284,7 +4292,14 @@ void MainComponent::importConfig()
                     if (genPresetWindow != nullptr) delete genPresetWindow.getComponent();
                     if (mixerMapWindow != nullptr)  delete mixerMapWindow.getComponent();
 
-                    if (settings.applyImportBundle(parsed))
+                    // What was written decides what is said and done (AUD11
+                    // DOCS-7): every file -- "Restore Complete"; some --
+                    // "Restore Incomplete", naming both lists; none --
+                    // "Restore Failed", with nothing changed, no suspension
+                    // and no reload.  Any bundle used to end in "Import
+                    // Complete" and a suspension, written or not.
+                    juce::StringArray restored, notRestored;
+                    if (settings.applyImportBundle(parsed, &restored, &notRestored))
                     {
                         // From here to the restart nothing is saved: the
                         // running engines keep their configuration, and any
@@ -4311,18 +4326,31 @@ void MainComponent::importConfig()
                             e->refreshTrackMapLookup();
                         populateGenPresetCombo();
 
-                        juce::AlertWindow::showMessageBoxAsync(
-                            juce::MessageBoxIconType::InfoIcon,
-                            "Import Complete",
-                            "Configuration restored. Restart STC now to apply it -- "
-                            "until then, changes are not saved.");
+                        if (notRestored.isEmpty())
+                            juce::AlertWindow::showMessageBoxAsync(
+                                juce::MessageBoxIconType::InfoIcon,
+                                "Restore Complete",
+                                "Configuration restored. Restart STC now to apply it -- "
+                                "until then, changes are not saved.");
+                        else
+                            juce::AlertWindow::showMessageBoxAsync(
+                                juce::MessageBoxIconType::WarningIcon,
+                                "Restore Incomplete",
+                                "Restored: " + restored.joinIntoString(", ") + ".\n"
+                                "NOT restored: " + notRestored.joinIntoString(", ") + " -- " + kNotRestoredWhy
+                                + " These are as they were.\n\n"
+                                "The previous version of each restored file is kept beside it as .bak. "
+                                "Restart STC now to apply what was restored -- until then, changes are not saved.");
                     }
                     else
                     {
                         juce::AlertWindow::showMessageBoxAsync(
                             juce::MessageBoxIconType::WarningIcon,
-                            "Import Failed",
-                            "Could not apply the backup file.");
+                            "Restore Failed",
+                            notRestored.isEmpty()
+                                ? juce::String("This backup holds no configuration. Nothing was changed.")
+                                : "NOT restored: " + notRestored.joinIntoString(", ") + " -- " + kNotRestoredWhy
+                                  + " Nothing was changed.");
                     }
                 });
         });
