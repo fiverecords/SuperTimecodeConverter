@@ -847,6 +847,17 @@ private:
     // being edited, regardless of what (if anything) the engine happens to
     // be playing right now.  AudioThumbnailCache is a small fixed-size
     // pool (just one source here, but JUCE requires a cache).
+    //
+    // The file is opened by a thread (loadOwnAudio), with the format
+    // manager of OwnAudioLoad: that one is shared with the thread, so it
+    // outlives a reader made after this window has closed.  Declared before
+    // the thumbnail, which holds the reader, so it goes after it.
+    struct OwnAudioLoad
+    {
+        juce::AudioFormatManager                 formats;
+        std::unique_ptr<juce::AudioFormatReader> reader;
+    };
+    std::shared_ptr<OwnAudioLoad> ownAudioLoad;
     juce::AudioFormatManager   ownFormatManager;
     juce::AudioThumbnailCache  ownThumbnailCache;
     juce::AudioThumbnail       ownThumbnail;
@@ -856,22 +867,49 @@ private:
     /// preset's audio file is treated as immutable for the life of the
     /// editor window (the parent closes / reopens the window if the user
     /// changes the audio file in the preset form).
+    ///
+    /// The disk is asked on a thread of its own, and the strip gets its
+    /// waveform and its length when the answer is posted back (AUD11
+    /// GENERATOR-16).  It was asked here, in the constructor: Cues...
+    /// pressed for a preset whose file is on a disk that is asleep or a
+    /// share that does not answer held the message thread, and with it the
+    /// tick of every engine, until the file had been found and opened --
+    /// the reason the preset table's own look at the disk is on a thread
+    /// (GeneratorPresetEditor::checkAudioFilesOnDisk).  Until the answer
+    /// comes the strip is empty, as for a preset without a file.
     void loadOwnAudio()
     {
         audioLengthMs = 0;
         if (preset.audioFilePath.isEmpty()) return;
-        juce::File f(preset.audioFilePath);
-        if (! f.existsAsFile()) return;
-        std::unique_ptr<juce::AudioFormatReader> reader(
-            ownFormatManager.createReaderFor(f));
-        if (reader == nullptr) return;
-        if (reader->sampleRate > 0.0)
+        const juce::File f(preset.audioFilePath);
+        auto load = std::make_shared<OwnAudioLoad>();
+        load->formats.registerBasicFormats();
+        juce::Component::SafePointer<GeneratorCuePointEditor> self(this);
+        juce::Thread::launch([self, load, f]
+        {
+            if (! f.existsAsFile()) return;
+            load->reader.reset(load->formats.createReaderFor(f));
+            if (load->reader == nullptr) return;
+            juce::MessageManager::callAsync([self, load]
+            {
+                if (auto* editor = self.getComponent())
+                    editor->takeOwnAudio(load);
+            });
+        });
+    }
+
+    /// The thread of loadOwnAudio has opened the file.  Message thread.
+    void takeOwnAudio(const std::shared_ptr<OwnAudioLoad>& load)
+    {
+        ownAudioLoad = load;
+        if (load->reader->sampleRate > 0.0)
             audioLengthMs = (uint32_t) std::llround(
-                1000.0 * (double) reader->lengthInSamples / reader->sampleRate);
+                1000.0 * (double) load->reader->lengthInSamples / load->reader->sampleRate);
+        strip.setAudioLengthMs(audioLengthMs);
         // Hand the reader off to the thumbnail; AudioThumbnail::setReader
         // takes ownership and triggers asynchronous decoding that the strip
         // observes via its ChangeListener attachment.
-        ownThumbnail.setReader(reader.release(), juce::Time::currentTimeMillis());
+        ownThumbnail.setReader(load->reader.release(), juce::Time::currentTimeMillis());
     }
 
     /// Timer tick (~30Hz when a playhead getter has been installed).
