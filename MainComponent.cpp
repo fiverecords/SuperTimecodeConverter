@@ -2561,6 +2561,15 @@ void MainComponent::addEngine()
     engines.back()->setMixerMap(&sharedMixerMap);
     engines.back()->setSlqMixerMap(&sharedSlqMixerMap);
     rebuildTabButtons();
+    // The new engine gets its settings block before its tab is shown.  The
+    // settings only grew at the next save, so syncUIFromEngine skipped
+    // everything it restores from them: the panel kept the previous
+    // engine's toggles, deck, trigger destination and audio devices, and
+    // the save queued below wrote the deck, the destination, the audio
+    // devices and AUDIO PLAYBACK into the new engine -- which then opened
+    // generator audio on the other engine's device at the next start
+    // (AUD11 MAIN-A-9).
+    settings.engines.resize(engines.size());
     selectEngine(newIndex);
     saveSettings();
 }
