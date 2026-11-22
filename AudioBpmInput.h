@@ -235,10 +235,27 @@ private:
     // BTT for `sampleRate`, configured for DJ/electronic music: the tempo
     // prior is centred on 128 BPM and the range is 60-200 BPM.  Called only
     // from audioDeviceAboutToStart.  nullptr if btt_new fails.
+    //
+    // BTT's suggested lengths are sample counts chosen for 44.1 kHz: an STFT
+    // of 1024 with a hop of 128, which gives the onset signal a rate of 344.5
+    // Hz (375 at 48 kHz), and buffers of 1024 onset values, about three
+    // seconds.  Passed unchanged at 88.2 kHz and above, the onset rate
+    // doubled or quadrupled, the buffers held 1.4 s or 0.7 s and every width
+    // counted in onset values shrank with them: a 100 BPM click read 200 at
+    // 88.2, 96, 176.4 and 192 kHz (AUD11 TC-IO-6).  The STFT length -- and
+    // with it the hop, a fixed fraction of it -- is doubled until the onset
+    // rate is back where BTT was tuned: x2 from 80 kHz, x4 from 160 kHz.
+    // Nothing changes below 80 kHz.  The two latency adjustments stay as
+    // they are: they move the beat callback, which nothing reads for its
+    // timing, not the tempo.
     BTT* createBtt(double sampleRate)
     {
+        int stftScale = 1;
+        while (stftScale < 16 && sampleRate / stftScale >= 80000.0)
+            stftScale *= 2;
+
         BTT* b = btt_new(
-            BTT_SUGGESTED_SPECTRAL_FLUX_STFT_LEN,
+            BTT_SUGGESTED_SPECTRAL_FLUX_STFT_LEN * stftScale,
             BTT_SUGGESTED_SPECTRAL_FLUX_STFT_OVERLAP,
             BTT_SUGGESTED_OSS_FILTER_ORDER,
             BTT_SUGGESTED_OSS_LENGTH,
