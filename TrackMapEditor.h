@@ -1269,9 +1269,9 @@ private:
                                  + (isOverrideScope() ? "already has an override on this engine"
                                                       : "is already in the Track Map")
                                  + ".\n\nReplace it? Its cue points, triggers and notes will be lost.")
-                    .withButton("Open Existing")
-                    .withButton("Replace")
-                    .withButton("Cancel");
+                    .withButton("Open Existing", 1)
+                    .withButton("Replace", 2)
+                    .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
                 deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
                     [this, savedKey](int result)
@@ -1588,9 +1588,9 @@ private:
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Track Already Mapped")
             .withMessage(msg)
-            .withButton("Open Existing")
-            .withButton("Add New")
-            .withButton("Cancel");
+            .withButton("Open Existing", 1)
+            .withButton("Add New", 2)
+            .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
         deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
             [this, artist, title, durationSec, otherKey](int result)
@@ -1629,8 +1629,8 @@ private:
             .withIconType(juce::MessageBoxIconType::QuestionIcon)
             .withTitle("Delete Track")
             .withMessage(msg)
-            .withButton("Delete")
-            .withButton("Cancel");
+            .withButton(juce::MessageBoxButtonOptions("Delete", 1).withPreferredAction())
+            .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
         deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
             [this, deleteArtist, deleteTitle, deleteDur](int result)
@@ -1654,8 +1654,8 @@ private:
             .withTitle("Clear All Tracks")
             .withMessage("Delete all " + juce::String(count)
                          + " tracks from the Track Map?\n\nThis cannot be undone.")
-            .withButton("Clear All")
-            .withButton("Cancel");
+            .withButton(juce::MessageBoxButtonOptions("Clear All", 1).withPreferredAction())
+            .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
         deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
             [this](int result)
@@ -1761,7 +1761,7 @@ private:
             .withIconType(juce::MessageBoxIconType::WarningIcon)
             .withTitle("Import Failed")
             .withMessage(why + " Nothing was imported.")
-            .withButton("OK"),
+            .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
             nullptr);
     }
 
@@ -2099,7 +2099,7 @@ private:
                             .withIconType(juce::MessageBoxIconType::InfoIcon)
                             .withTitle("Import Complete")
                             .withMessage(msg)
-                            .withButton("OK"),
+                            .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
                             nullptr);
                     }
                 }
@@ -2154,7 +2154,7 @@ private:
                     .withIconType(juce::MessageBoxIconType::InfoIcon)
                     .withTitle("Export Complete")
                     .withMessage(juce::String(trackMap.size()) + " track(s) exported.")
-                    .withButton("OK"),
+                    .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
                     nullptr);
             }
             else
@@ -2165,7 +2165,7 @@ private:
                     .withIconType(juce::MessageBoxIconType::WarningIcon)
                     .withTitle("Export Failed")
                     .withMessage("The Track Map was not exported. " + SafeJsonFile::couldNotWriteText(file))
-                    .withButton("OK"),
+                    .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
                     nullptr);
             }
         });

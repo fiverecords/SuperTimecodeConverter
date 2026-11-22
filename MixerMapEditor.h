@@ -56,8 +56,8 @@ public:
                 .withIconType(juce::MessageBoxIconType::WarningIcon)
                 .withTitle("Reset Mixer Map")
                 .withMessage("Reset all parameters to factory defaults?")
-                .withButton("Reset")
-                .withButton("Cancel");
+                .withButton(juce::MessageBoxButtonOptions("Reset", 1).withPreferredAction())
+                .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
             resetConfirmBox = juce::AlertWindow::showScopedAsync(options,
                 [this](int result)
@@ -132,7 +132,7 @@ public:
                         .withTitle(written ? "Export Complete" : "Export Failed")
                         .withMessage(written ? "Mixer Map exported to " + file.getFileName() + "."
                                              : "The Mixer Map was not exported. " + SafeJsonFile::couldNotWriteText(file))
-                        .withButton("OK"),
+                        .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
                         nullptr);
                 });
         };
@@ -162,7 +162,7 @@ public:
                             .withIconType(juce::MessageBoxIconType::WarningIcon)
                             .withTitle("Import Failed")
                             .withMessage(why + " Nothing was imported.")
-                            .withButton("OK"),
+                            .withButton(juce::MessageBoxButtonOptions("OK", 0).withPreferredAction().withRole(juce::MessageBoxButtonRole::cancel)),
                             nullptr);
                     };
                     // SafeJsonFile::parse: depth-limited (AUD11 FUZZ-2).

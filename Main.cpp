@@ -121,8 +121,8 @@ public:
                     .withMessage("Show Lock is active. Closing the application "
                                  "will stop all timecode outputs.\n\n"
                                  "Are you sure you want to quit?")
-                    .withButton("Quit")
-                    .withButton("Cancel");
+                    .withButton(juce::MessageBoxButtonOptions("Quit", 1).withPreferredAction())
+                    .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
                 juce::Component::SafePointer<MainWindow> safeThis(this);
                 juce::AlertWindow::showAsync(options, [safeThis](int result)
                 {

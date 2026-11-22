@@ -1131,8 +1131,8 @@ private:
             .withIconType(juce::MessageBoxIconType::WarningIcon)
             .withTitle("Clear All Presets")
             .withMessage("Remove all generator presets? This cannot be undone.")
-            .withButton("Clear All")
-            .withButton("Cancel");
+            .withButton(juce::MessageBoxButtonOptions("Clear All", 1).withPreferredAction())
+            .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
         confirmBox = juce::AlertWindow::showScopedAsync(options,
             [this](int result)

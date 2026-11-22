@@ -1302,8 +1302,8 @@ MainComponent::MainComponent()
                 .withMessage("Show Lock is active. Unlocking allows changes to "
                              "input sources, devices, frame rates, and engine "
                              "configuration.\n\nUnlock now?")
-                .withButton("Unlock")
-                .withButton("Cancel");
+                .withButton(juce::MessageBoxButtonOptions("Unlock", 1).withPreferredAction())
+                .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
             juce::Component::SafePointer<MainComponent> safeThis(this);
             juce::AlertWindow::showAsync(options, [safeThis, updateShowLockVisuals](int result)
             {
@@ -4284,8 +4284,8 @@ void MainComponent::importConfig()
                 .withMessage("This will replace ALL current settings, track maps, generator presets "
                              "and mixer maps. The application will need to restart to apply changes.\n\n"
                              "Continue?")
-                .withButton("Restore")
-                .withButton("Cancel");
+                .withButton(juce::MessageBoxButtonOptions("Restore", 1).withPreferredAction())
+                .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
             importConfirmBox = juce::AlertWindow::showScopedAsync(options,
                 [this, parsed](int result)

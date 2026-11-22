@@ -371,8 +371,8 @@ public:
                         .withTitle(count > 1 ? "Delete Cue Points" : "Delete Cue Point")
                         .withMessage(count > 1 ? "Delete " + juce::String(count) + " cue points?"
                                                : "Delete cue point " + what + "?")
-                        .withButton("Delete")
-                        .withButton("Cancel");
+                        .withButton(juce::MessageBoxButtonOptions("Delete", 1).withPreferredAction())
+                        .withButton(juce::MessageBoxButtonOptions("Cancel", 0).withRole(juce::MessageBoxButtonRole::cancel));
 
                     deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
                         [this](int result)
