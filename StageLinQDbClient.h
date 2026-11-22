@@ -593,7 +593,10 @@ public:
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = trackCache.find(key);
         if (it != trackCache.end())
+        {
+            noteCacheUse(key);
             return it->second;
+        }
         return {};
     }
 
@@ -607,7 +610,10 @@ public:
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = artworkCache.find(key);
         if (it != artworkCache.end())
+        {
+            noteCacheUse(key);
             return it->second;
+        }
         return {};
     }
 
@@ -620,7 +626,10 @@ public:
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = waveformCache.find(key);
         if (it != waveformCache.end())
+        {
+            noteCacheUse(key);
             return it->second;
+        }
         return {};
     }
 
@@ -633,7 +642,10 @@ public:
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = perfCache.find(key);
         if (it != perfCache.end())
+        {
+            noteCacheUse(key);
             return it->second;
+        }
         return {};
     }
 
@@ -841,6 +853,7 @@ private:
             artworkCache.clear();
             waveformCache.clear();
             perfCache.clear();
+            cacheUse.clear();
         }
         waitingRequests = requested;
         const double now = juce::Time::getMillisecondCounterHiRes();
@@ -2294,6 +2307,9 @@ private:
 
             if (perf.valid && perfCache.count(key) == 0)
                 perfCache[key] = std::move(perf);
+
+            cacheUse[key] = ++useCounter;
+            trimCaches();
         }
 
         DBG("StageLinQ DB: Loaded metadata for " + meta.artist + " - " + meta.title
@@ -2917,6 +2933,65 @@ private:
     std::map<std::string, juce::Image> artworkCache;
     std::map<std::string, DenonWaveformData> waveformCache;
     std::map<std::string, DenonPerformanceData> perfCache;
+
+    // What the caches may hold (AUD11 SLQ-14).  They were emptied only when
+    // a session began, and a session lasts as long as the unit keeps its
+    // address: every track looked up during a show stayed, with its decoded
+    // artwork (width x height x 4 bytes) and its waveform.  Now: at most
+    // kMaxCachedTracks tracks, and kMaxCachedBytes of artwork pixels and
+    // waveform bytes.  Over either, the track looked up or read longest ago
+    // goes (cacheUse) -- never one of the kMaxRemembered latest requested.
+    // A track that went is looked up again when it is requested again;
+    // until then the getters have nothing for it, as for a track that was
+    // not found.  Both limits are far above what four decks hold at a time
+    // and what an evening plays, so that a track still loaded on a deck is
+    // not the one dropped: nothing tells this client which tracks those are.
+    static constexpr size_t   kMaxCachedTracks = 1024;
+    static constexpr uint64_t kMaxCachedBytes  = uint64_t(256) << 20;
+    mutable std::map<std::string, uint64_t> cacheUse;   // key -> useCounter when last looked up or read
+    mutable uint64_t useCounter = 0;
+
+    // Caller holds cacheMutex: a getter found this track
+    void noteCacheUse(const std::string& key) const
+    {
+        auto it = cacheUse.find(key);
+        if (it != cacheUse.end())
+            it->second = ++useCounter;
+    }
+
+    // Caller holds cacheMutex, on this thread (requested is this thread's)
+    void trimCaches()
+    {
+        std::vector<std::string> keep;      // the latest requested, filled when something has to go
+        for (;;)
+        {
+            uint64_t bytes = 0;
+            for (const auto& a : artworkCache)
+                bytes += (uint64_t)a.second.getWidth() * (uint64_t)a.second.getHeight() * 4u;
+            for (const auto& w : waveformCache)
+                bytes += (uint64_t)w.second.data.size();
+            if (cacheUse.size() <= kMaxCachedTracks && bytes <= kMaxCachedBytes)
+                return;
+
+            if (keep.empty())
+                for (const auto& r : requested)
+                    keep.push_back(parseNetworkPath(r).key());
+
+            auto oldest = cacheUse.end();
+            for (auto it = cacheUse.begin(); it != cacheUse.end(); ++it)
+                if ((oldest == cacheUse.end() || it->second < oldest->second)
+                    && std::find(keep.begin(), keep.end(), it->first) == keep.end())
+                    oldest = it;
+            if (oldest == cacheUse.end())
+                return;                     // only the latest requested are left
+
+            trackCache.erase(oldest->first);
+            artworkCache.erase(oldest->first);
+            waveformCache.erase(oldest->first);
+            perfCache.erase(oldest->first);
+            cacheUse.erase(oldest);
+        }
+    }
 
     // Pending requests (protected by requestMutex)
     std::mutex requestMutex;
