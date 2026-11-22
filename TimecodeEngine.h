@@ -5436,6 +5436,13 @@ private:
     /// with an absolute position the interpolation runs at most
     /// kInterpolationCapMs of wall time ahead of a packet.  A real jump back
     /// that short -- a loop roll under 100 ms -- re-fires nothing either.
+    /// Nor does the end of a move back made in small steps (reverse play, a
+    /// spin back on the platter): the cursor stops up to kCueMovedBackMs
+    /// ahead of where the deck turns round, and the cues in between, passed
+    /// at the last re-arm, do not fire again on the way forward.  The same
+    /// holds for a list armed at a playhead that then steps back that
+    /// little (a play read within kInterpolationCapMs of a position that
+    /// moved faster than the deck now plays): before, the step re-armed it.
     void tickCuePoints(uint32_t playheadMs, bool sourceSeeked)
     {
         if (! sourceSeeked && playheadMs < lastCueCheckMs
