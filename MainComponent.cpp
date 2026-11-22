@@ -7194,6 +7194,28 @@ void MainComponent::updateStatusLabels()
     updateGenStopTcLabel(eng);
     updateGenPresetAbMarker();
 
+    // A Stop TC at or before Start TC is shown in red, with a tooltip
+    // (AUD11 GENERATOR-12).  The generator takes it as it is: its position
+    // does not wrap at midnight, so such a Stop TC is already behind Start
+    // TC, and PLAY goes to it and stops at once, with nothing to say why.
+    // (Not a preset with an audio file: it runs to the file's end and its
+    // Stop TC is 0 here.)  The text changes colour only when the answer
+    // changes.
+    {
+        const bool stopNotAfterStart = eng.getGeneratorStopMs() > 0.0
+                                    && eng.getGeneratorStopMs() <= eng.getGeneratorStartMs();
+        const juce::Colour wanted = stopNotAfterStart ? juce::Colour(0xFFFF4444) : juce::Colours::white;
+        if (txtGenStopTC.findColour(juce::TextEditor::textColourId) != wanted)
+        {
+            txtGenStopTC.setColour(juce::TextEditor::textColourId, wanted);
+            txtGenStopTC.applyColourToAllText(wanted);
+            txtGenStopTC.setTooltip(stopNotAfterStart
+                ? "This Stop TC is at or before Start TC: PLAY stops at once.  Set a Stop TC after "
+                  "Start TC, or 00:00:00:00 for no stop.  (A run across midnight cannot have a Stop TC.)"
+                : juce::String());
+        }
+    }
+
     // Generator audio playback status
     if (btnGenAudioOut.getToggleState())
     {
