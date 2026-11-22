@@ -652,6 +652,7 @@ private:
     // Global TCNet offset (ms): venue-wide latency compensation summed
     // with each engine's per-layer offset.  See AppSettings::tcnetGlobalOffsetMs.
     GainSlider sldTcnetGlobalOffset;  juce::Label lblTcnetGlobalOffset;
+    juce::Label lblOutputTcnetStatus;   // TCNetOutput::getStatusText() (AUD11 NET-SHOW-8)
 
     // Hippotizer output
     juce::ToggleButton btnHippoOut { "HIPPONET OUT" };

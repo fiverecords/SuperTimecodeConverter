@@ -2064,6 +2064,11 @@ MainComponent::MainComponent()
     rightContent.addAndMakeVisible(lblTcnetGlobalOffset);
     lblTcnetGlobalOffset.setText("TCNET GLOBAL OFFSET:", juce::dontSendNotification);
     styleLabel(lblTcnetGlobalOffset);
+    // Status line of the shared TCNet output, as the other outputs have
+    // one: TCNET OUT showed nothing when the output had not started, when
+    // a listening port was not open or when the sends were refused
+    // (AUD11 NET-SHOW-8).  The text is TCNetOutput::getStatusText().
+    rightContent.addAndMakeVisible(lblOutputTcnetStatus); styleLabel(lblOutputTcnetStatus); lblOutputTcnetStatus.setColour(juce::Label::textColourId, accentOrange);
     sldTcnetGlobalOffset.onValueChange = [this]
     {
         if (syncing) return;
@@ -6925,6 +6930,7 @@ void MainComponent::updateDeviceSelectorVisibility()
     cmbTcnetLayer.setVisible(showTcnetConfig);      lblTcnetLayer.setVisible(showTcnetConfig);
     sldTcnetOffset.setVisible(showTcnetConfig);     lblTcnetOffset.setVisible(showTcnetConfig);
     sldTcnetGlobalOffset.setVisible(showTcnetConfig); lblTcnetGlobalOffset.setVisible(showTcnetConfig);
+    lblOutputTcnetStatus.setVisible(showTcnetConfig);
     if (showTcnetConfig) repopulateTcnetLayerCombo();
 
     // Hippotizer output: disabled in this version (pending hardware validation)
@@ -6999,6 +7005,11 @@ void MainComponent::updateStatusLabels()
         lblOutputLANetTCStatus.setText(eng.getLANetTCOutput().isPaused() ? "PAUSED" : eng.getLANetTCOutStatusText(), juce::dontSendNotification);
     else
         lblOutputLANetTCStatus.setText(eng.getLANetTCOutStatusText(), juce::dontSendNotification);
+
+    // The TCNet output is one for all engines: the same line on every
+    // engine that has TCNET OUT on (AUD11 NET-SHOW-8).
+    if (lblOutputTcnetStatus.isVisible())
+        lblOutputTcnetStatus.setText(sharedTcnetOutput.getStatusText(), juce::dontSendNotification);
 
     if (eng.isOutputLtcEnabled())
     {
@@ -9031,6 +9042,7 @@ void MainComponent::resized()
         if (cmbTcnetLayer.isVisible()) layCombo(lblTcnetLayer, cmbTcnetLayer, rp);
         if (sldTcnetOffset.isVisible()) laySlider(lblTcnetOffset, sldTcnetOffset, rp);
         if (sldTcnetGlobalOffset.isVisible()) laySlider(lblTcnetGlobalOffset, sldTcnetGlobalOffset, rp);
+        if (lblOutputTcnetStatus.isVisible()) layStatus(lblOutputTcnetStatus, rp);
         rp.removeFromTop(2);
     }
 

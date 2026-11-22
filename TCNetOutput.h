@@ -169,6 +169,67 @@ public:
     void setGlobalOffsetMs(int v) { globalOffsetMs = juce::jlimit(-2000, 2000, v); }
     int  getGlobalOffsetMs() const { return globalOffsetMs; }
 
+    /// Broadcast sends (OptIn, Status, Time) the OS has refused since
+    /// start().  Message thread.
+    uint32_t getSendErrors() const { return sendErrors; }
+
+    /// True while the OS has refused a broadcast send within the last
+    /// second -- no route to the broadcast address, the interface's
+    /// address gone.  As ArtnetOutput::isSendFailing (AUD11 STATIC-1): it
+    /// tells only what the OS reports, a send it accepts and then drops is
+    /// not seen.  The Time packet goes out 60 times a second, so this
+    /// holds for as long as the sends fail.  Message thread.
+    bool isSendFailing() const
+    {
+        return lastSendErrorMs > 0.0
+            && (juce::Time::getMillisecondCounterHiRes() - lastSendErrorMs) < 1000.0;
+    }
+
+    /// Receivers registered now (at most kMaxSlaves).  Message thread.
+    int getReceiverCount() const
+    {
+        int n = 0;
+        for (auto& sl : slaves) if (sl.active) ++n;
+        return n;
+    }
+
+    /// One line for the TCNET OUT row of the window, which showed nothing
+    /// (AUD11 NET-SHOW-8): TCNET OUT stayed lit whether the output had
+    /// started, whether its two listening ports were open and whether one
+    /// packet left the PC.  In this order:
+    ///   "FAILED TO BIND"    start() could not open its sending sockets;
+    ///                       the output is not running
+    ///   "SEND FAILING: ip"  the OS refuses the broadcasts (isSendFailing)
+    ///   "PORT ... NOT OPEN" a listening port could not be bound, most
+    ///                       likely held by another program: without the
+    ///                       NodeListenerPort (65023) no request and no
+    ///                       TimeSync arrives, without 60000 no receiver
+    ///                       is found; the broadcasts go out all the same
+    ///   "TX: ip | RECEIVERS: n"  otherwise, n being the receivers heard
+    ///                       in the last 10 s; "(MAX)" when the table of
+    ///                       kMaxSlaves is full and one more was heard
+    /// Empty while stopped.  What is sent does not change: the OptIn still
+    /// announces 65023 when that port is not open.  Message thread.
+    juce::String getStatusText() const
+    {
+        if (!running)
+            return startFailed ? juce::String("FAILED TO BIND") : juce::String();
+        if (isSendFailing())
+            return "SEND FAILING: " + broadcastIp;
+        if (listenerSocket == nullptr && discoverySocket == nullptr)
+            return "PORTS 60000, 65023 NOT OPEN";
+        if (listenerSocket == nullptr)
+            return "PORT 65023 NOT OPEN: NO REQUESTS";
+        if (discoverySocket == nullptr)
+            return "PORT 60000 NOT OPEN: NO RECEIVERS";
+        if (unicastSocket == nullptr)
+            return "UNICAST SOCKET NOT OPEN";
+        const bool tableFull = lastSlaveRefusedMs > 0.0
+            && (juce::Time::getMillisecondCounterHiRes() - lastSlaveRefusedMs) < 3000.0;
+        return "TX: " + broadcastIp + " | RECEIVERS: " + juce::String(getReceiverCount())
+             + (tableFull ? " (MAX)" : "");
+    }
+
     bool start(int interfaceIndex = -1)
     {
         stop();
@@ -188,13 +249,13 @@ public:
         // Socket 1: broadcast sender for OptIn/Status (port 60000)
         broadcastSocket = std::make_unique<juce::DatagramSocket>(false);
         if (!broadcastSocket->bindToPort(0, bindIp) && !broadcastSocket->bindToPort(0))
-            { broadcastSocket = nullptr; return false; }
+            { broadcastSocket = nullptr; startFailed = true; return false; }
         setBroadcast(broadcastSocket.get());
 
         // Socket 2: broadcast sender for Time (port 60001)
         timeSocket = std::make_unique<juce::DatagramSocket>(false);
         if (!timeSocket->bindToPort(0, bindIp) && !timeSocket->bindToPort(0))
-            { timeSocket = nullptr; broadcastSocket = nullptr; return false; }
+            { timeSocket = nullptr; broadcastSocket = nullptr; startFailed = true; return false; }
         setBroadcast(timeSocket.get());
 
         // Socket 3: listener on our NodeListenerPort for incoming Requests
@@ -222,6 +283,7 @@ public:
             unicastSocket = nullptr;  // non-fatal
 
         running = true; seq = 0; uptimeSeconds = 0; tickCount = 0;
+        sendErrors = 0; lastSendErrorMs = 0.0; lastSlaveRefusedMs = 0.0;
         for (auto& s : slaves) s.active = false;
 
         sendOptIn();
@@ -236,6 +298,7 @@ public:
         stopTimer();
         if (running && broadcastSocket) sendOptOut();
         running = false;
+        startFailed = false;   // start() sets it again after this if it fails
         auto shutdown = [](auto& s) { if (s) { s->shutdown(); s = nullptr; } };
         shutdown(unicastSocket);
         shutdown(listenerSocket);
@@ -703,6 +766,9 @@ private:
                 return;
             }
         }
+        // The table is full: this receiver gets no Metrics, Metadata or
+        // Artwork.  Noted for the status line (AUD11 NET-SHOW-8).
+        lastSlaveRefusedMs = now;
     }
 
     void expireSlaves()
@@ -1253,7 +1319,7 @@ private:
         // knowing what they do with it -- the same choice DESIGN D35 made
         // for StageLinQ's 1.7.0 (AUDIT NET-10, deferred).
         p[64] = 1; p[65] = 7; p[66] = 0;
-        broadcastSocket->write(broadcastIp, kPortBroadcast, p, 68);
+        noteSend(broadcastSocket->write(broadcastIp, kPortBroadcast, p, 68));
     }
 
     void sendOptOut()
@@ -1288,7 +1354,7 @@ private:
             wstr(p + 172 + i * 16, nm[i], 16);
         }
         p[83] = generalSmpteMode();
-        broadcastSocket->write(broadcastIp, kPortBroadcast, p, 300);
+        noteSend(broadcastSocket->write(broadcastIp, kPortBroadcast, p, 300));
     }
 
     void sendTime()
@@ -1329,7 +1395,22 @@ private:
         }
         // p[104] is RESERVED per spec; leave at 0.
         p[105] = generalSmpteMode();
-        timeSocket->write(broadcastIp, kPortTime, p, 162);
+        noteSend(timeSocket->write(broadcastIp, kPortTime, p, 162));
+    }
+
+    /// Takes what a broadcast send returned: -1 is a send the OS refused.
+    /// No result of write() was looked at, so with no route to the
+    /// broadcast address -- ALL INTERFACES on a PC with no default gateway
+    /// (Linux), or before the network is up -- not one packet left and
+    /// nothing said so (AUD11 NET-SHOW-8).  The unicast sends to the
+    /// receivers are not counted.
+    void noteSend(int written)
+    {
+        if (written < 0)
+        {
+            ++sendErrors;
+            lastSendErrorMs = juce::Time::getMillisecondCounterHiRes();
+        }
     }
 
     // ============================================================
@@ -1380,6 +1461,12 @@ private:
     juce::String broadcastIp = "255.255.255.255", bindIp = "0.0.0.0";
     int selectedInterface = -1;
     bool running = false;
+    // For getStatusText() (AUD11 NET-SHOW-8).  Plain members: start(),
+    // stop(), the timer and the status line all run on the message thread.
+    bool startFailed = false;          // the last start() could not open its sending sockets
+    uint32_t sendErrors = 0;           // broadcast sends refused since start()
+    double lastSendErrorMs = 0.0;      // hi-res ms of the last one, 0 = none
+    double lastSlaveRefusedMs = 0.0;   // hi-res ms of the last OptIn the full slave table had no room for, 0 = none
     int globalOffsetMs = 0;  // venue-wide latency comp, see setGlobalOffsetMs
     LayerData layers[kPacketLayers] = {};
     LayerData emptyLayer;
