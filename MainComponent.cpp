@@ -1005,6 +1005,9 @@ MainComponent::MainComponent()
     btnOscIn.onClick = [this]
     {
         if (isShowLocked()) { btnOscIn.setToggleState(!btnOscIn.getToggleState(), juce::dontSendNotification); return; }
+        // The one place that writes the saved choice (AUD11 MAIN-A-6; why,
+        // at startOscInput).
+        settings.oscInputEnabled = btnOscIn.getToggleState();
         if (btnOscIn.getToggleState())
             startOscInput();
         else
@@ -2310,6 +2313,10 @@ MainComponent::MainComponent()
     {
         if (isShowLocked()) return;
         populateMidiAndNetworkCombos();
+        // OSC IN that is on but could not bind (its port was taken when STC
+        // started) is tried again here (AUD11 MAIN-A-6).
+        if (settings.oscInputEnabled && ! oscInputServer.getIsRunning())
+            startOscInput();
         startAudioDeviceScan();
     };
     btnRefreshDevices.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF1A1D23));
@@ -2880,7 +2887,7 @@ void MainComponent::syncUIFromEngine()
     selectGenPresetInCombo(eng.getGeneratorPresetName());
 
     // OSC Input (global)
-    btnOscIn.setToggleState(oscInputServer.getIsRunning(), juce::dontSendNotification);
+    btnOscIn.setToggleState(settings.oscInputEnabled, juce::dontSendNotification);   // the choice, bound or not (startOscInput)
     txtOscInPort.setText(juce::String(settings.oscInputPort), false);
     cmbOscInputInterface.setSelectedId(settings.oscInputInterface + 1, juce::dontSendNotification);
 
@@ -7940,14 +7947,22 @@ void MainComponent::handleOscMessage(const OscInputServer::Message& msg)
     }
 }
 
+/// Bind OSC IN.  settings.oscInputEnabled is the operator's choice and is
+/// written only by the OSC IN toggle's own click; this function and
+/// stopOscInput leave it alone, and the toggle shows it.  Before, a bind
+/// that failed cleared it here, also at launch: one start with the port
+/// taken -- another program on it, a second STC opened by mistake -- was
+/// saved as "OSC IN off", and from the next start on the show controller's
+/// commands did nothing, with no message (AUD11 MAIN-A-6).  Now a failed
+/// bind leaves the toggle on with "BIND FAILED" under the port field; it is
+/// tried again at the next start, at Refresh Devices, and when the port or
+/// the network device is changed.  Message thread.
 void MainComponent::startOscInput()
 {
     int port = settings.oscInputPort;
     int iface = settings.oscInputInterface;
     if (oscInputServer.start(port, iface))
     {
-        settings.oscInputEnabled = true;
-        btnOscIn.setToggleState(true, juce::dontSendNotification);
         int actualId = oscInputServer.getSelectedInterface() + 1;
         cmbOscInputInterface.setSelectedId(actualId, juce::dontSendNotification);
         lblOscInStatus.setText("LISTENING ON " + oscInputServer.getBindInfo(), juce::dontSendNotification);
@@ -7955,20 +7970,20 @@ void MainComponent::startOscInput()
     }
     else
     {
-        btnOscIn.setToggleState(false, juce::dontSendNotification);
-        settings.oscInputEnabled = false;
         lblOscInStatus.setText("BIND FAILED - PORT " + juce::String(port), juce::dontSendNotification);
         lblOscInStatus.setColour(juce::Label::textColourId, juce::Colour(0xFFFF4444));
     }
+    btnOscIn.setToggleState(settings.oscInputEnabled, juce::dontSendNotification);
     updateDeviceSelectorVisibility();
     resized();
 }
 
+/// Close OSC IN's socket.  The saved choice and the toggle are the
+/// caller's: the toggle's click has already set both, and the port and
+/// network device handlers stop and start again with the choice unchanged.
 void MainComponent::stopOscInput()
 {
     oscInputServer.stop();
-    settings.oscInputEnabled = false;
-    btnOscIn.setToggleState(false, juce::dontSendNotification);
     lblOscInStatus.setText("", juce::dontSendNotification);
     updateDeviceSelectorVisibility();
     resized();
