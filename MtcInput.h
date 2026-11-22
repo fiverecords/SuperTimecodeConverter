@@ -470,17 +470,25 @@ private:
 
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
+            const FrameRate previousFps = detectedFps;
             updateDetectedFps(rateCode);
 
             const int maxFrames = frameRateToInt(detectedFps);
 
             // Range sanity: a malformed sequence is dropped outright rather
-            // than propagated as a position.
+            // than propagated as a position.  Its rate goes with it: piece
+            // 7 carries the rate bits next to the hours' high bit, and a
+            // sequence refused here used to leave its rate behind -- the
+            // engine followed it at once and re-rated every output for a
+            // sequence, with the old value re-read at the new rate (AUD11
+            // FUZZ-8).  The rate is only read under tcLock, so the value
+            // set above is not seen.
             if (assembled.frames  >= maxFrames || assembled.frames  < 0
                 || assembled.seconds > 59 || assembled.seconds < 0
                 || assembled.minutes > 59 || assembled.minutes < 0
                 || assembled.hours   > 23 || assembled.hours   < 0)
             {
+                detectedFps = previousFps;
                 continuityValid = false;
                 return;
             }
