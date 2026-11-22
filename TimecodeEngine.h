@@ -3787,6 +3787,18 @@ public:
     /// more than kGenMaxPositionMs from 0 either way (AUD11 GENERATOR-11;
     /// an OSC jog adds any float to the position).  The generator then
     /// stays where it is, playing or not.
+    ///
+    /// With an audio file and neither loop option, a position before Start
+    /// TC is Start TC (AUD11 GENERATOR-5, generatorSeekStopsAtStartTc):
+    /// the file begins there, and the audio cannot be put before its top.
+    /// An OSC jog back past Start TC -- a "back 5 s" pressed in the first
+    /// seconds of a song -- put the audio at the file's top and the
+    /// timecode before Start TC, both running: the audio ahead of every
+    /// output by that much for the rest of the file (DESIGN D18 pulls only
+    /// a difference under a second together, by running the timecode
+    /// fast), the cue points that late against the music.  Now it lands
+    /// on Start TC, the top of the file, as a click on the waveform's left
+    /// edge does.
     /// The audio goes where the timecode puts it
     /// (seekGeneratorAudioToTimecode): timecode - Start TC, folded into the
     /// file while the player loops it, and on the timecode loop's gapless
@@ -3815,6 +3827,8 @@ public:
     {
         if (! std::isfinite(newMs) || std::abs(newMs) > kGenMaxPositionMs)
             return;
+        if (newMs < genStartMs && generatorSeekStopsAtStartTc())
+            newMs = genStartMs;
         const double fromMs = genCurrentMs;
         genCurrentMs    = juce::jmax(0.0, newMs);
         genLastTickTime = juce::Time::getMillisecondCounterHiRes();
@@ -6096,6 +6110,22 @@ private:
             seekGeneratorAudioIntoLoop(loopEndMs, true);
         else
             generatorAudioPlayer.seekSeconds(juce::jmax(0.0, (genCurrentMs - genStartMs) / 1000.0));
+    }
+
+    /// Whether a seek of the generator to before Start TC lands on Start TC
+    /// instead (setGeneratorPosition, AUD11 GENERATOR-5): with an audio
+    /// file -- loaded, or on its way -- and neither loop option.  Without a
+    /// file the timecode may be anywhere.  With "Loop timecode" a position
+    /// before Start TC is folded into the loop on its gapless path
+    /// (seekGeneratorAudioToTimecode), and on its seek path, as under
+    /// "Loop audio", the audio is held at the file's top until DESIGN D18
+    /// or the next wrap brings the two together: those are left as they
+    /// are, also for the last pass of a loop option turned off live, while
+    /// the player still loops the file.  Message thread.
+    bool generatorSeekStopsAtStartTc() const
+    {
+        return (generatorAudioPlayer.hasFileLoaded() || generatorAudioPlayer.isLoadPending())
+            && ! genLoopTimecode && ! genAudioLoop && ! generatorAudioPlayer.isLooping();
     }
 
     /// Whether the generator follows the armed A/B loop (#24).  With the
