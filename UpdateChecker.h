@@ -32,8 +32,25 @@ public:
 
     ~UpdateChecker() override
     {
-        // Timeout must exceed the HTTP connection timeout (8000ms) to prevent
-        // juce::Thread's destructor from waiting indefinitely if we're mid-request.
+        // The thread blocks inside the request (connect, then the read of
+        // the answer) and looked at threadShouldExit() only between the
+        // two, so a quit while the check was out waited for the network to
+        // give up: 7 s with the window frozen for a server that accepts and
+        // never answers, and after 10 s of an answer that stalls JUCE
+        // killed the thread (AUD11 CONC-2).  The request is cancelled
+        // first -- WebInputStream::cancel() ends a blocking connect or read
+        // from another thread -- and the thread then leaves at once.  The
+        // exit flag is raised before the lock is taken: run() either has
+        // its stream registered by then, and it is cancelled, or finds the
+        // flag when it comes to register one.
+        signalThreadShouldExit();
+        {
+            const juce::ScopedLock lock(requestLock);
+            if (request != nullptr)
+                request->cancel();
+        }
+        // Still longer than the connection timeout (8000 ms), should a
+        // platform's cancel() not end a request in progress.
         stopThread(10000);
     }
 
@@ -87,12 +104,34 @@ private:
                            .withExtraHeaders("Accept: application/vnd.github+json\r\n"
                                              "User-Agent: SuperTimecodeConverter/" + currentVer + "\r\n");
 
-        std::unique_ptr<juce::InputStream> stream = url.createInputStream(options);
+        // What url.createInputStream(options) does, step by step, so that
+        // the destructor can reach the stream while connect() or the read
+        // blocks (AUD11 CONC-2): the same request with the same headers,
+        // timeout and redirects.
+        auto stream = std::make_unique<juce::WebInputStream>(url, false);
+        stream->withExtraHeaders(options.getExtraHeaders());
+        stream->withConnectionTimeout(options.getConnectionTimeoutMs());
+        stream->withNumRedirectsToFollow(options.getNumRedirectsToFollow());
+        {
+            const juce::ScopedLock lock(requestLock);
+            if (threadShouldExit())
+                return;
+            request = stream.get();
+        }
+        // Whatever way run() leaves from here on, the stream is taken out of
+        // the destructor's reach before it is destroyed.
+        struct Unregister
+        {
+            UpdateChecker& owner;
+            ~Unregister() { const juce::ScopedLock lock(owner.requestLock); owner.request = nullptr; }
+        } unregister { *this };
+
+        const bool connected = stream->connect(nullptr) && ! stream->isError();
 
         if (threadShouldExit())
             return;
 
-        if (!stream)
+        if (! connected)
         {
             checkFailed.store(true, std::memory_order_relaxed);
             resultReady.store(true, std::memory_order_release);
@@ -100,7 +139,6 @@ private:
         }
 
         juce::String response = stream->readEntireStreamAsString();
-        stream.reset();
 
         if (threadShouldExit())
             return;
@@ -258,6 +296,11 @@ private:
 
     //--------------------------------------------------------------------------
     juce::String currentVer;
+
+    // The request in progress, for the destructor to cancel (AUD11 CONC-2).
+    // Set and cleared by run() under requestLock; never owned here.
+    juce::CriticalSection requestLock;
+    juce::WebInputStream* request = nullptr;
 
     // Results -- written by background thread, read by UI thread
     std::atomic<bool> resultReady     { false };
