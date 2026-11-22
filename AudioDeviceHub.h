@@ -609,8 +609,16 @@ private:
         setup.outputChannels.clear();
         if (inputName.isNotEmpty())  setup.inputChannels.setRange(0, 128, true);   // masked to what the device has
         if (outputName.isNotEmpty()) setup.outputChannels.setRange(0, 128, true);
-        if (sampleRate > 0) setup.sampleRate = sampleRate;
-        if (bufferSize > 0) setup.bufferSize = bufferSize;
+        // 0 is "device default" and has to be written as such (AUD11
+        // TC-IO-7): the setup read above still carries the rate and buffer
+        // of the device this manager had open before, and leaving them in
+        // made SAMPLE RATE / BUFFER SIZE put back to Default keep the
+        // previous explicit values on a running device -- while the same
+        // setting gave the device's own after an off/on or a restart.  With
+        // 0 JUCE chooses as it does for a manager's first open: the
+        // device's current rate and its default buffer size.
+        setup.sampleRate = sampleRate > 0 ? sampleRate : 0.0;
+        setup.bufferSize = bufferSize > 0 ? bufferSize : 0;
 
         const auto err = dev.manager->setAudioDeviceSetup(setup, true);
         if (err.isNotEmpty() || dev.manager->getCurrentAudioDevice() == nullptr)
