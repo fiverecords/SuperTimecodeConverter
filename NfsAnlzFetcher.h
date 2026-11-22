@@ -1087,18 +1087,22 @@ private:
             auto idx = pdbAnlzCache.find(key);
             if (idx != pdbAnlzCache.end())
             {
+                // The slot's index answers, also when it does not list the
+                // track (AUD11 PDL-8).  A miss used to download and parse
+                // the whole export.pdb again, for every such track -- 19,000
+                // READs for a 24 MB library -- while the worker waited.  The
+                // index is the medium's as long as it is kept: a media
+                // change, a stale handle, a lost player and stop() drop it
+                // (clearPdbCache, forgetSlot, removePlayer, clearAll).
+                if (indexRead != nullptr)
+                    *indexRead = true;
                 auto t = idx->second.find(targetTrackId);
-                if (t != idx->second.end())
-                {
-                    if (indexRead != nullptr)
-                        *indexRead = true;
-                    return t->second;
-                }
+                return t != idx->second.end() ? t->second : juce::String();
             }
             epoch = slotEpochLocked(playerIP, mountPath);
         }
 
-        // Not there (or no index yet): download export.pdb
+        // No index yet: download export.pdb
         juce::MemoryBlock pdb;
         if (!nfsDownloadFile(playerIP, mountPath, "PIONEER/rekordbox/export.pdb", pdb))
         {
