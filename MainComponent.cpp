@@ -10591,8 +10591,15 @@ void MainComponent::timerCallback()
             lblMixerStatus.setText("", juce::dontSendNotification);
         }
     }
-    else if (eng.getActiveInput() != SrcType::ProDJLink && eng.getActiveInput() != SrcType::StageLinQ)
+    else
     {
+        // Another input, or a DJ input that receives nothing.  The second
+        // case used to match no branch: with the cable pulled, the players
+        // off or the shared input not running, the status line said WAITING
+        // or NOT CONNECTED and the panel under it kept the last title, BPM,
+        // pitch, fader bars, next-cue countdown, artwork and waveform, as
+        // if live (AUD11 MAIN-B-11).  The panel is emptied in both cases;
+        // when the players are back, the branches above fill it again.
         lblProDJLinkTrackInfo.setText("", juce::dontSendNotification);
         lblProDJLinkMetadata.setText("", juce::dontSendNotification);
         lblNextCue.setText("", juce::dontSendNotification);
