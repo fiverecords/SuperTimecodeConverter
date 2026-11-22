@@ -3683,6 +3683,18 @@ public:
         return genLoopEnabled && genLoopOutMs > genLoopInMs;
     }
 
+    /// Shortest A/B loop the generator follows (AUD11 GENERATOR-18): a
+    /// shorter one is ignored, as one outside the timecode loop is
+    /// (generatorAbLoopFollowed).  The A/B had no minimum: [ and ] pressed
+    /// a few ms apart while playing gave a loop that wrapped at almost
+    /// every tick, each wrap a seek of the audio and a jump told to every
+    /// output -- an MTC Full Frame, an immediate Art-Net / LA-Net /
+    /// HippoNet frame, the LTC encoder re-seeded -- so the receivers got a
+    /// stream of locates and nothing else until the loop was taken off.
+    /// At a quarter of a second, five LTC frames at 24 fps and three MTC
+    /// quarter-frame cycles fit between two wraps.
+    static constexpr double kMinAbLoopMs = 250.0;
+
     /// True when the generator follows the A/B loop: armed
     /// (isGeneratorLoopActive) and not ignored (#24, generatorAbLoopFollowed:
     /// not inside the timecode loop, or, without it, past where the
@@ -6142,11 +6154,12 @@ private:
     /// end stopped the generator at once (Joaky's case, an A/B left on one
     /// preset and called from another with the same file).  Any other A/B
     /// is ignored: the tick does not wrap at its Out, and PLAY from Stopped
-    /// starts at Start TC, not at its In.  The three arguments are
-    /// loopTimecodeEnd's.  Message thread.
+    /// starts at Start TC, not at its In.  So is one shorter than
+    /// kMinAbLoopMs, wherever it lies (AUD11 GENERATOR-18).  The three
+    /// arguments are loopTimecodeEnd's.  Message thread.
     bool generatorAbLoopFollowed(bool loopTimecode, double loopEndMs, bool loopGapless) const
     {
-        if (! isGeneratorLoopActive())
+        if (! isGeneratorLoopActive() || genLoopOutMs - genLoopInMs < kMinAbLoopMs)
             return false;
         if (! loopTimecode)
         {
