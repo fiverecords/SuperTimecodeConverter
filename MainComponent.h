@@ -740,6 +740,7 @@ private:
     juce::ToggleButton btnTriggerOsc { "OSC Trigger" };
     juce::TextEditor edOscIp;
     juce::TextEditor edOscPort;
+    juce::Label lblOscDestStatus;   // under the two fields, only while the OSC IP is not an address (AUD11 NET-SHOW-10)
     juce::ToggleButton btnArtnetTrigger { "ART-NET Trigger" };
     juce::ComboBox cmbArtTrigNet, cmbArtTrigSub, cmbArtTrigUni;
     juce::Label    lblArtTrigAddr;

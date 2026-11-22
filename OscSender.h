@@ -4,6 +4,7 @@
 
 #pragma once
 #include <JuceHeader.h>
+#include "NetworkUtils.h"
 
 //==============================================================================
 // OscSender -- Lightweight OSC message sender over UDP.
@@ -16,6 +17,19 @@
 //   osc.connect("127.0.0.1", 53000);
 //   osc.send("/cue/1/go");                       // no args
 //   osc.send("/track/change", "i:42 s:Strobe");  // typed args
+//
+// The destination is an IPv4 address in numbers (AUD11 NET-SHOW-10).  It
+// used to be whatever text the OSC IP field held, handed to the socket at
+// every send, and the socket looks up by name anything it cannot read as an
+// address: "192.168.1.300", a letter O for a zero or a host name cost one
+// lookup per trigger, BPM or mixer value on the thread that sent it -- the
+// message thread -- and with a DNS server that does not answer each one
+// held that thread, and socketLock, for the resolver's timeout (10 s
+// measured on Linux).  "192.168.1" was read the old way, as 192.168.0.1,
+// and every message went there.  Now connect() and setDestination() take a
+// dotted quad or "localhost" and nothing else (usableAddress); with any
+// other text connect() fails, isConnected() stays false and nothing is
+// sent or looked up.  A host name is therefore no longer a destination.
 //==============================================================================
 class OscSender
 {
@@ -32,8 +46,10 @@ public:
         socket.reset();
         connected = false;
 
-        destIp = ip;
+        destIp = usableAddress(ip);
         destPort = port;
+        if (destIp.isEmpty())
+            return false;       // not an address: nothing to send to
 
         // canBroadcast: SO_BROADCAST, so a broadcast destination (x.x.x.255,
         // 255.255.255.255) can be sent to; without it every platform refuses
@@ -66,8 +82,27 @@ public:
     void setDestination(const juce::String& ip, int port)
     {
         juce::SpinLock::ScopedLockType lock(socketLock);
-        destIp = ip;
+        destIp = usableAddress(ip);
         destPort = port;
+    }
+
+    /// The address the sender uses for `text`: the dotted quad written back
+    /// from its four numbers (so "010" is 10, as typed, where the socket
+    /// would have read it as octal 8), 127.0.0.1 for "localhost", and an
+    /// empty string for anything else -- which is not a destination.
+    /// No lookup, no socket: callers use it to say why nothing is sent.
+    static juce::String usableAddress(const juce::String& text)
+    {
+        const auto trimmed = text.trim();
+        if (trimmed.equalsIgnoreCase("localhost"))
+            return "127.0.0.1";
+        uint32_t address = 0;
+        if (! parseIPv4(trimmed, address))
+            return {};
+        return juce::String((int) ((address >> 24) & 0xFFu)) + "."
+             + juce::String((int) ((address >> 16) & 0xFFu)) + "."
+             + juce::String((int) ((address >> 8) & 0xFFu)) + "."
+             + juce::String((int) (address & 0xFFu));
     }
 
     //--------------------------------------------------------------------------
@@ -176,7 +211,7 @@ public:
 
         // 5. Send under lock (protects socket pointer against concurrent disconnect)
         juce::SpinLock::ScopedLockType lock(socketLock);
-        if (!connected || !socket) return false;
+        if (!connected || !socket || destIp.isEmpty()) return false;
         return socket->write(destIp, destPort,
                              packet.getData(), (int)packet.getSize()) > 0;
     }
@@ -233,7 +268,7 @@ public:
         int totalSize = (int)(addrPadded + 8);
 
         juce::SpinLock::ScopedLockType lock(socketLock);
-        if (!connected || !socket) return false;
+        if (!connected || !socket || destIp.isEmpty()) return false;
         return socket->write(destIp, destPort, packet, totalSize) > 0;
     }
 
@@ -247,7 +282,7 @@ public:
 private:
     mutable juce::SpinLock socketLock;       // protects socket + connected + dest
     std::unique_ptr<juce::DatagramSocket> socket;
-    juce::String destIp = "127.0.0.1";
+    juce::String destIp = "127.0.0.1";       // always a usableAddress(), or empty
     int destPort = 53000;
     bool connected = false;
 

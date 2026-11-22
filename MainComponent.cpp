@@ -1803,6 +1803,15 @@ MainComponent::MainComponent()
     edOscPort.onFocusLost = applyOscDestination;
     edOscPort.onReturnKey  = applyOscDestination;
 
+    // Says why nothing is sent when the OSC IP is not an address (AUD11
+    // NET-SHOW-10); shown and worded in updateDeviceSelectorVisibility.
+    leftContent.addAndMakeVisible(lblOscDestStatus);
+    lblOscDestStatus.setVisible(false);
+    lblOscDestStatus.setFont(juce::Font(juce::FontOptions(10.0f)));
+    lblOscDestStatus.setColour(juce::Label::textColourId, juce::Colour(0xFFFF5555));
+    lblOscDestStatus.setJustificationType(juce::Justification::centredLeft);
+    lblOscDestStatus.setText("NOT AN IP ADDRESS - OSC IS NOT SENT", juce::dontSendNotification);
+
     leftContent.addAndMakeVisible(btnArtnetTrigger);
     btnArtnetTrigger.setVisible(false);
     btnArtnetTrigger.setColour(juce::ToggleButton::textColourId, textMid);
@@ -6888,6 +6897,14 @@ void MainComponent::updateDeviceSelectorVisibility()
         || (showTriggerOutputs && btnTriggerOsc.getToggleState());
     edOscIp.setVisible(showOscConfigFull);
     edOscPort.setVisible(showOscConfigFull);
+    // AUD11 NET-SHOW-10: the OSC IP this engine was last given is not an
+    // address (a slip of the keyboard, or a host name, which is no longer
+    // looked up), so its OscSender refused it and triggers, BPM and mixer
+    // values go nowhere.  The line under the fields says so for as long as
+    // it lasts; it reads the engine, not the field, which may be mid-edit.
+    lblOscDestStatus.setVisible(showOscConfigFull
+        && OscSender::usableAddress(eng.getTriggerOutput().getOscDestination()
+                                        .upToLastOccurrenceOf(":", false, false)).isEmpty());
 
     // Pro DJ Link / StageLinQ -- separate interface combos
     bool showPdlIface = showProDJLinkIn && input == SrcType::ProDJLink;
@@ -9013,6 +9030,8 @@ void MainComponent::resized()
                 edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
                 oscConfRow.removeFromLeft(4);
                 edOscPort.setBounds(oscConfRow);
+                if (lblOscDestStatus.isVisible())
+                    lblOscDestStatus.setBounds(leftPanel.removeFromTop(13));
             }
             leftPanel.removeFromTop(3);
         }
@@ -9114,6 +9133,8 @@ void MainComponent::resized()
         edOscIp.setBounds(oscConfRow.removeFromLeft(oscConfRow.getWidth() - 58));
         oscConfRow.removeFromLeft(4);
         edOscPort.setBounds(oscConfRow);
+        if (lblOscDestStatus.isVisible())
+            lblOscDestStatus.setBounds(leftPanel.removeFromTop(13));
         leftPanel.removeFromTop(3);
     }
 
