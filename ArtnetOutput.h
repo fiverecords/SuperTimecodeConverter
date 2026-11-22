@@ -127,8 +127,12 @@ public:
     //==============================================================================
     void setTimecode(const Timecode& tc)
     {
+        // Dated: the timer tells a publication that has stopped arriving
+        // from a value that stands still (AUD11 TC-IO-4).
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
         const juce::SpinLock::ScopedLockType lock(tcLock);
         timecodeToSend = tc;
+        timecodeSetMs = nowMs;
     }
 
     // Called from UI thread.  startTimer() is internally serialised in JUCE's
@@ -308,9 +312,11 @@ private:
     void sendArtTimeCode(FrameRate fps)
     {
         Timecode pending;
+        double pendingSetMs = 0.0;
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
             pending = timecodeToSend;
+            pendingSetMs = timecodeSetMs;
         }
 
         // Auto-increment: advance by 1 frame per send, then the shared
@@ -324,10 +330,37 @@ private:
         {
             tc = pending;
             artnetSeeded = true;
+            heldPastGrace = false;
         }
         else
         {
-            tc = trackPublishedValue(incrementFrame(encoderTc, fps), pending, 1, fps);
+            // Only against a publication that is arriving.  When the engine
+            // stops publishing while the source goes on, the published
+            // value stands still: tracked against it, this sender repeated
+            // one frame for as long as the engine was away and then jumped
+            // (AUD11 TC-IO-4).  It now counts on at the nominal rate for up
+            // to kPublicationGraceMs, as the LTC encoder does (DESIGN D26),
+            // and past that holds the last value.  The first fresh
+            // publication goes back to the tracking, which corrects one
+            // frame at a time or snaps, as it always has -- after a hold
+            // the sender is behind by as long as it held, and takes the
+            // published value in one step.
+            const Timecode next = incrementFrame(encoderTc, fps);
+            const double age = juce::Time::getMillisecondCounterHiRes() - pendingSetMs;
+            if (age <= kPublicationStaleMs)
+            {
+                tc = heldPastGrace ? pending : trackPublishedValue(next, pending, 1, fps);
+                heldPastGrace = false;
+            }
+            else if (age <= kPublicationGraceMs)
+            {
+                tc = next;
+            }
+            else
+            {
+                tc = encoderTc;
+                heldPastGrace = true;
+            }
         }
         encoderTc = tc;
 
@@ -391,14 +424,27 @@ private:
 
     juce::SpinLock tcLock;
     Timecode timecodeToSend;        // Written by UI thread under tcLock, read by timer thread under tcLock
+    double   timecodeSetMs = 0.0;   // when setTimecode() stored it (hi-res ms), under tcLock; 0 = never
 
-    // The encoder state -- encoderTc, artnetSeeded -- belongs to the timer
+    // The engine publishes on every 60 Hz tick while the timer runs.  A
+    // publication older than two ticks is not arriving: the engine's thread
+    // is blocked (a display wake, a device being opened) while the source
+    // goes on.  The sender then carries the value forward on its own for
+    // up to the grace -- DESIGN D26's second, as
+    // LtcOutput::kPublicationGraceMs -- and past it holds the value, so an
+    // application that has stopped shows as a stalled timecode (AUD11
+    // TC-IO-4).
+    static constexpr double kPublicationStaleMs = 2.0 * 1000.0 / 60.0;
+    static constexpr double kPublicationGraceMs = 1000.0;
+
+    // The encoder state -- encoderTc, artnetSeeded, heldPastGrace -- belongs to the timer
     // thread while the timer runs.  The message thread writes it only with
     // the timer stopped (start(), setPaused(): stopTimer() returns after an
     // in-flight callback), and forceResync() asks the timer thread through
     // resyncRequested instead of writing it (AUDIT C5, LTC-7).
     Timecode encoderTc;             // Auto-increment: last sent timecode
     bool     artnetSeeded = false;  // Auto-increment: false until first frame seeds encoderTc
+    bool     heldPastGrace = false; // the value was held with no publication for kPublicationGraceMs (AUD11 TC-IO-4)
     std::atomic<bool> resyncRequested { false };   // set by forceResync(), consumed by the timer or setPaused(true)
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
     std::atomic<double> lastFrameSendTime { 0.0 };

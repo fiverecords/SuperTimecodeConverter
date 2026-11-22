@@ -123,8 +123,12 @@ public:
     // Called from UI thread - thread-safe via SpinLock
     void setTimecode(const Timecode& tc)
     {
+        // Dated: the timer tells a publication that has stopped arriving
+        // from a value that stands still (AUD11 TC-IO-4).
+        const double nowMs = juce::Time::getMillisecondCounterHiRes();
         const juce::SpinLock::ScopedLockType lock(tcLock);
         pendingTimecode = tc;
+        pendingSetMs = nowMs;
     }
 
     // Called from UI thread.  startTimer() is internally serialised in JUCE's
@@ -272,15 +276,18 @@ private:
             if (qfIdx == 0)
             {
                 Timecode pending;
+                double pendingAtMs = 0.0;
                 {
                     const juce::SpinLock::ScopedLockType lock(tcLock);
                     pending = pendingTimecode;
+                    pendingAtMs = pendingSetMs;
                 }
 
                 if (!mtcSeeded)
                 {
                     cycleTimecode = pending;
                     mtcSeeded = true;
+                    heldPastGrace = false;
                 }
                 else
                 {
@@ -289,8 +296,39 @@ private:
                     // when the source has drifted a frame (pitch, clock), a
                     // snap only on a real seek.  Quarter frames keep their
                     // nominal rate; scaling them made MA3 lose lock.
-                    cycleTimecode = trackPublishedValue(
-                        incrementFrame(incrementFrame(cycleTimecode, fps), fps), pending, 2, fps);
+                    //
+                    // Only against a publication that is arriving.  When
+                    // the engine stops publishing while the source goes on,
+                    // the published value stands still: tracked against
+                    // it, each cycle was cut to one frame, and past four
+                    // frames the cycle snapped back to the frozen value,
+                    // again and again, then jumped when the engine came
+                    // back (AUD11 TC-IO-4).  The cycle now counts on at
+                    // the nominal rate for up to kPublicationGraceMs, as
+                    // the LTC encoder does (DESIGN D26), and past that
+                    // repeats its value.  The first fresh publication goes
+                    // back to the tracking, which corrects one frame at a
+                    // time or snaps, as it always has -- after a hold the
+                    // cycle is behind by as long as it held, and takes the
+                    // published value in one step.  No Full Frame is sent
+                    // for it: this is the timer thread, and the cycle
+                    // snapped without one before.
+                    const Timecode next = incrementFrame(incrementFrame(cycleTimecode, fps), fps);
+                    const double age = now - pendingAtMs;
+                    if (age <= kPublicationStaleMs)
+                    {
+                        cycleTimecode = heldPastGrace ? pending
+                                                      : trackPublishedValue(next, pending, 2, fps);
+                        heldPastGrace = false;
+                    }
+                    else if (age <= kPublicationGraceMs)
+                    {
+                        cycleTimecode = next;
+                    }
+                    else
+                    {
+                        heldPastGrace = true;   // the cycle keeps its value
+                    }
                 }
             }
 
@@ -367,9 +405,21 @@ private:
 
     juce::SpinLock tcLock;
     Timecode pendingTimecode;   // Written by UI thread, read under tcLock
+    double   pendingSetMs = 0.0;   // when setTimecode() stored it (hi-res ms), under tcLock; 0 = never
+
+    // The engine publishes on every 60 Hz tick while the timer runs.  A
+    // publication older than two ticks is not arriving: the engine's thread
+    // is blocked (a display wake, a device being opened) while the source
+    // goes on.  The sender then carries the value forward on its own for
+    // up to the grace -- DESIGN D26's second, as
+    // LtcOutput::kPublicationGraceMs -- and past it holds the value, so an
+    // application that has stopped shows as a stalled timecode (AUD11
+    // TC-IO-4).
+    static constexpr double kPublicationStaleMs = 2.0 * 1000.0 / 60.0;
+    static constexpr double kPublicationGraceMs = 1000.0;
     std::atomic<FrameRate> currentFps { FrameRate::FPS_25 };
 
-    // The cycle state -- cycleTimecode, mtcSeeded, currentQFIndex -- belongs
+    // The cycle state -- cycleTimecode, mtcSeeded, heldPastGrace, currentQFIndex -- belongs
     // to the timer thread while the timer runs.  The message thread writes it
     // only with the timer stopped (start(), setPaused(false): stopTimer()
     // returns after an in-flight callback, under JUCE's callback mutex), and
@@ -377,6 +427,7 @@ private:
     // resyncRequested instead of writing it (AUDIT C5).
     Timecode cycleTimecode;     // snapshot taken at QF index 0, read through QF 1-7
     bool     mtcSeeded = false; // Auto-increment: false until first QF0 seeds cycleTimecode
+    bool     heldPastGrace = false; // the cycle was held with no publication for kPublicationGraceMs (AUD11 TC-IO-4)
     std::atomic<int> currentQFIndex { 0 };
     std::atomic<bool> resyncRequested { false };   // set by forceResync(), consumed by the timer
     std::atomic<double> lastQfSendTime { 0.0 };
