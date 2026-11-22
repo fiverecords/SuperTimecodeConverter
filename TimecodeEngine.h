@@ -191,6 +191,16 @@ public:
 
     void setInputSource(InputSource source)
     {
+        // Leaving the generator while it plays pauses it (AUD11
+        // GENERATOR-V2).  Its state used to stay Playing behind the new
+        // input, the position standing still as nothing ticks it there;
+        // back on the generator it ran on at once -- the outputs active
+        // and, the audio output reopened, the file sounding from where it
+        // had been -- with no PLAY pressed.  Paused, it comes back where
+        // it was and waits for PLAY; STOP takes it to Start TC as ever.
+        if (activeInput == InputSource::SystemTime && source != InputSource::SystemTime)
+            generatorPause();
+
         // Stop current input
         switch (activeInput)
         {
