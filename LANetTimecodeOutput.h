@@ -157,6 +157,9 @@ public:
         // from a value that stands still (AUD11 TC-IO-4).
         const double nowMs = juce::Time::getMillisecondCounterHiRes();
         const juce::SpinLock::ScopedLockType lock(tcLock);
+        if (tc.frames != timecodeToSend.frames || tc.seconds != timecodeToSend.seconds
+            || tc.minutes != timecodeToSend.minutes || tc.hours != timecodeToSend.hours)
+            timecodeMovedMs = nowMs;
         timecodeToSend = tc;
         timecodeSetMs = nowMs;
     }
@@ -278,11 +281,12 @@ private:
     void sendLANetTimecode(FrameRate fps)
     {
         Timecode pending;
-        double pendingSetMs = 0.0;
+        double pendingSetMs = 0.0, pendingMovedMs = 0.0;
         {
             const juce::SpinLock::ScopedLockType lock(tcLock);
             pending = timecodeToSend;
             pendingSetMs = timecodeSetMs;
+            pendingMovedMs = timecodeMovedMs;
         }
 
         // Auto-increment: advance by 1 frame per send, then the shared
@@ -315,7 +319,13 @@ private:
             // published value in one step.
             const Timecode next = incrementFrame(encoderTc, fps);
             const double age = juce::Time::getMillisecondCounterHiRes() - pendingSetMs;
-            if (age <= kPublicationStaleMs)
+            // Carried forward only when the value was moving when the
+            // publication stopped: a source parked on a frame that still
+            // counts as present (an Art-Net sender repeating one) is
+            // tracked as it always was, and stays where it is.
+            const bool wasMoving = pendingMovedMs > 0.0
+                                && (pendingSetMs - pendingMovedMs) <= kPublicationMovingMs;
+            if (age <= kPublicationStaleMs || ! wasMoving)
             {
                 tc = heldPastGrace ? pending : trackPublishedValue(next, pending, 1, fps);
                 heldPastGrace = false;
@@ -393,6 +403,7 @@ private:
     juce::SpinLock tcLock;
     Timecode timecodeToSend;        // Written by UI thread under tcLock, read by timer thread under tcLock
     double   timecodeSetMs = 0.0;   // when setTimecode() stored it (hi-res ms), under tcLock; 0 = never
+    double   timecodeMovedMs = 0.0; // when setTimecode() last stored a different value, under tcLock; 0 = never
 
     // The engine publishes on every 60 Hz tick while the timer runs.  A
     // publication older than two ticks is not arriving: the engine's thread
@@ -404,6 +415,7 @@ private:
     // TC-IO-4).
     static constexpr double kPublicationStaleMs = 2.0 * 1000.0 / 60.0;
     static constexpr double kPublicationGraceMs = 1000.0;
+    static constexpr double kPublicationMovingMs = 250.0;   // the value last changed within this of its last publication: it was moving
 
     // The encoder state -- encoderTc, seeded, heldPastGrace -- belongs to the timer thread
     // while the timer runs.  The message thread writes it only with the
