@@ -399,6 +399,7 @@ private:
     void showTabContextMenu(int index);
     int getMiniStripHeight() const;
     juce::Rectangle<int> miniStripArea;  // cached from resized()
+    juce::uint64 miniStripShown = 0;     // what the strip showed when timerCallback last asked for its repaint (AUD11 MAIN-B-V2)
     void paintMiniStrip(juce::Graphics& g);
     void mouseDown(const juce::MouseEvent& e) override;
 

@@ -10763,18 +10763,39 @@ void MainComponent::timerCallback()
         }
     }
 
-    // Repaint mini strip so non-selected engine timecodes update live.
-    // Skip if no non-selected engine is running (nothing to animate).
+    // Repaint the mini strip when what it shows has changed: for each
+    // engine not on screen its state (active or not), timecode, input and
+    // name -- all that paintMiniStrip draws -- folded into one number and
+    // compared with the number of the last repaint asked for.
+    // The strip used to be repainted at every tick while another engine was
+    // active and not at all otherwise.  The tick on which the last of them
+    // stopped asked for nothing, so the strip stayed as the tick before had
+    // drawn it: the engine in its source colour with green digits, frozen,
+    // while it was stopped or had lost its source -- until something else
+    // repainted the window (AUD11 MAIN-B-V2).  A change in a stopped engine
+    // (a new Start TC, a rename, another input) did not show either.  And a
+    // running engine cost a repaint of the strip 60 times a second for
+    // digits that change 24 to 30 times (AUD11 MAIN-B-12).
     if (engines.size() > 1 && !miniStripArea.isEmpty())
     {
-        bool anyOtherActive = false;
+        juce::uint64 shown = (juce::uint64) selectedEngine;
+        auto fold = [&shown](juce::uint64 value) { shown = (shown ^ value) * 1099511628211ull; };
         for (int i = 0; i < (int)engines.size(); ++i)
         {
-            if (i != selectedEngine && engines[(size_t)i]->isSourceActive())
-                { anyOtherActive = true; break; }
+            if (i == selectedEngine) continue;
+            auto& other = *engines[(size_t)i];
+            const auto tc = other.getCurrentTimecode();
+            fold((juce::uint64) i);
+            fold(other.isSourceActive() ? 1u : 0u);
+            fold((juce::uint64) (((tc.hours * 60 + tc.minutes) * 60 + tc.seconds) * 100 + tc.frames));
+            fold((juce::uint64) (int) other.getActiveInput());
+            fold((juce::uint64) other.getName().hashCode64());
         }
-        if (anyOtherActive)
+        if (shown != miniStripShown)
+        {
+            miniStripShown = shown;
             repaint(miniStripArea);
+        }
     }
 
     // Debounced settings save
