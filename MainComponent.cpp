@@ -3036,9 +3036,19 @@ void MainComponent::syncUIFromEngine()
                                        juce::dontSendNotification);
     }
 
-    // Audio channel selections based on running engines
+    // Audio channel selections based on running engines.  A running
+    // component's selectors are filled here first, as the generator's is
+    // below: a start made from the settings -- every engine that was not on
+    // the selected tab at launch, and Audio BPM -- fills no selector, so
+    // the tab of a running engine showed empty channel selectors and the
+    // next save took its channels from them (AUD11 MAIN-A-V2, MAIN-A-V3).
+    // What the Audio Thru input selector shows may be another engine's (the
+    // tab just left): it is emptied, so that the fill takes the thru tap's
+    // channel, or the saved one.
     if (eng.getLtcInput().getIsRunning())
     {
+        cmbThruInputChannel.setSelectedId(0, juce::dontSendNotification);
+        populateAudioInputChannels();
         int ch = eng.getLtcInput().getSelectedChannel();
         if (ch >= 0) cmbAudioInputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
 
@@ -3050,6 +3060,8 @@ void MainComponent::syncUIFromEngine()
     }
     else if (eng.isAudioBpmRunning())
     {
+        cmbThruInputChannel.setSelectedId(0, juce::dontSendNotification);
+        populateAudioInputChannels();
         int ch = eng.getAudioBpmInput().getSelectedChannel();
         if (ch >= 0) cmbAudioInputChannel.setSelectedId(ch + 1, juce::dontSendNotification);
     }
@@ -3062,6 +3074,7 @@ void MainComponent::syncUIFromEngine()
 
     if (eng.getLtcOutput().getIsRunning())
     {
+        populateAudioOutputChannels();
         int ch = eng.getLtcOutput().getSelectedChannel();
         if (ch == -1)
             cmbAudioOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
@@ -3079,6 +3092,7 @@ void MainComponent::syncUIFromEngine()
 
     if (eng.getAudioThru() && eng.getAudioThru()->getIsRunning())
     {
+        populateThruOutputChannels();
         int ch = eng.getAudioThru()->getSelectedChannel();
         if (ch == -1)
             cmbThruOutputChannel.setSelectedId(kStereoItemId, juce::dontSendNotification);
@@ -5847,20 +5861,39 @@ void MainComponent::flushSettings()
 
             if (audioReady)
             {
+                // A channel selector with no selection leaves the saved
+                // channel and stereo flag as they are, as the device
+                // selectors do for the device.  The channel selectors get
+                // their items from a start and, for a running component,
+                // from syncUIFromEngine; one that was never filled, or whose
+                // channel has no item, shows nothing.  Its "no selection"
+                // used to be written as channel -1 and stereo off -- Ch 1
+                // after the next load -- for every audio component of the
+                // engine on screen that was not running (AUD11 MAIN-A-1,
+                // MAIN-B-1), or was started while another tab was selected
+                // (AUD11 MAIN-A-V2).
                 auto inEntry = getSelectedAudioInput();
                 if (inEntry.deviceName.isNotEmpty()) { es.audioInputDevice = inEntry.deviceName; es.audioInputType = inEntry.typeName; }
-                es.audioInputChannel = cmbAudioInputChannel.getSelectedId() - 1;
+                if (selected(cmbAudioInputChannel))
+                    es.audioInputChannel = cmbAudioInputChannel.getSelectedId() - 1;
 
                 auto outEntry = getSelectedAudioOutput();
                 if (outEntry.deviceName.isNotEmpty()) { es.audioOutputDevice = outEntry.deviceName; es.audioOutputType = outEntry.typeName; }
-                es.audioOutputStereo = (cmbAudioOutputChannel.getSelectedId() == kStereoItemId);
-                es.audioOutputChannel = es.audioOutputStereo ? 0 : (cmbAudioOutputChannel.getSelectedId() - 1);
+                if (selected(cmbAudioOutputChannel))
+                {
+                    es.audioOutputStereo = (cmbAudioOutputChannel.getSelectedId() == kStereoItemId);
+                    es.audioOutputChannel = es.audioOutputStereo ? 0 : (cmbAudioOutputChannel.getSelectedId() - 1);
+                }
 
                 auto thruEntry = getSelectedThruOutput();
                 if (thruEntry.deviceName.isNotEmpty()) { es.thruOutputDevice = thruEntry.deviceName; es.thruOutputType = thruEntry.typeName; }
-                es.thruOutputStereo = (cmbThruOutputChannel.getSelectedId() == kStereoItemId);
-                es.thruOutputChannel = es.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
-                es.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
+                if (selected(cmbThruOutputChannel))
+                {
+                    es.thruOutputStereo = (cmbThruOutputChannel.getSelectedId() == kStereoItemId);
+                    es.thruOutputChannel = es.thruOutputStereo ? 0 : (cmbThruOutputChannel.getSelectedId() - 1);
+                }
+                if (selected(cmbThruInputChannel))
+                    es.thruInputChannel = cmbThruInputChannel.getSelectedId() - 1;
 
                 // Generator audio playback device
                 es.generatorAudioEnabled = btnGenAudioOut.getToggleState();
@@ -5870,8 +5903,11 @@ void MainComponent::flushSettings()
                     es.generatorAudioDevice = genAudioEntry.deviceName;
                     es.generatorAudioType   = genAudioEntry.typeName;
                 }
-                es.generatorAudioStereo  = (cmbGenAudioChannel.getSelectedId() == kStereoItemId);
-                es.generatorAudioChannel = es.generatorAudioStereo ? 0 : (cmbGenAudioChannel.getSelectedId() - 1);
+                if (selected(cmbGenAudioChannel))   // as the channels above
+                {
+                    es.generatorAudioStereo  = (cmbGenAudioChannel.getSelectedId() == kStereoItemId);
+                    es.generatorAudioChannel = es.generatorAudioStereo ? 0 : (cmbGenAudioChannel.getSelectedId() - 1);
+                }
                 es.generatorAudioVolume  = (float) sldGenAudioVolume.getValue();
                 es.generatorAudioFileChannelMode = juce::jlimit(0, 2, cmbGenAudioFileMode.getSelectedId() - 1);
                 // Audio BPM device/channel
@@ -5887,7 +5923,8 @@ void MainComponent::flushSettings()
                             es.audioBpmDevice = scannedAudioInputs[abSel].deviceName;
                             es.audioBpmType   = scannedAudioInputs[abSel].typeName;
                         }
-                        es.audioBpmChannel = cmbAudioBpmChannel.getSelectedId() - 2;
+                        if (selected(cmbAudioBpmChannel))   // as the channels above
+                            es.audioBpmChannel = cmbAudioBpmChannel.getSelectedId() - 2;
                     }
                     else
                     {
@@ -5898,7 +5935,12 @@ void MainComponent::flushSettings()
                             es.audioBpmDevice = bpmEntry.deviceName;
                             es.audioBpmType   = bpmEntry.typeName;
                         }
-                        es.audioBpmChannel = cmbAudioInputChannel.getSelectedId() - 1;
+                        // An empty selector used to be saved as -1, which
+                        // for Audio BPM is the stereo mix: the analyser left
+                        // its channel at the following start (AUD11
+                        // MAIN-A-V3).
+                        if (selected(cmbAudioInputChannel))
+                            es.audioBpmChannel = cmbAudioInputChannel.getSelectedId() - 1;
                     }
                 }
                 es.audioBpmSmoothing = (float)sldBpmSmoothing.getValue() / 100.0f;
@@ -6140,16 +6182,50 @@ void MainComponent::populateAudioInputChannels()
         cmbThruInputChannel.addItem(nm, i + 1);
     }
 
-    cmbAudioInputChannel.setSelectedId(
-        (prevLtcCh > 0 && prevLtcCh <= n) ? prevLtcCh : 1, juce::dontSendNotification);
-    cmbThruInputChannel.setSelectedId(
-        (prevThru > 0 && prevThru <= n) ? prevThru : juce::jmin(2, n), juce::dontSendNotification);
+    // The selectors show the channels the running input reports.  They
+    // used to keep what they showed, or take Ch 1 / Ch 2 when they showed
+    // nothing -- which is what they show after a launch, and for an engine
+    // started while another tab was selected -- and the next save wrote
+    // that over the configured channels (AUD11 MAIN-A-1, MAIN-A-V2,
+    // MAIN-A-V3).  A selector whose component does not run keeps what it
+    // showed, or takes the saved channel.  A channel without an item here
+    // (Audio BPM on its stereo mix, a saved channel this device does not
+    // have) selects nothing, and an empty selector is not saved
+    // (flushSettings).
+    int ltcId  = (prevLtcCh > 0 && prevLtcCh <= n) ? prevLtcCh : 0;
+    int thruId = (prevThru > 0 && prevThru <= n) ? prevThru : 0;
+    const bool hasSettings = selectedEngine >= 0 && selectedEngine < (int) settings.engines.size();
+    if (eng.getLtcInput().getIsRunning())
+    {
+        ltcId = eng.getLtcInput().getSelectedChannel() + 1;
+        if (eng.getLtcInput().hasPassthruChannel())
+            thruId = eng.getLtcInput().getPassthruChannel() + 1;
+    }
+    else if (eng.isAudioBpmRunning())
+        ltcId = eng.getAudioBpmInput().getSelectedChannel() + 1;
+    else if (ltcId == 0 && hasSettings)
+        ltcId = settings.engines[(size_t) selectedEngine].audioInputChannel + 1;
+    if (thruId == 0 && hasSettings)
+        thruId = settings.engines[(size_t) selectedEngine].thruInputChannel + 1;
+
+    cmbAudioInputChannel.setSelectedId((ltcId > 0 && ltcId <= n) ? ltcId : 0, juce::dontSendNotification);
+    cmbThruInputChannel.setSelectedId((thruId > 0 && thruId <= n) ? thruId : 0, juce::dontSendNotification);
 }
 
 void MainComponent::populateAudioOutputChannels()
 {
     auto& eng = currentEngine();
     int prev = cmbAudioOutputChannel.getSelectedId();
+    // While LTC OUT runs, the selector shows the channel it runs on.  It
+    // used to keep what it showed, or take "Ch 1 + Ch 2" when it showed
+    // nothing: the first LTC OUT ON of a session started on the saved
+    // channel, showed the stereo pair, and the save that followed wrote the
+    // pair (AUD11 MAIN-A-1).
+    if (eng.getLtcOutput().getIsRunning())
+    {
+        const int ch = eng.getLtcOutput().getSelectedChannel();
+        prev = (ch == -1) ? kStereoItemId : ch + 1;
+    }
     cmbAudioOutputChannel.clear(juce::dontSendNotification);
     int n = juce::jmax(2, eng.getLtcOutput().getChannelCount());
     if (n >= 2) cmbAudioOutputChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
@@ -6164,6 +6240,11 @@ void MainComponent::populateThruOutputChannels()
     auto& eng = currentEngine();
     if (!eng.getAudioThru()) return;
     int prev = cmbThruOutputChannel.getSelectedId();
+    if (eng.getAudioThru()->getIsRunning())   // the channel it runs on, as populateAudioOutputChannels
+    {
+        const int ch = eng.getAudioThru()->getSelectedChannel();
+        prev = (ch == -1) ? kStereoItemId : ch + 1;
+    }
     cmbThruOutputChannel.clear(juce::dontSendNotification);
     int n = juce::jmax(2, eng.getAudioThru()->getChannelCount());
     if (n >= 2) cmbThruOutputChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
@@ -6177,6 +6258,11 @@ void MainComponent::populateGenAudioChannels()
 {
     auto& eng = currentEngine();
     int prev = cmbGenAudioChannel.getSelectedId();
+    if (eng.isGeneratorAudioRunning())   // the channel it runs on, as populateAudioOutputChannels
+    {
+        const int ch = eng.getGeneratorAudio().getSelectedChannel();
+        prev = (ch == -1) ? kStereoItemId : ch + 1;
+    }
     cmbGenAudioChannel.clear(juce::dontSendNotification);
     int n = juce::jmax(2, eng.getGeneratorAudio().getChannelCount());
     if (n >= 2) cmbGenAudioChannel.addItem("Ch 1 + Ch 2", kStereoItemId);
