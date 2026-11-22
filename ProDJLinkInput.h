@@ -2964,11 +2964,19 @@ private:
             // non-zero, so a 0 never overwrites status Pitch1 (offset 140),
             // which arrives about 6x less often.  getBPM does not use it for
             // this format: the 0x0b BPM is already effective.
+            // The field comes from the network: below -100.00 % the
+            // multiplier is negative and from about +409 500 % on it no
+            // longer fits, and converting either to uint32 is undefined (on
+            // x86-64 -100.01 % read as a pitch of 4096x in the PDL View
+            // until the next status).  Such a value is not stored and
+            // pitchRaw keeps status Pitch1; no player has that range (AUD11
+            // PDL-V1; AUDIT A17 guarded the beat count the same way).
             if (pitchPct != 0)
             {
                 double multiplier = 1.0 + double(pitchPct) / 10000.0;
-                uint32_t statusPitch = uint32_t(multiplier * double(0x100000));
-                p.pitchRaw.store(statusPitch, std::memory_order_relaxed);
+                const double scaled = multiplier * double(0x100000);
+                if (scaled >= 0.0 && scaled < 4294967296.0)   // never convert out of range (UB)
+                    p.pitchRaw.store(uint32_t(scaled), std::memory_order_relaxed);
             }
             p.hasAbsolutePosition.store(true, std::memory_order_relaxed);
             p.absPosIs3000Format.store(true, std::memory_order_relaxed);
