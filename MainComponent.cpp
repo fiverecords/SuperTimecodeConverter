@@ -8575,7 +8575,12 @@ void MainComponent::paint(juce::Graphics& g)
     if (engines.size() > 1)
         statusText = "[" + eng.getName() + "] " + statusText;
 
-    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(getWidth() - 420, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
+    // The text ends left of the "Check for updates" button, or of the update
+    // link that replaces it when that one is the wider (AUD11 MAIN-B-14).
+    const int statusRight = btnUpdateAvailable.isVisible()
+                              ? juce::jmin(getWidth() - 150, btnUpdateAvailable.getX() - 5)
+                              : getWidth() - 150;
+    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(statusRight - 270, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
 
     // Center area: display background + frame rate labels
     auto centerArea = getLocalBounds().reduced(panelWidth, 0);
@@ -9429,7 +9434,7 @@ void MainComponent::resized()
 
     // Update notification -- replaces check button in bottom bar
     if (btnUpdateAvailable.isVisible())
-        btnUpdateAvailable.setBounds(getWidth() - 245, getHeight() - bottomBar, 240, bottomBar);
+        placeUpdateLink();
 }
 
 //==============================================================================
@@ -10852,8 +10857,10 @@ void MainComponent::timerCallback()
             btnUpdateAvailable.setURL(juce::URL(updateChecker.getReleaseUrl()));
             btnUpdateAvailable.setVisible(true);
             btnCheckUpdates.setVisible(false);
-            // Position directly in top bar
-            btnUpdateAvailable.setBounds(getWidth() - 245, getHeight() - 24, 240, 24);
+            // Position directly in the bottom bar, and repaint the bar: the
+            // status text may have to make room (AUD11 MAIN-B-14)
+            placeUpdateLink();
+            repaint(0, getHeight() - 24, getWidth(), 24);
         }
         else if (updateChecker.didCheckFail())
         {
@@ -10883,12 +10890,17 @@ void MainComponent::timerCallback()
         }
     }
 
-    // Bottom bar repaint when state changes
+    // Bottom bar repaint when state changes.  isInputStarted() is part of
+    // the state: paint() words an input that is not active PAUSED or
+    // STOPPED by it, and a change of it alone (a device opened or lost with
+    // no timecode running) asked for no repaint (AUD11 MAIN-B-14).
     juce::String currentBottomStatus = TimecodeEngine::getInputName(eng.getActiveInput());
-    if (currentBottomStatus != lastBottomBarStatus || eng.isSourceActive() != lastBottomBarActive)
+    if (currentBottomStatus != lastBottomBarStatus || eng.isSourceActive() != lastBottomBarActive
+        || eng.isInputStarted() != lastBottomBarStarted)
     {
         lastBottomBarStatus = currentBottomStatus;
         lastBottomBarActive = eng.isSourceActive();
+        lastBottomBarStarted = eng.isInputStarted();
         repaint(0, getHeight() - 24, getWidth(), 24);
     }
 }

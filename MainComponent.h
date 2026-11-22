@@ -419,6 +419,7 @@ private:
     // Bottom bar repaint tracking
     juce::String lastBottomBarStatus;
     bool lastBottomBarActive = false;
+    bool lastBottomBarStarted = false;   // isInputStarted() as last painted: PAUSED or STOPPED (AUD11 MAIN-B-14)
 
     // FPS auto-detect change tracking (for button state updates)
     FrameRate lastDisplayedFps    = FrameRate::FPS_30;
@@ -800,6 +801,19 @@ private:
     // --- Update checker ---
     UpdateChecker updateChecker;
     juce::HyperlinkButton btnUpdateAvailable { "", juce::URL() };
+    /// The "Update available" link in the bottom bar: as wide as its text,
+    /// against the right edge.  It was 240 px wide whatever it said, with
+    /// the text centred, and lay over the last 95 px of the status text's
+    /// place: "Update available: v1.9.17" was written across the ACTIVE of
+    /// "GENERATOR ACTIVE" at every window width (AUD11 MAIN-B-14).  paint()
+    /// ends the status text left of the link when a long version name makes
+    /// the link wider than the "Check for updates" button it replaces.
+    void placeUpdateLink()
+    {
+        btnUpdateAvailable.changeWidthToFitText();
+        const int linkWidth = btnUpdateAvailable.getWidth() + 8;
+        btnUpdateAvailable.setBounds(getWidth() - 5 - linkWidth, getHeight() - 24, linkWidth, 24);
+    }
     juce::TextButton btnCheckUpdates { "Check for updates" };
     int updateCheckDelay = 0;               // ticks to wait before checking
     bool updateNotificationShown = false;    // true once UI is updated
