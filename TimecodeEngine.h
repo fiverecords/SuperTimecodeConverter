@@ -2085,7 +2085,28 @@ public:
                             // here; the position is corrected at the next beat,
                             // and the cues it moves across then fire (the
                             // one-beat rule at the cue dispatch below).
-                            pdlSnapMs = (double)rawPlayheadMs;
+                            // Not while the deck still reads moving: that is
+                            // a playing deck whose platter is held (P1 stays
+                            // 03, the speed falls to 0), stopped somewhere
+                            // inside the beat, not at its start.  Taken back
+                            // to the beat start, the value stepped back by as
+                            // far as the deck had played into the beat with
+                            // the deck still "playing", the cue dispatch took
+                            // the step for a seek, and a cue of that beat
+                            // fired a second time when the deck moved on
+                            // (capture S13, a hold of 130 ms; AUD11
+                            // VX-REF-1).  The anchor stays where the deck
+                            // stopped and is shown; only its time moves, so
+                            // the first advance after the hold starts from
+                            // there without the leap described above.
+                            if (! hasAbs && pdlMoving && pdlSnapMs > (double)rawPlayheadMs)
+                            {
+                                currentTimecode = ProDJLink::playheadToTimecode(
+                                    (uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                                tcSourceMs = (double)(uint32_t)pdlSnapMs;
+                            }
+                            else
+                                pdlSnapMs = (double)rawPlayheadMs;
                             pdlSnapTime = now;
                         }
                         // Always refresh speed -- the DJ may have moved the
@@ -2120,6 +2141,16 @@ public:
                             currentTimecode = ProDJLink::playheadToTimecode((uint32_t)interpMs, getEffectiveOutputFps());
                             tcSourceMs = (double)(uint32_t)interpMs;
                         }
+                    }
+                    else if (! hasAbs && pdlSnapSpeed <= 0.01 && pdlMoving
+                             && pdlSnapMs > (double)rawPlayheadMs)
+                    {
+                        // Beat fallback, between the statuses of a playing
+                        // deck whose platter is held: the position where it
+                        // stopped (the anchor), not the start of the beat
+                        // (AUD11 VX-REF-1, see the anchor above).
+                        currentTimecode = ProDJLink::playheadToTimecode((uint32_t)pdlSnapMs, getEffectiveOutputFps());
+                        tcSourceMs = (double)(uint32_t)pdlSnapMs;
                     }
 
                     // Freeze timecode on end-of-track only.
