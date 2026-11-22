@@ -925,9 +925,14 @@ private:
     {
         if (!isOverrideScope()) return;
 
+        // "No override yet" as completeLearn tests it: neither the exact key
+        // nor an override saved without a duration, which already serves
+        // this track on the engine -- a copy under "artist|title|<length>"
+        // would take its place there (AUD11 VIEWS-EDITORS-3).
         std::vector<const TrackMapEntry*> candidates;
         for (auto* g : globalMap->getAllSortedPtrs())
-            if (!trackMap.contains(g->artist, g->title, g->durationSec))
+            if (!trackMap.contains(g->artist, g->title, g->durationSec)
+                && !(g->durationSec > 0 && trackMap.contains(g->artist, g->title, 0)))
                 candidates.push_back(g);
 
         if (candidates.empty())
@@ -1421,35 +1426,100 @@ private:
         btnLearn.setButtonText("Learn");
     }
 
+    /// Select the row of the entry saved under `key` and open its form.
+    void openFormForKey(const std::string& key)
+    {
+        rebuildRows();
+        table.updateContent();
+        for (int i = 0; i < (int)rows.size(); ++i)
+        {
+            if (rows[(size_t)i]->key() == key)
+            {
+                table.selectRow(i);
+                openFormForRow(i);
+                break;
+            }
+        }
+    }
+
     /// Commit a learned track: either jump to its existing entry in the
     /// table or open a fresh form pre-filled with the captured fields.
     /// Shared between the immediate-Learn and the retry paths so the form
     /// opens identically regardless of how long the duration took to
     /// arrive.
+    ///
+    /// "Its existing entry" is the one the engine takes for this track
+    /// without looking at another length: the exact key or, failing that,
+    /// the entry saved without a duration (a manual Add, an old file, a
+    /// Learn before the length was known).  Only the exact key used to be
+    /// tested, so for such a track -- MAPPED for the engine and in the status
+    /// line -- Learn opened a blank NEW form; saving it added
+    /// "artist|title|<length>", the engine's exact-key step took that one
+    /// from then on, and the first entry's offset, triggers and cue points
+    /// were no longer used, with no message (AUD11 VIEWS-EDITORS-3).
+    /// An entry that matches only when its own, different length is ignored
+    /// may be another version of the track (same artist + title with
+    /// different lengths are separate tracks), so there the operator is
+    /// asked which of the two is meant.
     void completeLearn(juce::String artist, juce::String title, int durationSec)
     {
         learnedDurationSec = durationSec;
         finishLearnRetry();
 
-        if (trackMap.contains(artist, title, durationSec))
+        const TrackMapEntry* existing = trackMap.find(artist, title, durationSec);
+        if (existing == nullptr && durationSec > 0)
+            existing = trackMap.find(artist, title, 0);
+        if (existing != nullptr)
         {
-            rebuildRows();
-            table.updateContent();
-            auto targetKey = TrackMapEntry::makeKey(artist, title, durationSec);
-            for (int i = 0; i < (int)rows.size(); ++i)
-            {
-                if (rows[(size_t)i]->key() == targetKey)
-                {
-                    table.selectRow(i);
-                    openFormForRow(i);
-                    break;
-                }
-            }
+            openFormForKey(existing->key());
+            return;
         }
-        else
+
+        // The engine's third step: the same artist and title under another
+        // length.  Until an entry with this length exists the engine uses
+        // that one for this track too.
+        const TrackMapEntry* other = trackMap.findIgnoringDuration(artist, title);
+        if (other == nullptr)
         {
             openFormForNew(artist, title);
+            return;
         }
+
+        auto lengthText = [](int sec)
+        {
+            return juce::String(sec / 60) + ":" + juce::String(sec % 60).paddedLeft('0', 2);
+        };
+        const std::string otherKey = other->key();
+        juce::String msg = "\"" + (other->artist.isNotEmpty() ? other->artist + " - " : juce::String())
+                         + other->title + "\" is already in the Track Map with a length of "
+                         + lengthText(other->durationSec) + ". ";
+        msg += durationSec > 0
+            ? "This track is " + lengthText(durationSec)
+              + ".\n\nOpen the existing entry, or add a separate entry for this length?"
+            : juce::String("The length of this track is not known.\n\n"
+                           "Open the existing entry, or add a separate entry without a length?");
+
+        auto options = juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Track Already Mapped")
+            .withMessage(msg)
+            .withButton("Open Existing")
+            .withButton("Add New")
+            .withButton("Cancel");
+
+        deleteConfirmBox = juce::AlertWindow::showScopedAsync(options,
+            [this, artist, title, durationSec, otherKey](int result)
+            {
+                if (result == 1)
+                {
+                    openFormForKey(otherKey);
+                }
+                else if (result == 2)
+                {
+                    learnedDurationSec = durationSec;
+                    openFormForNew(artist, title);
+                }
+            });
     }
 
     void onAdd()
@@ -2020,7 +2090,9 @@ private:
     // Async file chooser (must stay alive until callback)
     std::unique_ptr<juce::FileChooser> fileChooser;
 
-    // Async delete confirmation (must stay alive until callback fires)
+    // Async delete confirmation (must stay alive until callback fires).
+    // Also holds the editor's other questions (Learn of a track mapped under
+    // another length): one box at a time, closed with the editor.
     juce::ScopedMessageBox deleteConfirmBox;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TrackMapEditor)
