@@ -218,13 +218,21 @@ public:
             generatorAudioPlayer.closeDevice();
 
         // A millisecond source cannot have rate conversion (see
-        // isMillisecondSource): drop it, and render at the user's chosen
-        // output rate, which is the only rate such a source has.
+        // isMillisecondSource): drop it, and render at the rate the outputs
+        // had, which is the only rate such a source has.  That is outputFps
+        // only while FPS CONVERT was on.  With it off the rate is the FPS
+        // buttons' choice, currentFps, and outputFps may be anything: a
+        // settings file keeps the default 30 there for an engine whose
+        // conversion was never used, and the settings are applied as
+        // setFrameRate, setFpsConvertEnabled, setOutputFrameRate,
+        // setInputSource -- so this used to put 30 over a saved 25 at every
+        // start, and at every switch to a DJ source (AUD11 ENGINE-CORE-1).
         if (isMillisecondSource(source))
         {
+            const FrameRate keep = getEffectiveOutputFps();
             fpsConvertEnabled = false;
-            currentFps = outputFps;
-            setOutputFrameRate(outputFps);
+            currentFps = keep;
+            setOutputFrameRate(keep);
         }
 
         // Reset the TrackMap cache on every source change: the track, its
@@ -283,6 +291,11 @@ public:
     {
         const bool fpsChanged = (currentFps != fps);
         currentFps = fps;
+        // With FPS CONVERT off this is the output rate too: outputFps goes
+        // with it, so that no stale rate is saved to the settings or found
+        // when conversion is switched on (AUD11 ENGINE-CORE-1).
+        if (! fpsConvertEnabled)
+            outputFps = fps;
         FrameRate outRate = getEffectiveOutputFps();
         mtcOutput.setFrameRate(outRate);
         artnetOutput.setFrameRate(outRate);
