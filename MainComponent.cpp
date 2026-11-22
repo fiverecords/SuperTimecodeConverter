@@ -6949,13 +6949,22 @@ void MainComponent::updateDeviceSelectorVisibility()
 
     // Close TrackMap / MixerMap editor windows when no engine uses ProDJLink/StageLinQ
     // (these are shared windows -- keep open as long as any engine is on PDL/SLQ)
+    // The Track Map is offered for Winamp too (showTrackMapBtns above), so its
+    // editor also stays while an engine is on Winamp: with Winamp engines
+    // only, this function -- which nearly every handler of the main window
+    // ends in -- deleted the editor the operator had just opened (AUD11
+    // MAIN-B-9).  The Mixer Map remains a DJ-protocol window.
     {
         bool anyPdl = false;
+        bool anyWinamp = false;
         for (auto& e : engines)
+        {
             if (e->getActiveInput() == SrcType::ProDJLink || e->getActiveInput() == SrcType::StageLinQ) { anyPdl = true; break; }
+            if (e->getActiveInput() == SrcType::Winamp) anyWinamp = true;
+        }
         if (!anyPdl)
         {
-            if (trackMapWindow != nullptr)
+            if (trackMapWindow != nullptr && !anyWinamp)
                 delete trackMapWindow.getComponent();
             if (mixerMapWindow != nullptr)
                 delete mixerMapWindow.getComponent();
