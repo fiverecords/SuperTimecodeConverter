@@ -620,7 +620,18 @@ private:
         setup.sampleRate = sampleRate > 0 ? sampleRate : 0.0;
         setup.bufferSize = bufferSize > 0 ? bufferSize : 0;
 
-        const auto err = dev.manager->setAudioDeviceSetup(setup, true);
+        // Not as "the chosen device" (second argument; AUD11 TC-IO-2).  A
+        // setup stored as the user's choice is what JUCE's manager goes
+        // back to when its device leaves the system's list: it fails to
+        // open the lost names and then opens the driver type's default
+        // device instead, with this fan-out still registered.  Every client
+        // on a lost interface was moved to another one that way -- LTC out
+        // of the computer's own output, LTC IN listening to its microphone
+        // -- under a status line that still named the lost device, and it
+        // stayed there when the interface came back.  With nothing stored
+        // the manager only retries the same names, fails, and is left with
+        // no device, which is the lost state described at the top.
+        const auto err = dev.manager->setAudioDeviceSetup(setup, false);
         if (err.isNotEmpty() || dev.manager->getCurrentAudioDevice() == nullptr)
         {
             error = err.isNotEmpty() ? err : juce::String("device did not open");
