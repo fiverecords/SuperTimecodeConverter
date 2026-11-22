@@ -2775,22 +2775,37 @@ private:
                 ca = std::move(existing);
         }
 
-        // Overwrite each component only when meta has equal or better data
+        // Overwrite each component only when meta has equal or better data.
+        // "merged" is set only when a component then differs from the one
+        // loaded (AUD11 VIEWS-EDITORS-7): "equal" counted as a change, so
+        // the early return below never happened and the whole file was
+        // written again, from the 60 Hz timer, at every load of a track
+        // whose file already held the same data.  Comparing the content
+        // rather than the sizes keeps a same-size change (a cue moved in
+        // rekordbox) written.
         bool merged = false;
 
         if (!meta.beatGrid.empty()
             && meta.beatGrid.size() >= ca.beatGrid.size())
         {
-            ca.beatGrid.clear();
-            for (auto& b : meta.beatGrid)
-                ca.beatGrid.push_back({ b.beatNumber, b.bpmTimes100, b.timeMs });
-            merged = true;
+            bool same = meta.beatGrid.size() == ca.beatGrid.size();
+            for (size_t i = 0; same && i < meta.beatGrid.size(); ++i)
+                same = meta.beatGrid[i].beatNumber  == ca.beatGrid[i].beatNumber
+                    && meta.beatGrid[i].bpmTimes100 == ca.beatGrid[i].bpmTimes100
+                    && meta.beatGrid[i].timeMs      == ca.beatGrid[i].timeMs;
+            if (!same)
+            {
+                ca.beatGrid.clear();
+                for (auto& b : meta.beatGrid)
+                    ca.beatGrid.push_back({ b.beatNumber, b.bpmTimes100, b.timeMs });
+                merged = true;
+            }
         }
 
         if (!meta.cueList.empty()
             && meta.cueList.size() >= ca.cueList.size())
         {
-            ca.cueList.clear();
+            std::vector<WaveformCache::CachedAnlz::Cue> cues;
             for (auto& c : meta.cueList)
             {
                 WaveformCache::CachedAnlz::Cue cc;
@@ -2804,20 +2819,47 @@ private:
                 cc.colorCode     = c.colorCode;
                 cc.hasColor      = c.hasColor;
                 cc.comment       = c.comment;
-                ca.cueList.push_back(std::move(cc));
+                cues.push_back(std::move(cc));
             }
-            merged = true;
+            bool same = cues.size() == ca.cueList.size();
+            for (size_t i = 0; same && i < cues.size(); ++i)
+            {
+                const auto& x = cues[i];
+                const auto& y = ca.cueList[i];
+                same = x.type == y.type && x.hotCueNumber == y.hotCueNumber
+                    && x.positionMs == y.positionMs && x.loopEndMs == y.loopEndMs
+                    && x.colorR == y.colorR && x.colorG == y.colorG && x.colorB == y.colorB
+                    && x.colorCode == y.colorCode && x.hasColor == y.hasColor
+                    && x.comment == y.comment;
+            }
+            if (!same)
+            {
+                ca.cueList = std::move(cues);
+                merged = true;
+            }
         }
 
         if (!meta.songStructure.empty()
             && meta.songStructure.size() >= ca.songStructure.size())
         {
-            ca.songStructure.clear();
-            for (auto& p : meta.songStructure)
-                ca.songStructure.push_back({ p.index, p.beatNumber, p.kind, p.fill,
-                                             p.beatCount, p.beatFill });
-            ca.phraseMood = meta.phraseMood;
-            merged = true;
+            bool same = meta.songStructure.size() == ca.songStructure.size()
+                     && meta.phraseMood == ca.phraseMood;
+            for (size_t i = 0; same && i < meta.songStructure.size(); ++i)
+            {
+                const auto& x = meta.songStructure[i];
+                const auto& y = ca.songStructure[i];
+                same = x.index == y.index && x.beatNumber == y.beatNumber && x.kind == y.kind
+                    && x.fill == y.fill && x.beatCount == y.beatCount && x.beatFill == y.beatFill;
+            }
+            if (!same)
+            {
+                ca.songStructure.clear();
+                for (auto& p : meta.songStructure)
+                    ca.songStructure.push_back({ p.index, p.beatNumber, p.kind, p.fill,
+                                                 p.beatCount, p.beatFill });
+                ca.phraseMood = meta.phraseMood;
+                merged = true;
+            }
         }
 
         if (meta.detailEntryCount > 0
@@ -2825,13 +2867,25 @@ private:
                 || (meta.detailBytesPerEntry == ca.detailBytesPerEntry
                     && meta.detailEntryCount >= ca.detailEntryCount)))
         {
-            ca.detailData          = meta.detailData;
-            ca.detailEntryCount    = meta.detailEntryCount;
-            ca.detailBytesPerEntry = meta.detailBytesPerEntry;
-            merged = true;
+            // The file holds exactly count x bytes-per-entry bytes
+            // (WaveformCache::saveAnlz); the entry may hold more.
+            const size_t detailSize = (size_t)meta.detailEntryCount
+                                    * (size_t)juce::jmax(0, meta.detailBytesPerEntry);
+            const bool same = meta.detailEntryCount == ca.detailEntryCount
+                           && meta.detailBytesPerEntry == ca.detailBytesPerEntry
+                           && ca.detailData.size() == detailSize
+                           && meta.detailData.size() >= detailSize
+                           && std::equal(ca.detailData.begin(), ca.detailData.end(), meta.detailData.begin());
+            if (!same)
+            {
+                ca.detailData          = meta.detailData;
+                ca.detailEntryCount    = meta.detailEntryCount;
+                ca.detailBytesPerEntry = meta.detailBytesPerEntry;
+                merged = true;
+            }
         }
 
-        if (!merged) return;  // disk already had equal or better data
+        if (!merged) return;  // the file already holds this data, or better
 
         ca.valid = true;
 
