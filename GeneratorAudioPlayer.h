@@ -1242,6 +1242,12 @@ private:
     // player goes finds it set.
     std::shared_ptr<std::atomic<bool>> destroyed { std::make_shared<std::atomic<bool>>(false) };
 
+    // The waveform hand-over the message thread has not taken yet
+    // (postWaveform): written by the LoaderThread, taken on the message
+    // thread, under waveformLock.
+    juce::CriticalSection waveformLock;
+    WaveformChange        pendingWaveform;
+
     // LoaderThread (loadFile): the message for getLoadError().
     void setLoadError(const juce::String& message)
     {
@@ -1360,17 +1366,38 @@ private:
     // left: two loads completing within one turn of the message loop can
     // let the first one's thumbnail start reading before the second swap,
     // which then waits for one block of a file that has just loaded.)
+    //
+    // The reader waits in pendingWaveform, not in the message: only the
+    // latest one is kept (a load that completes before the message thread
+    // has taken the one before replaces it, and the message of the first
+    // then delivers the second), and one that is never taken -- the
+    // application quitting -- goes with the player.  So however long the
+    // message thread is busy, one reader at most is held open for it.
     void postWaveform(WaveformChange& waveform)
     {
         if (! waveform.changed) return;
         thumbnailCache.getTimeSliceThread().removeAllClients();
-        // callAsync wants something copyable, and the reader must not leak
-        // if the message is never delivered (the application quitting).
-        auto reader = std::make_shared<std::unique_ptr<juce::AudioFormatReader>>(std::move(waveform.reader));
-        juce::MessageManager::callAsync([this, gone = destroyed, reader, hash = waveform.hash]
         {
-            if (! gone->load(std::memory_order_acquire))
-                thumbnail.setReader(reader->release(), hash);   // no reader: cleared
+            const juce::ScopedLock sl(waveformLock);
+            pendingWaveform.reader  = std::move(waveform.reader);
+            pendingWaveform.hash    = waveform.hash;
+            pendingWaveform.changed = true;
+        }
+        juce::MessageManager::callAsync([this, gone = destroyed]
+        {
+            if (gone->load(std::memory_order_acquire))
+                return;
+            std::unique_ptr<juce::AudioFormatReader> reader;
+            juce::int64 hash = 0;
+            {
+                const juce::ScopedLock sl(waveformLock);
+                if (! pendingWaveform.changed)
+                    return;                 // taken by the message of a load before this one
+                reader = std::move(pendingWaveform.reader);
+                hash   = pendingWaveform.hash;
+                pendingWaveform.changed = false;
+            }
+            thumbnail.setReader(reader.release(), hash);   // no reader: cleared
         });
     }
 
