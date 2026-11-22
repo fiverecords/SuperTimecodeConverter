@@ -3433,6 +3433,29 @@ private:
                 // CDJ-3000, or no beat (0, or ffffffff above): store as is, so
                 // a beat count from the previous track cannot outlive it.
                 p.beatCount.store(bc, std::memory_order_relaxed);
+
+                // Beat fallback: a count of 0 is the deck before beat 1 --
+                // "when the player is paused at the start of the track, this
+                // seems to hold the value 0, even though it is beat 1"
+                // (dysentery vcdj.adoc) -- and what ffffffff was mapped to
+                // while a track loads.  Only the count was stored, so the
+                // position kept the last value derived: capture S06 sat cued
+                // at the start for 13 s reading 89538 ms, the last place the
+                // scan after the load had visited, the outputs started there
+                // at PLAY and jumped to the first beat 64 ms later; after CUE
+                // at beat 153 it read 69540 ms with the deck back at the
+                // start (AUD11 PDL-2).  The position is now 0 there.  While
+                // a position has been derived for this track it is published
+                // at every status, like any other count, so the engine sees
+                // the deck start and counts on from 0 until beat 1 gives the
+                // first position.  Before that -- a track whose count has not
+                // been above 0 yet -- only a position left by the track
+                // before is cleared, once, and no timecode data is claimed,
+                // as before.
+                if (!p.hasAbsolutePosition.load(std::memory_order_relaxed)
+                    && (p.hasBeatDerivedPosition.load(std::memory_order_relaxed)
+                        || p.playheadMs.load(std::memory_order_relaxed) != 0))
+                    p.publishPosition(0, juce::Time::getMillisecondCounterHiRes());
             }
 
             // NOTE: beatInBar is NOT updated here.  Status packets arrive at ~5Hz
