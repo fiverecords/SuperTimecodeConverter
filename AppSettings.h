@@ -857,9 +857,16 @@ struct TrackMapEntry
                 cp.fromVar(item);
                 cuePoints.push_back(std::move(cp));
             }
-            // Ensure sorted by position
-            std::sort(cuePoints.begin(), cuePoints.end(),
-                      [](const CuePoint& a, const CuePoint& b) { return a.positionMs < b.positionMs; });
+            // Ensure sorted by position.  A stable sort, as the cue editors'
+            // (sortCuesByPosition): cue points at the same position keep the
+            // order of the file.  std::sort gave them another order at each
+            // load once an entry had enough cue points (more than 16 here),
+            // so the file's text changed at every restart and twin cues --
+            // a MIDI cue and an OSC cue at one moment -- were listed and
+            // fired in another order from one session to the next
+            // (AUD11 FUZZ-7).
+            std::stable_sort(cuePoints.begin(), cuePoints.end(),
+                             [](const CuePoint& a, const CuePoint& b) { return a.positionMs < b.positionMs; });
         }
     }
 
