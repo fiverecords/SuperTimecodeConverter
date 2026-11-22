@@ -28,10 +28,15 @@
 //  - Message thread (UI, OSC handlers dispatched via callAsync, the engine
 //    tick): openDevice / closeDevice / requestLoad / play / pause /
 //    stopAndReset / seekSeconds / setLoopingWhilePlaying and the getters.
+//    It never asks the disk about a preset's file (AUD11 GENERATOR-4):
+//    requestLoad only queues the request, and the waveform thumbnail is
+//    handed its reader, already open, by the LoaderThread (postWaveform).
 //  - LoaderThread ("STC Generator Loader"): loadFile / unloadFile /
-//    setLooping, as requestLoad schedules them.  setLooping also runs on the
-//    message thread, inside setLoopingWhilePlaying, only while no load is
-//    pending.
+//    setLooping, as requestLoad schedules them, and every access to the
+//    file a load needs: whether it exists, opening it and reading its
+//    header, for the transport and for the thumbnail.  setLooping also
+//    runs on the message thread, inside setLoopingWhilePlaying, only while
+//    no load is pending.
 //  - Audio thread: audioDeviceIOCallbackWithContext, called by the hub's
 //    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
 //    adds or removes us or the device restarts (message thread, or the
@@ -83,6 +88,9 @@ public:
         // The acquire/release pairing on shuttingDown ensures the callback
         // sees the flag if it observes the store.
         shuttingDown.store(true, std::memory_order_release);
+        // A waveform hand-over still in the message queue (postWaveform)
+        // finds this set and leaves the thumbnail alone.
+        destroyed->store(true, std::memory_order_release);
 
         // Step 2: closeDevice() releases us from the hub, which blocks until
         // any in-flight callback returns, so the audio thread is provably
@@ -176,18 +184,51 @@ public:
     //==========================================================================
     // File management
     //==========================================================================
+    /// What the waveform thumbnail is to show after a load or an unload:
+    /// a reader of its own on the new file, opened by the load, or none.
+    /// `changed` stays false when the load left the loaded file in place.
+    struct WaveformChange
+    {
+        bool changed = false;
+        std::unique_ptr<juce::AudioFormatReader> reader;
+        juce::int64 hash = 0;   // the thumbnail cache's key for the file
+    };
+
     /// Load an audio file synchronously.  Replaces any previously loaded
     /// file.  Returns true on success.  On failure, getLoadError() returns
     /// a human-readable description of why.  Runs on the LoaderThread
     /// (requestLoad); it blocks on file I/O, so not for the message thread.
+    /// The waveform thumbnail follows through the message queue
+    /// (postWaveform).
     bool loadFile(const juce::File& file)
     {
-        setLoadError({});
+        WaveformChange waveform;
+        const bool ok = loadFile(file, waveform);
+        postWaveform(waveform);
+        return ok;
+    }
 
+    /// The load itself.  `waveform` is given what the thumbnail is to show
+    /// once the load is done: the LoaderThread posts it after it has
+    /// settled the request, so the audio does not wait for the waveform.
+    bool loadFile(const juce::File& file, WaveformChange& waveform)
+    {
+        setLoadError({});
+        requestedFileMissing.store(false, std::memory_order_release);
+
+        // This is where the disk is asked whether the file is there (AUD11
+        // GENERATOR-4): requestLoad and its callers no longer do, so a path
+        // that is not on disk gets here.  The message names the file, as the
+        // panel's status line did when it was the one to find it missing.
         if (file == juce::File() || ! file.existsAsFile())
         {
-            if (file != juce::File()) setLoadError("FILE NOT FOUND");
+            if (file != juce::File())
+            {
+                requestedFileMissing.store(true, std::memory_order_release);
+                return failLoad("FILE NOT FOUND: " + file.getFileName(), waveform);
+            }
             unloadFile();
+            waveform.changed = true;
             return false;
         }
 
@@ -205,9 +246,7 @@ public:
             // the FormatManager.  For .mp3 specifically, this means the
             // Projucer flag JUCE_USE_MP3AUDIOFORMAT was not set when the
             // juce_audio_formats module was compiled.
-            setLoadError("UNSUPPORTED FORMAT: " + file.getFileExtension().removeCharacters(".").toUpperCase());
-            unloadFile();
-            return false;
+            return failLoad("UNSUPPORTED FORMAT: " + file.getFileExtension().removeCharacters(".").toUpperCase(), waveform);
         }
 
         const double  readerSR     = newReader->sampleRate;
@@ -232,11 +271,16 @@ public:
         }
 
         if (readerSR <= 0.0 || totalSamples <= 0)
-        {
-            setLoadError("EMPTY OR CORRUPT FILE");
-            unloadFile();
-            return false;
-        }
+            return failLoad("EMPTY OR CORRUPT FILE", waveform);
+
+        // The waveform thumbnail reads the file on its own thread, so it
+        // needs a reader of its own.  Opened here, on the LoaderThread,
+        // with the file known to be one the player takes: the message
+        // thread used to open it in requestLoad, before the load had
+        // started (AUD11 GENERATOR-4).
+        waveform.reader.reset(formatManager.createReaderFor(file));
+        waveform.hash    = file.hashCode64();
+        waveform.changed = true;
 
         // AudioFormatReaderSource takes ownership of the reader.
         std::unique_ptr<juce::AudioFormatReaderSource> newSource(
@@ -272,12 +316,12 @@ public:
             fileLengthAtomic.store(fileLengthSeconds, std::memory_order_release);
             fileLoadedAtomic.store(true, std::memory_order_release);
 
-            // Note: the AudioThumbnail is updated separately by requestLoad()
-            // on the caller's thread (typically the message thread) BEFORE
-            // this function runs.  Touching the thumbnail here would force
-            // this background thread to wait for the thumbnail's own internal
-            // decode job to finish, which can take hundreds of ms with MP3 if
-            // the previous file was still being processed.
+            // Note: the AudioThumbnail is not touched here.  It is given
+            // `waveform` afterwards (postWaveform), once the request is
+            // settled: taking the previous file's thumbnail down waits for
+            // the thumbnail's own decode job, which can take hundreds of ms
+            // with MP3 if that file was still being processed, and the
+            // audio does not wait for that.
 
             if (deviceOpen.load(std::memory_order_relaxed))
                 attachReaderToTransport();
@@ -317,7 +361,16 @@ public:
 
         fileLengthAtomic.store(0.0, std::memory_order_release);
         fileLoadedAtomic.store(false, std::memory_order_release);
-        // thumbnail is managed separately by requestLoad().
+        // The thumbnail is managed separately (postWaveform).
+    }
+
+    /// True when the request the LoaderThread settled last named a file
+    /// that is not on disk (AUD11 GENERATOR-4: nobody asks the disk before
+    /// the load does).  Read it once the load is no longer pending, as the
+    /// onLoadCompleted listener does.  Lock-free, any thread.
+    bool isRequestedFileMissing() const
+    {
+        return requestedFileMissing.load(std::memory_order_acquire);
     }
 
     bool hasFileLoaded() const
@@ -570,20 +623,20 @@ public:
     // file/loop pair is processed.  Use this in preference to the synchronous
     // loadFile() for any UI-driven path (preset switching, OSC, etc.).
     //
-    // The thumbnail source is updated SYNCHRONOUSLY here (typically on the
-    // message thread).  This is intentional: AudioThumbnail manages its own
-    // peak-generation thread, and updating its source from the caller's
-    // thread means the AUDIO load (running on LoaderThread) does not have
-    // to wait on the thumbnail's previous decode job to finish.  With a
-    // 32-entry thumbnail cache, navigating recently-seen presets does not
-    // re-decode peaks at all -- the cached version is reused immediately.
+    // No file is touched here (AUD11 GENERATOR-4).  This used to ask the
+    // disk whether the file exists and to give the thumbnail its source,
+    // which opens the file and reads its header -- on the caller's thread,
+    // the message thread, before the LoaderThread had started: a disk that
+    // answered slowly (a USB disk spinning up, a network share) held the
+    // window, the cue triggers, OSC and the tick of every engine for as
+    // long.  A file that is not on disk is now found missing by the load
+    // (isRequestedFileMissing), and the thumbnail gets its reader from the
+    // LoaderThread once the load is done (postWaveform); until then it
+    // shows the previous file.  With a 32-entry thumbnail cache, navigating
+    // recently-seen presets does not re-decode peaks at all -- the cached
+    // version is reused immediately.
     void requestLoad(const juce::File& file, bool shouldLoop)
     {
-        if (file == juce::File() || ! file.existsAsFile())
-            thumbnail.setSource(nullptr);
-        else
-            thumbnail.setSource(new juce::FileInputSource(file));
-
         // Mark the player as having a load in flight so that play(),
         // seekSeconds() and stopAndReset() leave the transport alone until
         // it is done, and the start comes from the onLoadCompleted callback
@@ -698,10 +751,10 @@ private:
                     // Apply loop first so any subsequent file load picks it up.
                     owner.setLooping(loop);
 
-                    if (file == juce::File())
-                        owner.unloadFile();
-                    else
-                        owner.loadFile(file);
+                    // What the waveform thumbnail is to show after this
+                    // request; posted below, after the audio is settled.
+                    WaveformChange waveform;
+                    owner.loadFile(file, waveform);   // an empty file unloads
 
                     // Single chokepoint for "load completed (or unloaded)".
                     // Doing it here, AFTER loadFile / unloadFile returns,
@@ -739,6 +792,8 @@ private:
                     // itself -- the late audio AUDIT LTC-4 had fixed.
                     if (settled && owner.onLoadCompleted)
                         juce::MessageManager::callAsync(std::function<void()>(owner.onLoadCompleted));
+
+                    owner.postWaveform(waveform);
                 }
             }
         }
@@ -1010,11 +1065,59 @@ private:
 
     juce::String loadError;          // human-readable last-load-error message; under transportLock
 
+    // LoaderThread (loadFile): the last request named a file that is not on
+    // disk.  See isRequestedFileMissing().
+    std::atomic<bool> requestedFileMissing { false };
+
+    // Set by the destructor, on the message thread, where the waveform
+    // hand-overs posted by postWaveform also run: one still queued when the
+    // player goes finds it set.
+    std::shared_ptr<std::atomic<bool>> destroyed { std::make_shared<std::atomic<bool>>(false) };
+
     // LoaderThread (loadFile): the message for getLoadError().
     void setLoadError(const juce::String& message)
     {
         const juce::ScopedLock sl(transportLock);
         loadError = message;
+    }
+
+    // LoaderThread (loadFile): a load that ends with no file -- the message,
+    // nothing loaded, and no waveform.
+    bool failLoad(const juce::String& message, WaveformChange& waveform)
+    {
+        setLoadError(message);
+        unloadFile();
+        waveform.reader.reset();
+        waveform.changed = true;
+        return false;
+    }
+
+    // LoaderThread, after a request is settled: give the thumbnail what the
+    // load opened for it (AUD11 GENERATOR-4).  AudioThumbnail belongs to the
+    // message thread, so the swap is posted there; it is given a reader that
+    // is already open (setReader), where setSource would open the file and
+    // read its header on that thread.
+    //
+    // Replacing a thumbnail's source waits for the thumbnail's own thread
+    // (the cache's TimeSliceThread) to finish the block of the previous
+    // file it is reading.  That wait is taken here first, by taking the
+    // previous source off that thread, so that the message thread does not
+    // wait for a disk: the swap then finds nothing in flight.  (What is
+    // left: two loads completing within one turn of the message loop can
+    // let the first one's thumbnail start reading before the second swap,
+    // which then waits for one block of a file that has just loaded.)
+    void postWaveform(WaveformChange& waveform)
+    {
+        if (! waveform.changed) return;
+        thumbnailCache.getTimeSliceThread().removeAllClients();
+        // callAsync wants something copyable, and the reader must not leak
+        // if the message is never delivered (the application quitting).
+        auto reader = std::make_shared<std::unique_ptr<juce::AudioFormatReader>>(std::move(waveform.reader));
+        juce::MessageManager::callAsync([this, gone = destroyed, reader, hash = waveform.hash]
+        {
+            if (! gone->load(std::memory_order_acquire))
+                thumbnail.setReader(reader->release(), hash);   // no reader: cleared
+        });
     }
 
     // Must be the LAST member declared.  Its destructor stops the thread

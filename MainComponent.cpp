@@ -7599,17 +7599,22 @@ void MainComponent::cycleGenPreset(int direction)
 /// is applied as 0, as the preset editor shows it (the field disabled,
 /// "(audio length)" in the table).  Applied, a Stop TC left over from
 /// before the file was added cut the file -- and a Loop timecode preset's
-/// loop -- at that point.  Applied with its file, a preset whose file is
-/// missing on disk has no file (the engine loads none) and runs as one
-/// without audio, to its Stop TC, although the editor, which goes by the
-/// path alone, shows "(audio length)" for it.  A file on disk that does
-/// not decode gets Stop TC 0 and then no audio, so the preset runs with no
-/// end.  Applied without its file (a browse while the audio plays), the
-/// path alone decides, as in the editor, and the disk is not touched: a
-/// preset whose file is missing gets Stop TC 0 then too.  A Stop TC typed
-/// in the panel or sent with /stc/N/gen/stoptime after this still
-/// applies.  With its file, the preset's path goes to `fileGiven`, the
-/// engine's genPresetFileGiven (#24), whether the file is on disk or not.
+/// loop -- at that point.  The path alone says whether the preset has a
+/// file, as in the editor: the disk is not asked here, on the message
+/// thread (AUD11 GENERATOR-4).  Applied with its file, a preset whose file
+/// is missing on disk has no file once the engine's load has found that
+/// out, and runs as one without audio, to its Stop TC: the engine is
+/// given the preset's Stop TC for that case and takes it when the load
+/// completes (TimecodeEngine::applyGeneratorStopMsForMissingFile; the
+/// panel and the settings follow in timerCallback), although the editor
+/// shows "(audio length)" for it.  A file on disk that does not decode
+/// gets Stop TC 0 and then no audio, so the preset runs with no end.
+/// Applied without its file (a browse while the audio plays), nothing is
+/// loaded, so nothing finds a missing file: it gets Stop TC 0 then too.
+/// A Stop TC typed in the panel or sent with /stc/N/gen/stoptime after
+/// this still applies.  With its file, the preset's path goes to
+/// `fileGiven`, the engine's genPresetFileGiven (#24), whether the file is
+/// on disk or not.
 ///
 /// Returns true when it kept the engine's A/B loop for a file the engine's
 /// player does not hold (see below): GO then arms it only once it has
@@ -7620,15 +7625,13 @@ bool MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorP
     const auto fps = eng.getCurrentFps();
     const juce::File audioFile = preset.audioFilePath.isNotEmpty()
                                    ? juce::File(preset.audioFilePath) : juce::File();
-    // Does the preset have audio?  With its file applied, the disk says,
-    // and a missing file goes to the engine as no file (it does not look
-    // it up again).  Without (a browse while the generator's audio plays),
-    // the path says, as in the preset editor: the disk is not asked while
-    // the audio is on air, because a path on a network share that does not
-    // answer would hold the message thread, which also runs the
-    // generator's tick.
-    const bool hasAudio = withAudioFile ? audioFile.existsAsFile()
-                                        : preset.audioFilePath.isNotEmpty();
+    // Does the preset have audio?  The path says, as in the preset editor.
+    // The disk is not asked here, with or without the file applied: a path
+    // on a disk that answers slowly (a USB disk spinning up, a network
+    // share) held the message thread, which also runs every engine's tick,
+    // for as long (AUD11 GENERATOR-4).  With its file applied, the
+    // engine's load is what finds a file missing; see below.
+    const bool hasAudio = preset.audioFilePath.isNotEmpty();
     eng.setGeneratorPresetName(preset.name);   // the preset is the track (TCNet metadata, #20)
     // Stop TC before Start TC.  Under a running Loop timecode preset Stop
     // TC can move the loop's end and switch its path, and a new Start TC
@@ -7667,7 +7670,10 @@ bool MainComponent::applyGenPresetToEngine(TimecodeEngine& eng, const GeneratorP
         const bool held = eng.getGeneratorAudioFile() == given;
         const double abIn = eng.getGeneratorLoopInMs(), abOut = eng.getGeneratorLoopOutMs();
         const bool abOn = eng.getGeneratorLoopEnabled();
-        eng.setGeneratorAudioFile(hasAudio ? audioFile : juce::File(), preset.audioLoop, preset.loopTimecode);
+        // The preset's own Stop TC goes with the file: the engine takes it
+        // if the load finds the file missing (AUD11 GENERATOR-4).
+        eng.setGeneratorAudioFile(hasAudio ? audioFile : juce::File(), preset.audioLoop, preset.loopTimecode,
+                                  parseTimecodeToMs(preset.stopTC, fps));
         eng.setGeneratorLoopInMs(sameFile ? abIn : 0.0);
         eng.setGeneratorLoopOutMs(sameFile ? abOut : 0.0);
         eng.setGeneratorLoopEnabled(sameFile && abOn);
@@ -9293,6 +9299,19 @@ void MainComponent::timerCallback()
     {
         engines[(size_t)i]->setStatusTextVisible(i == selectedEngine);
         engines[(size_t)i]->tick();
+
+        // A preset applied with its file (GO, a browse, OSC /gen/preset)
+        // whose file the engine's load has since found missing: the engine
+        // has taken the preset's Stop TC (AUD11 GENERATOR-4,
+        // applyGenPresetToEngine).  The panel's field shows it and the
+        // settings keep it, as when GO itself asked the disk.
+        if (engines[(size_t)i]->takeGeneratorStopMsFromMissingFile())
+        {
+            auto& eng = *engines[(size_t)i];
+            if (i == selectedEngine)
+                txtGenStopTC.setText(msToTimecodeString(eng.getGeneratorStopMs(), eng.getCurrentFps()), false);
+            saveSettings();
+        }
     }
 
     // Feed TCNet output layers from engines.

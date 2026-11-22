@@ -99,6 +99,7 @@ public:
             {
                 auto* self = weak.get();
                 if (self == nullptr) return;
+                self->applyGeneratorStopMsForMissingFile();
                 self->syncGeneratorPlayerLooping();
                 if (self->genState == GeneratorState::Stopped) return;
                 self->seekGeneratorAudioToTimecode();
@@ -3857,9 +3858,17 @@ public:
 
     bool isGeneratorAudioRunning() const { return generatorAudioPlayer.isDeviceOpen(); }
 
-    /// Load (or unload, when file is empty/missing) an audio file for the generator.
+    /// Load (or unload, when file is empty) an audio file for the generator.
     /// Loop flag is applied at the same time so subsequent file ends honour it.
-    /// Returns immediately -- the actual load runs on a dedicated I/O thread.
+    /// Returns immediately -- the actual load runs on a dedicated I/O thread,
+    /// and so does every look at the disk (AUD11 GENERATOR-4).  This used to
+    /// ask the disk whether the file was there, on the message thread, and
+    /// to unload for a missing one; a path that is not on disk now goes to
+    /// the player like any other, whose load finds it missing and ends with
+    /// no file loaded.  stopMsIfFileMissing (0 or more) is the Stop TC the
+    /// engine takes then, for the caller who set Stop TC 0 because the
+    /// preset has a file (MainComponent::applyGenPresetToEngine): see
+    /// applyGeneratorStopMsForMissingFile.
     ///
     /// shouldLoop is the preset's "Loop audio only";
     /// loopTimecode its "Loop timecode" (#24).  Both follow the file: they
@@ -3874,9 +3883,12 @@ public:
     /// off, as the preset editor's two boxes untick each other: turning the
     /// loop off later (OSC) then gives its last pass rather than "Loop
     /// audio".  Message thread.
-    void setGeneratorAudioFile(const juce::File& file, bool shouldLoop, bool loopTimecode = false)
+    void setGeneratorAudioFile(const juce::File& file, bool shouldLoop, bool loopTimecode = false,
+                               double stopMsIfFileMissing = -1.0)
     {
-        const juce::File f = (file == juce::File() || ! file.existsAsFile()) ? juce::File() : file;
+        const juce::File f = file;
+        genStopMsIfFileMissing   = (f != juce::File()) ? stopMsIfFileMissing : -1.0;
+        genStopMsFromMissingFile = false;
 
         // On a real file change, clear A/B loop state.  Loop In/Out
         // are absolute TC ms tied to the previously loaded file's
@@ -3926,7 +3938,39 @@ public:
         genAudioLoop    = false;   // as setGeneratorAudioFile(File(), false)
         genLoopTimecode = false;
         genAudioLoopLastPassEndMs = 0.0;
+        genStopMsIfFileMissing   = -1.0;
+        genStopMsFromMissingFile = false;
         generatorAudioPlayer.requestLoad(juce::File(), false);
+    }
+
+    /// The load of the file given with setGeneratorAudioFile has completed
+    /// (the player's onLoadCompleted, message thread).  If the file was not
+    /// on disk, the engine takes the Stop TC it was given for that case:
+    /// the preset then runs as one without audio, to its Stop TC, as it did
+    /// when the message thread asked the disk before the load (AUD11
+    /// GENERATOR-4).  Not when a newer request is on its way (its own
+    /// completion comes here), nor over a Stop TC set since the request
+    /// (the panel's field, OSC stoptime).
+    void applyGeneratorStopMsForMissingFile()
+    {
+        if (genStopMsIfFileMissing < 0.0 || generatorAudioPlayer.isLoadPending())
+            return;
+        const double ms = genStopMsIfFileMissing;
+        genStopMsIfFileMissing = -1.0;
+        if (ms <= 0.0 || genStopMs > 0.0 || ! generatorAudioPlayer.isRequestedFileMissing())
+            return;
+        setGeneratorStopMs(ms);
+        genStopMsFromMissingFile = true;
+    }
+
+    /// True once after applyGeneratorStopMsForMissingFile has set a Stop
+    /// TC: the owner shows it in its panel and keeps it in the settings
+    /// (MainComponent::timerCallback).  Message thread.
+    bool takeGeneratorStopMsFromMissingFile()
+    {
+        const bool taken = genStopMsFromMissingFile;
+        genStopMsFromMissingFile = false;
+        return taken;
     }
 
     bool       hasGeneratorAudioFile()    const { return generatorAudioPlayer.hasFileLoaded(); }
@@ -4155,6 +4199,12 @@ private:
     // (#24).  Set and consumed on the message thread (the tick, the UI,
     // OSC).
     bool   genJumpAnnounce = false;
+    // The Stop TC to take if the file given with setGeneratorAudioFile
+    // turns out not to be on disk (-1: none), and "it was taken", for the
+    // owner to show and save (AUD11 GENERATOR-4; see
+    // applyGeneratorStopMsForMissingFile).  Message thread.
+    double genStopMsIfFileMissing   = -1.0;
+    bool   genStopMsFromMissingFile = false;
 
     // Generator audio playback (per-engine, optional)
     GeneratorAudioPlayer generatorAudioPlayer;
