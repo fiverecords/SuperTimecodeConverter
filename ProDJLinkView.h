@@ -206,6 +206,13 @@ private:
         // BPM multiplier state (updated each tick from engine + TrackMap)
         int  bpmSessionOverride = TimecodeEngine::kBpmNoOverride;  // from engine: kBpmNoOverride=none, 0=1x, 1=x2...
         int  bpmTrackMapValue   = 0;  // from TrackMap entry: same encoding
+        // The multipliers in effect on the engines that follow this player:
+        // bit (m + 2) for multiplier m = -2..2.  More than one bit: the
+        // engines do not agree (a per-engine Track Map override, or a session
+        // override set in the main window), and the deck says so instead of
+        // showing one of them (AUD11 VIEWS-EDITORS-1).
+        uint8_t bpmEngineMults  = 0;
+        bool bpmEnginesDiffer() const { return (bpmEngineMults & (bpmEngineMults - 1)) != 0; }
         // Cached button hit-test bounds (set during paint, used in mouseDown)
         juce::Rectangle<int> bpmBtnBounds[5];  // order: /4 /2 1x x2 x4
         // Per-deck double-click timing for BPM multiplier buttons
@@ -220,6 +227,7 @@ private:
             double bpm = -1.0, faderPitch = -1.0;
             uint32_t playheadMs = 0xFFFFFFFF, trackId = 0;
             int bpmSessionOverride = -999, bpmTrackMapValue = -999;
+            uint8_t bpmEngineMults = 0;
             juce::String playState, artist, title, posSource, fpsStr;
             Timecode timecode {}, offsetTimecode {};
             juce::StringArray engineNames;
@@ -265,16 +273,21 @@ public:
                 }
                 else
                 {
-                    // Single click: set session override (skip if already effective)
+                    // Single click: set the session override on every engine
+                    // that follows this player (an engine on which the value
+                    // is already in effect is left as it is).  The click
+                    // used to stop at the first such engine while the deck
+                    // showed the last one's state: with two engines on one
+                    // player it changed one engine's MIDI clock / Link / OSC
+                    // BPM and lit nothing (AUD11 VIEWS-EDITORS-1).
                     for (auto& eng : engines)
                     {
                         if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
                             && eng->getEffectivePlayer() == pn)
                         {
                             if (eng->getEffectiveBpmMultiplier() == clickedMult)
-                                break;  // already active -- do nothing
+                                continue;  // already active on this engine
                             eng->setBpmPlayerOverride(clickedMult);
-                            break;
                         }
                     }
                 }
@@ -408,6 +421,9 @@ public:
 
         // Clear session override: TrackMap is now the source of truth.
         // Update engine's cachedBpmMultiplier so it takes effect immediately.
+        // On every engine that follows the player, as the single click
+        // (AUD11 VIEWS-EDITORS-1): a second engine kept its session override
+        // over the value just saved.
         for (auto& eng : engines)
         {
             if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
@@ -415,7 +431,6 @@ public:
             {
                 eng->setBpmPlayerOverride(TimecodeEngine::kBpmNoOverride);
                 eng->setCachedBpmMultiplier(newValue);
-                break;
             }
         }
 
@@ -594,13 +609,21 @@ public:
             ds.engineNames.clear();
             ds.bpmSessionOverride = TimecodeEngine::kBpmNoOverride;
             ds.bpmTrackMapValue   = tmEntry ? tmEntry->bpmMultiplier : 0;
+            ds.bpmEngineMults     = 0;
             for (auto& eng : engines)
             {
                 if (eng->getActiveInput() == TimecodeEngine::InputSource::ProDJLink
                     && eng->getEffectivePlayer() == pn)
                 {
                     ds.engineNames.add(eng->getName());
-                    ds.bpmSessionOverride = eng->getBpmPlayerOverride();
+                    // The session override of the first engine that has one
+                    // (it was the last engine's, set or not), and what is in
+                    // effect on each (AUD11 VIEWS-EDITORS-1).
+                    if (ds.bpmSessionOverride == TimecodeEngine::kBpmNoOverride)
+                        ds.bpmSessionOverride = eng->getBpmPlayerOverride();
+                    const int effMult = eng->getEffectiveBpmMultiplier();
+                    if (effMult >= -2 && effMult <= 2)
+                        ds.bpmEngineMults = (uint8_t)(ds.bpmEngineMults | (1 << (effMult + 2)));
                 }
             }
 
@@ -1261,6 +1284,7 @@ public:
                              || ds.trackId            != snap.trackId
                              || ds.bpmSessionOverride != snap.bpmSessionOverride
                              || ds.bpmTrackMapValue   != snap.bpmTrackMapValue
+                             || ds.bpmEngineMults     != snap.bpmEngineMults
                              || std::abs(ds.bpm        - snap.bpm)        > 0.005
                              || std::abs(ds.faderPitch - snap.faderPitch) > 0.0001
                              || ds.playState          != snap.playState
@@ -1293,6 +1317,7 @@ public:
                 snap.playheadMs         = ds.playheadMs;
                 snap.bpmSessionOverride = ds.bpmSessionOverride;
                 snap.bpmTrackMapValue   = ds.bpmTrackMapValue;
+                snap.bpmEngineMults     = ds.bpmEngineMults;
                 snap.bpm                = ds.bpm;
                 snap.faderPitch         = ds.faderPitch;
                 snap.playState          = ds.playState;
@@ -1795,7 +1820,13 @@ private:
                 int sess = ds.bpmSessionOverride;
                 int map  = ds.bpmTrackMapValue;
                 int eff  = (sess != TimecodeEngine::kBpmNoOverride) ? sess : map;
-                if (eff != 0)
+                if (ds.bpmEnginesDiffer())
+                {
+                    // No single multiplied BPM to show (AUD11 VIEWS-EDITORS-1);
+                    // the button row lights each multiplier in effect.
+                    bpmStr += "  " + juce::String::charToString(0x2192) + " ENGINES DIFFER";
+                }
+                else if (eff != 0)
                 {
                     double multBpm = TimecodeEngine::applyBpmMultiplier(ds.bpm, eff);
                     juce::String multLabel;
@@ -2007,7 +2038,11 @@ private:
                     ds.bpmBtnBounds[bi] = btnRect;
 
                     int mult = kBtns[bi].mult;
-                    bool active   = (eff == mult);
+                    // Engines that do not agree: every multiplier in effect
+                    // on one of them is lit (AUD11 VIEWS-EDITORS-1).
+                    bool active   = ds.bpmEnginesDiffer()
+                                  ? ((ds.bpmEngineMults >> (mult + 2)) & 1) != 0
+                                  : (eff == mult);
                     bool isSaved  = (map != 0 && map == mult);
 
                     juce::Colour bg, fg;
