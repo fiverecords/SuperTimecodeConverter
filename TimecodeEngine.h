@@ -4909,7 +4909,6 @@ public:
     juce::String getOscFwdBpmAddr() const { return oscFwdBpmAddr; }
     juce::String getOscFwdBpmCmd() const  { return oscFwdBpmCmd; }
 
-    // Send BPM via OSC: if command template is set, send as string; otherwise as float
     /// The BPM forward of a DJ source's tick that has no deck to follow
     /// (AUD11 ENGINE-CORE-4): MIDI clock, Ableton Link and OSC BPM get the
     /// tempo master's BPM, which is what the tick forwards first when it has
@@ -4930,6 +4929,7 @@ public:
         sendBpmOsc(masterBpm);
     }
 
+    // Send BPM via OSC: if command template is set, send as string; otherwise as float
     void sendBpmOsc(double bpm)
     {
         if (!oscForwardEnabled || !triggerOutput.isOscConnected() || bpm <= 0.0) return;
