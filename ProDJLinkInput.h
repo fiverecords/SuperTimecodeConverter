@@ -359,10 +359,13 @@ struct ProDJLinkPlayerState
                                                     // shows it (dysentery vcdj.adoc); also the beat
                                                     // packet's pitch and a non-zero 0x0b pitch
     std::atomic<uint32_t> actualSpeedRaw { 0 };   // Pitch2 (status offset 152, 0x98): the LOCAL
-                                                    // pitch fader with the motor ramp -- 0 when
-                                                    // stopped or the jog is held, ramps 0->fader
-                                                    // on play, fader->0 on pause.  Not the
-                                                    // effective speed under sync (AUDIT B13).
+                                                    // pitch fader with the motor ramp -- 0 while
+                                                    // paused or the jog is held, ramps 0->fader
+                                                    // on play, fader->0 on pause.  NOT 0 on every
+                                                    // stopped deck: cued (P1 06) or empty (P1 00)
+                                                    // it carries the fader (see getActualSpeed).
+                                                    // Not the effective speed under sync (AUDIT
+                                                    // B13).
     std::atomic<uint8_t>  beatInBar    { 1 };    // 1-4
 
     // From status packets
@@ -638,8 +641,11 @@ public:
         // the kernel splits packets between them -- causing packet reordering and
         // stale playhead values that appear as timecode fluctuation.
         //
-        // beatSock, statusSock, and bridgeSock bind to bindIp to ensure packets
-        // go out the correct NIC and to receive only from the selected interface.
+        // statusSock and bridgeSock bind to bindIp to ensure packets go out the
+        // correct NIC and to receive only from the selected interface (INADDR_ANY
+        // only when that bind fails).  beatSock does so on Windows only: on
+        // macOS and Linux it binds to INADDR_ANY, see below, and receives port
+        // 50001 from every interface.
         //
         // keepaliveSock binding is PLATFORM-SPECIFIC:
         //   Windows: bind to bindIp.  On multi-adapter systems (two NICs on the
@@ -1166,7 +1172,17 @@ public:
 
     /// Speed multiplier from status Pitch2, offset 152 (0x98): the LOCAL
     /// pitch fader with the motor ramp -- 0 -> fader on play, fader -> 0 on
-    /// pause, 0 while paused or the jog is held (dysentery vcdj.adoc).  Under
+    /// pause, 0 while paused or the jog is held (dysentery vcdj.adoc).  It is
+    /// not 0 on every stopped deck: on the CDJ-2000nexus captures (firmware
+    /// 1.24 and 1.44) a deck stopped on a cue point (P1 = 06) carries the
+    /// fader's value in 1300 of 1308 statuses, and a deck with no track in
+    /// 8994 of 12615; it reads 0 while paused (P1 = 05: 1470 of 1581, the
+    /// rest being the first status of a pause and a search made while
+    /// paused), while a track loads and during the scan after a load.  No
+    /// capture has the ramp of a pause or of a start: the value goes from
+    /// the fader to 0, or back, between two statuses.  So it is the deck's
+    /// speed only while the deck moves, and the engine asks
+    /// isPositionMoving on the beat fallback (AUD11 PDL-3).  Under
     /// sync, with the fader away from the master's pitch, it is not the
     /// effective speed; which copy the engine should use waits for a synced
     /// capture (AUDIT B13).
@@ -3333,9 +3349,11 @@ private:
         //   synced tempo master.  No motor ramp.
         // Offset 152 (0x98), Pitch2 -> actualSpeedRaw: the local pitch
         //   fader, ramping 0 -> fader on play and fader -> 0 on pause (brake
-        //   and release settings); 0 while paused or the jog is held.  Under
-        //   sync it is NOT the effective speed (AUDIT B13: which copy the
-        //   interpolation should use waits for a synced capture).
+        //   and release settings); 0 while paused or the jog is held.  The
+        //   captures add what that text leaves out: stopped on a cue point
+        //   or with no track loaded it stays at the fader (getActualSpeed).
+        //   Under sync it is NOT the effective speed (AUDIT B13: which copy
+        //   the interpolation should use waits for a synced capture).
         // Pitch1 = 0 is -100 %, a stop reachable in Wide tempo mode, not "no
         // value": it is stored like any other, so getBPM reads 0 there
         // instead of the last tempo (AUDIT PDL-9).
