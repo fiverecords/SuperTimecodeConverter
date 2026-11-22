@@ -275,6 +275,7 @@ public:
         armedCues.clear();
         rawGeneratorCues.clear();
         lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueStillSince = cueRestSeenAt = 0.0;
         cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;
 
         // Note: actual start is deferred to the caller (MainComponent),
@@ -1074,6 +1075,7 @@ public:
         cachedTrackDurationSec = 0;
         armedCues.clear();
         lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueStillSince = cueRestSeenAt = 0.0;
         cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;
         pll.reset(); clearBeatGrid(); pdlTcFrozen = false; pdlLastPlayheadMs = 0; pdlLastAbsPosTs = 0.0;
         pdlSnapMs = 0.0; pdlSnapTime = 0.0; pdlSnapSpeed = 1.0;
@@ -4349,6 +4351,7 @@ private:
         lastSeenTrackVersion = 0;
         armedCues.clear();
         lastCueCheckMs = cueFlagsAtMs = cueStopRawMs = 0;
+        cueStillSince = cueRestSeenAt = 0.0;
         cueArmPending = cueWasPlaying = cueRelocated = cueFlagsAtIncl = false;   // the new deck's list arms at its playhead
         lastSentClockBpm = -1.0f;
         lastSentOscBpm   = -1.0f;
@@ -4698,6 +4701,24 @@ private:
     // (dispatchTrackCues): Winamp's position runs on up to one 50 ms poll past
     // the pause; the DJ sources' own positions do not move while stopped.
     static constexpr uint32_t kCueMovedBackMs = 100;
+    // Where the deck stands while it does not play, for the arm at the next
+    // play (dispatchTrackCues, AUD11 ENGINE-CORE-2).  Message thread.
+    uint32_t cueStillMs = 0;       // the playhead at the last dispatch that did not play ...
+    double cueStillSince = 0.0;    // ... and since when it has read that (0: none yet)
+    uint32_t cueRestMs = 0;        // the last position it held for kCueRestDwellMs ...
+    double cueRestSeenAt = 0.0;    // ... and when it was last seen on it (0: none, or a
+                                   // relocation since)
+    // The position must read the same for kCueRestDwellMs to be where the deck
+    // stands: three packets of a CDJ-3000 (30 ms) or of StageLinQ (about
+    // 35 ms), so a deck that still moves between two packets is not taken for
+    // one at rest.  The play state may reach the engine up to
+    // kCueRestWindowMs after the deck left that position: a player's status
+    // comes every 200 ms, its position every 30.  Between two ticks a deck
+    // that plays moves by a tick and a packet of track, about 50 ms at 1x;
+    // a step forward of more than kCueRestStepMs is a relocation.
+    static constexpr double   kCueRestDwellMs  = 100.0;
+    static constexpr double   kCueRestWindowMs = 300.0;
+    static constexpr uint32_t kCueRestStepMs   = 150;
     uint32_t pdlPrevBeatCount = 0; // Pro DJ Link: the followed player's beat count at the last tick
                                    // (the cue dispatch's one-beat test, AUDIT ENG-2)
     juce::String oscFwdBpmAddr = "/composition/tempocontroller/tempo";
@@ -5221,7 +5242,10 @@ private:
     ///     with the flags it had (reloadCuePointsForTrack);
     ///   - while the deck does not play the playhead is followed and nothing
     ///     fires; at the next play the cues behind the playhead are passed
-    ///     (what a scrub, jog or cue preview moved past).  The cues ahead are
+    ///     (what a scrub, jog or cue preview moved past) -- behind the
+    ///     position the deck stood on, when it has just left it by playing
+    ///     and the play state came after (AUD11 ENGINE-CORE-2, see the code).
+    ///     The cues ahead are
     ///     re-armed too, as DESIGN D17 does for a seek while playing, when
     ///     the source reported a seek meanwhile (a hot cue or a relocation),
     ///     or when the deck moved back while it did not play: its own
@@ -5253,11 +5277,32 @@ private:
             cueStopRawMs  = rawMs;
             cueArmPending = false;
             cueRelocated  = false;
+            cueStillSince = cueRestSeenAt = 0.0;   // where the deck stood was another track's
         }
         if (! playing)
         {
             if (sourceSeeked) cueRelocated = true;
             cueStopRawMs   = juce::jmax(cueStopRawMs, rawMs);
+            // Note where the deck stands (AUD11 ENGINE-CORE-2): the position
+            // it has held for kCueRestDwellMs, refreshed while it stays on
+            // it.  A relocation meanwhile ends it -- the source's seek
+            // verdict, a step back behind it, or a step forward longer than
+            // a playing deck makes between two ticks -- and the next
+            // position the deck holds takes its place.
+            const double nowMs = juce::Time::getMillisecondCounterHiRes();
+            if (sourceSeeked || cueStillSince <= 0.0 || playheadMs != cueStillMs)
+            {
+                if (sourceSeeked || playheadMs < cueRestMs
+                    || playheadMs > cueStillMs + kCueRestStepMs)
+                    cueRestSeenAt = 0.0;
+                cueStillMs    = playheadMs;
+                cueStillSince = nowMs;
+            }
+            else if (nowMs - cueStillSince >= kCueRestDwellMs)
+            {
+                cueRestMs     = playheadMs;
+                cueRestSeenAt = nowMs;
+            }
             lastCueCheckMs = playheadMs;
             cueWasPlaying  = false;
             return;
@@ -5265,7 +5310,27 @@ private:
         if (! cueWasPlaying)
         {
             const bool movedBack = rawMs + kCueMovedBackMs < cueStopRawMs;
-            armCuesAt(playheadMs, cueRelocated || movedBack);
+            // The list is armed where the deck stood, not at this tick's
+            // playhead, when the deck left that position at most
+            // kCueRestWindowMs ago and has only moved forward from it as a
+            // playing deck does: the play state reaches the engine after the
+            // position has begun to move (StageLinQ: 20-40 ms of track on the
+            // #23 capture; a CDJ's status comes every 200 ms), and what the
+            // deck played meanwhile was crossed in playback, the cue on the
+            // position it started from included.  Armed at the playhead,
+            // those cues were passed without firing: a deck parked on a cue
+            // point never fired it (AUD11 ENGINE-CORE-2).  Without such a
+            // position -- a scrub, jog or cue preview that ran longer, a
+            // relocation, a deck that never stood -- the playhead it is, as
+            // before.  A cue that already fired keeps its flag unless the
+            // cues ahead are re-armed, so a pause and play fires none twice.
+            uint32_t armAt = playheadMs;
+            if (! sourceSeeked && cueRestSeenAt > 0.0
+                && cueRestMs <= playheadMs && playheadMs <= cueStillMs + kCueRestStepMs
+                && juce::Time::getMillisecondCounterHiRes() - cueRestSeenAt <= kCueRestWindowMs)
+                armAt = cueRestMs;
+            cueStillSince = cueRestSeenAt = 0.0;
+            armCuesAt(armAt, cueRelocated || movedBack);
             cueRelocated  = false;
             cueWasPlaying = true;
         }
