@@ -3690,8 +3690,20 @@ private:
     /// this did, made the next tick fire every cue in (0, now] while the
     /// generator ran or was paused (AUDIT ENG-3).  From Stop, play moves the
     /// cursor to the play-from position anyway (generatorPlay).
+    ///
+    /// Only while the engine's input is the generator (AUD11 GENERATOR-V1).
+    /// armedCues and the cursor are the one list and the one cursor the
+    /// Track Map cues of a DJ source use as well, and a generator preset
+    /// reaches an engine whatever its input (OSC /stc/N/gen/preset): on an
+    /// engine following a deck it replaced the track's armed cues with the
+    /// preset's -- the track's remaining cues did not fire, and a preset
+    /// cue could fire against the deck's position -- until the next track
+    /// load or Track Map edit.  The preset's cues are kept
+    /// in rawGeneratorCues all the same; MainComponent gives the generator
+    /// its preset's cues when the input is switched to it.
     void rearmGeneratorCues()
     {
+        if (activeInput != InputSource::SystemTime) return;
         armedCues.clear();
         lastCueCheckMs = (uint32_t) juce::jmax(0.0, genCurrentMs);
         if (rawGeneratorCues.empty()) return;
@@ -3826,8 +3838,9 @@ public:
     double getGeneratorStopMs()  const { return genStopMs; }
     double getGeneratorCurrentMs() const { return genCurrentMs; }
 
-    /// Read-only view of the Generator preset's currently armed cues.
-    /// Empty when no preset is active or input source is not SystemTime.
+    /// Read-only view of the Generator preset's cues, as last given
+    /// (setGeneratorCuePoints).  Empty when no preset is active, and after
+    /// a change of the input source until a preset is applied again.
     /// The list is mutated by setGeneratorCuePoints / clearing the input
     /// source change, so consumers should re-read on every paint rather
     /// than hold onto the reference across frames.
