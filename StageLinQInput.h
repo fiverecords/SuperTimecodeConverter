@@ -318,11 +318,37 @@ namespace StageLinQ
         juce::String asString() const { return stringVal; }
     };
 
+    // JUCE's JSON parser calls itself once for every array or object it
+    // opens, with no limit, and a StateMap block may carry 32,700 opening
+    // brackets: one value of "[[[[..." from anything that announced itself
+    // as a unit overflowed the connection thread's stack -- 4,000 brackets
+    // are enough on a 512 KiB stack -- and STC died (AUD11 SLQ-1, FUZZ-1).
+    // A real value is one flat object.  The text may hold at most this
+    // many opening square or curly brackets, wherever they are: that bounds
+    // the depth whatever the parser takes for a string (it accepts ' as
+    // well as "), and it is far more than a title such as
+    // "Song [Live] [Remaster]" brings.
+    static constexpr int kMaxJsonOpenBrackets = 64;
+
+    inline bool jsonNestingIsBounded(const juce::String& json)
+    {
+        // By code, so that the file's braces still balance for Gate 1
+        const juce::juce_wchar openSquare = 0x5B, openCurly = 0x7B;
+        int open = 0;
+        for (auto p = json.getCharPointer(); !p.isEmpty(); ++p)
+            if ((*p == openSquare || *p == openCurly) && ++open > kMaxJsonOpenBrackets)
+                return false;
+        return true;
+    }
+
     inline JsonValue parseJsonValue(const juce::String& json)
     {
         JsonValue v;
         auto trimmed = json.trim();
         if (trimmed.isEmpty()) return v;
+
+        // Not parsed: the value is dropped, as one that is not JSON is
+        if (!jsonNestingIsBounded(trimmed)) return v;
 
         // Try JUCE JSON parser first (handles objects, arrays, primitives)
         auto parsed = juce::JSON::parse(trimmed);
