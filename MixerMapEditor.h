@@ -165,7 +165,8 @@ public:
                             .withButton("OK"),
                             nullptr);
                     };
-                    auto parsed = juce::JSON::parse(file.loadFileAsString());
+                    // SafeJsonFile::parse: depth-limited (AUD11 FUZZ-2).
+                    auto parsed = SafeJsonFile::parse(file.loadFileAsString());
                     auto* obj = parsed.getDynamicObject();
                     auto* arr = obj != nullptr ? obj->getProperty("params").getArray() : nullptr;
                     if (!arr)

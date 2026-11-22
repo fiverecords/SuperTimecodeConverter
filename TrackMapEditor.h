@@ -1544,8 +1544,10 @@ private:
             }
             else
             {
-                // STC JSON format
-                auto parsed = juce::JSON::parse(file.loadFileAsString());
+                // STC JSON format.  SafeJsonFile::parse: a file nested deeper
+                // than any Track Map is refused before the parser, which it
+                // used to crash (AUD11 FUZZ-2).
+                auto parsed = SafeJsonFile::parse(file.loadFileAsString());
                 auto* obj = parsed.getDynamicObject();
                 if (!obj)
                 {

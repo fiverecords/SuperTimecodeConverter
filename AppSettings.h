@@ -55,7 +55,12 @@ struct SafeJsonFile
         if (!file.existsAsFile()) return {};
 
         const juce::String text = file.loadFileAsString();
-        auto parsed = juce::JSON::parse(text);
+        // Text that nests deeper than any STC file is not given to the
+        // parser at all (kMaxJsonDepth): it is quarantined like any other
+        // unreadable file, where it used to end STC at every start.
+        const JsonShape shape = scan(text);
+        const bool tooDeep = shape.depth > kMaxJsonDepth;
+        auto parsed = tooDeep ? juce::var() : juce::JSON::parse(text);
         // juce::JSON::parse stops at the end of the first complete value and
         // ignores what follows.  A stray closing brace in the middle of the
         // file -- one damaged byte, two configurations pasted one after the
@@ -64,7 +69,7 @@ struct SafeJsonFile
         // part back (AUD11 FUZZ-11).  Anything but whitespace after the
         // root object now makes the file unreadable, like one cut short.
         const bool hasObject = parsed.getDynamicObject() != nullptr;
-        if (hasObject && scan(text).complete)
+        if (hasObject && shape.complete)
             return parsed;
 
         // Not JSON, not an object, or an object with something after it.
@@ -75,6 +80,7 @@ struct SafeJsonFile
         lastLoadProblem() += file.getFileName() + " could not be read"
                            + (text.isEmpty() ? " (empty file)" : "")
                            + (hasObject ? " (there is text after the end of its JSON object)" : "")
+                           + (tooDeep ? " (it is nested too deep to be an STC file)" : "")
                            + (moved ? " and was moved to " + aside.getFileName()
                                     : " and could not be moved aside")
                            + ". Defaults are in use";
@@ -273,6 +279,30 @@ struct SafeJsonFile
             taken = out.getPosition();
         }
         return dest.getSize() == taken;
+    }
+
+    /// The deepest nesting of objects and arrays STC will parse.  Its own
+    /// files stay under 10 (a backup: bundle, settings, engines, engine,
+    /// override entries, entry, cue points, cue).  juce::JSON's parser
+    /// recurses once per level with no limit of its own: a file that is, or
+    /// begins with, tens of thousands of opening brackets overflowed the
+    /// stack -- about 5,000 levels on a 1 MiB stack, 40,000 on 8 MiB -- and
+    /// STC closed without a message, at every start when the file was
+    /// settings.json and at the click when it was a file chosen for import
+    /// (AUD11 FUZZ-2).
+    static constexpr int kMaxJsonDepth = 64;
+
+    /// juce::JSON::parse for the text of a file somebody chose or that may
+    /// have been edited: void, without parsing, for text nested deeper than
+    /// kMaxJsonDepth, and void for a root value that does not close or has
+    /// anything but whitespace after it (as load() refuses them, AUD11
+    /// FUZZ-11).  Otherwise what juce::JSON::parse returns.  Calling thread.
+    static juce::var parse(const juce::String& text)
+    {
+        const JsonShape shape = scan(text);
+        if (shape.depth > kMaxJsonDepth || ! shape.complete)
+            return {};
+        return juce::JSON::parse(text);
     }
 
     /// What scan() finds in JSON text without parsing it.
@@ -2518,7 +2548,7 @@ public:
     static juce::var readJsonFile(const juce::File& f)
     {
         if (!f.existsAsFile()) return {};
-        return juce::JSON::parse(f.loadFileAsString());
+        return SafeJsonFile::parse(f.loadFileAsString());   // depth-limited (AUD11 FUZZ-2)
     }
 
     juce::var buildExportBundle() const
