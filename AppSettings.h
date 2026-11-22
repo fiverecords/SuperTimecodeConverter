@@ -56,16 +56,25 @@ struct SafeJsonFile
 
         const juce::String text = file.loadFileAsString();
         auto parsed = juce::JSON::parse(text);
-        if (parsed.getDynamicObject() != nullptr)
+        // juce::JSON::parse stops at the end of the first complete value and
+        // ignores what follows.  A stray closing brace in the middle of the
+        // file -- one damaged byte, two configurations pasted one after the
+        // other -- therefore loaded as the part before it (one engine of
+        // three, say) without a word, and the next save wrote only that
+        // part back (AUD11 FUZZ-11).  Anything but whitespace after the
+        // root object now makes the file unreadable, like one cut short.
+        const bool hasObject = parsed.getDynamicObject() != nullptr;
+        if (hasObject && scan(text).complete)
             return parsed;
 
-        // Not JSON, or not an object.  Keep the bytes -- they may be
-        // recoverable by hand -- and report.
+        // Not JSON, not an object, or an object with something after it.
+        // Keep the bytes -- they may be recoverable by hand -- and report.
         const juce::String stamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
         const juce::File aside = file.getSiblingFile(file.getFileName() + ".corrupt-" + stamp);
         const bool moved = file.moveFileTo(aside);
         lastLoadProblem() += file.getFileName() + " could not be read"
                            + (text.isEmpty() ? " (empty file)" : "")
+                           + (hasObject ? " (there is text after the end of its JSON object)" : "")
                            + (moved ? " and was moved to " + aside.getFileName()
                                     : " and could not be moved aside")
                            + ". Defaults are in use";
