@@ -529,6 +529,7 @@ public:
         if (pendingLoad.load(std::memory_order_acquire)) return;
         if (! deviceOpen.load(std::memory_order_relaxed)) return;
         const juce::ScopedLock sl(sourceLock);
+        awaitingSeek.store(false, std::memory_order_release);   // a start the owner asks for after the load: where the transport is
         transport.start();
     }
 
@@ -605,6 +606,10 @@ public:
 
         const juce::ScopedLock sl(sourceLock);
         transport.setPosition(seconds);
+        // The transport is where the owner wants it: the audio callback may
+        // pull it again (awaitingSeek, AUD11 GENERATOR-10).  After the
+        // setPosition, so that no block is taken from the old position.
+        awaitingSeek.store(false, std::memory_order_release);
 
         if (shouldPlay.load(std::memory_order_acquire)
             && ! userPaused.load(std::memory_order_acquire)
@@ -844,6 +849,10 @@ private:
                 pendingLoop = loop;
                 hasPending  = true;
                 owner.pendingLoad.store(true, std::memory_order_release);
+                // With a listener wired, the audio also waits for the seek
+                // its catch-up makes (awaitingSeek, AUD11 GENERATOR-10).
+                if (owner.onLoadCompleted)
+                    owner.awaitingSeek.store(true, std::memory_order_release);
             }
             notify();
         }
@@ -1015,6 +1024,9 @@ private:
         // swap stopped it (AUDIT LTC-4).  Silence instead; the new file
         // starts from the onLoadCompleted catch-up.
         if (pendingLoad.load(std::memory_order_acquire)) return;
+        // And until the owner has put the transport where it wants it
+        // (awaitingSeek, AUD11 GENERATOR-10).
+        if (awaitingSeek.load(std::memory_order_acquire)) return;
         if (! transport.isPlaying()) return;
         if (! fileLoadedAtomic.load(std::memory_order_acquire)) return;
 
@@ -1197,6 +1209,22 @@ private:
     // the engine's current playhead so the audio does not race ahead of the
     // cursor during a hot-swap.
     std::atomic<bool>   pendingLoad         { false };
+
+    // Set with pendingLoad when an onLoadCompleted listener is wired,
+    // cleared by the first seekSeconds() or play() that reaches the
+    // transport afterwards -- the listener's catch-up (TimecodeEngine seeks
+    // to its playhead), or the owner's next start.  The audio callback
+    // plays silence while it is set (AUD11 GENERATOR-10).  pendingLoad
+    // ends when the LoaderThread has settled the request, and the catch-up
+    // runs on the message thread a moment later.  A newly attached file is
+    // stopped in between, but a request for the file that is already
+    // loaded leaves the transport as stopAndReset() left it, "playing" at
+    // the top: GO on the loaded preset then sounded the top of the file
+    // for every device block that fell in that moment (up to 186 ms each
+    // at 8192 samples), before the catch-up moved it -- to the A/B loop's
+    // In, when GO starts there.  Not set without a listener: then nobody
+    // seeks, and attachReaderToTransport starts the file itself.
+    std::atomic<bool>   awaitingSeek        { false };
 
     juce::String currentDeviceName, currentTypeName;
     int    numChannelsAvailable = 0;
