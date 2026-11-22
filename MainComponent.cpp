@@ -7222,7 +7222,20 @@ void MainComponent::updateStatusLabels()
         juce::String s;
         if (eng.isGeneratorAudioRunning())
         {
-            if (eng.hasGeneratorAudioFile())
+            // While the file the engine was given with a preset is being
+            // loaded, say so.  The load is off the message thread from its
+            // first look at the disk (AUD11 GENERATOR-4), so for as long as
+            // a slow disk takes this read FILE NOT FOUND for a first file
+            // and PLAYING with the name of the file being replaced, whose
+            // sound the player has already cut.
+            const auto given = genPresetFileGiven.find(&eng);
+            const juce::File loading = (eng.getGeneratorAudio().isLoadPending() && given != genPresetFileGiven.end())
+                                         ? given->second : juce::File();
+            if (loading != juce::File())
+            {
+                s = "LOADING " + loading.getFileName();
+            }
+            else if (eng.hasGeneratorAudioFile())
             {
                 auto fname = eng.getGeneratorAudioFile().getFileName();
                 // Under "Loop audio only" the audio goes round and the
