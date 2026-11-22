@@ -3081,7 +3081,12 @@ void MainComponent::syncUIFromEngine()
             if (thruCh >= 0) cmbThruInputChannel.setSelectedId(thruCh + 1, juce::dontSendNotification);
         }
     }
-    else if (eng.isAudioBpmRunning())
+    // Audio BPM only when it uses these selectors.  With LTC as the input
+    // it has its own (BPM DEVICE, BPM CHANNEL); if the LTC input is then
+    // not running -- its interface is not connected -- LTC CHANNEL would
+    // show the analyser's channel and the save would make it the LTC
+    // channel (AUD11 MAIN-A-2: the saved channel is kept).
+    else if (eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC)
     {
         cmbThruInputChannel.setSelectedId(0, juce::dontSendNotification);
         populateAudioInputChannels();
@@ -6390,7 +6395,7 @@ void MainComponent::populateAudioInputChannels()
         if (eng.getLtcInput().hasPassthruChannel())
             thruId = eng.getLtcInput().getPassthruChannel() + 1;
     }
-    else if (eng.isAudioBpmRunning())
+    else if (eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC)   // on these selectors, not on its own
         ltcId = eng.getAudioBpmInput().getSelectedChannel() + 1;
     else if (ltcId == 0 && hasSettings)
         ltcId = settings.engines[(size_t) selectedEngine].audioInputChannel + 1;
