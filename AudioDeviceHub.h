@@ -118,7 +118,18 @@ public:
         const bool alone = dev->fanout.empty();
         const double sr = alone ? sampleRate : dev->requestedSampleRate;
         const int    bs = alone ? bufferSize : dev->requestedBufferSize;
+        // An entry whose manager has no device any more counts as not open
+        // (AUD11 TC-IO-1).  JUCE closes the device itself when the interface
+        // leaves the system's list (AudioDeviceManager::audioDeviceListChanged)
+        // and the entry is left with open == true and nothing behind it.  A
+        // client joining it used to skip the reopen, was put on the fan-out
+        // with no device and got nullptr back: its start() failed, nothing
+        // ever released it, and while such a ghost stayed the entry could
+        // neither empty nor reopen -- every off/on failed until the last
+        // real client left, and a later reconfigureAll() started the ghosts,
+        // or called one whose engine had been removed.
         const bool wantsReconfigure = ! dev->open
+                                   || dev->manager->getCurrentAudioDevice() == nullptr
                                    || dev->inputName != wantIn || dev->outputName != wantOut
                                    || (alone && (dev->requestedSampleRate != sr || dev->requestedBufferSize != bs));
 
@@ -135,7 +146,11 @@ public:
 
             if (! open(*dev, wantIn, wantOut, sr, bs, error))
             {
-                if (wasOpen && ! dev->fanout.empty())
+                // Nothing to go back to when the request was the previous
+                // configuration itself -- a client joining a device that is
+                // lost and not back yet: the same open would fail twice.
+                const bool sameAsBefore = wantIn == prevIn && wantOut == prevOut && sr == prevSr && bs == prevBs;
+                if (wasOpen && ! dev->fanout.empty() && ! sameAsBefore)
                 {
                     juce::String restoreError;
                     open(*dev, prevIn, prevOut, prevSr, prevBs, restoreError);
@@ -151,8 +166,19 @@ public:
         // Registering after the open also means a re-opened device announces
         // itself to the existing clients only, and this one never sees a
         // stop it was not started for.
-        dev->fanout.add(client, asInput, !asInput, followsGlobalFormat, dev->manager->getCurrentAudioDevice());
-        return dev->manager->getCurrentAudioDevice();
+        // Only ever on a device that is there: a client that is given
+        // nullptr is not registered, so a failed start() leaves nothing
+        // behind for a later reopen to call (AUD11 TC-IO-1).
+        auto* running = dev->manager->getCurrentAudioDevice();
+        if (running == nullptr)
+        {
+            error = "device did not open";
+            if (dev->fanout.empty())
+                closeAndForget(dev);
+            return nullptr;
+        }
+        dev->fanout.add(client, asInput, !asInput, followsGlobalFormat, running);
+        return running;
     }
 
     /// Apply a new preferred rate and buffer to every open device, once
