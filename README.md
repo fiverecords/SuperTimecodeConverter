@@ -622,7 +622,7 @@ Routes audio from a channel on the LTC input device to a separate output device.
 
 ### Refresh Devices
 
-The **Refresh Devices** button scans for newly connected MIDI devices, audio interfaces, and network interfaces without disrupting existing configuration. Already-configured devices remain selected if they are still present. A configured audio device that is not connected stays configured -- nothing is opened in its place, and its selector names it with "(not listed)". An audio interface that goes away while it is in use, or stops delivering audio, shows `DEVICE LOST: <device>` in the LTC input, LTC output and Audio Thru status lines of the engine on screen; STC opens it again when the system lists it again, and so does Refresh Devices or switching the input or output off and on.
+The **Refresh Devices** button scans for newly connected MIDI devices, audio interfaces, and network interfaces without disrupting existing configuration. Already-configured devices remain selected if they are still present. A configured audio device that is not connected stays configured -- nothing is opened in its place, and its selector names it with "(not listed)". When it is connected later it is not opened by itself: press Refresh Devices (under Show Lock, unlock first). An audio interface that goes away while it is in use, or stops delivering audio, shows `DEVICE LOST: <device>` in the LTC input, LTC output and Audio Thru status lines of the engine on screen; STC opens it again when the system lists it again, and so does Refresh Devices or switching the input or output off and on. If Refresh Devices was pressed while the interface was away, press it again once it is back.
 
 ### Configuration Backup & Restore
 
