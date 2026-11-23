@@ -192,6 +192,10 @@ public:
     }
 
     bool         isDeviceOpen()        const { return deviceOpen.load(std::memory_order_relaxed); }
+    /// The interface this player is open on delivers no audio any more
+    /// (AUD11 TC-IO-2, AudioDeviceHub's "A lost device"); for the status
+    /// line, as LtcOutput::isDeviceLost.  Message thread.
+    bool         isDeviceLost()        const { return isDeviceOpen() && AudioDeviceHub::get().isDeviceLost(this); }
     juce::String getCurrentDeviceName() const { return currentDeviceName; }
     juce::String getCurrentTypeName()   const { return currentTypeName; }
     int          getSelectedChannel()  const { return selectedChannel.load(std::memory_order_relaxed); }

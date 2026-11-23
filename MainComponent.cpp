@@ -7330,7 +7330,15 @@ void MainComponent::updateStatusLabels()
             const auto given = genPresetFileGiven.find(&eng);
             const juce::File loading = (eng.getGeneratorAudio().isLoadPending() && given != genPresetFileGiven.end())
                                          ? given->second : juce::File();
-            if (loading != juce::File())
+            // An interface that delivers no audio any more says so here
+            // too, in place of whatever the line would read, as it does
+            // for LTC OUT and Audio Thru above (AUD11 TC-IO-2): this read
+            // PLAYING with the file's name for as long as it was lost.
+            if (eng.getGeneratorAudio().isDeviceLost())
+            {
+                s = "DEVICE LOST: " + eng.getGeneratorAudio().getCurrentDeviceName();
+            }
+            else if (loading != juce::File())
             {
                 s = "LOADING " + loading.getFileName();
             }
