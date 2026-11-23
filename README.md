@@ -748,6 +748,10 @@ STC and rekordbox use the same UDP ports for Pro DJ Link communication (50000, 5
 
 **Workaround:** Close rekordbox before starting STC, or run them on separate computers on the same network. If rekordbox was running and you switch to STC, you may need to restart STC to re-bind the ports cleanly.
 
+### System Sleep
+
+An operating system puts a computer that nobody touches to sleep on its idle timer, and network and MIDI traffic do not count as activity: every output stops. On **Windows** STC asks the system to stay awake while an engine is in use -- its input is anything but the internal generator and has been started, its generator is playing, or one of its outputs (MTC, Art-Net, LA-Net, LTC, Audio Thru, TCNet) is switched on. The display may still switch off, and STC left open with nothing running does not keep the PC awake. The request cannot prevent the sleep of a closed lid, of the power button or of a critical battery level, and what a laptop in Modern Standby does on battery is not covered. On **macOS and Linux** STC makes no such request: set the system itself not to sleep. For a show, switching sleep off in the system's power settings is the safe choice on every platform.
+
 ---
 
 ## Virtual Routing (Software Loopback)
