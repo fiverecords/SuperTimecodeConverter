@@ -45,7 +45,8 @@
 //    fan-out.  audioDeviceAboutToStart / audioDeviceStopped run when the hub
 //    adds or removes us or the device restarts (message thread, or the
 //    driver's thread for a restart it starts itself).  A restart is told
-//    to the owner on the message thread (onDeviceRestarted).
+//    to the owner on the message thread (onDeviceRestarted); a silence
+//    with no restart is marked for the owner's tick (takeCallbackGap).
 //  - sourceLock serialises everything that builds, replaces, prepares,
 //    repositions or starts the transport's source chain (setSource,
 //    prepareToPlay, releaseResources, setPosition, start) between those
@@ -784,6 +785,21 @@ public:
     /// as onLoadCompleted, with the same care for the engine's lifetime.
     std::function<void()> onDeviceRestarted;
 
+    /// True once after the device has called back again following a
+    /// silence that no restart announced (AUD11 GENERATOR-8): more than
+    /// kCallbackGapMs between two callbacks -- a driver that stopped and
+    /// carried on, the hub's DEVICE LOST ending with no reopen.  The
+    /// transport is then where it stopped while the owner's timecode has
+    /// run on by the length of the silence, so the owner brings the audio
+    /// back to it as after a restart (TimecodeEngine::tick).  The owner
+    /// asks on every tick, whatever it is doing, so that a mark is never
+    /// left standing to act later.  Message thread.
+    bool takeCallbackGap()
+    {
+        return callbackGapSeen.load(std::memory_order_acquire)
+            && callbackGapSeen.exchange(false, std::memory_order_acq_rel);
+    }
+
 private:
     //==========================================================================
     // LoaderThread -- dedicated I/O thread for asynchronous loadFile.
@@ -1016,6 +1032,21 @@ private:
         // backends, but a single atomic load is cheap insurance).
         if (shuttingDown.load(std::memory_order_acquire)) return;
 
+        // A callback that comes more than kCallbackGapMs after the one
+        // before it, with no start of the device in between
+        // (audioDeviceAboutToStart forgets the time), ends a silence of the
+        // device (AUD11 GENERATOR-8): marked for the owner's tick
+        // (takeCallbackGap).  Whatever the player is doing: what a silence
+        // means for the audio is the owner's to say.  One clock reading and
+        // two atomics, as the hub's fan-out takes for its health check;
+        // nothing is posted from this thread.
+        {
+            const double nowMs  = juce::Time::getMillisecondCounterHiRes();
+            const double lastMs = lastCallbackMs.exchange(nowMs, std::memory_order_relaxed);
+            if (lastMs > 0.0 && nowMs - lastMs > kCallbackGapMs)
+                callbackGapSeen.store(true, std::memory_order_release);
+        }
+
         if (userPaused.load(std::memory_order_acquire)) return;
         // While a load is pending the transport still holds the file being
         // replaced, and it may still be running: stopAndReset() only mutes
@@ -1134,6 +1165,13 @@ private:
     {
         if (shuttingDown.load(std::memory_order_acquire)) return;
 
+        // The callbacks start afresh: the time since the last one before
+        // this start is no silence to mark, and a mark not yet taken is
+        // dropped (takeCallbackGap) -- a restart is told below, and after
+        // an open the caller places the audio itself.
+        lastCallbackMs.store(0.0, std::memory_order_relaxed);
+        callbackGapSeen.store(false, std::memory_order_release);
+
         if (device)
         {
             currentSampleRate    = device->getCurrentSampleRate();
@@ -1188,6 +1226,20 @@ private:
     juce::AudioBuffer<float> scratchBuffer;
 
     std::atomic<bool> deviceOpen      { false };
+
+    // A silence of the device with no restart (takeCallbackGap, AUD11
+    // GENERATOR-8).  kCallbackGapMs is half the second after which the hub
+    // calls a device lost (AudioDeviceHub::kSilentMs) and more than two and
+    // a half times the longest callback period the BUFFER SIZE list makes
+    // (8192 samples at 44.1 kHz, 186 ms), so that one callback missed or
+    // late on a loaded machine is not taken for a silence; and far enough
+    // under the second up to which the owner's audio clock discipline
+    // (DESIGN D18) pulls timecode and audio together that no silence falls
+    // between the two.  A shorter one stays with that discipline, as before.
+    static constexpr double kCallbackGapMs = 500.0;
+    std::atomic<double> lastCallbackMs  { 0.0 };    // written by the audio thread; 0: none since the device started
+    std::atomic<bool>   callbackGapSeen { false };
+
     std::atomic<bool> shuttingDown    { false };  // set in dtor before closeDevice; audio callback returns immediately if true
     std::atomic<int>  selectedChannel { -1 };
     std::atomic<bool> loopFlag        { false };

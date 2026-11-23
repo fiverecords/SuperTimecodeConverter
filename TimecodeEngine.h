@@ -1702,6 +1702,19 @@ public:
 
         logLtcOutputGaps();
 
+        // The generator's audio device fell silent for more than half a
+        // second and carried on with no restart
+        // (GeneratorAudioPlayer::takeCallbackGap, AUD11 GENERATOR-8): the
+        // audio is late by the length of the silence.  From a second up
+        // DESIGN D18 left it so for the rest of the file; under a second
+        // it dragged the timecode back to the audio, as it still does
+        // after a silence shorter than this.  The audio is brought to the
+        // timecode instead, as after a restart.  Asked on every tick and
+        // with every input: a silence that comes while the generator is
+        // not the input is dropped here, and does not seek when it next is.
+        if (generatorAudioPlayer.takeCallbackGap() && activeInput == InputSource::SystemTime)
+            resyncGeneratorAudioAfterRestart();
+
         switch (activeInput)
         {
             case InputSource::SystemTime:
@@ -3976,7 +3989,20 @@ public:
     /// since in one step (updateGenerator).  That step is taken here
     /// first, exactly as the tick takes it; a seek to the timecode of the
     /// last tick would leave the audio behind by the time the reopen
-    /// took.  Message thread.
+    /// took.
+    ///
+    /// Also when the device fell silent for more than half a second and
+    /// carried on with no restart (tick, the player's takeCallbackGap):
+    /// the ticks ran on through the silence, so the step taken here is
+    /// the one the tick that follows would take.  Playing, the audio
+    /// jumps forward by the length of the silence -- folded into the file
+    /// where the player loops it (Loop audio, the timecode loop's gapless
+    /// path), and to the new pass where the timecode loop or the A/B went
+    /// round meanwhile.  Paused, it is only placed: a PAUSE pressed during
+    /// the silence left it behind by the part of the silence before it,
+    /// and PLAY does not seek.  Stopped -- by the operator, at Stop TC or
+    /// at the file's end, reached during the silence or before, and in
+    /// Clock mode -- nothing is done.  Message thread.
     void resyncGeneratorAudioAfterRestart()
     {
         if (activeInput == InputSource::SystemTime && ! genClockMode && genState == GeneratorState::Playing)
