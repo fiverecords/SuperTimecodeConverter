@@ -735,7 +735,7 @@ The StageLinQ playhead is driven by the device's BeatInfo stream. If STC connect
 
 Field-reported conditions that silence BeatInfo on SC5000 / SC6000:
 
-- **Deck has no track loaded, or is paused / not playing.** BeatInfo only streams while a track is actively playing.
+- **Deck has no track loaded, or is paused / not playing.** BeatInfo only streams while a track is actively playing. (Not on every unit: the PRIME 4+ of the two captures in issue #23, on Engine OS 5.0.4, streams BeatInfo for every deck all the time, paused or not.)
 - **The physical LINK button on the player is on.** Linking decks via the player itself disables BeatInfo. Turn LINK off on every player on the network.
 - **Decks are linked from Engine DJ.** Same effect as the physical LINK button. Unlink the decks from Engine DJ, or close Engine DJ entirely if it is not needed.
 - **Player was already running when STC started.** Some firmware revisions only emit BeatInfo if a consumer was already listening at the time the player booted. Power-cycling the player after STC is running is enough.
