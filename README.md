@@ -655,9 +655,11 @@ On Windows this is not an issue -- Windows Firewall prompts once on first launch
 
 STC is open-source software and is not signed with an Apple Developer certificate. On first launch, macOS Gatekeeper will block the application. To open it:
 
-1. Right-click (or Control-click) the application and select **Open**
-2. Click **Open** in the confirmation dialog
-3. Alternatively: **System Settings > Privacy & Security > Security**, find the blocked app and click **Open Anyway**
+1. Double-click the application once and close the warning. macOS offers the next step's button only after this blocked attempt, for about an hour.
+2. Open **System Settings > Privacy & Security**, scroll down to **Security**, find the blocked app and click **Open Anyway**
+3. Confirm with **Open Anyway** (macOS asks for your password or Touch ID)
+
+On macOS 14 and earlier there is a shorter way: right-click (or Control-click) the application, select **Open**, then click **Open** in the confirmation dialog. macOS 15 removed it, so from macOS 15 on the steps above are the only way.
 
 This is a one-time step -- macOS remembers the exception after the first launch.
 
