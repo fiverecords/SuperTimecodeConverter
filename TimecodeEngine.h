@@ -3179,8 +3179,23 @@ public:
 
     GeneratorState getGeneratorState() const { return genState; }
 
+    /// Play.  Only for the generator in transport mode (AUD11 GENERATOR-2):
+    /// with another input selected, or in Clock mode, the generator has no
+    /// transport -- the panel hides PLAY there -- but OSC /stc/N/gen/play
+    /// and the waveform window's PLAY came here all the same.  In Clock
+    /// mode that started the preset's audio file under the time of day,
+    /// with nothing on the panel to show or stop it, and the first tick
+    /// after CLOCK was turned off added the whole time since in one step
+    /// and fired every cue in it at once (updateGenerator does not run the
+    /// transport in Clock mode, so genLastTickTime stood still).  On
+    /// another input it left the generator Playing behind that input, to
+    /// run by itself, outputs and audio, the moment the input was switched
+    /// to the generator.  Now it does nothing in both cases; GO leaves
+    /// Clock mode before it plays (MainComponent::goGenPresetOnEngine).
+    /// Message thread.
     void generatorPlay()
     {
+        if (activeInput != InputSource::SystemTime || genClockMode) return;
         if (genState == GeneratorState::Playing) return;
 
         // Explicit user transition; any pending natural-EOF marker is no
@@ -3771,7 +3786,8 @@ public:
         // Paused (preserves previous behaviour for cold scrub / post-Stop
         // scrub).  Playing / Paused are not modified.
         const bool resumeFromEof = (genState == GeneratorState::Stopped
-                                    && genEndedAtEof);
+                                    && genEndedAtEof
+                                    && activeInput == InputSource::SystemTime && ! genClockMode);   // as generatorPlay
         if (genState == GeneratorState::Stopped)
             genState = resumeFromEof ? GeneratorState::Playing
                                       : GeneratorState::Paused;
