@@ -4985,6 +4985,7 @@ void MainComponent::openReturnedAudioDevices()
     const int    bs = getPreferredBufferSize();
     juce::StringArray notOpened;   // devices an open has just failed on: not asked again in this pass
     bool startedAny = false, leftUnopened = false;
+    std::vector<int> generatorsStarted;   // engines whose AUDIO PLAYBACK device this pass has opened
 
     for (auto& w : startable)
     {
@@ -5024,11 +5025,11 @@ void MainComponent::openReturnedAudioDevices()
                 case WaitingAudio::genAudio:
                     started = eng.startGeneratorAudio(w.typeName, w.deviceName,
                                                       es.generatorAudioStereo ? -1 : es.generatorAudioChannel, sr, bs);
-                    // The device opens with the file at its top: to where
-                    // the timecode is, and playing if the generator plays,
-                    // as startCurrentGenAudio does.
+                    // The device opens with the file at its top, and
+                    // silent: the audio is brought to the timecode when
+                    // the pass has made its last open (below).
                     if (started)
-                        eng.resyncGeneratorAudioToTimecode();
+                        generatorsStarted.push_back(w.engine);
                     break;
                 case WaitingAudio::audioBpm:
                     started = eng.startAudioBpm(w.typeName, w.deviceName, es.audioBpmChannel, sr, bs);
@@ -5045,6 +5046,23 @@ void MainComponent::openReturnedAudioDevices()
             leftUnopened = true;
         }
     }
+
+    // The generators' audio, once the last open of the pass is made: to
+    // where the timecode is NOW, and playing if the generator plays (AUD11
+    // MAIN-A-2, GENERATOR-8).  The opens ran on this thread, so no engine
+    // has ticked since the pass began and the timecode takes their time in
+    // one step at the next tick -- as after a restart by the hub, and that
+    // step is taken first here too (resyncGeneratorAudioAfterRestart).  A
+    // seek to the timecode of the last tick, made as each device opened,
+    // left the audio late by the opens: 0.4 s with one open of that length,
+    // twice that when a second component reopened the interface for its
+    // other direction, and DESIGN D18 then dragged the timecode back to the
+    // audio on every output of the engine, or from a second up left the
+    // audio late for the rest of the file.  Made once, here, it also needs
+    // no second seek when the device was restarted under the player by a
+    // later open of the pass (the engine's onDeviceRestarted).
+    for (int engineIndex : generatorsStarted)
+        engines[(size_t) engineIndex]->resyncGeneratorAudioAfterRestart();
 
     // The panel, when something was started (a pass that opened nothing
     // leaves it alone: the status lines say what failed).  The devices

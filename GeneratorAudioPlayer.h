@@ -792,17 +792,26 @@ public:
     /// True once after the device has called back again following a
     /// silence that no restart announced (AUD11 GENERATOR-8): more than
     /// kCallbackGapMs between two callbacks -- a driver that stopped and
-    /// carried on, the hub's DEVICE LOST ending with no reopen.  The
-    /// transport is then where it stopped while the owner's timecode has
-    /// run on by the length of the silence, so the owner brings the audio
-    /// back to it as after a restart (TimecodeEngine::tick).  The owner
-    /// asks on every tick, whatever it is doing, so that a mark is never
-    /// left standing to act later.  Message thread.
+    /// carried on, the hub's DEVICE LOST ending with no reopen -- or
+    /// between a start of the device and its first callback.  The
+    /// transport is then where it stopped, or where it was put when the
+    /// device started, while the owner's timecode has run on by the length
+    /// of the silence, so the owner brings the audio back to it as after a
+    /// restart (TimecodeEngine::tick).  The owner asks on every tick,
+    /// whatever it is doing, so that a mark is never left standing to act
+    /// later.  Message thread.
     bool takeCallbackGap()
     {
         return callbackGapSeen.load(std::memory_order_acquire)
             && callbackGapSeen.exchange(false, std::memory_order_acq_rel);
     }
+
+    /// When the device this player is on last started under it or for it
+    /// (audioDeviceAboutToStart), on juce::Time::getMillisecondCounterHiRes;
+    /// 0 before the first start.  For the owner, to tell a restart it has
+    /// already brought the audio to the timecode after from one it has not
+    /// (TimecodeEngine's onDeviceRestarted).
+    double getDeviceStartMs() const { return deviceStartMs.load(std::memory_order_relaxed); }
 
 private:
     //==========================================================================
@@ -1037,18 +1046,31 @@ private:
         if (shuttingDown.load(std::memory_order_acquire)) return;
 
         // A callback that comes more than kCallbackGapMs after the one
-        // before it, with no start of the device in between
-        // (audioDeviceAboutToStart forgets the time), ends a silence of the
-        // device (AUD11 GENERATOR-8): marked for the owner's tick
-        // (takeCallbackGap).  Whatever the player is doing: what a silence
-        // means for the audio is the owner's to say.  One clock reading and
-        // two atomics, as the hub's fan-out takes for its health check;
-        // nothing is posted from this thread.
+        // before it -- or, the first one since the device started, after
+        // that start (audioDeviceAboutToStart puts its own time there) --
+        // ends a silence of the device (AUD11 GENERATOR-8): marked for the
+        // owner's tick (takeCallbackGap).  Whatever the player is doing:
+        // what a silence means for the audio is the owner's to say.  One
+        // clock reading and two atomics, as the hub's fan-out takes for its
+        // health check; nothing is posted from this thread.
+        //
+        // When it is the first callback since a start that comes late, the
+        // transport is where the owner put it for the moment the device
+        // started, and nothing of that has sounded yet: the blocks from
+        // here to the owner's seek are left silent (awaitingSeek, set
+        // before the mark so that the seek the mark brings always ends
+        // it), and the audio is in step from the first block that sounds.
+        // After a silence between two callbacks the audio carries on and
+        // jumps at that seek, as before.
         {
             const double nowMs  = juce::Time::getMillisecondCounterHiRes();
             const double lastMs = lastCallbackMs.exchange(nowMs, std::memory_order_relaxed);
             if (lastMs > 0.0 && nowMs - lastMs > callbackGapLimitMs.load(std::memory_order_relaxed))
+            {
+                if (lastMs == deviceStartMs.load(std::memory_order_relaxed))
+                    awaitingSeek.store(true, std::memory_order_release);
                 callbackGapSeen.store(true, std::memory_order_release);
+            }
         }
 
         if (userPaused.load(std::memory_order_acquire)) return;
@@ -1172,8 +1194,17 @@ private:
         // The callbacks start afresh: the time since the last one before
         // this start is no silence to mark, and a mark not yet taken is
         // dropped (takeCallbackGap) -- a restart is told below, and after
-        // an open the caller places the audio itself.
-        lastCallbackMs.store(0.0, std::memory_order_relaxed);
+        // an open the caller places the audio itself.  The wait for the
+        // first callback does count, from here: the audio is placed for
+        // the moment of the start, so a device that starts and delivers
+        // nothing for a while -- an interface just plugged in -- left it
+        // late by that wait, and "none since the start" (0, as this used
+        // to store) made the wait nobody's.
+        {
+            const double startMs = juce::Time::getMillisecondCounterHiRes();
+            deviceStartMs.store(startMs, std::memory_order_relaxed);
+            lastCallbackMs.store(startMs, std::memory_order_relaxed);
+        }
         callbackGapSeen.store(false, std::memory_order_release);
 
         if (device)
@@ -1256,7 +1287,8 @@ private:
     // the audio was sought twice a second.
     static constexpr double kCallbackGapMs = 500.0;
     std::atomic<double> callbackGapLimitMs { kCallbackGapMs };
-    std::atomic<double> lastCallbackMs  { 0.0 };    // written by the audio thread; 0: none since the device started
+    std::atomic<double> lastCallbackMs  { 0.0 };    // the last callback, or the device's start until it makes one; 0: never started
+    std::atomic<double> deviceStartMs   { 0.0 };    // the device's last start (audioDeviceAboutToStart); 0: never started
     std::atomic<bool>   callbackGapSeen { false };
 
     std::atomic<bool> shuttingDown    { false };  // set in dtor before closeDevice; audio callback returns immediately if true
@@ -1295,6 +1327,9 @@ private:
     // at 8192 samples), before the catch-up moved it -- to the A/B loop's
     // In, when GO starts there.  Not set without a listener: then nobody
     // seeks, and attachReaderToTransport starts the file itself.
+    // Also set by the audio callback when the device's first callback
+    // comes late after a start, with the mark that makes the owner seek
+    // (callbackGapSeen).
     std::atomic<bool>   awaitingSeek        { false };
 
     juce::String currentDeviceName, currentTypeName;

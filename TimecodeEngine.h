@@ -114,11 +114,17 @@ public:
         // left the audio late for the rest of the file when they were
         // not.  The audio is brought to the timecode instead, as when the
         // operator reopens the output (resyncGeneratorAudioAfterRestart).
+        // Not when that has been done since the start this was posted for:
+        // MainComponent, at the end of a pass of opens that restarted the
+        // device for a second component (openReturnedAudioDevices), or the
+        // tick after the device's late first callback.  A second seek to
+        // the same place would only cut the audio that has just started.
         generatorAudioPlayer.onDeviceRestarted =
             [weak = juce::WeakReference<TimecodeEngine>(this)]()
             {
                 if (auto* self = weak.get())
-                    self->resyncGeneratorAudioAfterRestart();
+                    if (self->generatorAudioPlayer.getDeviceStartMs() >= self->genAudioResyncMs)
+                        self->resyncGeneratorAudioAfterRestart();
             };
     }
 
@@ -4002,17 +4008,29 @@ public:
     /// the silence left it behind by the part of the silence before it,
     /// and PLAY does not seek.  Stopped -- by the operator, at Stop TC or
     /// at the file's end, reached during the silence or before, and in
-    /// Clock mode -- nothing is done.  Message thread.
+    /// Clock mode -- nothing is done.
+    ///
+    /// And after the player's device was opened by a pass of opens on the
+    /// message thread (MainComponent::openReturnedAudioDevices, a returning
+    /// interface): no tick ran while they were made, as in a restart by
+    /// the hub.
+    ///
+    /// One call serves whatever asked for it up to now: the mark of a
+    /// silence that has ended and that the tick has not yet taken is
+    /// dropped here, and when this last ran is kept for the restart's own
+    /// call (onDeviceRestarted, the constructor).  Message thread.
     void resyncGeneratorAudioAfterRestart()
     {
+        generatorAudioPlayer.takeCallbackGap();
+        const double now = juce::Time::getMillisecondCounterHiRes();
         if (activeInput == InputSource::SystemTime && ! genClockMode && genState == GeneratorState::Playing)
         {
-            const double now = juce::Time::getMillisecondCounterHiRes();
             const double delta = now - genLastTickTime;
             genLastTickTime = now;
             if (delta > 0.0)
                 genCurrentMs += delta;
         }
+        genAudioResyncMs = now;
         resyncGeneratorAudioToTimecode();
     }
 
@@ -4310,6 +4328,7 @@ private:
     int inputFreewheelMs = (int) kSourceTimeoutMs;   // AUDIT D10
     juce::String genPresetName;        // preset in use, for metadata (see getActiveTrackInfo)
     double genLastTickTime = 0.0;
+    double genAudioResyncMs = 0.0;      // hiRes ms of the last resyncGeneratorAudioAfterRestart
     bool   cueCursorInclusive = false;  // next crossing check includes a cue exactly at lastCueCheckMs
     int    lastLoggedGapCount = 0;      // LTC output gaps already written to ltc_gaps.log
     int    lastLoggedTrackCount = 0;    // LTC value corrections already written there (DESIGN D30)
