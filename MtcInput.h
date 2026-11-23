@@ -121,8 +121,9 @@ public:
     /// source still counts as present.  A Full Frame does not refresh it: it
     /// keeps the source present for two frames at most, and only in the
     /// cases presentAt() and the Full Frame handler describe (AUDIT LTC-13).
-    /// The senders count on their own through it, so a short dropout -- a
-    /// USB stall, a display wake -- never reaches the wire; the price is that
+    /// The value is counted on through it (getCurrentTimecode ages the
+    /// last sync point by the time elapsed), so a short dropout -- a USB
+    /// stall, a display wake -- never reaches the wire; the price is that
     /// a real stop takes this long to reach the outputs.  The operator sets
     /// it (engine setting), default kSourceTimeoutMs.
     void setTimeoutMs(double ms) { timeoutMs.store(juce::jmax(50.0, ms), std::memory_order_relaxed); }

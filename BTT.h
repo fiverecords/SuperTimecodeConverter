@@ -68,6 +68,14 @@ typedef struct Opaque_BTT_Struct BTT;
 typedef void (*btt_onset_callback_t)(void* SELF, unsigned long long sample_time);
 typedef void (*btt_beat_callback_t) (void* SELF, unsigned long long sample_time);
 
+/* The fifth and sixth parameters are named here in the other order than
+   the definition takes them (btt_amalgamation.inc: ..., int oss_length,
+   int onset_threshold_len, int cbss_length, double sample_rate, ...).  The
+   definition is what runs: the fifth argument is the onset threshold
+   length and the sixth the CBSS length, and AudioBpmInput passes them in
+   that order.  Both are 1024 today (BTT_SUGGESTED_ONSET_THRESHOLD_N,
+   BTT_SUGGESTED_CBSS_LENGTH), so the names below mislead only someone who
+   tunes one of the two by this header (AUD11 TC-IO-11). */
 BTT*      btt_new                                (int spectral_flux_stft_len, int spectral_flux_stft_overlap,
                                                   int oss_filter_order      , int oss_length,
                                                   int cbss_length           , int onset_threshold_len, double sample_rate,

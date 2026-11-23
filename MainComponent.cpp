@@ -9494,8 +9494,12 @@ void MainComponent::timerCallback()
     // actual transmission timing, so the 60Hz UI timer only updates the
     // target timecode -- it does NOT limit output precision.  LTC output
     // uses its own audio-callback-driven auto-increment, so it's similarly
-    // decoupled.  If UI stalls (resize, modal dialog), outputs continue
-    // transmitting the last-known timecode until the next tick() updates it.
+    // decoupled.  If the UI stalls (resize, modal dialog) and no tick()
+    // publishes, these outputs carry a value that was moving forward on
+    // their own, at the nominal rate, for about a second
+    // (kPublicationGraceMs in MtcOutput, ArtnetOutput, LANetTimecodeOutput
+    // and LtcOutput: DESIGN D26, AUD11 TC-IO-4), then hold it; the first
+    // tick() after that gives them the published value again.
     for (int i = 0; i < (int)engines.size(); ++i)
     {
         engines[(size_t)i]->setStatusTextVisible(i == selectedEngine);
