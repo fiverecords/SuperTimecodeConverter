@@ -714,10 +714,6 @@ public:
     float getOutputVolume() const           { return transport.getGain(); }
 
     //==========================================================================
-    // Waveform thumbnail (for UI display).  The thumbnail is generated in a
-    // background thread by JUCE; UI components should listen as ChangeListener
-    // for repaint notifications as more peak data becomes available.
-    //==========================================================================
     // Asynchronous file load
     //==========================================================================
     // Schedule a load (or unload, when file == File()).  Returns immediately;
@@ -757,6 +753,10 @@ public:
         loaderThread.request(file, shouldLoop);
     }
 
+    //==========================================================================
+    // Waveform thumbnail (for UI display).  The thumbnail is generated in a
+    // background thread by JUCE; UI components should listen as ChangeListener
+    // for repaint notifications as more peak data becomes available.
     //==========================================================================
     juce::AudioThumbnail&       getThumbnail()       { return thumbnail; }
     const juce::AudioThumbnail& getThumbnail() const { return thumbnail; }
