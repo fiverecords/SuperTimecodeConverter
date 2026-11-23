@@ -1596,6 +1596,15 @@ MainComponent::MainComponent()
         {
             if (syncing) return;
             if (isShowLockedToggle(btnAudioBpm)) return;
+            // The choice goes into the settings at once, not only with the
+            // save queued below: syncUIFromEngine sets this toggle from them
+            // while the analyser does not run.  A Refresh Devices result
+            // that arrived before the save put a toggle just switched off
+            // back on; it was saved as on, and openReturnedAudioDevices
+            // started the analyser at the next change of the device list
+            // (AUD11 MAIN-A-2).
+            if (selectedEngine >= 0 && selectedEngine < (int) settings.engines.size())
+                settings.engines[(size_t) selectedEngine].audioBpmEnabled = btnAudioBpm.getToggleState();
             if (btnAudioBpm.getToggleState())
             {
                 // When LTC is active, populate the separate BPM device combo
