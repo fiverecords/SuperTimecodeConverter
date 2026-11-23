@@ -421,7 +421,7 @@ Operational controls remain active while locked: the generator transport (PLAY /
 
 - **Stereo or mono output:** configurable per output (LTC Out and Audio Thru)
 - **Driver type filtering:** filter audio devices by driver type (WASAPI, ASIO, DirectSound on Windows; CoreAudio on macOS; ALSA on Linux)
-- **Configurable sample rate and buffer size** — buffer sizes up to 8192 samples, for interfaces or machines that need the headroom
+- **Configurable sample rate and buffer size** — buffer sizes up to 8192 samples, for interfaces or machines that need the headroom. **Default** leaves the choice to the device: the rate it is running at and its own default buffer size
 - **ASIO support** for low-latency professional audio interfaces (Windows)
 - **Cross-engine device conflict detection** — device selectors show which devices are in use by other engines with colour-coded indicators (cyan for current engine, amber for other engines)
 - **Check for updates** — manually check for new versions from the bottom bar, with automatic check on startup
