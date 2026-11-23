@@ -70,6 +70,7 @@ STC connects directly to Pioneer CDJ and DJM hardware on the network, announcing
 - On-air status, master player detection, beat position
 - Per-player monitoring: any engine can follow any of 6 players independently
 - **Crossfader auto-follow (XF-A / XF-B):** instead of monitoring a fixed player, an engine can follow whichever deck is live on crossfader side A or B. When the DJ swaps decks, timecode seamlessly switches to the new player. Ideal for two-engine setups where each engine tracks one side of the crossfader.
+- **MASTER auto-follow:** the engine follows the player that is the tempo master, and moves when another player takes over as master (Pro DJ Link only).
 - **ON AIR auto-follow:** the engine follows the deck you are hearing -- it stays with the current deck while it plays on air, and when that deck goes quiet (fader down, crossfader cut) or stops, it moves to the loudest deck playing on air. Works in THRU too. Needs a DJM on the network for the on-air flags. Also available for Denon (StageLinQ).
 
 **Smooth timecode generation:**
@@ -141,7 +142,7 @@ STC connects to Denon Engine OS hardware via the StageLinQ protocol, receiving d
 - Overview waveform preview (3-band frequency display) with cue markers (colored by DJ assignment) and minute markers
 - Quick cue positions displayed on waveform (up to 8 hot cues with colors and labels from Engine DJ)
 - Extended metadata: album, genre, key, BPM, rating
-- StageLinQ View shows a "Database: ..." status line (waiting for the unit, downloading a medium's database, ready with its track count, or the reason it failed and when it retries) and, on a deck that has a track but no waveform, the reason in the waveform's place (for example "Not in the unit's database" or "SD: downloading (40 %)")
+- SLQ View shows a "Database: ..." status line (waiting for the unit, downloading a medium's database, ready with its track count, or the reason it failed and when it retries) and, on a deck that has a track but no waveform, the reason in the waveform's place (for example "Not in the unit's database" or "SD: downloading (40 %)")
 
 **Known limitations:**
 - No DJM-style mixer parameter mapping (Denon mixers expose basic fader data only via StateMap)
@@ -172,14 +173,14 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 Per-track timed triggers that fire at specific playhead positions during playback. While track-change triggers fire once when a track is loaded, cue points fire at precise moments within the track -- ideal for lighting cues, pyro triggers, video transitions, and show automation.
 
 - **Capture from playhead:** play the track on a CDJ or Denon deck, press Capture at each key moment. STC reads the current playhead position and creates a cue point there.
-- **Visual cue placement:** click or drag anywhere on the waveform strip to place an edit cursor, then Capture to create a cue at that exact position. The edit cursor clears automatically when the playhead moves (jog, scrub, play) or on click outside the waveform.
+- **Visual cue placement:** click or drag anywhere on the waveform strip to place an edit cursor. **Add** creates a cue at the cursor (at 00:00.000 when none is placed). **Capture** creates it at the cursor too while the playhead has not moved since the click; once it has moved -- the track is playing, a jog, a scrub -- Capture takes the live playhead. The cursor stays where you put it while the track plays, until a Capture, a new click, or a click outside the waveform.
 - **Waveform strip** with four cursor layers: playback position (red, real-time), edit cursor (cyan, click-to-place), cue markers (yellow), selected cue (white, highlighted for identification).
 - **Album artwork** displayed in the editor header from live CDJ/Denon or from cached PNG when offline.
-- **Multi-selection:** Ctrl+click and Shift+click to select multiple cues. Delete button removes all selected cues at once.
-- **Manual entry:** add cue points by typing the position (MM:SS.mmm) directly.
+- **Multi-selection:** Ctrl+click and Shift+click to select multiple cues. The Delete button removes all selected cues at once; it asks first when more than one cue is selected or the selected cue carries a trigger.
+- **Manual entry:** Add a cue, type its position (MM:SS.mmm) in the detail panel and press Apply.
 - **Same trigger types as track change:** MIDI Note, MIDI CC, OSC, Art-Net DMX -- any combination per cue point.
-- **Seek-aware:** seeking backward resets cues so they fire again; seeking forward passes the cues it jumps over without firing them. On a Pro DJ Link player that sends no absolute position STC follows the deck beat by beat: a jump into the next beat fires the cues it skips, and a jump back (a loop, a beat jump, a hot cue) is seen at the player's next status, up to about a quarter of a second later -- until then the cues just after the jump-back point can fire early.
-- **Only cues the playhead crosses fire:** when an engine moves to another deck (XF-A / XF-B, MASTER, ON AIR), when a track is loaded at a memory cue, when a paused deck is moved and then played, or when the generator's cues are re-armed, the cues behind the playhead at that moment are passed, not fired. A paused deck moved back by more than 100 ms and then played fires the cues ahead of it again when it crosses them (on a Pro DJ Link player that sends no absolute position, a move back within one beat is not seen).
+- **Seek-aware:** seeking backward resets cues so they fire again; seeking forward passes the cues it jumps over without firing them. A step back of 100 ms or less that the player does not report as a seek is not taken for one, so a cue just crossed does not fire twice (and a loop that short fires the cues inside it once). On a Pro DJ Link player that sends no absolute position STC follows the deck beat by beat: a jump into the next beat fires the cues it skips, and a jump back (a loop, a beat jump, a hot cue) is seen at the player's next status, up to about a quarter of a second later -- until then the cues just after the jump-back point can fire early.
+- **Only cues the playhead crosses fire:** when an engine moves to another deck (XF-A / XF-B, MASTER, ON AIR), when a track is loaded at a memory cue, when a paused deck is moved and then played, or when the generator's cues are re-armed, the cues behind the playhead at that moment are passed, not fired. A deck that stands on a cue point and is then played fires that cue: the cues are armed at the position the deck had held, not at where the playhead is when the play state arrives. A paused deck moved back by more than 100 ms and then played fires the cues ahead of it again when it crosses them (on a Pro DJ Link player that sends no absolute position, a move back within one beat is not seen).
 - **Playback-only firing:** cue points only fire during actual playback. Scrub, jog, and cue preview do not trigger cues -- DJs can preview tracks freely without causing spurious output.
 - **Live editing:** cue points added or modified while a track is playing take effect immediately without reloading the track.
 - **Waveform and artwork cache:** waveform preview data and album artwork are saved to disk the first time a track is seen. The cue editor shows both even when the CDJ is not connected, enabling offline cue programming.
@@ -414,7 +415,7 @@ Prevents accidental changes during live shows. A single click on the **SHOW LOCK
 
 Engaging the lock closes the Track Map, Mixer Map, generator preset and cue point editors, and they cannot be opened while it is on. Attempting a blocked action in the main window flashes the lock button as visual feedback; toggles, selectors, sliders and text fields go back to their value.
 
-Operational controls remain active while locked: the generator transport (PLAY / PAUSE / STOP, preset selection, PREV / NEXT / GO, and GO in the waveform window), its audio volume and A/B LOOP on/off, the OSC IN commands that drive the generator (`/stc/N/gen/clock`, `looptc`, `start`, `stoptime` and `preset` included, so a show controller can still change its clock mode, its Loop timecode and Start / Stop TC), the BPM multiplier as a session override (single click), switching the engine on screen, collapsing panels, and the view windows (Pro DJ Link View, StageLinQ View, generator waveform). Unlock requires a confirmation dialog to prevent accidental unlock, and quitting while locked asks for confirmation. Lock state persists across restarts.
+Operational controls remain active while locked: the generator transport (PLAY / PAUSE / STOP, preset selection, PREV / NEXT / GO, and GO in the waveform window), its audio volume and A/B LOOP on/off, the OSC IN commands that drive the generator (`/stc/N/gen/clock`, `looptc`, `start`, `stoptime` and `preset` included, so a show controller can still change its clock mode, its Loop timecode and Start / Stop TC), the BPM multiplier as a session override (single click), switching the engine on screen, collapsing panels, and the view windows (PDL View, SLQ View, generator waveform). Unlock requires a confirmation dialog to prevent accidental unlock, and quitting while locked asks for confirmation. Lock state persists across restarts.
 
 ### Additional Capabilities
 
@@ -423,7 +424,7 @@ Operational controls remain active while locked: the generator transport (PLAY /
 - **Configurable sample rate and buffer size** — buffer sizes up to 8192 samples, for interfaces or machines that need the headroom
 - **ASIO support** for low-latency professional audio interfaces (Windows)
 - **Cross-engine device conflict detection** — device selectors show which devices are in use by other engines with colour-coded indicators (cyan for current engine, amber for other engines)
-- **Check for updates** — manually check for new versions from the title bar, with automatic check on startup
+- **Check for updates** — manually check for new versions from the bottom bar, with automatic check on startup
 - **Refresh Devices** — scan for newly connected interfaces without losing existing configuration
 - **Collapsible UI panels** to reduce clutter and focus on active sections
 - **LTC output log** — `ltc_gaps.log`, next to the settings file, records every interruption the LTC output sees and every correction it makes: how late a callback was, whether it was absorbed or was a real hole, and each frame repeated, skipped or re-aligned with the frame it was about to send and the position it was comparing against. Written for diagnosing sync problems against a scope or decoder capture
@@ -436,7 +437,7 @@ Operational controls remain active while locked: the generator transport (PLAY /
 
 ### Download Precompiled Binaries
 
-Ready-to-use installers and app bundles are available in the [GitHub Releases](https://github.com/fiverecords/SuperTimecodeConverter/releases) page. Each release includes precompiled binaries for Windows (.exe installer) and macOS (.dmg). No build tools or dependencies required -- just download, install, and run.
+Ready-to-use installers and app bundles are available in the [GitHub Releases](https://github.com/fiverecords/SuperTimecodeConverter/releases) page. Each release includes precompiled binaries for Windows (a .zip holding the installer, `SuperTimecodeConverter_<version>_Setup.exe`) and macOS (a .zip holding the application). No build tools or dependencies required -- just download, install, and run.
 
 The sections below are for developers who want to build STC from source.
 
@@ -450,7 +451,7 @@ The sections below are for developers who want to build STC from source.
 
 - Windows 10/11
 - Visual Studio 2022 (Community, Professional, or Enterprise)
-- ASIO SDK (optional, for ASIO device support) — download from [Steinberg](https://www.steinberg.net/developers/)
+- ASIO SDK (optional: JUCE 9 brings the ASIO headers it needs; only for a build against your own copy of the SDK, see ASIO Setup) — download from [Steinberg](https://www.steinberg.net/developers/)
 
 #### macOS
 
@@ -558,17 +559,19 @@ The sections below are for developers who want to build STC from source.
 
 #### Option B: Projucer (Windows / macOS)
 
+The Projucer project the releases are built from is not in this repository, so the project has to be made:
+
 1. Clone the repository.
-2. Open Projucer and create a new GUI Application project pointing to the source files.
-3. Set the JUCE modules path to your local JUCE installation. If using ASIO on Windows, set the ASIO SDK path in the exporter settings.
-4. Click "Save and Open in IDE" and build in Visual Studio or Xcode.
+2. Open the Projucer of JUCE 9.0.5 or later (9.0.6 for 1.9.16-beta2) and create a new GUI Application project with the source files. A project saved with an older Projucer must be opened and saved again with this one.
+3. Mark only `Main.cpp`, `MainComponent.cpp`, `btt_build.cpp` and `sqlite3.c` to be compiled; everything else is a header or is included by one of them. `btt_amalgamation.c` must not be compiled: `btt_build.cpp` includes the same library, and every BTT symbol would be defined twice.
+4. Add the JUCE modules listed in Option A and the ones they depend on (`juce_audio_processors`, `juce_audio_processors_headless` and `juce_data_structures`), set C++17, enable `JUCE_USE_MP3AUDIOFORMAT` in `juce_audio_formats`, and give the exporters the definitions of Option A (`SQLITE_THREADSAFE=1`; on Windows also `NOMINMAX=1`, `_WIN32_WINNT=0x0A00`, `_CRT_SECURE_NO_WARNINGS`, `SQLITE_WIN32_GETVERSIONEX=0` and the compiler flag `/bigobj`).
+5. Set the JUCE modules path to your local JUCE installation. For ASIO and Ableton Link see the two sections below.
+6. Click "Save and Open in IDE" and build in Visual Studio or Xcode.
 
 ### ASIO Setup (Windows, Optional)
 
-1. Download the ASIO SDK from Steinberg.
-2. Extract it to a known path (e.g. `C:\SDKs\asiosdk_2.3.3_2019-06-14`).
-3. Add the ASIO SDK path to your project's header search paths.
-4. Enable `JUCE_ASIO=1` in the project preprocessor definitions.
+1. Enable `JUCE_ASIO=1` in the project preprocessor definitions. JUCE 9 brings the ASIO headers it needs, so this is all a build requires.
+2. To build against your own copy of the ASIO SDK instead (the project the releases are built from does), also define `JUCE_ASIO_USE_EXTERNAL_SDK=1`: download the SDK from Steinberg, extract it to a known path (e.g. `C:\SDKs\asiosdk_2.3.3_2019-06-14`) and add its `common` folder, which holds `iasiodrv.h`, to your project's header search paths.
 
 ### Ableton Link (Optional)
 
@@ -588,7 +591,7 @@ Without these steps, Link is compiled as a no-op stub and the rest of the app wo
 ### Basic Workflow
 
 1. **Engine 1** is ready by default. Click **+** in the tab bar to add more engines (up to 8).
-2. **Select an input source** from the left panel (Pro DJ Link, MTC, Art-Net, System, or LTC).
+2. **Select an input source** from the left panel (Pro DJ Link, StageLinQ, MTC, Art-Net, LTC, Generator, LA-Net or Winamp).
 3. **Enable one or more outputs** from the right panel.
 4. **Select the frame rate** or let it auto-detect from the input signal.
 5. The timecode display in the centre shows the current time in real-time.
@@ -623,7 +626,7 @@ The **Refresh Devices** button scans for newly connected MIDI devices, audio int
 
 ### Configuration Backup & Restore
 
-The **Backup** and **Restore** buttons in the title bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes.
+The **Backup** and **Restore** buttons at the left of the tab bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes; its dialog says which files were restored, and which were not when one could not be written.
 
 ### Settings
 
@@ -639,7 +642,7 @@ All settings are automatically saved per engine to:
 
 ### macOS: Disable the Firewall for Pro DJ Link
 
-**This is critical for reliable timecode on macOS.** The macOS application firewall inspects every incoming UDP packet before delivering it to the application. STC's Pro DJ Link network thread receives hundreds of packets per second (CDJ status at 30Hz per player, beat data, DJM mixer/VU data). The firewall inspection adds latency to each packet, and under load the firewall thread itself consumes significant CPU -- enough to delay packet delivery to STC and cause timecode fluctuation, missed beats, and sluggish waveform cursor updates.
+**This is critical for reliable timecode on macOS.** The macOS application firewall inspects every incoming UDP packet before delivering it to the application. STC's Pro DJ Link network thread receives hundreds of packets per second (CDJ position at about 30Hz per player, status, beat data, DJM mixer/VU data). The firewall inspection adds latency to each packet, and under load the firewall thread itself consumes significant CPU -- enough to delay packet delivery to STC and cause timecode fluctuation, missed beats, and sluggish waveform cursor updates.
 
 **Workaround:** Disable the macOS firewall entirely, or add STC to the firewall's allowed applications list:
 
@@ -664,7 +667,7 @@ Since macOS Catalina, all audio input access requires explicit microphone permis
 
 **CMake builds:** The `juce_add_gui_app` block in CMakeLists.txt includes `MICROPHONE_PERMISSION_ENABLED TRUE`, which embeds the `NSMicrophoneUsageDescription` key in the app bundle's Info.plist. macOS will prompt for microphone access on first launch. If STC was built from an older CMakeLists.txt without this key, macOS silently blocks input with no prompt. Rebuild with the current CMakeLists.txt to fix.
 
-**Projucer builds:** Enable "Microphone Permission" in the Projucer exporter settings (enabled by default in the .jucer project).
+**Projucer builds:** Set "Microphone Access" to enabled in the Xcode exporter's settings.
 
 **If permission was already denied:** Go to **System Settings > Privacy & Security > Microphone** and toggle Super Timecode Converter ON.
 
@@ -672,7 +675,7 @@ Since macOS Catalina, all audio input access requires explicit microphone permis
 
 AnyDesk remote desktop software uses UDP ports in the 50000-60001 range -- overlapping with both **Pro DJ Link** (ports 50000-50002) and **TCNet** (ports 60000-60001). When AnyDesk is installed and its background service is running, it can intercept or block UDP traffic on these ports, causing:
 
-- **Pro DJ Link:** CDJs fail to send absolute position data (abspos packets) to STC. Timecode updates at ~5Hz instead of 67Hz, producing visible stuttering. Keepalive and status packets may still arrive, making the connection appear partially functional.
+- **Pro DJ Link:** CDJs fail to send absolute position data (abspos packets) to STC. Timecode then updates at ~5Hz, from the status packets, instead of ~30Hz, producing visible stuttering. Keepalive and status packets may still arrive, making the connection appear partially functional.
 - **TCNet:** Resolume and other TCNet slaves cannot receive Time packets from STC. The connection fails completely.
 
 This affects any software using these ports, including the official PRO DJ LINK Bridge.
@@ -681,7 +684,7 @@ This affects any software using these ports, including the official PRO DJ LINK 
 
 ### macOS: DJM Subscribe Race Condition
 
-On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake. Workaround: restart STC or toggle the Pro DJ Link interface off and on. A delayed-subscribe fix is planned for a future release.
+On macOS, the DJM-900NXS2 / DJM-A9 / DJM-V10 may occasionally fail to deliver mixer fader data on the first connection after the DJM is powered on. This is a timing issue in the subscribe handshake: a mixer that gets the subscribe before it has registered STC's announcement ignores it. STC therefore holds its first subscribe until three seconds after its first keepalive and repeats it every second; whether that covers every case on macOS is not established. Workaround: restart STC or toggle the Pro DJ Link interface off and on.
 
 ### StageLinQ: Playhead Does Not Advance
 
@@ -766,8 +769,10 @@ The application is built around a modular, header-only architecture:
 | `BTT.h` | Standalone public API header for the Beat-and-Tempo-Tracking library |
 | `btt_build.cpp` | C++ build wrapper for BTT amalgamation (MSVC compatibility, macro isolation) |
 | `btt_amalgamation.inc` | Single-file BTT library amalgamation (not compiled on its own: included by btt_build.cpp) |
+| `btt_amalgamation.c` | The same library as a plain C file, kept for reference and not compiled (compiling it next to btt_build.cpp defines every BTT symbol twice) |
 | `StageLinQInput.h` | Native StageLinQ protocol: device discovery, StateMap, BeatInfo, mixer state |
 | `StageLinQDbClient.h` | Engine Library database access via FileTransfer + SQLite for waveform preview and artwork |
+| `sqlite3.c` / `sqlite3.h` | The SQLite amalgamation (public domain) that reads the Engine Library database |
 | `StageLinQView.h` | External window: Denon deck display with track info, deck state, mixer data |
 | `ProDJLinkView.h` | External window: 4-deck display with preview + detail waveforms, rekordbox cue markers, beat grid, song structure phrases, artwork, mixer strip with VU meters |
 | `MediaDisplay.h` | Color waveform preview renderer (ThreeBand and ColorNxs2 formats) with beat grid lines, rekordbox cue markers, loop overlays, and minute markers |
@@ -775,7 +780,7 @@ The application is built around a modular, header-only architecture:
 | `WaveformCache.h` | Disk cache for waveform preview, album artwork, and ANLZ data (beat grid, cues, phrases, detail waveform) |
 | `TrackMapEditor.h` | Table editor for artist+title -> timecode offset + trigger mapping |
 | `CuePointEditor.h` | Table editor for per-track cue points with waveform strip, click + drag cursor, Capture from live playhead |
-| `GeneratorPresetEditor.h` | Table editor for generator presets (Name, Start TC, Stop TC) |
+| `GeneratorPresetEditor.h` | Table editor for generator presets (name, Start TC, Stop TC, audio file and the two loop options), with import / export, the way into the preset's cue point editor and the in-app OSC command reference |
 | `GeneratorAudioPlayer.h` | Generator audio file playback on the shared audio device; the generator's timecode follows its audio clock while a file plays |
 | `GeneratorWaveformView.h` / `GeneratorWaveformWindow.h` | Generator waveform strip and its external window |
 | `GeneratorCuePointEditor.h` | Per-preset cue point editor with mirror waveform strip, click + drag cursor, and live playback cursor |
@@ -785,6 +790,7 @@ The application is built around a modular, header-only architecture:
 | `CustomLookAndFeel.h` | Dark theme UI styling, device conflict markers, and cross-platform font selection |
 | `UpdateChecker.h` | GitHub release version checker (automatic on startup + manual) |
 | `MainComponent.*` | Main UI, engine tab management, routing logic, and device management |
+| `Main.cpp` | The application: version string, single instance, the main window, and quitting (with the Show Lock confirmation) |
 
 ### Key Design Decisions
 
