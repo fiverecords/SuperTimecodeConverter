@@ -4687,7 +4687,14 @@ void MainComponent::startCurrentGenAudio()
         // where the timecode is -- folded into the timecode loop as a seek
         // is, and also while paused, so PLAY resumes in step -- and resume
         // it if the generator plays (#24, resyncGeneratorAudioToTimecode).
-        eng.resyncGeneratorAudioToTimecode();
+        // Where the timecode is now: the open ran on this thread, no tick
+        // has run meanwhile, and the timecode takes its time in one step
+        // at the next one.  That step is taken first, as after a restart
+        // by the hub (resyncGeneratorAudioAfterRestart, AUD11
+        // GENERATOR-8): sought to the timecode of the last tick, the
+        // audio of a playing generator came late by the time the open
+        // took, and DESIGN D18 drew the timecode back to it.
+        eng.resyncGeneratorAudioAfterRestart();
     }
 }
 
