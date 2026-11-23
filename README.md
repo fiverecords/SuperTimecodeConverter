@@ -42,7 +42,7 @@ Audio passthrough (channel 2 thru) remains tied to the primary engine (Engine 1)
 - **Art-Net** — receive Art-Net timecode over the network (configurable interface/port)
 - **LTC (Linear Time Code)** — decode LTC audio signal from any audio input device and channel
 - **Freewheel** — for the signal inputs (MTC, LTC, Art-Net, LA-Net), how long the source still counts as present after the last frame or packet (for MTC, after the last quarter frame; a Full Frame on its own keeps the source present for two frames at most): 150 ms by default, up to 2 s, per engine. A longer window rides through a dropout without the outputs noticing; a real stop reaches them that much later
-- **Generator** — internal timecode generator with two modes: **Clock** (follows the system wall clock continuously, for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software. Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. A preset can **loop its timecode** (_Loop timecode_): where the generator would stop — at the end of the preset's audio file, or at Stop TC for a preset without one — the timecode, the audio and the cue points go back to Start TC and play again, for as long as the generator runs, so a show or a promo can loop unattended; at the end of an audio file the loop has no gap. Supports an **A/B loop**: set the loop in and out points at the current position and arm the A/B LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
+- **Generator** — internal timecode generator with two modes: **Clock** (follows the system wall clock continuously, for scheduled programming) or **Transport** (play/pause/stop with configurable start/stop timecodes). Includes a **preset system** with named timecode ranges (stored in `generator_presets.json`) — select a preset and press GO to instantly load start/stop timecodes and begin playback. Presets can be imported/exported as JSON files. Supports **OSC remote control** on a configurable UDP port (default 9800) for integration with show controllers, QLab, Companion, and other OSC-capable software (every address is in _OSC Reference_ under Usage). Each preset can also carry an **audio file** (WAV / AIFF / FLAC / OGG / MP3) that plays in lockstep with the generated timecode — see _Generator Audio Playback_ below. A preset can **loop its timecode** (_Loop timecode_): where the generator would stop — at the end of the preset's audio file, or at Stop TC for a preset without one — the timecode, the audio and the cue points go back to Start TC and play again, for as long as the generator runs, so a show or a promo can loop unattended; at the end of an audio file the loop has no gap. Supports an **A/B loop**: set the loop in and out points at the current position and arm the A/B LOOP toggle to repeat that range indefinitely, with both the timecode and any associated audio looping together.
 - **LA-Net (LaserAnimation Net-Timecode)** — receive Net-Timecode over the network from LaserAnimation systems (configurable interface)
 - **Winamp / WACUP** *(Windows only)* — follow playback position from a running Winamp or WACUP instance. The input attaches automatically as soon as a Winamp window appears, so it can be selected before the player is launched. On macOS and Linux this source falls back to the Generator.
 
@@ -165,7 +165,7 @@ Map tracks by **title** (and optionally artist and duration) to timecode offsets
 **Per-track triggers (any combination, fired simultaneously on track change):**
 - MIDI Note On (+ Note Off 100 ms later)
 - MIDI CC (controller + value)
-- OSC (address + typed arguments with variable expansion)
+- OSC (address + typed arguments with variable expansion; the syntax is in _OSC Reference_ under Usage)
 - Art-Net DMX (channel + value, configurable universe)
 
 ### Cue Points
@@ -207,7 +207,7 @@ Value mapping is automatic based on parameter type:
 |------|----------|-----|---------|-----|
 | Continuous | faders, EQ, knobs, levels | 0.0-1.0 | 0-127 | 0-255 |
 | Toggle | CUE buttons, Beat FX On, Isolator On, Filter LPF/HPF | 0.0 / 1.0 | 0 / 127 | 0 / 255 |
-| Discrete | Beat FX Select, XF Assign, Color FX Select, Fader Curve | integer | 0-127 clamped | raw value |
+| Discrete | Beat FX Select, XF Assign, Color FX Select, Fader Curve | the value, as a float (3.0) | 0-127 clamped | raw value |
 
 Table editor with per-parameter enable/disable, editable addresses and CC/Note/DMX numbers. Values only sent when changed. Three-way DJM model toggle (DJM-900NXS2 / DJM-A9 / DJM-V10) shows or hides model-specific parameters. Export and import mixer maps as JSON files for backup or sharing between machines.
 
@@ -627,6 +627,47 @@ The **Refresh Devices** button scans for newly connected MIDI devices, audio int
 ### Configuration Backup & Restore
 
 The **Backup** and **Restore** buttons at the left of the tab bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes; its dialog says which files were restored, and which were not when one could not be written.
+
+### OSC Reference
+
+**OSC IN -- remote control of the generator.** Tick **OSC IN** in the Generator panel (shown while the engine's input is the generator). STC listens on one UDP port for all engines (default 9800), on the network interface chosen next to it; the line under the port reads `LISTENING ON ...`, or `BIND FAILED - PORT n` when the port cannot be opened, as when another program holds it. `N` is the engine number as the tabs count it, 1 to 8: it is required, and a message for an engine that does not exist is ignored. Addresses are compared as written (no OSC pattern matching). A bundle is unpacked and its messages run at once, in order; the time tag is not used. STC sends no reply. These commands also act under Show Lock.
+
+| Address | Argument | What it does |
+|---------|----------|--------------|
+| `/stc/N/gen/play` | -- | PLAY. Acts only while the engine's input is the generator in Transport mode; otherwise it is ignored |
+| `/stc/N/gen/pause` | -- | PAUSE: stays where it is |
+| `/stc/N/gen/stop` | -- | STOP: back to Start TC |
+| `/stc/N/gen/jog` | float, seconds | Moves the position by that much; negative moves back. With an audio file and neither loop option, a jog to before Start TC lands on Start TC |
+| `/stc/N/gen/clock` | int, `1` or `0` | `1` = Clock mode, `0` = Transport mode |
+| `/stc/N/gen/looptc` | int, `1` or `0` | _Loop timecode_ on or off for what is playing, until the next GO or preset load (see _Generator Audio Playback_) |
+| `/stc/N/gen/start` | string, `HH:MM:SS:FF` | Sets Start TC |
+| `/stc/N/gen/stoptime` | string, `HH:MM:SS:FF` | Sets Stop TC; `00:00:00:00` = no stop |
+| `/stc/N/gen/preset` | string, preset name | GO on that preset, as the panel's GO: its Start / Stop TC, cue points and audio file are loaded and it plays. The name is matched without regard to case; an unknown name is ignored. A generator in Clock mode leaves Clock mode first. On an engine whose input is not the generator the preset is applied and its file loaded, but nothing plays: it waits, stopped, for a PLAY once the input is the generator |
+
+Arguments: STC reads OSC int32, float32 and string arguments; send the type the table names. `jog` takes an int too, and `clock` and `looptc` take a float (cut to a whole number) or a string of digits; OSC true / false are not read, and a command whose argument is missing does nothing. A timecode is text in the engine's frame rate with `:`, `;` or `.` between the fields; each field is limited to its range, and text holding anything else is ignored. Example (QLab, Companion, TouchOSC -- any sender of plain OSC over UDP): `/stc/1/gen/preset "Opening"`, `/stc/1/gen/start "01:30:00:00"`, `/stc/2/gen/jog -5.0`, `/stc/1/gen/stop`. The table of commands is in the application too: Generator Presets, **OSC ?**.
+
+**What STC sends.** Each engine has one OSC destination, the OSC IP and port fields (default 127.0.0.1, port 53000), used by everything below. The IP is an address in numbers (`192.168.1.50`, or `localhost` for 127.0.0.1): a host name is not looked up. While the engine on screen has anything else in that field, a red line under it reads `NOT AN IP ADDRESS - OSC IS NOT SENT`.
+
+| What | Sent when | Address | Arguments |
+|------|-----------|---------|-----------|
+| Track trigger (**OSC Trigger** on) | at the track change, for a track with a Track Map entry | the entry's OSC address | the entry's OSC args, with variables |
+| Cue point trigger (**OSC Trigger** on) | the playhead crosses the cue point | the cue point's OSC address | the cue point's OSC args, without variables |
+| **OSC BPM FWD** | the BPM changes by 0.05 or more | the address set next to it, default `/composition/tempocontroller/tempo` | one float, the BPM after the BPM multiplier; with a command template, one string instead, `%BPM%` replaced by the BPM with one decimal |
+| **OSC MIXER FWD** | a mixer value that is enabled in the Mixer Map changes | that parameter's OSC address in the Mixer Map (`/mixer/ch1`, `/mixer/crossfader`, ...) | one float: 0.0-1.0 for a continuous control, 0.0 or 1.0 for a toggle, the value itself for a discrete one (3.0 for Beat FX 3) |
+
+OSC args of a trigger are tokens separated by spaces, each `type:value`: `i:` an int32, `f:` a float32, `s:` a string (`s:"two words"` when it has spaces). A token of any other form is left out. In a track's trigger -- not in a cue point's -- the tokens `{artist}`, `{title}` and `{offset}` stand for the track's artist, its title and its timecode offset, each sent as one string argument. Example: address `/cue/go`, args `i:12 f:0.5 {title}` sends `/cue/go` with an int, a float and a string. A trigger with an empty address sends nothing.
+
+### Keyboard Shortcuts
+
+| Key | Where | What it does |
+|-----|-------|--------------|
+| `Ctrl+Shift+E` (`Cmd+Shift+E` on macOS) | main window | Backup: export the configuration. Blocked under Show Lock |
+| `Ctrl+Shift+I` (`Cmd+Shift+I` on macOS) | main window | Restore: import a backup. Blocked under Show Lock |
+| `[` and `]` | main window and generator waveform window, with the generator's transport on screen and no text box being edited | A/B loop In and Out at the playhead. Blocked under Show Lock |
+| `L` | the same | A/B LOOP on / off |
+| `Enter` | a field of the Track Map editor's form | saves the entry |
+| `Enter` | Name, Start TC or Stop TC in Generator Presets | saves the selected preset, or adds a new one when none is selected |
+| `Enter` / `Esc` | a confirmation box | `Enter` presses its first button, `Esc` its last (Cancel, or the only button) |
 
 ### Settings
 
