@@ -3195,7 +3195,10 @@ void MainComponent::syncUIFromEngine()
         auto& es = settings.engines[(size_t)selectedEngine];
 
         // Audio input device: use Audio BPM device when BPM is active on a non-LTC source
-        bool bpmUsesSharedAudio = eng.isAudioBpmRunning() && eng.getActiveInput() != SrcType::LTC;
+        // -- switched on, that is, running or not (the toggle, set above):
+        // while the analyser waits for its interface the selector then
+        // names that device, "(not listed)", and not the LTC input's.
+        bool bpmUsesSharedAudio = btnAudioBpm.getToggleState() && eng.getActiveInput() != SrcType::LTC;
         juce::String inType  = bpmUsesSharedAudio ? es.audioBpmType   : es.audioInputType;
         juce::String inDev   = bpmUsesSharedAudio ? es.audioBpmDevice : es.audioInputDevice;
         // A configured device that is not in the list leaves its selector
