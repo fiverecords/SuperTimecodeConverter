@@ -667,7 +667,7 @@ OSC args of a trigger are tokens separated by spaces, each `type:value`: `i:` an
 | `L` | the same | A/B LOOP on / off |
 | `Enter` | a field of the Track Map editor's form | saves the entry |
 | `Enter` | Name, Start TC or Stop TC in Generator Presets | saves the selected preset, or adds a new one when none is selected |
-| `Enter` / `Esc` | a confirmation box | `Enter` presses its first button, `Esc` its last (Cancel, or the only button) |
+| `Enter` / `Esc` | a confirmation box | `Enter` presses its first button, `Esc` its last (Cancel, or the only button). The Save / Discard / Cancel question Generator Presets asks about an unsaved form takes `Esc` (Cancel) only |
 
 ### Settings
 
