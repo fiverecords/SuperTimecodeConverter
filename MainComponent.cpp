@@ -6462,8 +6462,12 @@ void MainComponent::applyAudioSettings()
     // (resyncGeneratorAudioAfterRestart takes it first), so a seek made
     // as one device opened would leave that audio late by the opens that
     // follow it.  A paused generator's audio is only placed and stays
-    // paused; a stopped one's is not touched (PLAY seeks), which is every
-    // generator at a launch, where this does nothing.
+    // paused; a stopped one's is not touched (PLAY seeks).  At a launch
+    // every generator is stopped and this does nothing, unless GO was
+    // pressed before the first scan had answered (a driver that takes
+    // seconds to scan): that generator's audio stayed silent once its
+    // device was open, as after Refresh Devices, and now starts in step
+    // with the timecode.
     for (int engineIndex : generatorsStarted)
         engines[(size_t) engineIndex]->resyncGeneratorAudioAfterRestart();
 
