@@ -1047,7 +1047,7 @@ private:
         {
             const double nowMs  = juce::Time::getMillisecondCounterHiRes();
             const double lastMs = lastCallbackMs.exchange(nowMs, std::memory_order_relaxed);
-            if (lastMs > 0.0 && nowMs - lastMs > kCallbackGapMs)
+            if (lastMs > 0.0 && nowMs - lastMs > callbackGapLimitMs.load(std::memory_order_relaxed))
                 callbackGapSeen.store(true, std::memory_order_release);
         }
 
@@ -1184,6 +1184,14 @@ private:
 
             // Pre-allocate scratch so the audio thread never reallocates.
             scratchBuffer.setSize(2, currentBufferSize, false, false, false);
+
+            // A device whose own callback period is long is not silent
+            // between two of its callbacks (callbackGapLimitMs): 8192
+            // samples at 16 kHz, a telephone-rate interface under SAMPLE
+            // RATE Default with the largest BUFFER SIZE, are 512 ms.
+            callbackGapLimitMs.store(juce::jmax(kCallbackGapMs,
+                                                currentSampleRate > 0.0 ? 2500.0 * currentBufferSize / currentSampleRate : 0.0),
+                                     std::memory_order_relaxed);
         }
 
         // sourceLock: setSource reads the prepared rate and block size and
@@ -1240,7 +1248,14 @@ private:
     // under the second up to which the owner's audio clock discipline
     // (DESIGN D18) pulls timecode and audio together that no silence falls
     // between the two.  A shorter one stays with that discipline, as before.
+    // callbackGapLimitMs is what the callback compares with: kCallbackGapMs,
+    // or two and a half callback periods of the running device where that
+    // is longer (a period over 200 ms, which no BUFFER SIZE makes at 44.1
+    // kHz or above), set when the device starts.  With kCallbackGapMs alone
+    // every callback of such a device counted as the end of a silence, and
+    // the audio was sought twice a second.
     static constexpr double kCallbackGapMs = 500.0;
+    std::atomic<double> callbackGapLimitMs { kCallbackGapMs };
     std::atomic<double> lastCallbackMs  { 0.0 };    // written by the audio thread; 0: none since the device started
     std::atomic<bool>   callbackGapSeen { false };
 
