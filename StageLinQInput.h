@@ -21,8 +21,8 @@
 //
 // NOTE: This implementation is based entirely on the open-source reverse-
 // engineering work cited above.  No Denon hardware was available during
-// development.  Extensive logging is included for Wireshark-assisted
-// debugging when hardware becomes available.
+// development.  The logging in this file is DBG only, for reading next to
+// a Wireshark capture in a debug build: a release build has none of it.
 //
 // Two field captures have been read since: a PRIME 4+ on Engine OS 5.0.4,
 // from issue #23 (replayed by tools/audit/slq_capture_replay.cpp;
@@ -1177,7 +1177,8 @@ public:
             discoveredDevices.clear();
         }
 
-        // Generate fresh token each start
+        // The token: the same one at every start (generateToken copies
+        // kKnownGoodToken)
         StageLinQ::generateToken(ownToken);
 
         discoveryPortTaken.store(false, std::memory_order_relaxed);   // until this run's bind says otherwise
@@ -3119,7 +3120,10 @@ private:
                     buf.erase(buf.begin(), buf.begin() + juce::jmin(offset, (int)buf.size()));
             }
 
-            // Timeout: last-resort send
+            // Timeout with our service request not sent yet: send it now.
+            // The connection is kept only when the unit has announced a
+            // service port by then (the return below); otherwise the caller
+            // closes it right after this send.
             if (!sentOurRequest)
             {
                 DBG("StageLinQ: Timeout, sending service request as last resort");
