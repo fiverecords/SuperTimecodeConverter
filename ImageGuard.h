@@ -13,6 +13,11 @@
 // Album art reaches that reader from a StageLinQ unit's database, from a
 // CDJ's dbserver, and from STC's own artwork cache on disk.
 //
+// JUCE 9.0.5 repaired that callback and the GIF reader's table overrun.
+// The checks here stay: they do not depend on the JUCE version, and JUCE
+// still has no size limit of its own (a GIF or JPEG header stating
+// 30000 x 30000 pixels still takes its decoder down).
+//
 // isSafePng() therefore validates the whole file first and accepts only
 // what libpng 1.6 (as JUCE's reader drives it) reads without an error:
 //  - the 8-byte signature;

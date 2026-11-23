@@ -219,7 +219,8 @@ public:
     /// here, while the table is still whole.  A cell being edited commits its
     /// text as it does when the operator clicks elsewhere.  This is the only
     /// table in STC with components in its cells; another one would need
-    /// the same.
+    /// the same.  (Seen with JUCE 9.0.3.  From 9.0.5 ~TableListBox clears
+    /// its model pointer first; this stays as a second guard.)
     ~MixerMapEditor() override
     {
         if (hasKeyboardFocus(true))

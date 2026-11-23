@@ -1263,9 +1263,11 @@ private:
     // states a sample size of tens of thousands of bits, or a WAV stating
     // 3000 channels, loaded as a valid file and left the read-ahead thread
     // and the thumbnail's thread spinning, after which the next preset
-    // change or the quit never came back.  JUCE's readers accept such a
-    // header, so the bounds are set here: 8 to 64 bits a sample and 1 to
-    // 256 channels, a frame of at most 2,048 bytes.  Files an audio program
+    // change or the quit never came back.  That was JUCE 9.0.3; from 9.0.5
+    // its WAV and AIFF readers take only 8, 16, 24 and 32 bits and no longer
+    // loop, but they still hand out a WAV of 65,535 channels and the FLAC
+    // reader still accepts a 1-bit header.  So the bounds are set here: 8 to
+    // 64 bits a sample and 1 to 256 channels, a frame of at most 2,048 bytes.  Files an audio program
     // writes are far inside them (the transport plays the first two
     // channels of a file with more, as before).  Under 8 bits there is
     // nothing to lose -- JUCE's AIFF reader gives silence for such a file --
