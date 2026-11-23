@@ -4874,13 +4874,15 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
 //    it opens: the attempt is made kAudioReturnDelayMs after the last
 //    announcement, and when something that is listed did not open it is
 //    made again kAudioReturnRetryMs later, kAudioReturnMaxTries times in all
-//    for one state of the list.  After that the next change of the list --
-//    or the operator -- is waited for; a backend that announces a change
-//    for less than a new device (CoreAudio: any property) therefore cannot
-//    make a device that will not open stall the message thread again and
-//    again.  ASIO lists its installed drivers whether or not the hardware
-//    is there, so for an ASIO device "listed" is always true and each
-//    change of the other drivers' lists gives it those attempts.
+//    for one state of the list -- failures one after the other; an interface
+//    that has left the list and come back is a new state.  After that the
+//    next change of the list -- or the operator -- is waited for; a backend
+//    that announces a change for less than a new device (CoreAudio: any
+//    property) therefore cannot make a device that will not open stall the
+//    message thread again and again.  ASIO lists its installed drivers
+//    whether or not the hardware is there, so for an ASIO device "listed"
+//    is always true and each change of the other drivers' lists gives it
+//    those attempts.
 // Everything here runs on the message thread, as an open made by the
 // operator does.
 //==============================================================================
@@ -4956,11 +4958,17 @@ void MainComponent::openReturnedAudioDevices()
                 }
         return startable;
     };
-    auto startable = startableNow();
-    if (startable.empty())
-        return;
 
-    // kAudioReturnMaxTries attempts for one state of the list.
+    // kAudioReturnMaxTries attempts for one state of the list.  The state
+    // is noted at every pass, also at one that finds nothing to start: an
+    // interface that has left the list and come back is then a new state,
+    // with its attempts, whatever failed before it left (AUD11 MAIN-A-2,
+    // TC-IO-2).  Noted only where something was startable, the list without
+    // the interface was never seen, its return read as the same list, and
+    // an interface that had not opened three times -- held by another
+    // program, its driver not ready -- was not tried again when it was
+    // unplugged and plugged back in, although it would then have opened.
+    // An announcement that brings the same list still starts no new count.
     juce::StringArray listedNow;
     for (auto& listed : listedInputs)  listedNow.add("in|"  + listed.first + "|" + listed.second);
     for (auto& listed : listedOutputs) listedNow.add("out|" + listed.first + "|" + listed.second);
@@ -4969,6 +4977,10 @@ void MainComponent::openReturnedAudioDevices()
         audioReturnListTried = listedNow;
         audioReturnTries = 0;
     }
+
+    auto startable = startableNow();
+    if (startable.empty())
+        return;
     if (audioReturnTries >= kAudioReturnMaxTries)
         return;
 
@@ -5090,7 +5102,15 @@ void MainComponent::openReturnedAudioDevices()
         syncUIFromEngine();
     }
 
-    if (leftUnopened && ++audioReturnTries < kAudioReturnMaxTries)
+    // The attempts counted are those that failed one after the other: a
+    // pass that leaves nothing unopened ends the count, so that failures
+    // from before a success are not held against the next return of the
+    // interface under the same list.  It starts no timer, and a pass that
+    // leaves something unopened counts as before: nothing here makes a
+    // further attempt without a new announcement or the retries above.
+    if (! leftUnopened)
+        audioReturnTries = 0;
+    else if (++audioReturnTries < kAudioReturnMaxTries)
         audioReturnTimer.startTimer(kAudioReturnRetryMs);
 }
 
