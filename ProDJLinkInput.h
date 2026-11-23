@@ -1114,13 +1114,15 @@ public:
         return players[idx].mediaChanges[slot - 2].load(std::memory_order_relaxed);
     }
 
-    /// Track info -- Phase 1 only provides what we can extract from status packets.
-    /// Full metadata (artist/title) requires Phase 2 DB queries.
+    /// The title a track has until its metadata is known: "Track #<id>",
+    /// from the track ID in the status packets, with no artist.  The engine
+    /// takes it at a track change and replaces it when DbServerClient has
+    /// the track's artist and title.
     TrackInfo getTrackInfo(int playerNum) const
     {
         int idx = playerNum - 1;
         if (idx < 0 || idx >= ProDJLink::kMaxPlayers) return {};
-        // Phase 1: no metadata yet -- return track ID as title placeholder
+        // The track ID as the placeholder title
         TrackInfo info;
         uint32_t tid = players[idx].trackId.load(std::memory_order_relaxed);
         if (tid != 0)
@@ -1967,7 +1969,9 @@ private:
 
             // --- Poll sockets ---
             // Strategy: block on beatSock for up to 5ms (the busiest socket,
-            // carrying abspos at ~15ms intervals and DJM mixer data).
+            // carrying abspos at ~15ms intervals -- a CDJ-3000 sends its
+            // 0x0b packets in pairs every ~30ms, one position in each pair,
+            // see handleBeatPacket -- and DJM mixer data).
             // This drives the loop rate from ~1000 iter/sec down to ~200 iter/sec,
             // reducing syscall count from ~31,000/sec to ~600/sec.
             // The loop wakes immediately when any beat packet arrives, so there
@@ -1998,7 +2002,8 @@ private:
                     handleKeepalivePacket(buf, n, sender);
             }
 
-            // Beat (port 50001) -- abspos ~67Hz, DJM mixer ~33Hz, drain all ready
+            // Beat (port 50001) -- abspos ~67 packets/s (~30 positions/s, in
+            // pairs), DJM mixer ~33Hz, drain all ready
             int beatDrained = 0;
             if (beatSock)
             {
