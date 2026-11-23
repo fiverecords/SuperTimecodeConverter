@@ -444,7 +444,7 @@ The sections below are for developers who want to build STC from source.
 
 ### Prerequisites
 
-- **JUCE Framework 9** (the releases are built with 9.0.2) — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
+- **JUCE Framework 9.0.5 or later** (1.9.16-beta2 is built with 9.0.6; the code does not compile against 9.0.4 or older) — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
 
 #### Windows
 
@@ -461,7 +461,7 @@ The sections below are for developers who want to build STC from source.
 
 - Ubuntu 22.04+ / Debian 12+ (or equivalent)
 - GCC 11+ or Clang 14+
-- Development packages: `libfreetype-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libfontconfig1-dev libasound2-dev libcurl4-openssl-dev`
+- Development packages: `libfreetype-dev libfontconfig1-dev libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxcomposite-dev libxrender-dev libxi-dev libasound2-dev libcurl4-openssl-dev` (JUCE 9 needs `libxi-dev`: without it the build stops at `X11/extensions/XInput2.h`)
 
 ### Build Instructions
 
@@ -475,7 +475,7 @@ The sections below are for developers who want to build STC from source.
 
 2. **Clone JUCE** (if you don't have it already):
    ```bash
-   git clone --depth 1 --branch 9.0.2 https://github.com/juce-framework/JUCE.git ../JUCE
+   git clone --depth 1 --branch 9.0.6 https://github.com/juce-framework/JUCE.git ../JUCE
    ```
 
 3. **Create a `CMakeLists.txt`** in the project root:
