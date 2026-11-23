@@ -1325,6 +1325,10 @@ private:
         help << "  /stc/N/gen/stoptime (string)  \"HH:MM:SS:FF\"\n\n";
         help << "PRESETS\n";
         help << "  /stc/N/gen/preset (string)    preset name (loads + plays)\n\n";
+        help << "PLAY acts only while the engine's input is the generator in\n";
+        help << "transport mode. On an engine with another input a preset is\n";
+        help << "applied and waits, stopped, for a PLAY once the input is the\n";
+        help << "generator.\n\n";
         help << "N = 1 to 8 (engine number)\n\n";
         help << "EXAMPLES\n\n";
         help << "QLab (Network Cue, type OSC):\n";
