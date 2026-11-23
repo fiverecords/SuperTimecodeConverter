@@ -6339,6 +6339,8 @@ void MainComponent::loadAndApplyNonAudioSettings()
 
 void MainComponent::applyAudioSettings()
 {
+    std::vector<int> generatorsStarted;   // engines whose AUDIO PLAYBACK device is opened below
+
     // Apply audio device settings for all engines
     for (int i = 0; i < (int)settings.engines.size() && i < (int)engines.size(); i++)
     {
@@ -6428,12 +6430,14 @@ void MainComponent::applyAudioSettings()
 
                 // Open with channel from settings -- combo isn't populated yet.
                 // syncUIFromEngine() (called next) will sync the combo selection.
-                eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs);
+                if (eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs))
+                    generatorsStarted.push_back(i);
                 populateGenAudioChannels();
             }
             else if (!es.generatorAudioDevice.isEmpty())
             {
-                eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs);
+                if (eng.startGeneratorAudio(es.generatorAudioType, es.generatorAudioDevice, ch, sr, bs))
+                    generatorsStarted.push_back(i);
             }
         }
         // Volume and file channel mode persist across audio-on/off toggles
@@ -6442,6 +6446,26 @@ void MainComponent::applyAudioSettings()
         eng.setGeneratorAudioVolume(es.generatorAudioVolume);
         eng.setGeneratorAudioFileChannelMode(es.generatorAudioFileChannelMode);
     }
+
+    // The generators' audio, once the last device above is open (AUD11
+    // GENERATOR-8).  Each player's device was opened with the file at its
+    // top and silent, and nothing brought it anywhere: Refresh Devices
+    // pressed while a generator played left its audio silent, the timecode
+    // running on and the status line reading READY, until the next GO or
+    // seek; pressed while it was paused, PLAY then started the file from
+    // its top wherever the timecode stood.  The audio is brought to where
+    // the timecode is now, and playing if the generator plays, as after
+    // the automatic open of a returning interface
+    // (openReturnedAudioDevices) and for the same reason once and here
+    // rather than at each open: the opens run on this thread, no engine
+    // ticks meanwhile, and the timecode takes their time in one step
+    // (resyncGeneratorAudioAfterRestart takes it first), so a seek made
+    // as one device opened would leave that audio late by the opens that
+    // follow it.  A paused generator's audio is only placed and stays
+    // paused; a stopped one's is not touched (PLAY seeks), which is every
+    // generator at a launch, where this does nothing.
+    for (int engineIndex : generatorsStarted)
+        engines[(size_t) engineIndex]->resyncGeneratorAudioAfterRestart();
 
     updateDeviceSelectorVisibility();
 }
