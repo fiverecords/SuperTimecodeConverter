@@ -18,7 +18,7 @@
 //   3. Define the preprocessor macros:
 //        STC_ENABLE_LINK=1
 //        LINK_PLATFORM_WINDOWS=1   (Windows only)
-//        _WIN32_WINNT=0x0602       (Windows only)
+//        _WIN32_WINNT=0x0A00       (Windows only)
 //        NOMINMAX=1                (Windows only)
 //   4. On Windows, link against: ws2_32, iphlpapi, winmm
 //      On macOS/Linux: no extra libraries needed

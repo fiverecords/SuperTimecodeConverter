@@ -4112,7 +4112,7 @@ public:
     bool       isGeneratorAudioPlaying()  const { return generatorAudioPlayer.isPlaying(); }
     bool       isGeneratorAudioLooping()  const { return generatorAudioPlayer.isLooping(); }
 
-    /// Output volume for the generator audio playback (0..1.5 linear, 1=unity).
+    /// Output volume for the generator audio playback (0..2 linear, 1=unity).
     void  setGeneratorAudioVolume(float linearGain) { generatorAudioPlayer.setOutputVolume(linearGain); }
     float getGeneratorAudioVolume() const           { return generatorAudioPlayer.getOutputVolume(); }
 
