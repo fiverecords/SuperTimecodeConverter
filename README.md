@@ -626,7 +626,7 @@ The **Refresh Devices** button scans for newly connected MIDI devices, audio int
 
 ### Configuration Backup & Restore
 
-The **Backup** and **Restore** buttons at the left of the tab bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes; its dialog says which files were restored, and which were not when one could not be written.
+The **Backup** and **Restore** buttons at the left of the tab bar let you export and import the entire STC configuration as a single JSON file. The backup bundles all engine settings, Track Map entries, Mixer Map mappings, and Generator Presets into one portable file (`stc_backup.json`). Useful for migrating to a new machine, keeping a safety copy before a show, or sharing a known-good setup between systems. Restore replaces all config files and prompts for a restart to fully apply changes; when a file could not be restored, its dialog says which files were restored and which were not.
 
 ### OSC Reference
 
@@ -819,7 +819,7 @@ The application is built around a modular, header-only architecture:
 | `btt_amalgamation.c` | The same library as a plain C file, kept for reference and not compiled (compiling it next to btt_build.cpp defines every BTT symbol twice) |
 | `StageLinQInput.h` | Native StageLinQ protocol: device discovery, StateMap, BeatInfo, mixer state |
 | `StageLinQDbClient.h` | Engine Library database access via FileTransfer + SQLite for waveform preview and artwork |
-| `sqlite3.c` / `sqlite3.h` | The SQLite amalgamation (public domain) that reads the Engine Library database |
+| `sqlite3.c` / `sqlite3.h` | The SQLite amalgamation, which reads the Engine Library database |
 | `StageLinQView.h` | External window: Denon deck display with track info, deck state, mixer data |
 | `ProDJLinkView.h` | External window: 4-deck display with preview + detail waveforms, rekordbox cue markers, beat grid, song structure phrases, artwork, mixer strip with VU meters |
 | `MediaDisplay.h` | Color waveform preview renderer (ThreeBand and ColorNxs2 formats) with beat grid lines, rekordbox cue markers, loop overlays, and minute markers |
