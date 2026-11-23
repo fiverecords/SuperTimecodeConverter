@@ -223,7 +223,7 @@ void MainComponent::AudioScanThread::run()
 }
 
 //==============================================================================
-// SAMPLE RATE / BUFFER SIZE helpers (same as v1.3)
+// SAMPLE RATE / BUFFER SIZE helpers
 //==============================================================================
 static int sampleRateToComboId(double sr)
 {
@@ -2307,7 +2307,9 @@ MainComponent::MainComponent()
     txtLtcUserBits.onReturnKey  = applyUserBits;
     txtLtcUserBits.onFocusLost  = applyUserBits;
 
-    // AudioThru controls visible for all engines in the panel but only functional for engine 0
+    // Audio Thru belongs to the first engine (isPrimary): its toggle and
+    // these controls are hidden on the others (syncUIFromEngine,
+    // updateDeviceSelectorVisibility).
     addRightLabelAndCombo(lblThruOutputDevice, cmbThruOutputDevice, "AUDIO THRU OUTPUT DEVICE:");
     cmbThruOutputDevice.onChange = [this]
     {
@@ -4804,7 +4806,7 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
 }
 
 //==============================================================================
-// DRIVER TYPE FILTER HELPERS (same as v1.3)
+// DRIVER TYPE FILTER HELPERS
 //==============================================================================
 juce::StringArray MainComponent::getUniqueTypeNames(const juce::Array<AudioDeviceEntry>& entries) const
 {
@@ -11276,7 +11278,7 @@ juce::Colour MainComponent::getInputColour(SrcType s) const
 }
 
 //==============================================================================
-// STYLING (same as v1.3)
+// STYLING
 //==============================================================================
 void MainComponent::styleInputButton(juce::TextButton& btn, bool active, juce::Colour colour)
 {
