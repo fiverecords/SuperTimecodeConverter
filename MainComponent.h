@@ -27,6 +27,7 @@
 #include <memory>
 #include <map>
 #include <set>
+#include <functional>
 
 //==============================================================================
 // The panels' horizontal sliders with a value box ("100%", "0 ms") on their
@@ -301,6 +302,34 @@ private:
     std::unique_ptr<AudioScanThread> scanThread;
     bool settingsLoaded = false;
     bool audioDevicesApplied = false;   // the first scan's results opened the audio devices
+
+    // A configured audio interface that is connected, or comes back, while
+    // STC runs: the audio components that are on and wait for it are started
+    // by openReturnedAudioDevices() (AUD11 MAIN-A-2, TC-IO-2; the rules are
+    // above its definition).  Message thread.
+    struct WaitingAudio   // one audio component that is switched on, does not run and has a device saved
+    {
+        enum Kind { ltcIn, ltcOut, thru, genAudio, audioBpm };
+        int engine;
+        Kind kind;
+        juce::String typeName, deviceName;   // as saved
+        bool isInput;
+    };
+    std::vector<WaitingAudio> audioWaitingForDevice() const;
+    void audioDeviceListChanged();    // AudioDeviceHub::watchDeviceList's callback
+    void openReturnedAudioDevices();
+    struct OneShotTimer : public juce::Timer
+    {
+        std::function<void()> onTimer;
+        void timerCallback() override { stopTimer(); if (onTimer != nullptr) onTimer(); }
+    };
+    OneShotTimer audioReturnTimer;            // from the last announcement of a burst to the attempt
+    juce::StringArray audioReturnListTried;   // the system's device list at the last attempt
+    int audioReturnTries = 0;                 // attempts under that list that left something unopened
+    bool openingReturnedAudio = false;        // inside openReturnedAudioDevices()
+    static constexpr int kAudioReturnDelayMs  = 500;
+    static constexpr int kAudioReturnRetryMs  = 2000;
+    static constexpr int kAudioReturnMaxTries = 3;   // as AudioDeviceHub's own reopen
 
     juce::Array<AudioDeviceEntry> scannedAudioInputs;
     juce::Array<AudioDeviceEntry> scannedAudioOutputs;

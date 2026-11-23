@@ -4812,7 +4812,256 @@ void MainComponent::onAudioScanComplete(const juce::Array<AudioDeviceEntry>& inp
         applyAudioSettings();
         audioDevicesApplied = true;
     }
+    // From the first scan's result on, the system's device list is listened
+    // to: an interface that is connected later is opened for the components
+    // that wait for it (openReturnedAudioDevices; AUD11 MAIN-A-2, TC-IO-2).
+    audioReturnTimer.onTimer = [this] { openReturnedAudioDevices(); };
+    AudioDeviceHub::get().watchDeviceList([safeThis = juce::Component::SafePointer<MainComponent>(this)]
+    {
+        if (safeThis != nullptr)
+            safeThis->audioDeviceListChanged();
+    });
     syncUIFromEngine();  // Re-populate Audio BPM device combo now that scan data is available
+}
+
+//==============================================================================
+// A CONFIGURED AUDIO INTERFACE THAT IS CONNECTED, OR COMES BACK, WHILE STC RUNS
+// (AUD11 MAIN-A-2, TC-IO-2)
+//
+// Two rules met here, each right alone.  With the configured device not
+// listed a start opens nothing and keeps the saved name (audioDeviceToStart,
+// MAIN-A-2); and AudioDeviceHub reopens on its return only a device it still
+// holds (TC-IO-2), which a component whose start failed does not.  So an
+// interface that was not connected when STC started was not opened when it
+// was plugged in, and one lost during a session was no longer followed once
+// Refresh Devices had run while it was away: only Refresh Devices opened it,
+// and Show Lock refuses that.
+//
+// Now: when the system's device list changes, every audio component that is
+// switched on, does not run and has a configured device -- LTC in, LTC OUT,
+// Audio Thru, the generator's AUDIO PLAYBACK and AUDIO BPM, on every engine,
+// whichever tab is selected -- is started on that device if the list carries
+// it now, with the saved channels and the global SAMPLE RATE / BUFFER SIZE:
+// the calls applyAudioSettings makes for an engine on another tab.  Also
+// under Show Lock: it changes no setting, and queues no save.  What it must
+// not do, and how:
+//  - Touch what runs.  Only components that do not run are started, never
+//    through Refresh Devices' path (which restarts all of them), and a start
+//    that would make the hub reopen a device that is open now is left to the
+//    operator (AudioDeviceHub::wouldRestartOpenDevice).  A device this pass
+//    has just opened may be reopened once by the next component that adds
+//    its other direction, as at any launch.
+//  - Act when nothing waits: the announcement is then ignored on the spot.
+//  - Open anything but the configured device: a device that is not listed
+//    is not replaced, a component with no device saved is not looked at.
+//  - Start what the operator switched off: LTC OUT and Audio Thru by the
+//    engine's own flags, LTC in by the input that is selected, AUDIO
+//    PLAYBACK and AUDIO BPM by the saved choice (flushSettings), AUDIO
+//    PLAYBACK only while the generator is the input.
+//  - Loop.  Announcements come in bursts, and a device can be listed before
+//    it opens: the attempt is made kAudioReturnDelayMs after the last
+//    announcement, and when something that is listed did not open it is
+//    made again kAudioReturnRetryMs later, kAudioReturnMaxTries times in all
+//    for one state of the list.  After that the next change of the list --
+//    or the operator -- is waited for; a backend that announces a change
+//    for less than a new device (CoreAudio: any property) therefore cannot
+//    make a device that will not open stall the message thread again and
+//    again.  ASIO lists its installed drivers whether or not the hardware
+//    is there, so for an ASIO device "listed" is always true and each
+//    change of the other drivers' lists gives it those attempts.
+// Everything here runs on the message thread, as an open made by the
+// operator does.
+//==============================================================================
+std::vector<MainComponent::WaitingAudio> MainComponent::audioWaitingForDevice() const
+{
+    std::vector<WaitingAudio> waiting;
+    for (int i = 0; i < (int) settings.engines.size() && i < (int) engines.size(); ++i)
+    {
+        const auto& es = settings.engines[(size_t) i];
+        auto& eng = *engines[(size_t) i];
+        const bool ltcIsInput = eng.getActiveInput() == SrcType::LTC;
+
+        if (ltcIsInput && ! eng.getLtcInput().getIsRunning() && es.audioInputDevice.isNotEmpty())
+            waiting.push_back({ i, WaitingAudio::ltcIn, es.audioInputType, es.audioInputDevice, true });
+
+        if (eng.isOutputLtcEnabled() && ! eng.getLtcOutput().getIsRunning() && es.audioOutputDevice.isNotEmpty())
+            waiting.push_back({ i, WaitingAudio::ltcOut, es.audioOutputType, es.audioOutputDevice, false });
+
+        if (eng.isPrimary() && eng.isOutputThruEnabled() && ltcIsInput
+            && eng.getAudioThru() != nullptr && ! eng.getAudioThru()->getIsRunning() && es.thruOutputDevice.isNotEmpty())
+            waiting.push_back({ i, WaitingAudio::thru, es.thruOutputType, es.thruOutputDevice, false });
+
+        // The engine closes the player's device on any other input
+        // (setInputSource), and the toggle stays on for the way back.
+        if (es.generatorAudioEnabled && eng.getActiveInput() == SrcType::SystemTime
+            && ! eng.isGeneratorAudioRunning() && es.generatorAudioDevice.isNotEmpty())
+            waiting.push_back({ i, WaitingAudio::genAudio, es.generatorAudioType, es.generatorAudioDevice, false });
+
+        if (es.audioBpmEnabled && ! eng.isAudioBpmRunning() && es.audioBpmDevice.isNotEmpty())
+            waiting.push_back({ i, WaitingAudio::audioBpm, es.audioBpmType, es.audioBpmDevice, true });
+    }
+    return waiting;
+}
+
+void MainComponent::audioDeviceListChanged()
+{
+    // Before the first scan's result nothing has been started yet; and when
+    // no component waits for a device, a change of the list is nobody's
+    // business here.  Otherwise the attempt is put off until the burst of
+    // announcements has ended: each one starts the wait again.
+    if (! audioDevicesApplied || audioWaitingForDevice().empty())
+        return;
+    audioReturnTimer.startTimer(kAudioReturnDelayMs);
+}
+
+void MainComponent::openReturnedAudioDevices()
+{
+    // One pass at a time, should a driver run the message loop while it
+    // opens and the timer come round again inside it.
+    if (openingReturnedAudio)
+        return;
+    const juce::ScopedValueSetter<bool> busy(openingReturnedAudio, true);
+
+    auto& hub = AudioDeviceHub::get();
+    const auto listedInputs  = hub.getListedDevices(true);
+    const auto listedOutputs = hub.getListedDevices(false);
+
+    // What waits, is listed now, and can be started without the hub
+    // reopening a device that is open -- judged before this pass opens
+    // anything.  A device saved without its driver type (an old file) is
+    // taken from the first type that lists it, as audioDeviceToStart does.
+    auto startableNow = [this, &hub, &listedInputs, &listedOutputs]
+    {
+        std::vector<WaitingAudio> startable;
+        for (auto& w : audioWaitingForDevice())
+            for (auto& listed : (w.isInput ? listedInputs : listedOutputs))
+                if (listed.second == w.deviceName && (w.typeName.isEmpty() || listed.first == w.typeName))
+                {
+                    w.typeName = listed.first;
+                    if (! hub.wouldRestartOpenDevice(w.typeName, w.deviceName, w.isInput))
+                        startable.push_back(w);
+                    break;
+                }
+        return startable;
+    };
+    auto startable = startableNow();
+    if (startable.empty())
+        return;
+
+    // kAudioReturnMaxTries attempts for one state of the list.
+    juce::StringArray listedNow;
+    for (auto& listed : listedInputs)  listedNow.add("in|"  + listed.first + "|" + listed.second);
+    for (auto& listed : listedOutputs) listedNow.add("out|" + listed.first + "|" + listed.second);
+    if (listedNow != audioReturnListTried)
+    {
+        audioReturnListTried = listedNow;
+        audioReturnTries = 0;
+    }
+    if (audioReturnTries >= kAudioReturnMaxTries)
+        return;
+
+    // A save the operator's last change has queued is written first, so
+    // that what is started here is what the panel shows; this pass itself
+    // queues none.
+    if (settingsDirty)
+    {
+        flushSettings();
+        startable = startableNow();
+    }
+
+    const double sr = getPreferredSampleRate();
+    const int    bs = getPreferredBufferSize();
+    juce::StringArray notOpened;   // devices an open has just failed on: not asked again in this pass
+    bool startedAny = false, leftUnopened = false;
+
+    for (auto& w : startable)
+    {
+        const auto& es = settings.engines[(size_t) w.engine];
+        auto& eng = *engines[(size_t) w.engine];
+
+        // Audio Thru plays what the LTC input taps: it is started once that
+        // runs (this pass has started it just before, if it could).  And an
+        // LTC OUT start stops an Audio Thru it finds on its channel: with
+        // Audio Thru running on that device, LTC OUT is left to the operator.
+        if (w.kind == WaitingAudio::thru
+            && ! (eng.getLtcInput().getIsRunning() && eng.getLtcInput().hasPassthruChannel()))
+            continue;
+        if (w.kind == WaitingAudio::ltcOut && eng.getAudioThru() != nullptr && eng.getAudioThru()->getIsRunning()
+            && eng.getAudioThru()->getCurrentDeviceName() == w.deviceName)
+            continue;
+
+        const juce::String device = (w.isInput ? "in|" : "out|") + w.typeName + "|" + w.deviceName;
+        bool started = false;
+        if (! notOpened.contains(device))
+        {
+            switch (w.kind)
+            {
+                case WaitingAudio::ltcIn:
+                    started = startLtcInputAsOpened(eng, w.typeName, w.deviceName, es.audioInputChannel,
+                                                    (eng.isPrimary() && eng.isOutputThruEnabled()) ? es.thruInputChannel : -1,
+                                                    sr, bs);
+                    break;
+                case WaitingAudio::ltcOut:
+                    started = startLtcOutputAsOpened(eng, w.typeName, w.deviceName,
+                                                     es.audioOutputStereo ? -1 : es.audioOutputChannel, sr, bs);
+                    break;
+                case WaitingAudio::thru:
+                    started = startThruOutputAsOpened(eng, w.typeName, w.deviceName,
+                                                      es.thruOutputStereo ? -1 : es.thruOutputChannel, sr, bs);
+                    break;
+                case WaitingAudio::genAudio:
+                    started = eng.startGeneratorAudio(w.typeName, w.deviceName,
+                                                      es.generatorAudioStereo ? -1 : es.generatorAudioChannel, sr, bs);
+                    // The device opens with the file at its top: to where
+                    // the timecode is, and playing if the generator plays,
+                    // as startCurrentGenAudio does.
+                    if (started)
+                        eng.resyncGeneratorAudioToTimecode();
+                    break;
+                case WaitingAudio::audioBpm:
+                    started = eng.startAudioBpm(w.typeName, w.deviceName, es.audioBpmChannel, sr, bs);
+                    break;
+            }
+        }
+        if (started)
+        {
+            startedAny = true;
+        }
+        else
+        {
+            notOpened.addIfNotAlreadyThere(device);
+            leftUnopened = true;
+        }
+    }
+
+    // The panel, when something was started (a pass that opened nothing
+    // leaves it alone: the status lines say what failed).  The devices
+    // listed now that the last scan did not list are added to its lists, at
+    // the end -- nothing is removed and no position changes, so every
+    // selector keeps what it shows -- and the engine on screen is shown as
+    // after a tab change: its selectors on the devices that are back, the
+    // channels of what now runs.
+    auto addListed = [](juce::Array<AudioDeviceEntry>& scanned, const std::vector<std::pair<juce::String, juce::String>>& listed)
+    {
+        for (auto& l : listed)
+        {
+            bool known = false;
+            for (auto& e : scanned)
+                if (e.typeName == l.first && e.deviceName == l.second) { known = true; break; }
+            if (! known)
+                scanned.add({ l.first, l.second, AudioDeviceEntry::makeDisplayName(l.first, l.second) });
+        }
+    };
+    if (startedAny)
+    {
+        addListed(scannedAudioInputs, listedInputs);
+        addListed(scannedAudioOutputs, listedOutputs);
+        populateAudioCombos();
+        syncUIFromEngine();
+    }
+
+    if (leftUnopened && ++audioReturnTries < kAudioReturnMaxTries)
+        audioReturnTimer.startTimer(kAudioReturnRetryMs);
 }
 
 //==============================================================================

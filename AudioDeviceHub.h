@@ -5,7 +5,9 @@
 #pragma once
 #include <JuceHeader.h>
 #include <atomic>
+#include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 //==============================================================================
@@ -81,6 +83,19 @@
 // when the system's device list changes and lists it again, at most three
 // times until an open succeeds; a device that is still there is never
 // reopened without the operator.
+//
+// A device nobody holds (AUD11 MAIN-A-2, TC-IO-2).  All of the above is
+// about entries, and an entry lives only while it has a client.  A component
+// whose start failed -- its interface was not connected when STC started, or
+// Refresh Devices ran while it was away -- is not a client: nothing here
+// remembers it, and nothing here listens for its device, because the hub
+// hears of list changes through its entries' managers.  Those components are
+// the owner's, which knows which of them are switched on and what they are
+// configured for.  For it the hub keeps one more manager that opens nothing
+// (watchDeviceList) and tells the owner of every change, and it answers the
+// two questions the owner has before it starts such a component by itself:
+// what the system lists now (getListedDevices), and whether the start would
+// restart a device that runs (wouldRestartOpenDevice).
 //
 // Message thread only for acquire/release; the callbacks run on the audio
 // thread.
@@ -274,12 +289,76 @@ public:
         return false;
     }
 
+    /// Listen to the system's device list from now on, whether or not a
+    /// device is open, and call `onChange` on the message thread each time
+    /// a driver type announces a change (AUD11 MAIN-A-2, TC-IO-2; see "A
+    /// device nobody holds" above).  The announcements come in bursts --
+    /// every driver type of the manager makes its own, and one interface
+    /// can appear as several changes -- and CoreAudio makes one for any
+    /// property of any device: the callback should only note that it was
+    /// called.  The manager made for this opens no device (zero channels,
+    /// as the device scan's); its driver types are created here, on the
+    /// message thread, which is where they deliver their announcements.
+    /// A second call only replaces the callback.  shutdown() ends it.
+    void watchDeviceList(std::function<void()> onChange)
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+        listWatch.onChange = std::move(onChange);
+        if (listWatch.manager == nullptr)
+        {
+            listWatch.manager = std::make_unique<juce::AudioDeviceManager>();
+            listWatch.manager->initialise(0, 0, nullptr, false);
+        }
+        for (auto* type : listWatch.manager->getAvailableDeviceTypes())
+            type->addListener(&listWatch);   // adding again is a no-op
+    }
+
+    /// The devices the system lists now for one direction, as (driver type
+    /// name, device name) in the order a device scan gives them; empty
+    /// before watchDeviceList().  Read from the watching manager's driver
+    /// types as they are: the types that announce changes (WASAPI,
+    /// DirectSound, CoreAudio) rescan before they announce, and the others
+    /// (ASIO: the installed drivers, whether or not the hardware is
+    /// connected) list what they listed when STC started.  No scan is made
+    /// here.  Message thread.
+    std::vector<std::pair<juce::String, juce::String>> getListedDevices(bool inputs) const
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+        std::vector<std::pair<juce::String, juce::String>> listed;
+        if (listWatch.manager != nullptr)
+            for (auto* type : listWatch.manager->getAvailableDeviceTypes())
+                for (auto& name : type->getDeviceNames(inputs))
+                    listed.push_back({ type->getTypeName(), name });
+        return listed;
+    }
+
+    /// Whether acquire() for this device and direction would close and
+    /// reopen a device that is open now, under the clients it has: the
+    /// name is open in the other direction only (the entry is upgraded in
+    /// place), or its stream has gone silent (acquire reopens it).  False
+    /// when nothing is open under that name, and when the client would just
+    /// join a running device.  For a start nobody asked for (AUD11
+    /// MAIN-A-2): the operator's own starts do not ask.  Message thread.
+    bool wouldRestartOpenDevice(const juce::String& typeName, const juce::String& deviceName, bool asInput) const
+    {
+        JUCE_ASSERT_MESSAGE_THREAD
+        const Device* dev = findDevice(typeName, deviceName, asInput);
+        const bool sameDirection = dev != nullptr;
+        if (dev == nullptr)
+            dev = findDevice(typeName, deviceName, ! asInput);
+        if (dev == nullptr || hasNoDevice(*dev))
+            return false;
+        return ! sameDirection || isSilent(*dev);
+    }
+
     /// Close everything and drop the managers while JUCE is still alive.
     /// Call at the end of the main component's destructor, after every
     /// client has stopped; the static instance then destroys nothing at exit.
     static void shutdown()
     {
         auto& hub = get();
+        hub.listWatch.onChange = nullptr;
+        hub.listWatch.manager = nullptr;   // with its driver types, which held the listener
         for (auto& d : hub.devices)
             if (d->open) { d->manager->removeAudioCallback(&d->fanout); d->manager->closeAudioDevice(); d->open = false; }
         hub.devices.clear();
@@ -502,6 +581,23 @@ private:
 
     std::vector<std::unique_ptr<Device>> devices;
     bool opening = false;             // inside open(): a list change announced from in there is ignored
+
+    // The device list for the owner (watchDeviceList).  A listener of its
+    // own, on a manager of its own: the hub's audioDeviceListChanged()
+    // below stays on the entries' managers only, so an entry's three
+    // reopen attempts are still counted against the announcements of its
+    // own driver type and not used up by this manager's in the same burst.
+    struct ListWatch : public juce::AudioIODeviceType::Listener
+    {
+        void audioDeviceListChanged() override
+        {
+            if (onChange != nullptr && juce::MessageManager::existsAndIsCurrentThread())
+                onChange();
+        }
+        std::function<void()> onChange;
+        std::unique_ptr<juce::AudioDeviceManager> manager;
+    };
+    ListWatch listWatch;
 
     // AUD11 TC-IO-2.  Silent: no device behind the entry, or a device that
     // delivers (almost) nothing -- no callback for kSilentMs (the longest
