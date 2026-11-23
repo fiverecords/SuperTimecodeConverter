@@ -3116,12 +3116,19 @@ void MainComponent::syncUIFromEngine()
         // Ableton Link toggle
         btnLink.setToggleState(eng.getLinkBridge().isEnabled(), juce::dontSendNotification);
 
-        // Audio BPM toggle + smoothing
-        btnAudioBpm.setToggleState(eng.isAudioBpmRunning(), juce::dontSendNotification);
+        // Audio BPM toggle + smoothing.  The toggle is the operator's
+        // choice, as AUDIO PLAYBACK's below and LTC OUT's are: on also
+        // while the analyser does not run because its interface is not
+        // connected.  It used to follow "is running", and since the save
+        // takes the choice from it (flushSettings), one session without
+        // the interface switched AUDIO BPM off for good (AUD11 MAIN-A-2).
+        btnAudioBpm.setToggleState(eng.isAudioBpmRunning() || es.audioBpmEnabled, juce::dontSendNotification);
         sldBpmSmoothing.setValue(eng.getAudioBpmInput().getSmoothing() * 100.0f, juce::dontSendNotification);
 
         // When LTC is active, Audio BPM uses separate device/channel combos
-        if (eng.getActiveInput() == SrcType::LTC && eng.isAudioBpmRunning())
+        // -- filled whenever the toggle is on, running or not: they are on
+        // screen then, and would otherwise show what the tab before left.
+        if (eng.getActiveInput() == SrcType::LTC && btnAudioBpm.getToggleState())
         {
             cmbAudioBpmDevice.clear(juce::dontSendNotification);
             for (int i = 0; i < scannedAudioInputs.size(); i++)
@@ -3135,6 +3142,9 @@ void MainComponent::syncUIFromEngine()
                 if (scannedAudioInputs[i].deviceName == es.audioBpmDevice
                     && scannedAudioInputs[i].typeName == es.audioBpmType)
                 { cmbAudioBpmDevice.setSelectedId(i + 1, juce::dontSendNotification); break; }
+            // Not listed: named, dimmed, as the four device selectors below.
+            cmbAudioBpmDevice.setTextWhenNothingSelected(es.audioBpmDevice.isNotEmpty() && audioDevicesApplied
+                                                             ? es.audioBpmDevice + " (not listed)" : juce::String());
             populateAudioBpmChannels();
             int abChId = es.audioBpmChannel + 2;
             if (abChId >= 1 && abChId <= cmbAudioBpmChannel.getNumItems())
@@ -6317,8 +6327,14 @@ void MainComponent::flushSettings()
                 }
                 es.generatorAudioVolume  = (float) sldGenAudioVolume.getValue();
                 es.generatorAudioFileChannelMode = juce::jlimit(0, 2, cmbGenAudioFileMode.getSelectedId() - 1);
-                // Audio BPM device/channel
-                es.audioBpmEnabled = eng.isAudioBpmRunning();
+                // Audio BPM device/channel.  Enabled is the operator's choice
+                // -- the toggle, which syncUIFromEngine keeps on while the
+                // analyser waits for its interface -- as generatorAudioEnabled
+                // above and ltcOutEnabled are.  It was saved from "is
+                // running": after one session without the interface AUDIO
+                // BPM came back switched off, its device and channel kept
+                // (AUD11 MAIN-A-2).
+                es.audioBpmEnabled = btnAudioBpm.getToggleState();
                 if (eng.isAudioBpmRunning())
                 {
                     if (eng.getActiveInput() == SrcType::LTC)
@@ -6391,10 +6407,17 @@ void MainComponent::flushSettings()
                 es.thruOutputStereo  = (ch == -1);
                 es.thruOutputChannel = (ch == -1) ? 0 : ch;
             }
-            // Generator audio playback (per-engine)
-            es.generatorAudioEnabled = eng.isGeneratorAudioRunning();
+            // Generator audio playback (per-engine).  Enabled stays as it
+            // was saved while this engine's tab was selected: it is the
+            // operator's choice, and no control of another tab can change
+            // it.  It used to be saved from "is running" here, so one save
+            // with the interface not connected -- or with the engine on
+            // another input, which closes the player's device -- switched
+            // AUDIO PLAYBACK off for good (AUD11 MAIN-A-2).  Audio BPM
+            // below likewise.
             if (eng.isGeneratorAudioRunning())
             {
+                es.generatorAudioEnabled = true;
                 es.generatorAudioDevice = eng.getGeneratorAudio().getCurrentDeviceName();
                 es.generatorAudioType   = eng.getGeneratorAudio().getCurrentTypeName();
                 int ch = eng.getGeneratorAudio().getSelectedChannel();
@@ -6422,7 +6445,8 @@ void MainComponent::flushSettings()
             es.linkEnabled = eng.getLinkBridge().isEnabled();
 
             // Audio BPM
-            es.audioBpmEnabled = eng.isAudioBpmRunning();
+            if (eng.isAudioBpmRunning())
+                es.audioBpmEnabled = true;
             if (eng.getAudioBpmInput().getIsRunning())
             {
                 es.audioBpmDevice = eng.getAudioBpmInput().getCurrentDeviceName();
