@@ -478,10 +478,10 @@ The sections below are for developers who want to build STC from source.
    git clone --depth 1 --branch 9.0.6 https://github.com/juce-framework/JUCE.git ../JUCE
    ```
 
-3. **Create a `CMakeLists.txt`** in the project root:
+3. **Create a `CMakeLists.txt`** in the project root (`VERSION` is the number in `Main.cpp`'s `getApplicationVersion()`, digits only; it goes into the bundle and file properties, the version STC shows is the one in `Main.cpp`):
    ```cmake
    cmake_minimum_required(VERSION 3.22)
-   project(SuperTimecodeConverter VERSION 1.9.14)
+   project(SuperTimecodeConverter VERSION 1.9.16)
 
    set(CMAKE_CXX_STANDARD 17)
    set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -491,7 +491,7 @@ The sections below are for developers who want to build STC from source.
    juce_add_gui_app(SuperTimecodeConverter
        PRODUCT_NAME "Super Timecode Converter"
        COMPANY_NAME "Fiverecords"
-       VERSION "1.9.14"
+       VERSION "1.9.16"
        HARDENED_RUNTIME_ENABLED TRUE
        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
        MICROPHONE_PERMISSION_ENABLED TRUE
@@ -517,6 +517,21 @@ The sections below are for developers who want to build STC from source.
        JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SuperTimecodeConverter,JUCE_VERSION>"
        SQLITE_THREADSAFE=1
    )
+
+   if (WIN32)
+       # What the Visual Studio project of the releases defines.  NOMINMAX is
+       # required: without it the Windows SDK's min / max macros break the
+       # std::min / std::max calls in STC's headers.
+       target_compile_definitions(SuperTimecodeConverter PRIVATE
+           NOMINMAX=1
+           _WIN32_WINNT=0x0A00
+           _CRT_SECURE_NO_WARNINGS
+           SQLITE_WIN32_GETVERSIONEX=0
+       )
+       if (MSVC)
+           target_compile_options(SuperTimecodeConverter PRIVATE /bigobj)
+       endif()
+   endif()
 
    target_link_libraries(SuperTimecodeConverter PRIVATE
        juce::juce_audio_basics
@@ -561,7 +576,7 @@ To enable Ableton Link tempo sync:
 
 1. Clone the Link SDK: `git clone --recurse-submodules https://github.com/Ableton/link.git`
 2. Add include paths: `<link_repo>/include` and `<link_repo>/modules/asio-standalone/asio/include`
-3. Define `STC_ENABLE_LINK=1` (plus `LINK_PLATFORM_WINDOWS=1`, `_WIN32_WINNT=0x0602`, `NOMINMAX=1` on Windows)
+3. Define `STC_ENABLE_LINK=1` (plus `LINK_PLATFORM_WINDOWS=1`, `_WIN32_WINNT=0x0A00`, `NOMINMAX=1` on Windows)
 4. Link against `ws2_32`, `iphlpapi`, `winmm` on Windows (no extra libraries on macOS/Linux)
 
 Without these steps, Link is compiled as a no-op stub and the rest of the app works normally.
@@ -740,6 +755,7 @@ The application is built around a modular, header-only architecture:
 | `MidiOutputHub.h` | One MIDI output per physical port: every send serialised under the port's lock, one MTC stream per port |
 | `OnAirFollow.h` | The ON AIR rule shared by Pro DJ Link and StageLinQ: keep the deck on air until it goes quiet, then the loudest deck on air |
 | `NetworkUtils.h` | Cross-platform network interface enumeration (Windows / macOS / Linux) |
+| `ImageGuard.h` | Checks artwork that comes from a player, a unit's database or the disk cache before JUCE decodes it: a PNG is validated whole, a JPEG must state a size within the limits, GIF and WebP are refused |
 | `AppSettings.h` | JSON-based persistent settings, TrackMap and TrackMapEntry types |
 | `MixerMap.h` | DJM parameter mapping with three-tier model support (900NXS2 / A9 / V10) and ParamType-aware value mapping (Continuous / Toggle / Discrete) |
 | `OscSender.h` | Lightweight OSC 1.0 sender (int32, float32, string arguments) |
