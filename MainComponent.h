@@ -450,6 +450,21 @@ private:
     juce::String lastBottomBarStatus;
     bool lastBottomBarActive = false;
     bool lastBottomBarStarted = false;   // isInputStarted() as last painted: PAUSED or STOPPED (AUD11 MAIN-B-14)
+    juce::String lastBottomBarName;      // the engine name the bar was laid out with ("" while the status text shows none)
+
+    // --- Bottom bar layout ---
+    // The bar holds four things, from the left: the version text, the GitHub
+    // link, the status text of the engine shown ("[ENGINE 1] MTC ACTIVE") and,
+    // at the right edge, "Check for updates" or the "Update available" link
+    // that replaces it.  layoutBottomBar() gives each a place of its own, from
+    // the widths of the texts as they are now; paint() writes the version and
+    // the status into the two areas kept here.
+    juce::Rectangle<int> bottomBarVersionArea;
+    juce::Rectangle<int> bottomBarStatusArea;
+    static juce::Font bottomBarFont();
+    static juce::String bottomBarVersionText();
+    juce::String bottomBarStatusText(const char* state);
+    void layoutBottomBar();
 
     // FPS auto-detect change tracking (for button state updates)
     FrameRate lastDisplayedFps    = FrameRate::FPS_30;
@@ -831,20 +846,7 @@ private:
 
     // --- Update checker ---
     UpdateChecker updateChecker;
-    juce::HyperlinkButton btnUpdateAvailable { "", juce::URL() };
-    /// The "Update available" link in the bottom bar: as wide as its text,
-    /// against the right edge.  It was 240 px wide whatever it said, with
-    /// the text centred, and lay over the last 95 px of the status text's
-    /// place: "Update available: v1.9.17" was written across the ACTIVE of
-    /// "GENERATOR ACTIVE" at every window width (AUD11 MAIN-B-14).  paint()
-    /// ends the status text left of the link when a long version name makes
-    /// the link wider than the "Check for updates" button it replaces.
-    void placeUpdateLink()
-    {
-        btnUpdateAvailable.changeWidthToFitText();
-        const int linkWidth = btnUpdateAvailable.getWidth() + 8;
-        btnUpdateAvailable.setBounds(getWidth() - 5 - linkWidth, getHeight() - 24, linkWidth, 24);
-    }
+    juce::HyperlinkButton btnUpdateAvailable { "", juce::URL() };   // placed by layoutBottomBar()
     juce::TextButton btnCheckUpdates { "Check for updates" };
     int updateCheckDelay = 0;               // ticks to wait before checking
     bool updateNotificationShown = false;    // true once UI is updated

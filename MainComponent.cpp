@@ -2372,7 +2372,7 @@ MainComponent::MainComponent()
     btnRefreshDevices.setColour(juce::TextButton::textColourOffId, textMid);
 
     addAndMakeVisible(btnGitHub);
-    btnGitHub.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)), false);
+    btnGitHub.setFont(bottomBarFont(), false);
     btnGitHub.setColour(juce::HyperlinkButton::textColourId, juce::Colour(0xFF546E7A));
 
     // --- Update checker button (hidden until update found) ---
@@ -8932,6 +8932,100 @@ void MainComponent::mouseDown(const juce::MouseEvent& e)
 //==============================================================================
 // PAINT
 //==============================================================================
+//==============================================================================
+// BOTTOM BAR
+//==============================================================================
+juce::Font MainComponent::bottomBarFont()
+{
+    return juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain));
+}
+
+juce::String MainComponent::bottomBarVersionText()
+{
+    return "STC v" + juce::JUCEApplication::getInstance()->getApplicationVersion()
+         + "  |  Fiverecords " + juce::String::charToString(0x00A9) + " 2026";
+}
+
+/// The status text of the engine shown, for one of its three states (ACTIVE,
+/// PAUSED, STOPPED).  The engine's name leads it when there are several.
+juce::String MainComponent::bottomBarStatusText(const char* state)
+{
+    auto& eng = currentEngine();
+    juce::String text = TimecodeEngine::getInputName(eng.getActiveInput()) + " " + state;
+    if (engines.size() > 1)
+        text = "[" + eng.getName() + "] " + text;
+    return text;
+}
+
+/// Gives the four things in the bottom bar a place each, so that no text is
+/// written over another at any window width, engine name or version name.
+///
+/// They had fixed places that took no account of each other: the status text
+/// ended 150 px from the right edge and grew to the left, into the GitHub
+/// link, whose 320 px stood in the middle of the window.  At the smallest
+/// window an engine name of twelve letters was enough, and the "Update
+/// available" link, wider than the "Check for updates" button it replaces,
+/// pushed the status text further in: with "Update available: v1.9.17-beta2"
+/// two engines with their default names already wrote "[ENGINE 1] GENERATOR
+/// ACTIVE" across the end of the link (1.9.16; AUD11 MAIN-B-14 had only
+/// taken the update link off the status text).
+///
+/// - At the right edge: "Check for updates", or the update link, as wide as
+///   its text (at most half the window).
+/// - At the left: the version text, as wide as it is.
+/// - The status text ends left of the right-hand item.  Its place is as wide
+///   as its longest wording (STOPPED), so that nothing in the bar moves when
+///   the input starts or stops; an engine name too long for the window is
+///   cut short there, and never reaches the version text.
+/// - The GitHub link stays in the middle of the window while that is free.
+///   Otherwise it goes to the middle of what is left between the version and
+///   the status text, and where it does not fit there it is not shown: of
+///   the four it is the one a show can do without.
+///
+/// Called by resized(), when the update link appears, and by the timer when
+/// the status text has another engine name or input (timerCallback).
+void MainComponent::layoutBottomBar()
+{
+    if (engines.empty()) return;  // guard: same as resized()
+
+    const int barH = 24, y = getHeight() - barH, gap = 12;
+    const auto font = bottomBarFont();
+    auto widthOf = [&font](const juce::String& text) { return juce::GlyphArrangement::getStringWidthInt(font, text) + 2; };
+
+    auto rightItem = juce::Rectangle<int>(getWidth() - 145, y, 140, barH);
+    btnCheckUpdates.setBounds(rightItem);
+    if (btnUpdateAvailable.isVisible())
+    {
+        btnUpdateAvailable.changeWidthToFitText();
+        const int linkWidth = juce::jmin(btnUpdateAvailable.getWidth() + 8, getWidth() / 2);
+        rightItem = { getWidth() - 5 - linkWidth, y, linkWidth, barH };
+        btnUpdateAvailable.setBounds(rightItem);
+    }
+
+    bottomBarVersionArea = { 10, y, widthOf(bottomBarVersionText()), barH };
+
+    const int statusRight = rightItem.getX() - 5;
+    const int statusLeft  = juce::jmax(bottomBarVersionArea.getRight() + gap,
+                                       statusRight - widthOf(bottomBarStatusText("STOPPED")));
+    bottomBarStatusArea = juce::Rectangle<int>::leftTopRightBottom(statusLeft, y, juce::jmax(statusLeft, statusRight), y + barH);
+
+    btnGitHub.changeWidthToFitText();
+    const int linkWidth = btnGitHub.getWidth();
+    const int freeLeft = bottomBarVersionArea.getRight() + gap, freeRight = statusLeft - gap;
+    int linkX = (getWidth() - linkWidth) / 2;
+    if (linkX < freeLeft || linkX + linkWidth > freeRight)
+        linkX = freeLeft + (freeRight - freeLeft - linkWidth) / 2;
+    btnGitHub.setVisible(freeRight - freeLeft >= linkWidth);
+    btnGitHub.setBounds(linkX, y, linkWidth, barH);
+
+    // What the bar was laid out for: the timer compares these with the engine shown
+    auto& eng = currentEngine();
+    lastBottomBarStatus = TimecodeEngine::getInputName(eng.getActiveInput());
+    lastBottomBarName   = engines.size() > 1 ? eng.getName() : juce::String();
+
+    repaint(0, y, getWidth(), barH);
+}
+
 void MainComponent::paint(juce::Graphics& g)
 {
     if (engines.empty()) return;  // guard: same as resized()
@@ -8961,28 +9055,17 @@ void MainComponent::paint(juce::Graphics& g)
     int bbH = 24;
     g.setColour(bgDarker); g.fillRect(0, getHeight() - bbH, getWidth(), bbH);
     g.setColour(borderCol); g.drawLine(0.0f, (float)(getHeight() - bbH), (float)getWidth(), (float)(getHeight() - bbH), 1.0f);
-    g.setColour(textDim); g.setFont(juce::Font(juce::FontOptions(getMonoFontName(), 9.0f, juce::Font::plain)));
-    juce::String verStr = "STC v" + juce::JUCEApplication::getInstance()->getApplicationVersion()
-                        + "  |  Fiverecords " + juce::String::charToString(0x00A9) + " 2026";
-    g.drawText(verStr,
-               juce::Rectangle<int>(10, getHeight() - bbH, 280, bbH), juce::Justification::centredLeft);
+    // The version at the left and the status of the engine shown towards the
+    // right, each in the place layoutBottomBar() gave it
+    g.setColour(textDim); g.setFont(bottomBarFont());
+    g.drawText(bottomBarVersionText(), bottomBarVersionArea, juce::Justification::centredLeft);
 
     auto& eng = currentEngine();
-    juce::String statusText; juce::Colour statusColour;
-    if (eng.isSourceActive()) { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " ACTIVE"; statusColour = getInputColour(eng.getActiveInput()); }
-    else if (eng.isInputStarted()) { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " PAUSED"; statusColour = juce::Colour(0xFFFFAB00); }
-    else { statusText = TimecodeEngine::getInputName(eng.getActiveInput()) + " STOPPED"; statusColour = textDim; }
-
-    // Show engine name in status if multiple engines
-    if (engines.size() > 1)
-        statusText = "[" + eng.getName() + "] " + statusText;
-
-    // The text ends left of the "Check for updates" button, or of the update
-    // link that replaces it when that one is the wider (AUD11 MAIN-B-14).
-    const int statusRight = btnUpdateAvailable.isVisible()
-                              ? juce::jmin(getWidth() - 150, btnUpdateAvailable.getX() - 5)
-                              : getWidth() - 150;
-    g.setColour(statusColour); g.drawText(statusText, juce::Rectangle<int>(statusRight - 270, getHeight() - bbH, 270, bbH), juce::Justification::centredRight);
+    const char* state; juce::Colour statusColour;
+    if (eng.isSourceActive()) { state = "ACTIVE"; statusColour = getInputColour(eng.getActiveInput()); }
+    else if (eng.isInputStarted()) { state = "PAUSED"; statusColour = juce::Colour(0xFFFFAB00); }
+    else { state = "STOPPED"; statusColour = textDim; }
+    g.setColour(statusColour); g.drawText(bottomBarStatusText(state), bottomBarStatusArea, juce::Justification::centredRight);
 
     // Center area: display background + frame rate labels
     auto centerArea = getLocalBounds().reduced(panelWidth, 0);
@@ -9831,12 +9914,7 @@ void MainComponent::resized()
     }
 
     timecodeDisplay.setBounds(centerArea);
-    btnGitHub.setBounds(getWidth() / 2 - 160, getHeight() - bottomBar, 320, bottomBar);
-    btnCheckUpdates.setBounds(getWidth() - 145, getHeight() - bottomBar, 140, bottomBar);
-
-    // Update notification -- replaces check button in bottom bar
-    if (btnUpdateAvailable.isVisible())
-        placeUpdateLink();
+    layoutBottomBar();
 }
 
 //==============================================================================
@@ -11263,10 +11341,9 @@ void MainComponent::timerCallback()
             btnUpdateAvailable.setURL(juce::URL(updateChecker.getReleaseUrl()));
             btnUpdateAvailable.setVisible(true);
             btnCheckUpdates.setVisible(false);
-            // Position directly in the bottom bar, and repaint the bar: the
-            // status text may have to make room (AUD11 MAIN-B-14)
-            placeUpdateLink();
-            repaint(0, getHeight() - 24, getWidth(), 24);
+            // It replaces the check button in the bottom bar and is the wider
+            // of the two: the status text and the GitHub link make room
+            layoutBottomBar();
         }
         else if (updateChecker.didCheckFail())
         {
@@ -11300,14 +11377,23 @@ void MainComponent::timerCallback()
     // the state: paint() words an input that is not active PAUSED or
     // STOPPED by it, and a change of it alone (a device opened or lost with
     // no timecode running) asked for no repaint (AUD11 MAIN-B-14).
+    //
+    // Another input, another engine or another engine name gives the status
+    // text another length: the bar is laid out again, whatever changed them
+    // (layoutBottomBar notes what it was laid out for, and repaints the bar).
     juce::String currentBottomStatus = TimecodeEngine::getInputName(eng.getActiveInput());
-    if (currentBottomStatus != lastBottomBarStatus || eng.isSourceActive() != lastBottomBarActive
+    const bool statusTextChanged = currentBottomStatus != lastBottomBarStatus
+                                || (engines.size() > 1 ? eng.getName() : juce::String()) != lastBottomBarName;
+    if (statusTextChanged || eng.isSourceActive() != lastBottomBarActive
         || eng.isInputStarted() != lastBottomBarStarted)
     {
         lastBottomBarStatus = currentBottomStatus;
         lastBottomBarActive = eng.isSourceActive();
         lastBottomBarStarted = eng.isInputStarted();
-        repaint(0, getHeight() - 24, getWidth(), 24);
+        if (statusTextChanged)
+            layoutBottomBar();
+        else
+            repaint(0, getHeight() - 24, getWidth(), 24);
     }
 }
 
