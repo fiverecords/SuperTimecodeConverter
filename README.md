@@ -445,7 +445,7 @@ The sections below are for developers who want to build STC from source.
 
 ### Prerequisites
 
-- **JUCE Framework 9.0.5 or later** (1.9.16-beta2 is built with 9.0.6; the code does not compile against 9.0.4 or older) — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
+- **JUCE Framework 9.0.5 or later** (1.9.16 is built with 9.0.6; the code does not compile against 9.0.4 or older) — download from [juce.com](https://juce.com/get-juce/) or clone from [GitHub](https://github.com/juce-framework/JUCE)
 
 #### Windows
 
@@ -562,7 +562,7 @@ The sections below are for developers who want to build STC from source.
 The Projucer project the releases are built from is not in this repository, so the project has to be made:
 
 1. Clone the repository.
-2. Open the Projucer of JUCE 9.0.5 or later (9.0.6 for 1.9.16-beta2) and create a new GUI Application project with the source files. A project saved with an older Projucer must be opened and saved again with this one.
+2. Open the Projucer of JUCE 9.0.5 or later (9.0.6 for 1.9.16) and create a new GUI Application project with the source files. A project saved with an older Projucer must be opened and saved again with this one.
 3. Mark only `Main.cpp`, `MainComponent.cpp`, `btt_build.cpp` and `sqlite3.c` to be compiled; everything else is a header or is included by one of them. `btt_amalgamation.c` must not be compiled: `btt_build.cpp` includes the same library, and every BTT symbol would be defined twice.
 4. Add the JUCE modules listed in Option A and the ones they depend on (`juce_audio_processors`, `juce_audio_processors_headless` and `juce_data_structures`), set C++17, enable `JUCE_USE_MP3AUDIOFORMAT` in `juce_audio_formats`, and give the exporters the definitions of Option A (`SQLITE_THREADSAFE=1`; on Windows also `NOMINMAX=1`, `_WIN32_WINNT=0x0A00`, `_CRT_SECURE_NO_WARNINGS`, `SQLITE_WIN32_GETVERSIONEX=0` and the compiler flag `/bigobj`).
 5. Set the JUCE modules path to your local JUCE installation. For ASIO and Ableton Link see the two sections below.
